@@ -20,7 +20,9 @@ CPU based approaches.
 Clone the repository and install the base library:
 
 ```bash
-pip install cubic
+git clone cubic
+cd cubic
+pip install -e .
 ```
 
 Optional extras from `pyproject.toml` enable additional functionality:
