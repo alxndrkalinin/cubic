@@ -1,12 +1,16 @@
 # cubic
 
-cubic is a Python library for morphometric analysis of multidimensional
-bioimages with CUDA acceleration. It was created to streamline common
-morphology workflows on large 3D microscopy data. The library provides tools
-for deconvolution, segmentation (via Cellpose integration) and feature
-extraction, all accessible from a simple Python API. By leveraging GPU enabled
-operations where possible, cubic offers substantial speed ups over purely
-CPU based approaches.
+`cubic` is a Python library that accelerates processing and analysis of
+multidimensional (2D/3D+) bioimages using CUDA.
+By leveraging GPU-enabled operations where possible, it offers substantial
+speed ups over purely CPU-based approaches.
+`cubic`'s device-agnostic API wraps scipy/scikit-image and cupy/cuCIM,
+allowing to add GPU acceleration to existing codebases by simply replacing import
+statement and and transferring input arrays to the target device.
+It also provides custom GPU-accelerated implementations of additional
+features, including Forier Ring and Shell Correlation for image resolution,
+faster Richardson-Lucy deconvolution, average precision (AP) for segmentation
+quality assesement, and other.
 
 ## Getting started
 
@@ -59,8 +63,7 @@ Pre-commit will then run style checks automatically. Please open an issue or
 pull request on GitHub.
 
 ## Usage
-See the example notebooks in `examples/notebooks/` for demonstrations of
-deconvolution and segmentation workflows.
+See the example notebooks in `examples/notebooks/`.
 
 ## Citation
 If you use `cubic` in your research, please cite it:
@@ -69,7 +72,7 @@ If you use `cubic` in your research, please cite it:
 @inproceedings{kalinin2025cubic,
   title={cubic: CUDA-accelerated 3D BioImage Computing},
   author={Kalinin, Alexandr A and Carpenter, Anne E and Singh, Shantanu and O’Meara, Matthew J},
-  booktitle={International Conference on Computer Vision Workshop (ICCVW)},
+  booktitle={International Conference on Computer Vision Workshops (ICCVW)},
   year={2025},
   organization={IEEE}
 }
