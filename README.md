@@ -20,18 +20,18 @@ CPU based approaches.
 Clone the repository and install the base library:
 
 ```bash
-git clone cubic
+git clone https://github.com/alxndrkalinin/cubic.git
 cd cubic
-pip install -e .
+pip install .
 ```
 
 Optional extras from `pyproject.toml` enable additional functionality:
 
 ```bash
 # mesh feature extraction
-pip install -e '.[mesh]'
+pip install '.[mesh]'
 # segmentation via Cellpose
-pip install -e '.[cellpose]'
+pip install '.[cellpose]'
 # developer tools (pre-commit, pytest)
 pip install -e '.[dev]'
 # install everything
@@ -63,13 +63,14 @@ See the example notebooks in `examples/notebooks/` for demonstrations of
 deconvolution and segmentation workflows.
 
 ## Citation
-If you use cubic in your research, please cite it:
+If you use `cubic` in your research, please cite it:
 
 ```bibtex
-@misc{cubic,
-  author       = {Alexandr Kalinin},
-  title        = {cubic: morphometric analysis of nD bioimages with CUDA support},
-  year         = {2025},
-  howpublished = {\url{https://github.com/alxndrkalinin/cubic}}
+@inproceedings{kalinin2025cubic,
+  title={cubic: CUDA-accelerated 3D BioImage Computing},
+  author={Kalinin, Alexandr A and Carpenter, Anne E and Singh, Shantanu and O’Meara, Matthew J},
+  booktitle={International Conference on Computer Vision Workshop (ICCVW)},
+  year={2025},
+  organization={IEEE}
 }
 ```
