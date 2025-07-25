@@ -25,16 +25,21 @@ class SkimageProxy(ModuleType):
             return self.__dict__[func_name]
 
         def func_wrapper(*args: Any, **kwargs: Any) -> Any:
-            """Wrap skimage or cucim.skimage function based on device capability."""
-            array = args[0] if args else kwargs.get("image", None)
+            """Wrap skimage or cucim functions based on device capability."""
             base_module = "skimage"
 
-            if self.cp is not None and hasattr(array, "device"):
-                device_val = getattr(array, "device", None)
-                if hasattr(device_val, "id") or (
-                    isinstance(device_val, str) and device_val != "cpu"
-                ):
-                    base_module = "cucim.skimage"
+            if self.__name__ == "io":
+                base_module = "cubic.cucim"
+                array = args[1] if len(args) > 1 else kwargs.get("arr", None)
+            else:
+                array = args[0] if args else kwargs.get("image", None)
+
+                if self.cp is not None and hasattr(array, "device"):
+                    device_val = getattr(array, "device", None)
+                    if hasattr(device_val, "id") or (
+                        isinstance(device_val, str) and device_val != "cpu"
+                    ):
+                        base_module = "cucim.skimage"
 
             full_func_name = f"{base_module}.{self.__name__}.{func_name}"
             module_name, method_name = full_func_name.rsplit(".", maxsplit=1)
