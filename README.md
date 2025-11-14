@@ -17,10 +17,13 @@ quality assesement, and other.
 ### Dependencies
 * Python >=3.10
 * numpy/scipy/scikit-image
-* [optional] CUDA 11.x-12.x, cupy, cuCIM
+* [optional] CUDA>=11.x, [CuPy](https://docs.cupy.dev/en/stable/install.html), [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file#install-cucim)
 * [optional] Cellpose for segmentation
 
 ### Installation
+
+Install optional CUDA dependencies if GPU support is needed.
+
 Clone the repository and install the base library:
 
 ```bash
