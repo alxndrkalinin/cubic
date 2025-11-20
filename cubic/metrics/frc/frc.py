@@ -137,14 +137,77 @@ class FRC(object):
 
 
 def _calculate_frc_core(
-    image1: np.ndarray, image2: np.ndarray, bin_delta: int
+    image1: np.ndarray,
+    image2: np.ndarray,
+    bin_delta: int,
+    *,
+    backend: str = "mask",
 ) -> FourierCorrelationDataCollection:
-    """Core FRC calculation logic."""
+    """
+    Core FRC calculation logic.
+    
+    Args:
+        image1: First input image
+        image2: Second input image
+        bin_delta: Bin width (step size between bins). Controls binning resolution
+                   for both backends.
+        backend: "mask" (existing iterators) or "hist" (radial histogram)
+    """
     assert image1.shape == image2.shape
     frc_data = FourierCorrelationDataCollection()
-    iterator = FourierRingIterator(image1.shape, bin_delta)
-    frc_task = FRC(image1, image2, iterator)
-    frc_data[0] = frc_task.execute()
+    
+    if backend == "hist":
+        # Histogram backend using radial.py
+        from .radial import radial_bins, radial_bin_id, reduce_power, reduce_cross
+        
+        # Compute FFT (same as FRC class)
+        fft_image1 = np.fft.fftshift(np.fft.fft2(image1))
+        fft_image2 = np.fft.fftshift(np.fft.fft2(image2))
+        
+        shape = fft_image1.shape
+        edges, radii, nb = radial_bins(shape, bin_delta)
+        bin_id = radial_bin_id(shape, edges)
+        
+        # Compute per-bin sums
+        Sx2, Nx = reduce_power(fft_image1, bin_id, nb)
+        Sy2, Ny = reduce_power(fft_image2, bin_id, nb)
+        Sxy_re, _ = reduce_cross(fft_image1, fft_image2, bin_id, nb, numerator="real")
+        
+        # Compute FRC from sums (matching iterator backend: use abs of cross-correlation)
+        # The iterator backend uses abs(c1), so we do the same here for consistency
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            eps = np.finfo(np.float32).tiny
+            Sx2_safe = np.clip(Sx2, eps, None)
+            Sy2_safe = np.clip(Sy2, eps, None)
+            Sxy_re_safe = np.clip(np.abs(Sxy_re), eps, None)
+            
+            frc = np.exp(
+                np.log(Sxy_re_safe) - 0.5 * (np.log(Sx2_safe) + np.log(Sy2_safe))
+            )
+            frc[frc == np.inf] = 0.0
+            frc = np.nan_to_num(frc)
+        
+        # Convert to spatial frequency (same as FRC.execute)
+        freq_nyq = int(np.floor(shape[0] / 2.0))
+        spatial_freq = asnumpy(radii.astype(np.float32) / freq_nyq)
+        
+        # Convert to numpy arrays if needed (for CuPy compatibility)
+        frc = asnumpy(frc)
+        n_points = asnumpy(Nx.astype(np.float32))
+        
+        # Package result in same format as FRC.execute
+        data_set = FourierCorrelationData()
+        data_set.correlation["correlation"] = frc
+        data_set.correlation["frequency"] = spatial_freq
+        data_set.correlation["points-x-bin"] = n_points
+        
+        frc_data[0] = data_set
+    else:
+        # Default mask/iterator backend
+        iterator = FourierRingIterator(image1.shape, bin_delta)
+        frc_task = FRC(image1, image2, iterator)
+        frc_data[0] = frc_task.execute()
+    
     return frc_data
 
 
@@ -176,8 +239,16 @@ def calculate_frc(
     z_correction: float = 1.0,
     spacing: float | Sequence[float] = 1.0,
     zero_padding: bool = True,
+    backend: str = "mask",
 ) -> FourierCorrelationData:
-    """Calculate a regular FRC with single or two image inputs."""
+    """
+    Calculate a regular FRC with single or two image inputs.
+    
+    Args:
+        bin_delta: Bin width (step size between bins). Controls binning resolution
+                   for both backends. Default: 1.
+        backend: "mask" (existing iterators) or "hist" (radial histogram)
+    """
     single_image = image2 is None
     reverse = average and single_image
     original_image1 = image1.copy() if reverse else None
@@ -194,7 +265,7 @@ def calculate_frc(
         disable_hamming=disable_hamming,
     )
 
-    frc_data = _calculate_frc_core(image1, image2, bin_delta)
+    frc_data = _calculate_frc_core(image1, image2, bin_delta, backend=backend)
 
     # Average with reverse pattern (only for single image mode)
     if reverse:
@@ -207,7 +278,7 @@ def calculate_frc(
             disable_hamming=disable_hamming,
         )
 
-        frc_data_rev = _calculate_frc_core(image1, image2, bin_delta)
+        frc_data_rev = _calculate_frc_core(image1, image2, bin_delta, backend=backend)
 
         # Average the two results
         frc_data[0].correlation["correlation"] = (
