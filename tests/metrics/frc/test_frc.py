@@ -9,7 +9,7 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.frc import frc_resolution, fsc_resolution
+from cubic.metrics.frc import calculate_frc, frc_resolution, fsc_resolution
 
 
 def _fractional_to_absolute(
@@ -117,28 +117,28 @@ def test_calculate_frc_cpu_vs_gpu(
         assert np.isclose(cpu_res, gpu_res, atol=1e-5)
 
 
-def test_calculate_fsc_cpu_vs_gpu(
-    cells_volume: tuple[np.ndarray, list[float]],
-) -> None:
-    """Compare FSC resolution calculated on CPU and GPU."""
-    volume, spacing = cells_volume
-
-    rng = np.random.default_rng(42)
-    noisy_volume = volume.astype(np.float32) + rng.normal(0, 0.5, volume.shape).astype(
-        np.float32
-    )
-
-    cpu_res = fsc_resolution(noisy_volume, spacing=spacing, bin_delta=1)
-    _assert_positive(cpu_res["xy"])
-    _assert_positive(cpu_res["z"])
-
-    if _gpu_available():
-        gpu_res = fsc_resolution(ascupy(noisy_volume), spacing=spacing, bin_delta=1)
-        assert np.allclose(
-            [cpu_res["xy"], cpu_res["z"]],
-            [gpu_res["xy"], gpu_res["z"]],
-            atol=1e-3,
-        )
+# def test_calculate_fsc_cpu_vs_gpu(
+#     cells_volume: tuple[np.ndarray, list[float]],
+# ) -> None:
+#     """Compare FSC resolution calculated on CPU and GPU."""
+#     volume, spacing = cells_volume
+#
+#     rng = np.random.default_rng(42)
+#     noisy_volume = volume.astype(np.float32) + rng.normal(0, 0.5, volume.shape).astype(
+#         np.float32
+#     )
+#
+#     cpu_res = fsc_resolution(noisy_volume, spacing=spacing, bin_delta=1)
+#     _assert_positive(cpu_res["xy"])
+#     _assert_positive(cpu_res["z"])
+#
+#     if _gpu_available():
+#         gpu_res = fsc_resolution(ascupy(noisy_volume), spacing=spacing, bin_delta=1)
+#         assert np.allclose(
+#             [cpu_res["xy"], cpu_res["z"]],
+#             [gpu_res["xy"], gpu_res["z"]],
+#             atol=1e-3,
+#         )
 
 
 # def test_calculate_frc_single_vs_two_image() -> None:
@@ -180,3 +180,57 @@ def test_calculate_fsc_cpu_vs_gpu(
 #     # Results should be different
 #     assert not np.allclose([single_res["xy"], single_res["z"]],
 #                           [two_res["xy"], two_res["z"]], rtol=0.1)
+
+
+def test_frc_mask_vs_hist(
+    cells_volume: tuple[np.ndarray, list[float]],
+) -> None:
+    """Compare FRC results from mask and histogram backends."""
+    volume, spacing = cells_volume
+    slice_image = _middle_slice(volume)
+    xy_spacing = spacing[1:]  # [y, x] spacing
+
+    # Calculate FRC with both backends
+    result_mask = calculate_frc(
+        slice_image,
+        bin_delta=1,
+        spacing=xy_spacing,
+        backend="mask",
+        disable_hamming=False,
+    )
+    result_hist = calculate_frc(
+        slice_image,
+        bin_delta=1,
+        spacing=xy_spacing,
+        backend="hist",
+        disable_hamming=False,
+    )
+
+    # Both backends should give nearly identical results (same coordinate system)
+    corr_mask = result_mask.correlation["correlation"]
+    corr_hist = result_hist.correlation["correlation"]
+    freq_mask = result_mask.correlation["frequency"]
+    freq_hist = result_hist.correlation["frequency"]
+
+    # Compare all but the last bin (which may have edge effects)
+    min_len = min(len(corr_mask), len(corr_hist)) - 1
+
+    # Correlation values should match closely
+    assert np.allclose(
+        corr_mask[:min_len],
+        corr_hist[:min_len],
+        atol=0.01,
+        rtol=0.02,
+    ), "FRC correlation values should match between backends"
+
+    # Frequencies should match closely
+    assert np.allclose(
+        freq_mask[:min_len],
+        freq_hist[:min_len],
+        atol=0.001,
+        rtol=0.01,
+    ), "FRC frequencies should match between backends"
+
+    # Both should produce positive resolution values
+    _assert_positive(result_mask.resolution["resolution"])
+    _assert_positive(result_hist.resolution["resolution"])

@@ -77,7 +77,7 @@ def preprocess_images(
 
 
 class FRC(object):
-    """A class for calculating 2D Fourier ring correlation."""
+    """A class for calculating 2D Fourier ring correlation (unshifted FFT)."""
 
     def __init__(self, image1: np.ndarray, image2: np.ndarray, iterator):
         """Create new FRC executable object and perform FFT on input images."""
@@ -87,11 +87,9 @@ class FRC(object):
             raise ValueError("Fourier ring correlation requires 2D images.")
 
         self.iterator = iterator
-        # Calculate power spectra for the input images.
-        self.fft_image1 = np.fft.fftshift(np.fft.fft2(image1))
-        self.fft_image2 = np.fft.fftshift(np.fft.fft2(image2))
-
-        # Get the Nyquist frequency
+        # Compute unshifted FFT (mean-subtracted, no fftshift)
+        self.fft_image1 = np.fft.fftn(image1 - image1.mean())
+        self.fft_image2 = np.fft.fftn(image2 - image2.mean())
         self.freq_nyq = int(np.floor(image1.shape[0] / 2.0))
 
     def execute(self):
@@ -142,72 +140,76 @@ def _calculate_frc_core(
     bin_delta: int,
     *,
     backend: str = "mask",
+    spacing: Sequence[float] | None = None,
 ) -> FourierCorrelationDataCollection:
     """
     Core FRC calculation logic.
-    
+
     Args:
         image1: First input image
         image2: Second input image
         bin_delta: Bin width (step size between bins). Controls binning resolution
                    for both backends.
         backend: "mask" (existing iterators) or "hist" (radial histogram)
+        spacing: Physical spacing per axis. If None, uses index units.
     """
     assert image1.shape == image2.shape
     frc_data = FourierCorrelationDataCollection()
-    
+
     if backend == "hist":
-        # Histogram backend using radial.py
-        from .radial import radial_bins, radial_bin_id, reduce_power, reduce_cross
-        
-        # Compute FFT (same as FRC class)
-        fft_image1 = np.fft.fftshift(np.fft.fft2(image1))
-        fft_image2 = np.fft.fftshift(np.fft.fft2(image2))
-        
+        # Histogram backend using radial binning
+        from .radial import radial_edges, reduce_cross, reduce_power, radial_bin_id
+
+        # Compute unshifted FFT (mean-subtracted)
+        fft_image1 = np.fft.fftn(image1 - image1.mean())
+        fft_image2 = np.fft.fftn(image2 - image2.mean())
+
+        # Build radial bins and compute per-bin sums
         shape = fft_image1.shape
-        edges, radii, nb = radial_bins(shape, bin_delta)
-        bin_id = radial_bin_id(shape, edges)
-        
-        # Compute per-bin sums
-        Sx2, Nx = reduce_power(fft_image1, bin_id, nb)
-        Sy2, Ny = reduce_power(fft_image2, bin_id, nb)
-        Sxy_re, _ = reduce_cross(fft_image1, fft_image2, bin_id, nb, numerator="real")
-        
-        # Compute FRC from sums (matching iterator backend: use abs of cross-correlation)
-        # The iterator backend uses abs(c1), so we do the same here for consistency
+        edges, radii = radial_edges(shape, bin_delta, spacing=spacing)
+        bin_id = radial_bin_id(shape, edges, spacing=spacing)
+
+        Sx2, Nx = reduce_power(fft_image1, bin_id)
+        Sy2, Ny = reduce_power(fft_image2, bin_id)
+        Sxy_re, _ = reduce_cross(fft_image1, fft_image2, bin_id, numerator="real")
+
+        # Compute FRC: abs(Sxy) / sqrt(Sx2 * Sy2) in log domain for stability
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             eps = np.finfo(np.float32).tiny
             Sx2_safe = np.clip(Sx2, eps, None)
             Sy2_safe = np.clip(Sy2, eps, None)
             Sxy_re_safe = np.clip(np.abs(Sxy_re), eps, None)
-            
+
             frc = np.exp(
                 np.log(Sxy_re_safe) - 0.5 * (np.log(Sx2_safe) + np.log(Sy2_safe))
             )
             frc[frc == np.inf] = 0.0
             frc = np.nan_to_num(frc)
-        
-        # Convert to spatial frequency (same as FRC.execute)
+
+        # Convert radii to normalized spatial frequency
+        # If spacing was provided, radii are in physical units; normalize to [0,1]
+        # If spacing was None, radii are in index units; normalize by Nyquist
         freq_nyq = int(np.floor(shape[0] / 2.0))
-        spatial_freq = asnumpy(radii.astype(np.float32) / freq_nyq)
-        
-        # Convert to numpy arrays if needed (for CuPy compatibility)
+        if spacing is None:
+            spatial_freq = asnumpy(radii.astype(np.float32) / freq_nyq)
+        else:
+            # radii are in physical units; normalize to max frequency
+            max_freq = float(np.max(radii))
+            spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
         frc = asnumpy(frc)
         n_points = asnumpy(Nx.astype(np.float32))
-        
-        # Package result in same format as FRC.execute
+
         data_set = FourierCorrelationData()
         data_set.correlation["correlation"] = frc
         data_set.correlation["frequency"] = spatial_freq
         data_set.correlation["points-x-bin"] = n_points
-        
         frc_data[0] = data_set
     else:
         # Default mask/iterator backend
         iterator = FourierRingIterator(image1.shape, bin_delta)
         frc_task = FRC(image1, image2, iterator)
         frc_data[0] = frc_task.execute()
-    
+
     return frc_data
 
 
@@ -243,7 +245,7 @@ def calculate_frc(
 ) -> FourierCorrelationData:
     """
     Calculate a regular FRC with single or two image inputs.
-    
+
     Args:
         bin_delta: Bin width (step size between bins). Controls binning resolution
                    for both backends. Default: 1.
@@ -265,7 +267,20 @@ def calculate_frc(
         disable_hamming=disable_hamming,
     )
 
-    frc_data = _calculate_frc_core(image1, image2, bin_delta, backend=backend)
+    # Adjust spacing to match preprocessed image shape (padding may have changed dimensions)
+    # For padded dimensions, use the spacing from the first dimension
+    if spacing is not None and len(spacing) != image1.ndim:
+        if len(spacing) < image1.ndim:
+            # Extend spacing if needed (use first spacing value for new dimensions)
+            spacing = list(spacing) + [spacing[0]] * (image1.ndim - len(spacing))
+        else:
+            # Truncate if too long (shouldn't happen, but be safe)
+            spacing = list(spacing[: image1.ndim])
+
+    # Pass spacing to core calculation (for histogram backend)
+    frc_data = _calculate_frc_core(
+        image1, image2, bin_delta, backend=backend, spacing=spacing
+    )
 
     # Average with reverse pattern (only for single image mode)
     if reverse:
@@ -278,7 +293,9 @@ def calculate_frc(
             disable_hamming=disable_hamming,
         )
 
-        frc_data_rev = _calculate_frc_core(image1, image2, bin_delta, backend=backend)
+        frc_data_rev = _calculate_frc_core(
+            image1, image2, bin_delta, backend=backend, spacing=spacing
+        )
 
         # Average the two results
         frc_data[0].correlation["correlation"] = (
@@ -328,7 +345,7 @@ def frc_resolution(
 
 
 class DirectionalFSC(object):
-    """Calculate the directional FSC between two images."""
+    """Calculate the directional FSC between two images (unshifted FFT)."""
 
     def __init__(
         self,
@@ -345,8 +362,9 @@ class DirectionalFSC(object):
             raise ValueError("Image dimensions do not match")
 
         self.iterator = iterator
-        self.fft_image1 = np.fft.fftshift(np.fft.fftn(image1))
-        self.fft_image2 = np.fft.fftshift(np.fft.fftn(image2))
+        # Compute unshifted FFT (mean-subtracted, no fftshift)
+        self.fft_image1 = np.fft.fftn(image1 - image1.mean())
+        self.fft_image2 = np.fft.fftn(image2 - image2.mean())
         if normalize_power:
             pixels = image1.shape[0] ** 3
             self.fft_image1 /= np.array(pixels * np.mean(image1))

@@ -1,102 +1,152 @@
+"""Radial binning utilities for histogram-based FRC/FSC."""
+
+from collections.abc import Sequence
+
 import numpy as np
-from typing import Tuple, Optional
-from math import floor
 
 
-def radial_bins(
-    shape: Tuple[int, ...],
-    bin_delta: int = 1,
-    nbins: Optional[int] = None,
-    unit: str = "index",
-) -> Tuple[np.ndarray, np.ndarray, int]:
+def radial_edges(
+    shape: tuple[int, ...],
+    bin_delta: float = 1.0,
+    spacing: Sequence[float] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build uniform radial bin edges and centers for a given grid shape.
-    Frequencies in 'index' units (fftfreq(n)*n) so it's scale-agnostic.
-    Returns (edges, radii, nbins).
-    
+    Build uniform radial bin edges and centers for 2D/3D unshifted FFT grids.
+
+    bin_delta is always in index bins. When spacing is provided, it converts
+    to physical frequency units internally.
+
     Args:
         shape: Image shape (2D or 3D)
-        bin_delta: Bin width (step size between bins). Used to calculate nbins
-                   if nbins is None. Default: 1.
-        nbins: Optional explicit number of bins. If provided, overrides bin_delta.
-        unit: Unit type (currently only "index" is supported)
-    
-    Returns:
-        Tuple of (edges, radii, nbins)
+        bin_delta: Bin width in index bins (default: 1.0)
+        spacing: Physical spacing per axis. None uses index units,
+                 given uses physical frequency (cycles per length).
+
+    Returns
+    -------
+        edges: (M+1,) radial bin edges from 0 to kmax
+        radii: (M,) radial bin centers (midpoints)
     """
-    axes = [np.fft.fftfreq(n) * n for n in shape]
-    kmax = min(float(np.max(np.abs(ax))) for ax in axes)
-    if nbins is None:
-        # Calculate nbins from bin_delta to match iterator backend behavior
-        # For 2D: nbins = floor(shape[0] / (2 * bin_delta))
-        # For consistency with radial_bins default, use min(shape)
-        nbins = int(floor(min(shape) / (2 * bin_delta)))
-    edges = np.linspace(0.0, kmax, nbins + 1, dtype=np.float64)
+    if bin_delta <= 0:
+        raise ValueError("bin_delta must be > 0")
+
+    ndim = len(shape)
+    if spacing is not None:
+        if len(spacing) != ndim:
+            raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
+        # Physical frequency step per index bin along each axis: Δk_i = 1/(n_i·spacing_i)
+        dk_axes = [1.0 / (n * sp) for n, sp in zip(shape, spacing)]
+        step = bin_delta * min(dk_axes)
+        axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing)]
+    else:
+        # Index units: fftfreq(n) * n gives [0, 1, 2, ..., n//2, -(n//2), ..., -1]
+        step = bin_delta
+        axes = [np.fft.fftfreq(n) * n for n in shape]
+
+    # Maximum radial frequency
+    kmax = min(np.max(np.abs(ax)) for ax in axes)
+
+    # Build edges from 0 to kmax with step size
+    nb = max(1, int(np.ceil(kmax / step)))
+    edges = np.linspace(0.0, kmax, nb + 1, dtype=np.float64)
     radii = 0.5 * (edges[:-1] + edges[1:])
-    return edges, radii, nbins
+    return edges, radii
 
 
-def radial_bin_id(shape: Tuple[int, ...], edges: np.ndarray) -> np.ndarray:
+def radial_bin_id(
+    shape: tuple[int, ...],
+    edges: np.ndarray,
+    spacing: Sequence[float] | None = None,
+) -> np.ndarray:
     """
-    Compute a single flat bin-id per voxel; no boolean masks.
-    Returns int array of size np.prod(shape) with values in [0, nbins-1].
+    Compute radial bin ID for each voxel in unshifted FFT grid.
+
+    Args:
+        shape: Image shape (2D or 3D)
+        edges: Radial bin edges from radial_edges()
+        spacing: Physical spacing per axis (None for index units)
+
+    Returns
+    -------
+        Flattened int32 array with bin_id ∈ [0, nbins-1].
+        DC term (K≈0) is excluded with bin_id = -1.
     """
-    axes = [np.fft.fftfreq(n) * n for n in shape]
+    ndim = len(shape)
+    if spacing is not None:
+        if len(spacing) != ndim:
+            raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
+        axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing)]
+    else:
+        axes = [np.fft.fftfreq(n) * n for n in shape]
+
+    # Build radial coordinate grid
     grids = np.meshgrid(*axes, indexing="ij")
-    K = np.sqrt(sum(g**2 for g in grids))
-    bid = np.digitize(K.ravel(), edges) - 1
-    nbins = len(edges) - 1
-    return np.clip(bid, 0, nbins - 1).astype(np.int32, copy=False)
+    K = np.sqrt(sum(g**2 for g in grids)).ravel()
+
+    # Assign bin IDs
+    bid = np.digitize(K, edges) - 1
+    bid = np.clip(bid, 0, len(edges) - 2).astype(np.int32, copy=False)
+
+    # Exclude DC (K ≈ 0)
+    bid[K < 1e-10] = -1
+    return bid
 
 
-def reduce_power(F: np.ndarray, bin_id: np.ndarray, nbins: int):
-    """
-    Per-bin Σ|F|^2 and counts. Works for 2D/3D; NumPy API only (CuPy-aware).
-    """
-    a = np.abs(F).ravel()
-    S2 = np.bincount(bin_id, weights=a * a, minlength=nbins)
-    N = np.bincount(bin_id, minlength=nbins)
+def reduce_power(F: np.ndarray, bin_id: np.ndarray):
+    """Sum per-bin power Σ|F|² and counts (DC excluded)."""
+    valid = bin_id >= 0
+    nbins = int(bin_id[valid].max()) + 1 if valid.any() else 0
+    a = np.abs(F).ravel()[valid]
+    S2 = np.bincount(bin_id[valid], weights=a * a, minlength=nbins)
+    N = np.bincount(bin_id[valid], minlength=nbins)
     return S2, N
+
+
+def reduce_abs(F: np.ndarray, bin_id: np.ndarray):
+    """Sum per-bin magnitude Σ|F| and counts (DC excluded)."""
+    valid = bin_id >= 0
+    nbins = int(bin_id[valid].max()) + 1 if valid.any() else 0
+    a = np.abs(F).ravel()[valid]
+    S1 = np.bincount(bin_id[valid], weights=a, minlength=nbins)
+    N = np.bincount(bin_id[valid], minlength=nbins)
+    return S1, N
 
 
 def reduce_cross(
     FX: np.ndarray,
     FY: np.ndarray,
     bin_id: np.ndarray,
-    nbins: int,
     numerator: str = "real",
 ):
     """
-    Per-bin cross-spectrum sums. 'numerator' in {'real','mag'}.
-    - 'real': sum Re{X * conj(Y)} (classic FRC numerator)
-    - 'mag' : sum |X * conj(Y)| (optional)
+    Sum per-bin cross-spectrum (DC excluded).
+
+    numerator='real': Σ Re{X·conj(Y)} (classic FRC/FSC, can be negative).
+    numerator='mag': Σ |X|·|Y|.
     """
-    X = FX.ravel()
-    Y = FY.ravel()
-    # Re{X conj Y} = Xr*Yr + Xi*Yi
+    valid = bin_id >= 0
+    nbins = int(bin_id[valid].max()) + 1 if valid.any() else 0
+    X = FX.ravel()[valid]
+    Y = FY.ravel()[valid]
     Sxy_re = np.bincount(
-        bin_id, weights=(X.real * Y.real + X.imag * Y.imag), minlength=nbins
+        bin_id[valid], weights=X.real * Y.real + X.imag * Y.imag, minlength=nbins
     )
     if numerator == "real":
         return Sxy_re, None
-    # |X conj Y| = |X| * |Y|
-    aX = np.hypot(X.real, X.imag)
-    aY = np.hypot(Y.real, Y.imag)
-    Sxy_mag = np.bincount(bin_id, weights=(aX * aY), minlength=nbins)
+    Sxy_mag = np.bincount(
+        bin_id[valid],
+        weights=np.hypot(X.real, X.imag) * np.hypot(Y.real, Y.imag),
+        minlength=nbins,
+    )
     return Sxy_re, Sxy_mag
 
 
 def frc_from_sums(
     Sx2: np.ndarray,
     Sy2: np.ndarray,
-    Sxy_re: np.ndarray,
-    Sxy_mag: Optional[np.ndarray] = None,
+    Sxy: np.ndarray,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """
-    Compute FRC curve from per-bin sums. Default: real-numerator FRC.
-    """
-    denom = np.sqrt(np.maximum(Sx2, 0) * np.maximum(Sy2, 0)) + eps
-    num = Sxy_re if Sxy_mag is None else Sxy_mag
-    frc = np.clip(num / denom, -1.0, 1.0)  # real-numerator can be negative
-    return frc
+    """Compute FRC/FSC curve from per-bin sums: Sxy / sqrt(Sx2·Sy2)."""
+    denom = np.sqrt(np.maximum(Sx2, 0.0) * np.maximum(Sy2, 0.0)) + eps
+    return np.clip(Sxy / denom, -1.0, 1.0)

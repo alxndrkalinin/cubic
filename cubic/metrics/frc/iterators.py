@@ -156,7 +156,7 @@ def _angle_mask(phi: np.ndarray, phi_min: float, phi_max: float) -> np.ndarray:
 
 
 class FourierRingIterator:
-    """Iterate over concentric Fourier rings for 2D images."""
+    """Iterate over concentric Fourier rings for 2D images (unshifted FFT)."""
 
     def __init__(self, shape: Iterable[int], d_bin: int) -> None:
         if len(shape) != 2:
@@ -165,13 +165,16 @@ class FourierRingIterator:
         self.d_bin = d_bin
         self.ring_start = 0
         self._nbins = int(floor(shape[0] / (2 * self.d_bin)))
-        axes = (np.arange(-np.floor(i / 2.0), np.ceil(i / 2.0)) for i in shape)
-        y, x = np.meshgrid(*axes)
+        # Use unshifted fftfreq coordinates (no fftshift)
+        axes = [np.fft.fftfreq(n) * n for n in shape]
+        y, x = np.meshgrid(*axes, indexing="ij")
         self.meshgrid = (y, x)
         self.r = np.sqrt(x**2 + y**2)
         self.current_ring = self.ring_start
         self.freq_nyq = int(np.floor(shape[0] / 2.0))
-        self._radii = np.arange(0, self.freq_nyq, self.d_bin)
+        # Use bin midpoints matching histogram backend
+        bin_starts = np.arange(0, self.freq_nyq, self.d_bin)
+        self._radii = bin_starts + 0.5 * self.d_bin
 
     @property
     def radii(self) -> np.ndarray:
@@ -184,10 +187,14 @@ class FourierRingIterator:
         return self._nbins
 
     def get_points_on_ring(self, ring_start: int, ring_stop: int) -> np.ndarray:
-        """Return boolean mask for points on a ring."""
+        """Return boolean mask for points on a ring. DC term (r==0) is excluded."""
         arr_inf = self.r >= ring_start
         arr_sup = self.r < ring_stop
-        return np.logical_and(arr_inf, arr_sup)
+        ring_mask = np.logical_and(arr_inf, arr_sup)
+        # Exclude DC term (r==0, with small epsilon for floating point safety)
+        eps = 1e-10
+        ring_mask = np.logical_and(ring_mask, self.r > eps)
+        return ring_mask
 
     def __iter__(self) -> "FourierRingIterator":
         """Return iterator over rings."""
@@ -255,19 +262,22 @@ class SectionedFourierRingIterator(FourierRingIterator):
 
 
 class FourierShellIterator:
-    """Simple iterator over concentric Fourier shells for 3D images."""
+    """Simple iterator over concentric Fourier shells for 3D images (unshifted FFT)."""
 
     def __init__(self, shape: Iterable[int], d_bin: int) -> None:
         self.d_bin = d_bin
-        axes = (np.arange(-np.floor(i / 2.0), np.ceil(i / 2.0)) for i in shape)
-        z, y, x = np.meshgrid(*axes)
+        # Use unshifted fftfreq coordinates (no fftshift)
+        axes = [np.fft.fftfreq(n) * n for n in shape]
+        z, y, x = np.meshgrid(*axes, indexing="ij")
         self.meshgrid = (z, y, x)
         self.r = np.sqrt(x**2 + y**2 + z**2)
         self.shell_start = 0
         self.shell_stop = int(floor(shape[0] / (2 * self.d_bin))) - 1
         self.current_shell = self.shell_start
         self.freq_nyq = int(np.floor(shape[0] / 2.0))
-        self.radii = np.arange(0, self.freq_nyq, self.d_bin)
+        # Use bin midpoints matching histogram backend
+        bin_starts = np.arange(0, self.freq_nyq, self.d_bin)
+        self.radii = bin_starts + 0.5 * self.d_bin
 
     @property
     def steps(self) -> np.ndarray:
@@ -280,10 +290,14 @@ class FourierShellIterator:
         return self.freq_nyq
 
     def get_points_on_shell(self, shell_start: int, shell_stop: int) -> np.ndarray:
-        """Return boolean mask for points within a shell."""
+        """Return boolean mask for points within a shell. DC term (r==0) is excluded."""
         arr_inf = self.r >= shell_start
         arr_sup = self.r < shell_stop
-        return arr_inf * arr_sup
+        shell_mask = arr_inf * arr_sup
+        # Exclude DC term (r==0, with small epsilon for floating point safety)
+        eps = 1e-10
+        shell_mask = shell_mask * (self.r > eps)
+        return shell_mask
 
     def __getitem__(self, limits: tuple[int, int]):
         """Return coordinates for points within ``limits`` shell."""
