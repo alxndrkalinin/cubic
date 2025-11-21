@@ -330,6 +330,7 @@ def frc_resolution(
     spacing: float | Sequence[float] = 1.0,
     zero_padding: bool = True,
     curve_fit_type: str = "smooth-spline",
+    backend: str = "mask",
 ) -> float:
     """Calculate either single- or two-image FRC-based 2D image resolution."""
     frc_result = calculate_frc(
@@ -339,6 +340,7 @@ def frc_resolution(
         curve_fit_type=curve_fit_type,
         spacing=spacing,
         zero_padding=zero_padding,
+        backend=backend,
     )
 
     return frc_result.resolution["resolution"]
@@ -679,11 +681,16 @@ def frc_resolution_difference(
     *,
     bin_delta: int = 3,
     spacing: float | tuple[float, float] = 1.0,
+    backend: str = "mask",
 ) -> float:
     """Calculate difference between FRC-based resulutions of two images."""
     if isinstance(spacing, (int, float)):
         spacing = (spacing, spacing)
 
-    image1_res = frc_resolution(image1, bin_delta=bin_delta, spacing=spacing)
-    image2_res = frc_resolution(image2, bin_delta=bin_delta, spacing=spacing)
+    image1_res = frc_resolution(
+        image1, bin_delta=bin_delta, spacing=spacing, backend=backend
+    )
+    image2_res = frc_resolution(
+        image2, bin_delta=bin_delta, spacing=spacing, backend=backend
+    )
     return (image2_res - image1_res) * 1000  # return diff in nm
