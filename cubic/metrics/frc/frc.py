@@ -158,15 +158,20 @@ def _calculate_frc_core(
 
     if backend == "hist":
         # Histogram backend using radial binning
+        from cubic.cuda import get_array_module
+
         from .radial import radial_edges, reduce_cross, reduce_power, radial_bin_id
 
-        # Compute unshifted FFT (mean-subtracted)
+        # Compute unshifted FFT
         fft_image1 = np.fft.fftn(image1 - image1.mean())
         fft_image2 = np.fft.fftn(image2 - image2.mean())
 
-        # Build radial bins and compute per-bin sums
+        # Build radial bins
         shape = fft_image1.shape
         edges, radii = radial_edges(shape, bin_delta, spacing=spacing)
+        xp = get_array_module(fft_image1)
+        edges = xp.asarray(edges)
+
         bin_id = radial_bin_id(shape, edges, spacing=spacing)
 
         Sx2, Nx = reduce_power(fft_image1, bin_id)
@@ -191,11 +196,11 @@ def _calculate_frc_core(
         # If spacing was None, radii are in index units; normalize by Nyquist
         freq_nyq = int(np.floor(shape[0] / 2.0))
         if spacing is None:
-            spatial_freq = asnumpy(radii.astype(np.float32) / freq_nyq)
+            spatial_freq = radii.astype(np.float32) / freq_nyq
         else:
             # radii are in physical units; normalize to max frequency
             max_freq = float(np.max(radii))
-            spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
+            spatial_freq = radii.astype(np.float32) / max_freq
         frc = asnumpy(frc)
         n_points = asnumpy(Nx.astype(np.float32))
 

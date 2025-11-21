@@ -5,6 +5,8 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from cubic.cuda import get_array_module
+
 
 def _kmax_index(shape: tuple[int, ...]) -> float:
     """Compute minimum Nyquist frequency in index units (unshifted FFT)."""
@@ -105,6 +107,9 @@ def radial_bin_id(
     """
     Compute radial bin ID for each voxel in unshifted FFT grid.
 
+    Device-aware: returns array on same device as edges (CPU/GPU).
+    Uses broadcasting instead of meshgrid to reduce memory usage.
+
     Args:
         shape: Image shape (2D or 3D)
         edges: Radial bin edges from radial_edges()
@@ -115,31 +120,53 @@ def radial_bin_id(
         Flattened int32 array with bin_id ∈ [0, nbins-1].
         DC term (K≈0) is excluded with bin_id = -1.
     """
+    # Get array module to create fftfreq on correct device
+    xp = get_array_module(edges)
+
     ndim = len(shape)
+    if ndim not in (2, 3):
+        raise ValueError("Only 2D and 3D images are supported")
+
     if spacing is not None:
         if len(spacing) != ndim:
             raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
-        axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing)]
+        # xp.fft.fftfreq needed to create arrays on correct device
+        axes = [xp.fft.fftfreq(n, d=sp).astype(np.float32) for n, sp in zip(shape, spacing)]
     else:
-        axes = [np.fft.fftfreq(n) * n for n in shape]
+        # xp.fft.fftfreq needed to create arrays on correct device
+        axes = [xp.fft.fftfreq(n).astype(np.float32) * n for n in shape]
 
-    # Build radial coordinate grid
-    grids = np.meshgrid(*axes, indexing="ij")
-    K = np.sqrt(sum(g**2 for g in grids)).ravel()
+    # Build K with broadcasting
+    if ndim == 2:
+        k0 = axes[0][:, None]
+        k1 = axes[1][None, :]
+        K = np.sqrt(k0 * k0 + k1 * k1).ravel()
+    else:  # ndim == 3
+        k0 = axes[0][:, None, None]
+        k1 = axes[1][None, :, None]
+        k2 = axes[2][None, None, :]
+        K = np.sqrt(k0 * k0 + k1 * k1 + k2 * k2).ravel()
 
-    # Assign bin IDs
+    # Bin on same device
     bid = np.digitize(K, edges) - 1
-    bid = np.clip(bid, 0, len(edges) - 2).astype(np.int32, copy=False)
+    nbins = int(edges.size) - 1
+    bid = np.clip(bid, 0, nbins - 1).astype(np.int32, copy=False)
 
-    # Exclude DC (K ≈ 0)
-    bid[K < 1e-10] = -1
+    # Exclude DC robustly using dtype-specific threshold
+    tiny = np.finfo(K.dtype).tiny if hasattr(K, "dtype") else 1e-12
+    bid[K < tiny] = -1
     return bid
 
 
 def reduce_power(F: np.ndarray, bin_id: np.ndarray):
-    """Sum per-bin power Σ|F|² and counts (DC excluded)."""
+    """
+    Sum per-bin power Σ|F|² and counts (DC excluded).
+
+    Device-aware: preserves device of input arrays.
+    """
     valid = bin_id >= 0
     nbins = int(bin_id[valid].max()) + 1 if valid.any() else 0
+    # np.abs, np.bincount all preserve device
     a = np.abs(F).ravel()[valid]
     S2 = np.bincount(bin_id[valid], weights=a * a, minlength=nbins)
     N = np.bincount(bin_id[valid], minlength=nbins)
@@ -147,9 +174,14 @@ def reduce_power(F: np.ndarray, bin_id: np.ndarray):
 
 
 def reduce_abs(F: np.ndarray, bin_id: np.ndarray):
-    """Sum per-bin magnitude Σ|F| and counts (DC excluded)."""
+    """
+    Sum per-bin magnitude Σ|F| and counts (DC excluded).
+
+    Device-aware: preserves device of input arrays.
+    """
     valid = bin_id >= 0
     nbins = int(bin_id[valid].max()) + 1 if valid.any() else 0
+    # np.abs, np.bincount all preserve device
     a = np.abs(F).ravel()[valid]
     S1 = np.bincount(bin_id[valid], weights=a, minlength=nbins)
     N = np.bincount(bin_id[valid], minlength=nbins)
@@ -165,6 +197,8 @@ def reduce_cross(
     """
     Sum per-bin cross-spectrum (DC excluded).
 
+    Device-aware: preserves device of input arrays.
+
     numerator='real': Σ Re{X·conj(Y)} (classic FRC/FSC, can be negative).
     numerator='mag': Σ |X|·|Y|.
     """
@@ -172,6 +206,7 @@ def reduce_cross(
     nbins = int(bin_id[valid].max()) + 1 if valid.any() else 0
     X = FX.ravel()[valid]
     Y = FY.ravel()[valid]
+    # np.bincount, np.hypot all preserve device
     Sxy_re = np.bincount(
         bin_id[valid], weights=X.real * Y.real + X.imag * Y.imag, minlength=nbins
     )
@@ -191,6 +226,11 @@ def frc_from_sums(
     Sxy: np.ndarray,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """Compute FRC/FSC curve from per-bin sums: Sxy / sqrt(Sx2·Sy2)."""
+    """
+    Compute FRC/FSC curve from per-bin sums: Sxy / sqrt(Sx2·Sy2).
+
+    Device-aware: all operations preserve device naturally.
+    """
+    # np.sqrt, np.maximum, np.clip all preserve device
     denom = np.sqrt(np.maximum(Sx2, 0.0) * np.maximum(Sy2, 0.0)) + eps
     return np.clip(Sxy / denom, -1.0, 1.0)

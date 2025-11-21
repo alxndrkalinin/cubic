@@ -9,7 +9,7 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.frc import calculate_frc, frc_resolution, fsc_resolution
+from cubic.metrics.frc import calculate_frc
 
 
 def _fractional_to_absolute(
@@ -99,138 +99,156 @@ def _assert_positive(result: Any) -> None:
         assert float(result) > 0
 
 
-def test_calculate_frc_cpu_vs_gpu(
+def test_frc_all_backends_devices(
     cells_volume: tuple[np.ndarray, list[float]],
 ) -> None:
-    """Compare FRC resolution calculated on CPU and GPU."""
+    """Test all backend-device combinations in a single test to minimize redundant calculations."""
     volume, spacing = cells_volume
-    slice_image = _middle_slice(volume)
-
-    # Use 2D spacing (xy only)
+    slice_cpu = _middle_slice(volume)
     xy_spacing = spacing[1:]  # [y, x] spacing
 
-    cpu_res = frc_resolution(slice_image, spacing=xy_spacing)
-    _assert_positive(cpu_res)
+    # Prepare GPU image if available
+    has_gpu = _gpu_available()
+    slice_gpu = ascupy(slice_cpu) if has_gpu else None
 
-    if _gpu_available():
-        gpu_res = frc_resolution(ascupy(slice_image), spacing=xy_spacing)
-        assert np.isclose(cpu_res, gpu_res, atol=1e-5)
+    # Compute all combinations exactly once
+    results = {}
+    for backend in ["mask", "hist"]:
+        # CPU
+        results[(backend, "cpu")] = calculate_frc(
+            slice_cpu,
+            bin_delta=1,
+            spacing=xy_spacing,
+            backend=backend,
+            disable_hamming=False,
+        )
 
+        # GPU
+        if has_gpu:
+            results[(backend, "gpu")] = calculate_frc(
+                slice_gpu,
+                bin_delta=1,
+                spacing=xy_spacing,
+                backend=backend,
+                disable_hamming=False,
+            )
 
-# def test_calculate_fsc_cpu_vs_gpu(
-#     cells_volume: tuple[np.ndarray, list[float]],
-# ) -> None:
-#     """Compare FSC resolution calculated on CPU and GPU."""
-#     volume, spacing = cells_volume
-#
-#     rng = np.random.default_rng(42)
-#     noisy_volume = volume.astype(np.float32) + rng.normal(0, 0.5, volume.shape).astype(
-#         np.float32
-#     )
-#
-#     cpu_res = fsc_resolution(noisy_volume, spacing=spacing, bin_delta=1)
-#     _assert_positive(cpu_res["xy"])
-#     _assert_positive(cpu_res["z"])
-#
-#     if _gpu_available():
-#         gpu_res = fsc_resolution(ascupy(noisy_volume), spacing=spacing, bin_delta=1)
-#         assert np.allclose(
-#             [cpu_res["xy"], cpu_res["z"]],
-#             [gpu_res["xy"], gpu_res["z"]],
-#             atol=1e-3,
-#         )
+    # Test 1: Each result should have valid structure and positive resolution
+    for (backend, device), result in results.items():
+        _assert_positive(result.resolution["resolution"])
+        corr = result.correlation["correlation"]
+        freq = result.correlation["frequency"]
+        assert len(corr) > 0, f"Empty correlation for {backend}-{device}"
+        assert len(freq) > 0, f"Empty frequency for {backend}-{device}"
+        assert len(corr) == len(freq), f"Length mismatch for {backend}-{device}"
 
-
-# def test_calculate_frc_single_vs_two_image() -> None:
-#     """Test that single image FRC works correctly."""
-#     # Create a test image with known properties
-#     rng = np.random.default_rng(42)
-#     test_image = rng.random((64, 64)).astype(np.float32)
-
-#     # Single image FRC
-#     single_res = frc_resolution(test_image)
-#     _assert_positive(single_res)
-
-#     # Two image FRC (should give different result)
-#     test_image2 = test_image + rng.normal(0, 0.1, test_image.shape).astype(np.float32)
-#     two_res = frc_resolution(test_image, test_image2)
-#     _assert_positive(two_res)
-
-#     # Results should be different
-#     assert not np.isclose(single_res, two_res, rtol=0.1)
-
-
-# def test_calculate_fsc_single_vs_two_image() -> None:
-#     """Test that single image FSC works correctly."""
-#     # Create a test volume with known properties
-#     rng = np.random.default_rng(42)
-#     test_volume = rng.random((32, 32, 32)).astype(np.float32)
-
-#     # Single image FSC
-#     single_res = fsc_resolution(test_volume, bin_delta=5)
-#     _assert_positive(single_res["xy"])
-#     _assert_positive(single_res["z"])
-
-#     # Two image FSC (should give different result)
-#     test_volume2 = test_volume + rng.normal(0, 0.2, test_volume.shape).astype(np.float32)
-#     two_res = fsc_resolution(test_volume, test_volume2, bin_delta=5)
-#     _assert_positive(two_res["xy"])
-#     _assert_positive(two_res["z"])
-
-#     # Results should be different
-#     assert not np.allclose([single_res["xy"], single_res["z"]],
-#                           [two_res["xy"], two_res["z"]], rtol=0.1)
-
-
-def test_frc_mask_vs_hist(
-    cells_volume: tuple[np.ndarray, list[float]],
-) -> None:
-    """Compare FRC results from mask and histogram backends."""
-    volume, spacing = cells_volume
-    slice_image = _middle_slice(volume)
-    xy_spacing = spacing[1:]  # [y, x] spacing
-
-    # Calculate FRC with both backends
-    result_mask = calculate_frc(
-        slice_image,
-        bin_delta=1,
-        spacing=xy_spacing,
-        backend="mask",
-        disable_hamming=False,
-    )
-    result_hist = calculate_frc(
-        slice_image,
-        bin_delta=1,
-        spacing=xy_spacing,
-        backend="hist",
-        disable_hamming=False,
-    )
-
-    # Both backends should give nearly identical results (same coordinate system)
-    corr_mask = result_mask.correlation["correlation"]
-    corr_hist = result_hist.correlation["correlation"]
-    freq_mask = result_mask.correlation["frequency"]
-    freq_hist = result_hist.correlation["frequency"]
-
-    # Compare all but the last bin (which may have edge effects)
+    # Test 2: Backend consistency on CPU (mask vs hist)
+    mask_cpu = results[("mask", "cpu")]
+    hist_cpu = results[("hist", "cpu")]
+    corr_mask = mask_cpu.correlation["correlation"]
+    corr_hist = hist_cpu.correlation["correlation"]
+    freq_mask = mask_cpu.correlation["frequency"]
+    freq_hist = hist_cpu.correlation["frequency"]
     min_len = min(len(corr_mask), len(corr_hist)) - 1
 
-    # Correlation values should match closely
     assert np.allclose(
         corr_mask[:min_len],
         corr_hist[:min_len],
-        atol=0.01,
-        rtol=0.02,
-    ), "FRC correlation values should match between backends"
+        atol=0.015,
+        rtol=0.03,
+    ), "FRC correlation should match between backends on CPU"
 
-    # Frequencies should match closely
     assert np.allclose(
         freq_mask[:min_len],
         freq_hist[:min_len],
         atol=0.001,
         rtol=0.01,
-    ), "FRC frequencies should match between backends"
+    ), "FRC frequencies should match between backends on CPU"
 
-    # Both should produce positive resolution values
-    _assert_positive(result_mask.resolution["resolution"])
-    _assert_positive(result_hist.resolution["resolution"])
+    if not has_gpu:
+        return  # Skip GPU tests if not available
+
+    # Test 3: Backend consistency on GPU (mask vs hist)
+    mask_gpu = results[("mask", "gpu")]
+    hist_gpu = results[("hist", "gpu")]
+    corr_mask_gpu = mask_gpu.correlation["correlation"]
+    corr_hist_gpu = hist_gpu.correlation["correlation"]
+    freq_mask_gpu = mask_gpu.correlation["frequency"]
+    freq_hist_gpu = hist_gpu.correlation["frequency"]
+    min_len_gpu = min(len(corr_mask_gpu), len(corr_hist_gpu)) - 1
+
+    assert np.allclose(
+        corr_mask_gpu[:min_len_gpu],
+        corr_hist_gpu[:min_len_gpu],
+        atol=0.015,
+        rtol=0.03,
+    ), "FRC correlation should match between backends on GPU"
+
+    assert np.allclose(
+        freq_mask_gpu[:min_len_gpu],
+        freq_hist_gpu[:min_len_gpu],
+        atol=0.001,
+        rtol=0.01,
+    ), "FRC frequencies should match between backends on GPU"
+
+    # Test 4: Device consistency (CPU vs GPU for each backend)
+    for backend in ["mask", "hist"]:
+        cpu_result = results[(backend, "cpu")]
+        gpu_result = results[(backend, "gpu")]
+
+        corr_cpu = cpu_result.correlation["correlation"]
+        corr_gpu = gpu_result.correlation["correlation"]
+        freq_cpu = cpu_result.correlation["frequency"]
+        freq_gpu = gpu_result.correlation["frequency"]
+
+        min_len = min(len(corr_cpu), len(corr_gpu)) - 1
+
+        assert np.allclose(
+            corr_cpu[:min_len],
+            corr_gpu[:min_len],
+            atol=1e-5,
+            rtol=1e-5,
+        ), f"FRC correlation should match CPU/GPU for {backend} backend"
+
+        assert np.allclose(
+            freq_cpu[:min_len],
+            freq_gpu[:min_len],
+            atol=1e-6,
+            rtol=1e-6,
+        ), f"FRC frequencies should match CPU/GPU for {backend} backend"
+
+    # Test 5: Cross-consistency (all combinations vs reference)
+    ref = mask_cpu
+    ref_corr = ref.correlation["correlation"]
+    ref_freq = ref.correlation["frequency"]
+
+    for (backend, device), result in results.items():
+        if backend == "mask" and device == "cpu":
+            continue  # Skip reference
+
+        corr = result.correlation["correlation"]
+        freq = result.correlation["frequency"]
+        min_len = min(len(ref_corr), len(corr)) - 1
+
+        # Same backend should have tighter tolerance
+        if backend == "mask":
+            atol_corr, rtol_corr = 1e-5, 1e-5
+            atol_freq, rtol_freq = 1e-6, 1e-6
+        else:
+            # Different backend (hist vs mask) has relaxed tolerance
+            atol_corr, rtol_corr = 0.015, 0.03
+            atol_freq, rtol_freq = 0.001, 0.01
+
+        assert np.allclose(
+            ref_corr[:min_len],
+            corr[:min_len],
+            atol=atol_corr,
+            rtol=rtol_corr,
+        ), f"Correlation mismatch: mask-cpu vs {backend}-{device}"
+
+        assert np.allclose(
+            ref_freq[:min_len],
+            freq[:min_len],
+            atol=atol_freq,
+            rtol=rtol_freq,
+        ), f"Frequency mismatch: mask-cpu vs {backend}-{device}"

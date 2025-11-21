@@ -162,9 +162,15 @@ class FourierRingIterator:
         if len(shape) != 2:
             raise AssertionError("shape must be 2D")
 
+        from .radial import radial_edges
+
         self.d_bin = d_bin
         self.ring_start = 0
-        self._nbins = int(floor(shape[0] / (2 * self.d_bin)))
+
+        # Use radial_edges for consistent binning with histogram backend
+        self.edges, self._radii = radial_edges(tuple(shape), d_bin, spacing=None)
+        self._nbins = len(self._radii)
+
         # Use unshifted fftfreq coordinates (no fftshift)
         axes = [np.fft.fftfreq(n) * n for n in shape]
         y, x = np.meshgrid(*axes, indexing="ij")
@@ -172,13 +178,10 @@ class FourierRingIterator:
         self.r = np.sqrt(x**2 + y**2)
         self.current_ring = self.ring_start
         self.freq_nyq = int(np.floor(shape[0] / 2.0))
-        # Use bin midpoints matching histogram backend
-        bin_starts = np.arange(0, self.freq_nyq, self.d_bin)
-        self._radii = bin_starts + 0.5 * self.d_bin
 
     @property
     def radii(self) -> np.ndarray:
-        """Radii for the concentric rings."""
+        """Radii for the concentric rings (bin midpoints)."""
         return self._radii
 
     @property
@@ -186,7 +189,7 @@ class FourierRingIterator:
         """Number of available rings."""
         return self._nbins
 
-    def get_points_on_ring(self, ring_start: int, ring_stop: int) -> np.ndarray:
+    def get_points_on_ring(self, ring_start: float, ring_stop: float) -> np.ndarray:
         """Return boolean mask for points on a ring. DC term (r==0) is excluded."""
         arr_inf = self.r >= ring_start
         arr_sup = self.r < ring_stop
@@ -204,7 +207,7 @@ class FourierRingIterator:
         """Return mask and index for the next ring."""
         if self.current_ring < self._nbins:
             ring = self.get_points_on_ring(
-                self.current_ring * self.d_bin, (self.current_ring + 1) * self.d_bin
+                self.edges[self.current_ring], self.edges[self.current_ring + 1]
             )
         else:
             raise StopIteration
@@ -252,7 +255,7 @@ class SectionedFourierRingIterator(FourierRingIterator):
         """Return next ring limited to the selected angular sector."""
         if self.current_ring < self._nbins:
             ring = self.get_points_on_ring(
-                self.current_ring * self.d_bin, (self.current_ring + 1) * self.d_bin
+                self.edges[self.current_ring], self.edges[self.current_ring + 1]
             )
         else:
             raise StopIteration
@@ -265,23 +268,26 @@ class FourierShellIterator:
     """Simple iterator over concentric Fourier shells for 3D images (unshifted FFT)."""
 
     def __init__(self, shape: Iterable[int], d_bin: int) -> None:
+        from .radial import radial_edges
+
         self.d_bin = d_bin
+
+        # Use radial_edges for consistent binning with histogram backend
+        self.edges, self.radii = radial_edges(tuple(shape), d_bin, spacing=None)
+        self.shell_start = 0
+        self.shell_stop = len(self.radii) - 1
+
         # Use unshifted fftfreq coordinates (no fftshift)
         axes = [np.fft.fftfreq(n) * n for n in shape]
         z, y, x = np.meshgrid(*axes, indexing="ij")
         self.meshgrid = (z, y, x)
         self.r = np.sqrt(x**2 + y**2 + z**2)
-        self.shell_start = 0
-        self.shell_stop = int(floor(shape[0] / (2 * self.d_bin))) - 1
         self.current_shell = self.shell_start
         self.freq_nyq = int(np.floor(shape[0] / 2.0))
-        # Use bin midpoints matching histogram backend
-        bin_starts = np.arange(0, self.freq_nyq, self.d_bin)
-        self.radii = bin_starts + 0.5 * self.d_bin
 
     @property
     def steps(self) -> np.ndarray:
-        """Available shell radii."""
+        """Available shell radii (bin midpoints)."""
         return self.radii
 
     @property
@@ -289,7 +295,7 @@ class FourierShellIterator:
         """Nyquist frequency for the current shape."""
         return self.freq_nyq
 
-    def get_points_on_shell(self, shell_start: int, shell_stop: int) -> np.ndarray:
+    def get_points_on_shell(self, shell_start: float, shell_stop: float) -> np.ndarray:
         """Return boolean mask for points within a shell. DC term (r==0) is excluded."""
         arr_inf = self.r >= shell_start
         arr_sup = self.r < shell_stop
@@ -299,7 +305,7 @@ class FourierShellIterator:
         shell_mask = shell_mask * (self.r > eps)
         return shell_mask
 
-    def __getitem__(self, limits: tuple[int, int]):
+    def __getitem__(self, limits: tuple[float, float]):
         """Return coordinates for points within ``limits`` shell."""
         shell_start, shell_stop = limits
         shell = self.get_points_on_shell(shell_start, shell_stop)
@@ -314,7 +320,7 @@ class FourierShellIterator:
         shell_idx = self.current_shell
         if shell_idx <= self.shell_stop:
             shell = self.get_points_on_shell(
-                self.current_shell * self.d_bin, (self.current_shell + 1) * self.d_bin
+                self.edges[self.current_shell], self.edges[self.current_shell + 1]
             )
         else:
             raise StopIteration
@@ -362,7 +368,7 @@ class SectionedFourierShellIterator(FourierShellIterator):
         shell_idx = self.current_shell
         if rotation_idx <= self.rotation_stop and shell_idx <= self.shell_stop:
             shell = self.get_points_on_shell(
-                self.current_shell * self.d_bin, (self.current_shell + 1) * self.d_bin
+                self.edges[self.current_shell], self.edges[self.current_shell + 1]
             )
             cone = self.get_angle_sector(
                 self.current_rotation * self.d_angle,
@@ -462,7 +468,7 @@ class RotatingFourierShellIterator(FourierShellIterator):
         shell_idx = self.current_shell
         if shell_idx <= self.shell_stop:
             shell = self.get_points_on_shell(
-                self.current_shell * self.d_bin, (self.current_shell + 1) * self.d_bin
+                self.edges[self.current_shell], self.edges[self.current_shell + 1]
             )
             self.current_shell += 1
         elif rotation_idx <= self.rotation_stop:
@@ -474,7 +480,7 @@ class RotatingFourierShellIterator(FourierShellIterator):
             shell_idx = 0
             self.current_rotation += 1
             shell = self.get_points_on_shell(
-                self.current_shell * self.d_bin, (self.current_shell + 1) * self.d_bin
+                self.edges[self.current_shell], self.edges[self.current_shell + 1]
             )
         else:
             raise StopIteration
