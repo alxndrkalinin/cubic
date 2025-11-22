@@ -127,9 +127,14 @@ def radial_bin_id(
     if ndim not in (2, 3):
         raise ValueError("Only 2D and 3D images are supported")
 
+    # Check if spacing is effectively "no scaling" (all 1.0)
     if spacing is not None:
         if len(spacing) != ndim:
             raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
+        if all(abs(sp - 1.0) < 1e-10 for sp in spacing):
+            spacing = None  # Treat spacing=1.0 as no spacing
+
+    if spacing is not None:
         # xp.fft.fftfreq needed to create arrays on correct device
         axes = [xp.fft.fftfreq(n, d=sp).astype(np.float32) for n, sp in zip(shape, spacing)]
     else:
@@ -150,11 +155,14 @@ def radial_bin_id(
     # Bin on same device
     bid = np.digitize(K, edges) - 1
     nbins = int(edges.size) - 1
+
+    # Clip overflow bins to last bin (match mask backend behavior)
     bid = np.clip(bid, 0, nbins - 1).astype(np.int32, copy=False)
 
     # Exclude DC robustly using dtype-specific threshold
     tiny = np.finfo(K.dtype).tiny if hasattr(K, "dtype") else 1e-12
     bid[K < tiny] = -1
+
     return bid
 
 

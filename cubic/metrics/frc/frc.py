@@ -79,7 +79,7 @@ def preprocess_images(
 class FRC(object):
     """A class for calculating 2D Fourier ring correlation (unshifted FFT)."""
 
-    def __init__(self, image1: np.ndarray, image2: np.ndarray, iterator):
+    def __init__(self, image1: np.ndarray, image2: np.ndarray, iterator, spacing=None):
         """Create new FRC executable object and perform FFT on input images."""
         if image1.shape != image2.shape:
             raise ValueError("The image dimensions do not match")
@@ -87,10 +87,12 @@ class FRC(object):
             raise ValueError("Fourier ring correlation requires 2D images.")
 
         self.iterator = iterator
+        self.spacing = spacing
         # Compute unshifted FFT (mean-subtracted, no fftshift)
         self.fft_image1 = np.fft.fftn(image1 - image1.mean())
         self.fft_image2 = np.fft.fftn(image2 - image2.mean())
         self.freq_nyq = int(np.floor(image1.shape[0] / 2.0))
+        self.shape = image1.shape
 
     def execute(self):
         """Calculate the FRC."""
@@ -110,7 +112,14 @@ class FRC(object):
             points[idx] = len(subset1)
 
         # Calculate FRC
-        spatial_freq = asnumpy(radii.astype(np.float32) / self.freq_nyq)
+        # If spacing was provided, radii are in physical units; normalize to [0,1]
+        # If spacing was None, radii are in index units; normalize by Nyquist
+        if self.spacing is None:
+            spatial_freq = asnumpy(radii.astype(np.float32) / self.freq_nyq)
+        else:
+            # radii are in physical units; normalize to max frequency
+            max_freq = float(np.max(radii))
+            spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
         c1 = asnumpy(c1)
         c2 = asnumpy(c2)
         c3 = asnumpy(c3)
@@ -211,8 +220,8 @@ def _calculate_frc_core(
         frc_data[0] = data_set
     else:
         # Default mask/iterator backend
-        iterator = FourierRingIterator(image1.shape, bin_delta)
-        frc_task = FRC(image1, image2, iterator)
+        iterator = FourierRingIterator(image1.shape, bin_delta, spacing=spacing)
+        frc_task = FRC(image1, image2, iterator, spacing=spacing)
         frc_data[0] = frc_task.execute()
 
     return frc_data
@@ -244,7 +253,7 @@ def calculate_frc(
     disable_hamming: bool = False,
     average: bool = True,
     z_correction: float = 1.0,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
     backend: str = "mask",
 ) -> FourierCorrelationData:
@@ -260,7 +269,9 @@ def calculate_frc(
     reverse = average and single_image
     original_image1 = image1.copy() if reverse else None
 
-    if isinstance(spacing, (int, float)):
+    if spacing is None:
+        spacing = None
+    elif isinstance(spacing, (int, float)):
         spacing = [spacing] * image1.ndim
     else:
         spacing = list(spacing)
@@ -311,7 +322,7 @@ def calculate_frc(
     # Analyze results
     analyzer = FourierCorrelationAnalysis(
         frc_data,
-        spacing[0],
+        spacing[0] if spacing is not None else 1.0,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         snr_value=snr_value,
@@ -332,7 +343,7 @@ def frc_resolution(
     image2: np.ndarray | None = None,
     *,
     bin_delta: int = 1,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
     curve_fit_type: str = "smooth-spline",
     backend: str = "mask",
@@ -454,13 +465,15 @@ def calculate_sectioned_fsc(
     disable_hamming: bool = False,
     z_correction: float = 1.0,
     disable_3d_sum: bool = False,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
 ) -> FourierCorrelationDataCollection:
     """Calculate sectioned FSC for one or two images."""
     single_image = image2 is None
 
-    if isinstance(spacing, (int, float)):
+    if spacing is None:
+        spacing = None
+    elif isinstance(spacing, (int, float)):
         spacing = [spacing] * image1.ndim
     else:
         spacing = list(spacing)
@@ -478,6 +491,7 @@ def calculate_sectioned_fsc(
         bin_delta,
         angle_delta,
         extract_angle_delta,
+        spacing=spacing,
     )
     fsc_task = DirectionalFSC(image1, image2, iterator)
     data = fsc_task.execute()
@@ -507,7 +521,7 @@ def fsc_resolution(
     *,
     bin_delta: int = 10,
     zero_padding: bool = True,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
 ) -> dict[str, float]:
     """Calculate either single- or two-image FSC-based 3D image resolution."""
     fsc_result = calculate_sectioned_fsc(
@@ -529,7 +543,7 @@ def grid_crop_resolution(
     image: np.ndarray,
     *,
     bin_delta: int = 1,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     crop_size: int = 512,
     pad_mode: str = "reflect",
     return_resolution: bool = True,
@@ -608,7 +622,7 @@ def five_crop_resolution(
     image: np.ndarray,
     *,
     bin_delta: int = 1,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     crop_size: int = 512,
     pad_mode: str = "reflect",
     return_resolution: bool = True,
@@ -685,7 +699,7 @@ def frc_resolution_difference(
     image2: np.ndarray,
     *,
     bin_delta: int = 3,
-    spacing: float | tuple[float, float] = 1.0,
+    spacing: float | tuple[float, float] | None = None,
     backend: str = "mask",
 ) -> float:
     """Calculate difference between FRC-based resulutions of two images."""

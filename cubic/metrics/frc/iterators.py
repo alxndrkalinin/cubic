@@ -38,7 +38,7 @@
 # mypy: ignore-errors
 
 from math import floor
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 
@@ -158,7 +158,9 @@ def _angle_mask(phi: np.ndarray, phi_min: float, phi_max: float) -> np.ndarray:
 class FourierRingIterator:
     """Iterate over concentric Fourier rings for 2D images (unshifted FFT)."""
 
-    def __init__(self, shape: Iterable[int], d_bin: int) -> None:
+    def __init__(
+        self, shape: Iterable[int], d_bin: int, spacing: Sequence[float] | None = None
+    ) -> None:
         if len(shape) != 2:
             raise AssertionError("shape must be 2D")
 
@@ -166,16 +168,26 @@ class FourierRingIterator:
 
         self.d_bin = d_bin
         self.ring_start = 0
+        shape = tuple(shape)
+
+        # Check if spacing is effectively "no scaling" (all 1.0)
+        if spacing is not None and all(abs(sp - 1.0) < 1e-10 for sp in spacing):
+            spacing = None  # Treat spacing=1.0 as no spacing
 
         # Use radial_edges for consistent binning with histogram backend
-        self.edges, self._radii = radial_edges(tuple(shape), d_bin, spacing=None)
+        self.edges, self._radii = radial_edges(shape, d_bin, spacing=spacing)
         self._nbins = len(self._radii)
 
         # Use unshifted fftfreq coordinates (no fftshift)
-        axes = [np.fft.fftfreq(n) * n for n in shape]
+        # Match radial_bin_id formula for consistency
+        if spacing is not None:
+            axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing)]
+        else:
+            axes = [np.fft.fftfreq(n) * n for n in shape]
         y, x = np.meshgrid(*axes, indexing="ij")
         self.meshgrid = (y, x)
         self.r = np.sqrt(x**2 + y**2)
+
         self.current_ring = self.ring_start
         self.freq_nyq = int(np.floor(shape[0] / 2.0))
 
@@ -189,11 +201,22 @@ class FourierRingIterator:
         """Number of available rings."""
         return self._nbins
 
-    def get_points_on_ring(self, ring_start: float, ring_stop: float) -> np.ndarray:
-        """Return boolean mask for points on a ring. DC term (r==0) is excluded."""
+    def get_points_on_ring(self, ring_start: float, ring_stop: float, is_last: bool = False) -> np.ndarray:
+        """Return boolean mask for points on a ring. DC term (r==0) is excluded.
+
+        Args:
+            ring_start: Lower edge of ring
+            ring_stop: Upper edge of ring
+            is_last: If True, include all points >= ring_start (for overflow bins)
+        """
         arr_inf = self.r >= ring_start
-        arr_sup = self.r < ring_stop
-        ring_mask = np.logical_and(arr_inf, arr_sup)
+        if is_last:
+            # Last bin: include all points >= ring_start (overflow bins)
+            ring_mask = arr_inf
+        else:
+            # Regular bin: ring_start <= r < ring_stop
+            arr_sup = self.r < ring_stop
+            ring_mask = np.logical_and(arr_inf, arr_sup)
         # Exclude DC term (r==0, with small epsilon for floating point safety)
         eps = 1e-10
         ring_mask = np.logical_and(ring_mask, self.r > eps)
@@ -206,8 +229,11 @@ class FourierRingIterator:
     def __next__(self):  # -> tuple[tuple[np.ndarray, np.ndarray], int]
         """Return mask and index for the next ring."""
         if self.current_ring < self._nbins:
+            is_last = (self.current_ring == self._nbins - 1)
             ring = self.get_points_on_ring(
-                self.edges[self.current_ring], self.edges[self.current_ring + 1]
+                self.edges[self.current_ring],
+                self.edges[self.current_ring + 1],
+                is_last=is_last
             )
         else:
             raise StopIteration
@@ -219,8 +245,14 @@ class FourierRingIterator:
 class SectionedFourierRingIterator(FourierRingIterator):
     """Fourier ring iterator that yields only a specific rotated section."""
 
-    def __init__(self, shape: Iterable[int], d_bin: int, d_angle: int) -> None:
-        FourierRingIterator.__init__(self, shape, d_bin)
+    def __init__(
+        self,
+        shape: Iterable[int],
+        d_bin: int,
+        d_angle: int,
+        spacing: Sequence[float] | None = None,
+    ) -> None:
+        FourierRingIterator.__init__(self, shape, d_bin, spacing=spacing)
         self.d_angle = np.deg2rad(d_angle)
         y, x = self.meshgrid
         self.phi = np.arctan2(y, x) + np.pi
@@ -267,21 +299,33 @@ class SectionedFourierRingIterator(FourierRingIterator):
 class FourierShellIterator:
     """Simple iterator over concentric Fourier shells for 3D images (unshifted FFT)."""
 
-    def __init__(self, shape: Iterable[int], d_bin: int) -> None:
+    def __init__(
+        self, shape: Iterable[int], d_bin: int, spacing: Sequence[float] | None = None
+    ) -> None:
         from .radial import radial_edges
 
         self.d_bin = d_bin
+        shape = tuple(shape)
+
+        # Check if spacing is effectively "no scaling" (all 1.0)
+        if spacing is not None and all(abs(sp - 1.0) < 1e-10 for sp in spacing):
+            spacing = None  # Treat spacing=1.0 as no spacing
 
         # Use radial_edges for consistent binning with histogram backend
-        self.edges, self.radii = radial_edges(tuple(shape), d_bin, spacing=None)
+        self.edges, self.radii = radial_edges(shape, d_bin, spacing=spacing)
         self.shell_start = 0
         self.shell_stop = len(self.radii) - 1
 
         # Use unshifted fftfreq coordinates (no fftshift)
-        axes = [np.fft.fftfreq(n) * n for n in shape]
+        # Match radial_bin_id formula for consistency
+        if spacing is not None:
+            axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing)]
+        else:
+            axes = [np.fft.fftfreq(n) * n for n in shape]
         z, y, x = np.meshgrid(*axes, indexing="ij")
         self.meshgrid = (z, y, x)
         self.r = np.sqrt(x**2 + y**2 + z**2)
+
         self.current_shell = self.shell_start
         self.freq_nyq = int(np.floor(shape[0] / 2.0))
 
@@ -295,11 +339,22 @@ class FourierShellIterator:
         """Nyquist frequency for the current shape."""
         return self.freq_nyq
 
-    def get_points_on_shell(self, shell_start: float, shell_stop: float) -> np.ndarray:
-        """Return boolean mask for points within a shell. DC term (r==0) is excluded."""
+    def get_points_on_shell(self, shell_start: float, shell_stop: float, is_last: bool = False) -> np.ndarray:
+        """Return boolean mask for points within a shell. DC term (r==0) is excluded.
+
+        Args:
+            shell_start: Lower edge of shell
+            shell_stop: Upper edge of shell
+            is_last: If True, include all points >= shell_start (for overflow bins)
+        """
         arr_inf = self.r >= shell_start
-        arr_sup = self.r < shell_stop
-        shell_mask = arr_inf * arr_sup
+        if is_last:
+            # Last bin: include all points >= shell_start (overflow bins)
+            shell_mask = arr_inf
+        else:
+            # Regular bin: shell_start <= r < shell_stop
+            arr_sup = self.r < shell_stop
+            shell_mask = arr_inf * arr_sup
         # Exclude DC term (r==0, with small epsilon for floating point safety)
         eps = 1e-10
         shell_mask = shell_mask * (self.r > eps)
@@ -319,8 +374,11 @@ class FourierShellIterator:
         """Return mask and index for the next shell."""
         shell_idx = self.current_shell
         if shell_idx <= self.shell_stop:
+            is_last = (shell_idx == self.shell_stop)
             shell = self.get_points_on_shell(
-                self.edges[self.current_shell], self.edges[self.current_shell + 1]
+                self.edges[self.current_shell],
+                self.edges[self.current_shell + 1],
+                is_last=is_last
             )
         else:
             raise StopIteration
@@ -332,8 +390,14 @@ class FourierShellIterator:
 class SectionedFourierShellIterator(FourierShellIterator):
     """Fourier shell iterator that divides each shell into angular sections."""
 
-    def __init__(self, shape: Iterable[int], d_bin: int, d_angle: int) -> None:
-        FourierShellIterator.__init__(self, shape, d_bin)
+    def __init__(
+        self,
+        shape: Iterable[int],
+        d_bin: int,
+        d_angle: int,
+        spacing: Sequence[float] | None = None,
+    ) -> None:
+        FourierShellIterator.__init__(self, shape, d_bin, spacing=spacing)
         self.d_angle = np.deg2rad(d_angle)
         z, y, x = self.meshgrid
         self.phi = np.arctan2(y, z) + np.pi
@@ -390,9 +454,14 @@ class HollowSectionedFourierShellIterator(SectionedFourierShellIterator):
     """Sectioned shell iterator with a hollowed central region."""
 
     def __init__(
-        self, shape: Iterable[int], d_bin: int, d_angle: int, d_extract_angle: int = 5
+        self,
+        shape: Iterable[int],
+        d_bin: int,
+        d_angle: int,
+        d_extract_angle: int = 5,
+        spacing: Sequence[float] | None = None,
     ) -> None:
-        SectionedFourierShellIterator.__init__(self, shape, d_bin, d_angle)
+        SectionedFourierShellIterator.__init__(self, shape, d_bin, d_angle, spacing=spacing)
         self.d_extract_angle = np.deg2rad(d_extract_angle)
 
     def get_angle_sector(self, phi_min: float, phi_max: float) -> np.ndarray:
@@ -409,9 +478,16 @@ class AxialExcludeSectionedFourierShellIterator(HollowSectionedFourierShellItera
     """Sectioned shell iterator that excludes cones around the axial direction."""
 
     def __init__(
-        self, shape: Iterable[int], d_bin: int, d_angle: int, d_extract_angle: int = 5
+        self,
+        shape: Iterable[int],
+        d_bin: int,
+        d_angle: int,
+        d_extract_angle: int = 5,
+        spacing: Sequence[float] | None = None,
     ) -> None:
-        HollowSectionedFourierShellIterator.__init__(self, shape, d_bin, d_angle)
+        HollowSectionedFourierShellIterator.__init__(
+            self, shape, d_bin, d_angle, d_extract_angle, spacing=spacing
+        )
         self.d_extract_angle = np.deg2rad(d_extract_angle)
 
     def get_angle_sector(self, phi_min: float, phi_max: float) -> np.ndarray:
@@ -436,11 +512,17 @@ class AxialExcludeSectionedFourierShellIterator(HollowSectionedFourierShellItera
 class RotatingFourierShellIterator(FourierShellIterator):
     """Fourier shell iterator that rotates a plane through the volume."""
 
-    def __init__(self, shape: Iterable[int], d_bin: int, d_angle: int) -> None:
+    def __init__(
+        self,
+        shape: Iterable[int],
+        d_bin: int,
+        d_angle: int,
+        spacing: Sequence[float] | None = None,
+    ) -> None:
         if len(shape) != 3:
             raise AssertionError("This iterator assumes a 3D shape")
 
-        FourierShellIterator.__init__(self, shape, d_bin)
+        FourierShellIterator.__init__(self, shape, d_bin, spacing=spacing)
         plane = expand_to_shape(np.ones((1, shape[1], shape[2])), shape)
         self.plane = plane
         self.rotated_plane = plane > 0
