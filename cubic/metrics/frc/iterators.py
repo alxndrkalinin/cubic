@@ -170,10 +170,6 @@ class FourierRingIterator:
         self.ring_start = 0
         shape = tuple(shape)
 
-        # Check if spacing is effectively "no scaling" (all 1.0)
-        if spacing is not None and all(abs(sp - 1.0) < 1e-10 for sp in spacing):
-            spacing = None  # Treat spacing=1.0 as no spacing
-
         # Use radial_edges for consistent binning with histogram backend
         self.edges, self._radii = radial_edges(shape, d_bin, spacing=spacing)
         self._nbins = len(self._radii)
@@ -306,10 +302,6 @@ class FourierShellIterator:
 
         self.d_bin = d_bin
         shape = tuple(shape)
-
-        # Check if spacing is effectively "no scaling" (all 1.0)
-        if spacing is not None and all(abs(sp - 1.0) < 1e-10 for sp in spacing):
-            spacing = None  # Treat spacing=1.0 as no spacing
 
         # Use radial_edges for consistent binning with histogram backend
         self.edges, self.radii = radial_edges(shape, d_bin, spacing=spacing)
