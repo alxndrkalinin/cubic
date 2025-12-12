@@ -7,7 +7,7 @@ from .frc import (
     grid_crop_resolution,
     frc_resolution_difference,
     dcr_resolution,
-    calculate_dcr,
+    dcr_curve,
 )
 from .feature import cosine_median, morphology_correlations
 from .skimage_metrics import psnr, ssim
@@ -24,6 +24,6 @@ __all__ = [
     "grid_crop_resolution",
     "frc_resolution_difference",
     "dcr_resolution",
-    "calculate_dcr",
+    "dcr_curve",
     "morphology_correlations",
 ]

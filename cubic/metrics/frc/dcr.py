@@ -1,520 +1,421 @@
-"""Decorrelation Analysis (DCR) for single-image resolution estimation."""
+"""Decorrelation Analysis (DCR) - Descloux et al. 2019.
+
+Implementation following the algorithm described in:
+"Parameter-free image resolution estimation based on decorrelation analysis"
+Nature Methods 16:918-924 (2019)
+"""
 
 from collections.abc import Sequence
 
 import numpy as np
-from numpy.fft import fftn
-from scipy.signal import find_peaks, savgol_filter
+from scipy.signal import find_peaks
 
-from cubic.cuda import asnumpy, get_array_module
+from cubic.cuda import asnumpy
+from cubic.skimage import filters
 
 
 def dcr_curve(
-    vol: np.ndarray,
-    iterator,
+    image: np.ndarray,
     *,
-    spacing: Sequence[float] | None = None,
-    cap_k: float | None = None,
-    smooth: int = 5,
-    drop_bins: int = 2,
-) -> tuple[float, np.ndarray, np.ndarray]:
+    spacing: float | Sequence[float] | None = None,
+    num_radii: int = 100,
+    num_highpass: int = 30,
+    sigma_range: tuple[float, float] = (0.0, 0.5),
+) -> tuple[float, np.ndarray, list[np.ndarray], np.ndarray]:
     """
-    Compute decorrelation curve and estimate resolution.
-
-    Uses unshifted FFT convention consistent with FRC/FSC implementation.
+    Compute decorrelation curve using algorithm from Descloux et al. 2019.
 
     Parameters
     ----------
-    vol : np.ndarray
-        2D or 3D image (already windowed/padded if desired)
-    iterator : FourierRingIterator or FourierShellIterator
-        Iterator providing radial bins in unshifted FFT coordinates
-    spacing : sequence of floats, optional
-        Physical spacing per axis. If provided, resolution is in physical units.
-    cap_k : float, optional
-        Maximum frequency to consider (in index or physical units)
-    smooth : int
-        Savitzky-Golay smoothing window size (default: 5)
-    drop_bins : int
-        Number of low-frequency bins to ignore for peak finding (default: 2)
+    image : np.ndarray
+        2D or 3D input image (numpy or cupy array)
+    spacing : float or sequence of floats, optional
+        Physical spacing per axis. If None, uses index units.
+    num_radii : int
+        Number of radial sampling points for d(r) (default: 100)
+    num_highpass : int
+        Number of Gaussian high-pass filters to apply (default: 30)
+    sigma_range : tuple of float
+        Range of high-pass filter sigmas in normalized frequency units (default: (0.0, 0.5))
 
     Returns
     -------
     resolution : float
-        Estimated resolution (in index units if spacing=None, physical units otherwise)
-    K : np.ndarray
-        Frequency values for each bin
-    r : np.ndarray
-        Decorrelation curve values
+        Estimated resolution (k_c = max of all peak positions)
+    radii : np.ndarray
+        Normalized frequency values for mask radii
+    all_curves : list of np.ndarray
+        List of d(r) curves for each high-pass filtered version
+    all_peaks : np.ndarray
+        Array of [r_i, A_i] pairs (peak position and amplitude), shape (N, 2)
 
     Notes
     -----
-    DCR curve is defined as:
-        r(k) = Σ_{k'≤k} |F(k')| / √(E²_total × N(k))
-
-    Resolution is estimated as the first local maximum of r(k).
+    Implements the canonical decorrelation analysis:
+    1. Compute FFT and normalize: I_n(k) = I(k) / |I(k)|
+    2. For each radius r, compute Pearson correlation d(r)
+    3. Apply N_g high-pass filters and repeat
+    4. Resolution = max(r_0, r_1, ..., r_Ng)
     """
-    vol = vol.astype(np.float32, copy=False)
-    vol = vol - np.mean(vol)
-    # Use unshifted FFT (consistent with FRC/FSC)
-    F = fftn(vol)
-    absF = np.abs(F)
-    E2tot = np.sum(absF**2)
+    # Validate dimensions
+    if image.ndim not in (2, 3):
+        raise ValueError(f"DCR requires 2D or 3D images, got {image.ndim}D")
 
-    # Accumulate Σ|F| and counts per shell
-    # Iterator yields (ind_ring, idx) where idx is the bin index
-    radii = iterator.radii
-    S1 = np.zeros(len(radii), dtype=np.float64)
-    N = np.zeros(len(radii), dtype=np.float64)
-    K = radii.copy()
+    # Ensure float32 and center
+    image = image.astype(np.float32, copy=False)
+    image = image - np.mean(image)
 
-    for ind_ring, idx in iterator:
-        if cap_k is not None and K[idx] > cap_k:
-            break
-        # Extract Fourier coefficients at this ring
-        subset = absF[ind_ring]
-        S1[idx] = np.sum(subset)
-        N[idx] = len(subset)
+    # Optional: Apply Tukey window for edge apodization
+    image = _apply_tukey_window(image, alpha=0.1)
 
-    S1 = np.asarray(S1, dtype=np.float64)
-    N = np.asarray(N, dtype=np.float64)
-    K = np.asarray(K, dtype=np.float64)
+    # Normalize spacing
+    if spacing is None:
+        spacing_arr = np.ones(image.ndim, dtype=np.float32)
+    elif isinstance(spacing, (int, float)):
+        spacing_arr = np.full(image.ndim, float(spacing), dtype=np.float32)
+    else:
+        spacing_arr = np.array(spacing, dtype=np.float32)
 
-    # Note: K values come from iterator.radii, which are already in physical units
-    # if spacing was passed to the iterator. No manual conversion needed here.
+    # Generate high-pass filter sigmas (normalized frequency units)
+    sigma_min, sigma_max = sigma_range
+    if num_highpass > 1:
+        sigmas = np.linspace(sigma_min, sigma_max, num_highpass)
+    else:
+        sigmas = np.array([sigma_min])
 
-    # DCR curve (cumulative decorrelation)
-    cumN = np.cumsum(N)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.cumsum(S1) / np.sqrt(E2tot * cumN)
-    r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+    # Storage for all curves and peaks
+    all_curves = []
+    all_peaks = []
+    k_max = None  # Will be set from first call
 
-    # Find first local maximum beyond low-frequency bins
-    if smooth and smooth > 1:
-        win = smooth if (smooth % 2 == 1) else smooth + 1
-        win = max(5, min(win, (len(r) // 2) * 2 + 1))
-        r = savgol_filter(r, window_length=win, polyorder=2, mode="interp")
+    # Process each high-pass filtered version
+    for sigma_hp in sigmas:
+        # Apply high-pass filter
+        if sigma_hp > 0:
+            filtered_image = _highpass_filter(image, sigma_hp, spacing_arr)
+        else:
+            filtered_image = image.copy()
 
-    start = max(1, int(drop_bins))
-    peaks, _ = find_peaks(r, plateau_size=(1, None))
-    peaks = peaks[peaks >= start]
-    idx = int(peaks[0]) if peaks.size else int(np.argmax(r[start:]) + start)
+        # Compute decorrelation curve for this filtered image
+        # Pass spacing for correct anisotropy handling
+        radii, d_curve, k_max = _compute_decorrelation_curve(
+            filtered_image,
+            num_radii,
+            spacing=spacing_arr if spacing is not None else None,
+        )
 
-    # Resolution is 1/frequency
-    resolution = 1.0 / K[idx] if K[idx] > 0 else float("inf")
+        # Find local maximum
+        peaks, properties = find_peaks(d_curve, plateau_size=(1, None))
 
-    return resolution, K[: len(r)], r
+        if len(peaks) > 0:
+            # Take first peak (highest correlation maximum)
+            peak_idx = peaks[0]
+            r_peak = radii[peak_idx]
+            a_peak = d_curve[peak_idx]
+        else:
+            # No peak found - too much filtering
+            r_peak = 0.0
+            a_peak = 0.0
+
+        all_curves.append(d_curve)
+        all_peaks.append([r_peak, a_peak])
+
+    # Extract peak positions
+    all_peaks = np.array(all_peaks)
+    r_peaks = all_peaks[:, 0]
+
+    # Resolution is the MAXIMUM peak frequency (Equation 2 in paper)
+    # k_c is in normalized units (0 to 1), where 1 = Nyquist = k_max
+    k_c_norm = np.max(r_peaks)
+
+    # Convert normalized k_c to physical frequency, then to resolution
+    # k_c_physical = k_c_norm * k_max (in cycles per unit length)
+    # Resolution = 1 / k_c_physical
+    if k_c_norm > 0 and k_max is not None:
+        k_c_physical = k_c_norm * k_max
+        resolution = 1.0 / k_c_physical
+    else:
+        resolution = float("inf")
+
+    return resolution, radii, all_curves, all_peaks
 
 
-def dcr_curve_hist(
-    vol: np.ndarray,
-    bin_delta: int,
-    *,
-    spacing: Sequence[float] | None = None,
-    cap_k: float | None = None,
-    smooth: int = 5,
-    drop_bins: int = 2,
-) -> tuple[float, np.ndarray, np.ndarray]:
+def _compute_decorrelation_curve(
+    image: np.ndarray,
+    num_radii: int = 100,
+    spacing: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Compute decorrelation curve using histogram backend (GPU-compatible).
+    Compute decorrelation curve d(r) for a single image (vectorized).
+
+    Implements Equation 1 from the paper using radial binning and cumulative sums
+    for GPU-efficient computation:
+    d(r) = Pearson correlation between I(k) and I_n(k)·M(k,r)
 
     Parameters
     ----------
-    vol : np.ndarray
-        2D or 3D image
-    bin_delta : int
-        Bin width in frequency space
-    spacing : sequence of floats, optional
-        Physical spacing per axis. If provided, resolution is in physical units.
-    cap_k : float, optional
-        Maximum frequency to consider (in index or physical units)
-    smooth : int
-        Savitzky-Golay smoothing window size (default: 5)
-    drop_bins : int
-        Number of low-frequency bins to ignore for peak finding (default: 2)
+    image : np.ndarray
+        Input image (pre-filtered and centered, numpy or cupy array)
+    num_radii : int
+        Number of radial sampling points
+    spacing : np.ndarray, optional
+        Physical spacing per axis. If None, uses index units.
 
     Returns
     -------
-    resolution : float
-        Estimated resolution (in index units if spacing=None, physical units otherwise)
-    K : np.ndarray
-        Frequency values for each bin
-    r : np.ndarray
-        Decorrelation curve values
+    radii : np.ndarray
+        Normalized frequency values (0 to 1) - on CPU
+    d_curve : np.ndarray
+        Decorrelation values d(r) - on CPU
+    k_max : float
+        Maximum frequency (Nyquist limit) in physical or index units
     """
-    from .radial import reduce_abs, radial_edges, radial_bin_id
+    from cubic.cuda import get_array_module
 
-    vol = vol.astype(np.float32, copy=False)
-    vol = vol - np.mean(vol)
+    from .radial import radial_k_grid
 
-    # Compute unshifted FFT
-    F = fftn(vol)
-    xp = get_array_module(F)
+    xp = get_array_module(image)
 
-    # Build radial bins
-    shape = vol.shape
-    edges, radii = radial_edges(shape, bin_delta, spacing=spacing)
-    edges = xp.asarray(edges)  # Transfer edges to device
+    # Compute FFT (dispatches to cupy.fft if input is on GPU)
+    F = np.fft.fftn(image)
 
-    # Compute bin IDs
-    bin_id = radial_bin_id(shape, edges, spacing=spacing)
+    # Absolute value |F(k)|
+    absF = np.abs(F)
 
-    # Sum |F| and counts per bin
-    S1, N = reduce_abs(F, bin_id)
+    # Use shared infrastructure for frequency grid with correct anisotropy handling
+    k_radius, k_max = radial_k_grid(image.shape, spacing=spacing)
 
-    # Total power (on device)
-    absF = xp.abs(F)
-    E2tot = xp.sum(absF**2)
+    # Transfer k_radius to same device as image
+    if xp is not np:
+        k_radius = xp.asarray(k_radius)
 
-    # Apply cap_k if specified
-    if cap_k is not None:
-        if spacing is None:
-            valid = radii <= cap_k
-        else:
-            valid = radii <= cap_k
-        S1 = S1[valid]
-        N = N[valid]
-        radii = radii[valid]
+    # Normalize frequencies to [0, 1] range
+    k_radius_norm = k_radius / k_max
 
-    # Transfer to CPU for cumsum and analysis
-    S1 = asnumpy(S1).astype(np.float64)
-    N = asnumpy(N).astype(np.float64)
-    E2tot = float(asnumpy(E2tot))
-    K = radii  # Already on CPU
+    # Create radii from 0 to 1 (same as original loop-based version)
+    radii_cpu = np.linspace(0, 1, num_radii, dtype=np.float32)
 
-    # DCR curve (cumulative decorrelation)
-    cumN = np.cumsum(N)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.cumsum(S1) / np.sqrt(E2tot * cumN)
-    r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+    # Create bin edges: each radius r defines a bin [0, r]
+    # We need edges that correspond to the radii values
+    # Use radii as right edges of bins, with 0 as first left edge
+    edges_cpu = np.concatenate([[0], radii_cpu]).astype(np.float32)
+    edges = xp.asarray(edges_cpu) if xp is not np else edges_cpu
 
-    # Find first local maximum beyond low-frequency bins
-    if smooth and smooth > 1:
-        win = smooth if (smooth % 2 == 1) else smooth + 1
-        win = max(5, min(win, (len(r) // 2) * 2 + 1))
-        r = savgol_filter(r, window_length=win, polyorder=2, mode="interp")
+    # Assign each pixel to a radial bin (vectorized)
+    k_flat = k_radius_norm.ravel()
+    bin_id = np.digitize(k_flat, edges) - 1
+    bin_id = np.clip(bin_id, 0, num_radii - 1).astype(np.int32)
 
-    start = max(1, int(drop_bins))
-    peaks, _ = find_peaks(r, plateau_size=(1, None))
-    peaks = peaks[peaks >= start]
-    idx = int(peaks[0]) if peaks.size else int(np.argmax(r[start:]) + start)
+    # Flatten |F| for bincount
+    absF_flat = absF.ravel()
 
-    # Resolution is 1/frequency
-    resolution = 1.0 / K[idx] if K[idx] > 0 else float("inf")
+    # Per-bin sums using bincount (vectorized, GPU-accelerated)
+    # The decorrelation formula simplifies because |F_normalized| = 1:
+    # d(r) = sum_{k<=r}(|F(k)|) / sqrt(sum_all(|F|²) * count(k<=r))
+    #
+    # Derivation:
+    # - F_normalized = F / |F|, so |F_normalized| = 1
+    # - numerator = Re{sum(F * conj(F_n * M))} = sum(|F| * M)
+    # - denom1 = sum(|F|²) [total power, constant]
+    # - denom2 = sum(|F_n * M|²) = sum(M) = count [since |F_n|=1]
 
-    return resolution, K[: len(r)], r
+    # Sum |F| per bin
+    cross_bin = np.bincount(bin_id, weights=absF_flat, minlength=num_radii)
+    # Count pixels per bin
+    count_bin = np.bincount(bin_id, minlength=num_radii).astype(np.float32)
+
+    # Cumulative sums for d(r) which uses all frequencies <= r
+    cross_cumsum = np.cumsum(cross_bin)
+    count_cumsum = np.cumsum(count_bin)
+
+    # Total power (constant denominator term)
+    power = np.sum(absF_flat**2)
+
+    # Compute d(r) = cross_cumsum / sqrt(power * count_cumsum)
+    eps = 1e-10
+    d_curve = cross_cumsum / (np.sqrt(power * count_cumsum) + eps)
+
+    radii = radii_cpu
+
+    # Transfer to CPU for peak finding (scipy doesn't support GPU)
+    d_curve = asnumpy(d_curve).astype(np.float32)
+
+    return radii, d_curve, k_max
+
+
+def _highpass_filter(
+    image: np.ndarray,
+    sigma: float,
+    spacing: np.ndarray,
+) -> np.ndarray:
+    """
+    Apply Gaussian high-pass filter.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image (numpy or cupy array)
+    sigma : float
+        High-pass cutoff in normalized frequency units (0-1)
+    spacing : np.ndarray
+        Physical spacing per axis
+
+    Returns
+    -------
+    filtered : np.ndarray
+        High-pass filtered image (same device as input)
+    """
+    if sigma <= 0:
+        return image.copy()
+
+    # Convert sigma from normalized frequency to real space pixels
+    # sigma in freq domain → 1/sigma in spatial domain
+    # Normalized freq 1 = Nyquist = 0.5 cycles/pixel
+    # So sigma=0.1 in norm freq ≈ cutoff at 0.05 cycles/pixel ≈ 20 pixels
+    sigma_spatial = 1.0 / (2.0 * np.pi * sigma + 1e-6)
+
+    # Compute low-pass (Gaussian blur) - cubic.skimage.filters.gaussian is device-agnostic
+    lowpass = filters.gaussian(image, sigma=sigma_spatial, preserve_range=True)
+
+    # High-pass = original - low-pass
+    highpass = image - lowpass
+
+    return highpass
+
+
+def _apply_tukey_window(image: np.ndarray, alpha: float = 0.1) -> np.ndarray:
+    """
+    Apply Tukey (tapered cosine) window for edge apodization.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image (numpy or cupy array)
+    alpha : float
+        Taper fraction (0=rectangular, 1=Hann)
+
+    Returns
+    -------
+    windowed : np.ndarray
+        Windowed image (same device as input)
+    """
+    from scipy.signal.windows import tukey
+
+    from cubic.cuda import get_array_module
+
+    # Create separable Tukey windows for each dimension (on CPU from scipy)
+    windows = []
+    for axis_size in image.shape:
+        w = tukey(axis_size, alpha=alpha).astype(image.dtype)
+        windows.append(w)
+
+    # Create N-D window by outer product (on CPU)
+    if image.ndim == 2:
+        window_nd = np.outer(windows[0], windows[1])
+    elif image.ndim == 3:
+        window_nd = np.einsum("i,j,k->ijk", windows[0], windows[1], windows[2])
+    else:
+        return image
+
+    # Transfer window to same device as image (scipy only works on CPU)
+    xp = get_array_module(image)
+    window_nd = xp.asarray(window_nd)
+
+    return image * window_nd
 
 
 def dcr_resolution(
     image: np.ndarray,
     *,
-    bin_delta: int = 1,
     spacing: float | Sequence[float] | None = None,
-    smooth: int = 5,
-    drop_bins: int = 2,
-    backend: str = "mask",
-) -> float:
+    num_radii: int = 100,
+    num_highpass: int = 30,
+    sigma_range: tuple[float, float] = (0.0, 0.5),
+) -> float | dict[str, float]:
     """
-    Calculate resolution using Decorrelation Analysis (DCR).
-
-    DCR analyzes the decorrelation of Fourier components as a function
-    of spatial frequency. Unlike FRC which compares two images, DCR
-    analyzes a single image's frequency content.
+    Calculate resolution using DCR algorithm (Descloux et al. 2019).
 
     Parameters
     ----------
     image : np.ndarray
-        2D or 3D input image
-    bin_delta : int
-        Bin width in frequency space (default: 1)
-    spacing : float or sequence of floats
-        Physical spacing per axis in nm/μm (default: 1.0).
-        If float, same spacing is used for all axes.
-    smooth : int
-        Savitzky-Golay smoothing window size (default: 5)
-    drop_bins : int
-        Number of low-frequency bins to ignore for peak finding (default: 2)
-    backend : str
-        Backend to use: "mask" (iterator-based, CPU-only) or
-        "hist" (histogram-based, GPU-compatible). Default: "mask"
+        2D or 3D input image (numpy or cupy array)
+    spacing : float or sequence of floats, optional
+        Physical spacing per axis in nm/μm. If None, returns in index units.
+        For 3D: [z_spacing, y_spacing, x_spacing]
+    num_radii : int
+        Number of radial sampling points (default: 100)
+    num_highpass : int
+        Number of high-pass filters (default: 30)
+    sigma_range : tuple of float
+        Range of high-pass sigmas in normalized frequency (default: (0.0, 0.5))
 
     Returns
     -------
-    resolution : float
-        Estimated resolution in physical units (based on spacing)
-
-    Notes
-    -----
-    DCR curve is defined as:
-        r(k) = Σ_{k'≤k} |F(k')| / √(E²_total × N(k))
-
-    where:
-    - F(k) = Fourier transform of the image
-    - N(k) = number of Fourier components up to frequency k
-    - E²_total = total power in the image
-
-    Resolution is estimated as 1/k_max where k_max is the first local
-    maximum of r(k), indicating where high-frequency content begins
-    to decorrelate.
-
-    Comparison with FRC
-    -------------------
-    - **FRC**: Compares two images, measures correlation between them
-    - **DCR**: Analyzes single image, measures decorrelation in frequency
-
-    Use DCR when you have only one image and want to assess frequency
-    content without checkerboard splitting or other image-pair generation.
-
-    Backend Selection
-    -----------------
-    - **mask**: Float64 precision, iterator-based, CPU-only
-    - **hist**: Float32 precision, histogram-based, GPU-compatible, faster
+    resolution : float or dict
+        For 2D: Estimated resolution in physical units (if spacing provided)
+        For 3D: Dict with 'xy' and 'z' resolutions, computed from 2D slices
 
     Examples
     --------
     >>> from cubic.metrics.frc import dcr_resolution
     >>> import numpy as np
-    >>> image = np.random.randn(64, 64)  # Test image
-    >>> res = dcr_resolution(image, spacing=0.1)  # 0.1 μm/pixel
+    >>> # 2D image
+    >>> image_2d = np.random.randn(64, 64)
+    >>> res = dcr_resolution(image_2d, spacing=0.065)  # 0.065 μm/pixel
     >>> print(f"Resolution: {res:.2f} μm")
+    >>> # 3D image
+    >>> image_3d = np.random.randn(30, 64, 64)
+    >>> res = dcr_resolution(image_3d, spacing=[0.2, 0.065, 0.065])
+    >>> print(f"XY: {res['xy']:.2f} μm, Z: {res['z']:.2f} μm")
     """
-    # Validate dimensions
-    if image.ndim not in (2, 3):
-        raise ValueError(f"DCR requires 2D or 3D images, got {image.ndim}D")
-
-    # Normalize spacing to sequence
-    if spacing is None:
-        spacing_seq = None
-    elif isinstance(spacing, (int, float)):
-        spacing_seq = [float(spacing)] * image.ndim
-    else:
-        spacing_seq = list(spacing)
-
-    # Select backend
-    if backend == "hist":
-        # Histogram backend (GPU-compatible)
-        resolution, _, _ = dcr_curve_hist(
+    if image.ndim == 2:
+        # 2D: return single resolution
+        resolution, _, _, _ = dcr_curve(
             image,
-            bin_delta,
-            spacing=spacing_seq,
-            smooth=smooth,
-            drop_bins=drop_bins,
+            spacing=spacing,
+            num_radii=num_radii,
+            num_highpass=num_highpass,
+            sigma_range=sigma_range,
         )
-    elif backend == "mask":
-        # Iterator backend (CPU-only)
-        if image.ndim == 2:
-            from .iterators import FourierRingIterator
+        return resolution
 
-            iterator = FourierRingIterator(image.shape, bin_delta, spacing=spacing_seq)
-        else:  # image.ndim == 3
-            from .iterators import FourierShellIterator
-
-            iterator = FourierShellIterator(image.shape, bin_delta, spacing=spacing_seq)
-
-        resolution, _, _ = dcr_curve(
-            image,
-            iterator,
-            spacing=spacing_seq,
-            smooth=smooth,
-            drop_bins=drop_bins,
-        )
-    else:
-        raise ValueError(f"Unknown backend: {backend}. Use 'mask' or 'hist'")
-
-    return resolution
-
-
-def calculate_dcr(
-    image: np.ndarray,
-    *,
-    bin_delta: int = 1,
-    spacing: float | Sequence[float] | None = None,
-    smooth: int = 5,
-    drop_bins: int = 2,
-    backend: str = "mask",
-):
-    """
-    Calculate DCR curve and resolution, returning full analysis data.
-
-    Parameters
-    ----------
-    image : np.ndarray
-        2D or 3D input image
-    bin_delta : int
-        Bin width in frequency space (default: 1)
-    spacing : float or sequence of floats
-        Physical spacing per axis in nm/μm (default: 1.0).
-        If float, same spacing is used for all axes.
-    smooth : int
-        Savitzky-Golay smoothing window size (default: 5)
-    drop_bins : int
-        Number of low-frequency bins to ignore for peak finding (default: 2)
-    backend : str
-        Backend to use: "mask" (iterator-based, CPU-only) or
-        "hist" (histogram-based, GPU-compatible). Default: "mask"
-
-    Returns
-    -------
-    FourierCorrelationData
-        Object containing DCR curve, frequency values, and resolution estimate
-
-    Examples
-    --------
-    >>> from cubic.metrics.frc import calculate_dcr
-    >>> import numpy as np
-    >>> image = np.random.randn(64, 64)
-    >>> dcr_data = calculate_dcr(image, spacing=0.1)
-    >>> print(f"Resolution: {dcr_data.resolution['resolution']:.2f} μm")
-    >>> # Plot DCR curve
-    >>> import matplotlib.pyplot as plt
-    >>> plt.plot(dcr_data.correlation['frequency'], dcr_data.correlation['correlation'])
-    >>> plt.xlabel('Spatial Frequency')
-    >>> plt.ylabel('Decorrelation')
-    """
-    from .analysis import FourierCorrelationData
-
-    # Validate dimensions
-    if image.ndim not in (2, 3):
-        raise ValueError(f"DCR requires 2D or 3D images, got {image.ndim}D")
-
-    # Normalize spacing to sequence
-    if spacing is None:
-        spacing_seq = None
-    elif isinstance(spacing, (int, float)):
-        spacing_seq = [float(spacing)] * image.ndim
-    else:
-        spacing_seq = list(spacing)
-
-    # Select backend and compute DCR curve
-    if backend == "hist":
-        resolution, K, r = dcr_curve_hist(
-            image,
-            bin_delta,
-            spacing=spacing_seq,
-            smooth=smooth,
-            drop_bins=drop_bins,
-        )
-        # For histogram backend, get N from reduce_abs
-        from .radial import reduce_abs, radial_edges, radial_bin_id
-
-        F = fftn(image.astype(np.float32, copy=False) - np.mean(image))
-        xp = get_array_module(F)
-        edges, _ = radial_edges(image.shape, bin_delta, spacing=spacing_seq)
-        edges = xp.asarray(edges)
-        bin_id = radial_bin_id(image.shape, edges, spacing=spacing_seq)
-        _, N = reduce_abs(F, bin_id)
-        N = asnumpy(N).astype(np.float32)
-    elif backend == "mask":
-        # Iterator backend
-        if image.ndim == 2:
-            from .iterators import FourierRingIterator
-
-            iterator = FourierRingIterator(image.shape, bin_delta, spacing=spacing_seq)
-        else:  # image.ndim == 3
-            from .iterators import FourierShellIterator
-
-            iterator = FourierShellIterator(image.shape, bin_delta, spacing=spacing_seq)
-
-        resolution, K, r = dcr_curve(
-            image,
-            iterator,
-            spacing=spacing_seq,
-            smooth=smooth,
-            drop_bins=drop_bins,
-        )
-        # Get N by creating fresh iterator (iterators can only be used once)
-        if image.ndim == 2:
-            from .iterators import FourierRingIterator
-
-            iterator_N = FourierRingIterator(image.shape, bin_delta, spacing=spacing_seq)
-        else:  # image.ndim == 3
-            from .iterators import FourierShellIterator
-
-            iterator_N = FourierShellIterator(image.shape, bin_delta, spacing=spacing_seq)
-
-        vol = image.astype(np.float32, copy=False) - np.mean(image)
-        F = fftn(vol)
-        absF = np.abs(F)
-        radii = iterator_N.radii
-        N = np.zeros(len(radii), dtype=np.float32)
-        for ind_ring, idx in iterator_N:
-            N[idx] = len(absF[ind_ring])
-    else:
-        raise ValueError(f"Unknown backend: {backend}. Use 'mask' or 'hist'")
-
-    # Normalize frequency to [0, 1] range for compatibility with FRC
-    freq_normalized = K / np.max(K) if np.max(K) > 0 else K
-
-    # Create FourierCorrelationData object
-    data = FourierCorrelationData()
-    data.correlation["correlation"] = r.astype(np.float32)
-    data.correlation["frequency"] = freq_normalized.astype(np.float32)
-    data.correlation["points-x-bin"] = N
-    data.resolution["resolution"] = float(resolution)
-    data.resolution["spacing"] = np.mean(spacing_seq) if spacing_seq else 1.0
-
-    return data
-
-
-def _shells_and_radii_from_iterator(iterator):
-    """
-    Extract shells and radii from FRC/FSC iterator.
-
-    Works with iterators using unshifted FFT coordinates (post-fix).
-    Supports common iterator patterns:
-      - iterable of shells + attribute .radii
-      - iterator that yields (shell_mask, index)
-
-    Parameters
-    ----------
-    iterator : FourierRingIterator or FourierShellIterator
-        Iterator providing radial bins
-
-    Returns
-    -------
-    shells : list
-        List of shell masks (boolean arrays or index tuples)
-    radii : np.ndarray
-        Radial frequency values for each shell (bin midpoints)
-    """
-    # Case 1: iterator has .radii attribute and is iterable
-    # This is the standard pattern for FourierRingIterator and FourierShellIterator
-    if hasattr(iterator, "radii") and hasattr(iterator, "__iter__"):
-        shells = []
-        for item in iterator:
-            # Iterator yields (mask_indices, shell_index)
-            if isinstance(item, tuple) and len(item) >= 1:
-                shells.append(item[0])  # Take mask indices
-            else:
-                shells.append(item)
-        radii = np.asarray(iterator.radii)
-        return shells, radii
-
-    # Case 2: explicit .shells() method + radii getter
-    if hasattr(iterator, "shells") and callable(iterator.shells):
-        shells = list(iterator.shells())
-        radii = getattr(iterator, "radii", None)
-        if radii is None and hasattr(iterator, "get_radii"):
-            radii = iterator.get_radii()
-        return shells, np.asarray(radii)
-
-    # Case 3: iterator yields (shell, radius) pairs
-    shells, radii = [], []
-    for item in iterator:
-        if isinstance(item, (tuple, list)) and len(item) >= 2:
-            shells.append(item[0])
-            # If item has explicit radius, use it; otherwise accumulate indices
-            if len(item) > 1 and isinstance(item[1], (int, float)):
-                radii.append(float(item[1]))
+    elif image.ndim == 3:
+        # 3D: compute directional resolutions from 2D slices
+        # Normalize spacing
+        if spacing is None:
+            spacing_z = 1.0
+            spacing_y = 1.0
+            spacing_x = 1.0
+        elif isinstance(spacing, (int, float)):
+            spacing_z = spacing_y = spacing_x = float(spacing)
         else:
-            raise TypeError(
-                "Iterator must yield (shell, index) or have .radii attribute"
-            )
+            spacing_z, spacing_y, spacing_x = spacing[0], spacing[1], spacing[2]
 
-    # If no radii were collected, try to get from iterator
-    if not radii and hasattr(iterator, "radii"):
-        radii = np.asarray(iterator.radii)
+        # XY resolution: analyze middle XY slice
+        mid_z = image.shape[0] // 2
+        xy_slice = image[mid_z, :, :]
+        xy_spacing = [spacing_y, spacing_x]
+        res_xy, _, _, _ = dcr_curve(
+            xy_slice,
+            spacing=xy_spacing,
+            num_radii=num_radii,
+            num_highpass=num_highpass,
+            sigma_range=sigma_range,
+        )
+
+        # Z resolution: analyze middle XZ slice
+        mid_y = image.shape[1] // 2
+        xz_slice = image[:, mid_y, :]
+        xz_spacing = [spacing_z, spacing_x]
+        res_xz, _, _, _ = dcr_curve(
+            xz_slice,
+            spacing=xz_spacing,
+            num_radii=num_radii,
+            num_highpass=num_highpass,
+            sigma_range=sigma_range,
+        )
+
+        return {"xy": res_xy, "z": res_xz}
+
     else:
-        radii = np.asarray(radii)
-
-    return shells, radii
+        raise ValueError(f"DCR requires 2D or 3D images, got {image.ndim}D")

@@ -136,7 +136,9 @@ def radial_bin_id(
 
     if spacing is not None:
         # xp.fft.fftfreq needed to create arrays on correct device
-        axes = [xp.fft.fftfreq(n, d=sp).astype(np.float32) for n, sp in zip(shape, spacing)]
+        axes = [
+            xp.fft.fftfreq(n, d=sp).astype(np.float32) for n, sp in zip(shape, spacing)
+        ]
     else:
         # xp.fft.fftfreq needed to create arrays on correct device
         axes = [xp.fft.fftfreq(n).astype(np.float32) * n for n in shape]
@@ -164,6 +166,62 @@ def radial_bin_id(
     bid[K < tiny] = -1
 
     return bid
+
+
+def radial_k_grid(
+    shape: tuple[int, ...],
+    spacing: Sequence[float] | None = None,
+) -> tuple[np.ndarray, float]:
+    """
+    Compute radial frequency magnitude for each point in unshifted FFT grid.
+
+    This is the shared infrastructure for computing physical frequency coordinates,
+    used by both FRC/FSC (via radial_bin_id) and DCR.
+
+    Parameters
+    ----------
+    shape : tuple
+        Image shape (2D or 3D)
+    spacing : sequence of float, optional
+        Physical spacing per axis. If None, uses index units.
+
+    Returns
+    -------
+    k_radius : ndarray
+        Frequency magnitude at each grid point (same shape as FFT output)
+    k_max : float
+        Maximum frequency (Nyquist limit)
+    """
+    ndim = len(shape)
+    if ndim not in (2, 3):
+        raise ValueError("Only 2D and 3D images are supported")
+
+    if spacing is not None:
+        if len(spacing) != ndim:
+            raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
+        # Physical frequency coordinates: fftfreq(n, d=sp) gives cycles per unit
+        axes = [
+            np.fft.fftfreq(n, d=float(sp)).astype(np.float32)
+            for n, sp in zip(shape, spacing)
+        ]
+        k_max = _kmax_phys(shape, spacing)
+    else:
+        # Index frequency coordinates
+        axes = [np.fft.fftfreq(n).astype(np.float32) for n in shape]
+        k_max = 0.5  # Nyquist in index units
+
+    # Build k_radius using broadcasting for efficiency
+    if ndim == 2:
+        k0 = axes[0][:, None]
+        k1 = axes[1][None, :]
+        k_radius = np.sqrt(k0 * k0 + k1 * k1)
+    else:  # ndim == 3
+        k0 = axes[0][:, None, None]
+        k1 = axes[1][None, :, None]
+        k2 = axes[2][None, None, :]
+        k_radius = np.sqrt(k0 * k0 + k1 * k1 + k2 * k2)
+
+    return k_radius, float(k_max)
 
 
 def reduce_power(F: np.ndarray, bin_id: np.ndarray):

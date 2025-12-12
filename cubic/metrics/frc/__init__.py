@@ -1,6 +1,6 @@
 """Expose FRC functions."""
 
-from .dcr import calculate_dcr, dcr_resolution
+from .dcr import dcr_resolution, dcr_curve
 from .frc import (
     calculate_frc,
     frc_resolution,
@@ -20,5 +20,5 @@ __all__ = [
     "grid_crop_resolution",
     "frc_resolution_difference",
     "dcr_resolution",
-    "calculate_dcr",
+    "dcr_curve",
 ]
