@@ -18,11 +18,21 @@ def _kmax_phys(shape: tuple[int, ...], spacing: Sequence[float]) -> float:
     return float(min((n // 2) / (n * float(sp)) for n, sp in zip(shape, spacing)))
 
 
+def _kmax_phys_max(shape: tuple[int, ...], spacing: Sequence[float]) -> float:
+    """Compute maximum Nyquist frequency in physical units.
+
+    Used for sectioned FSC where XY-dominant sectors need to extend
+    to the XY Nyquist, not the minimum (typically Z) Nyquist.
+    """
+    return float(max((n // 2) / (n * float(sp)) for n, sp in zip(shape, spacing)))
+
+
 @lru_cache(maxsize=256)
 def _radial_edges_cached(
     shape: tuple[int, ...],
     bin_delta: float,
     spacing_key: tuple[float, ...] | None,
+    use_max_nyquist: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute radial bin edges and centers (cached).
@@ -31,6 +41,8 @@ def _radial_edges_cached(
         shape: Image shape (tuple of ints)
         bin_delta: Bin width in index bins
         spacing_key: Physical spacing tuple (hashable) or None
+        use_max_nyquist: If True, use maximum Nyquist (for SFSC with
+            anisotropic data). Default False uses minimum Nyquist.
 
     Returns
     -------
@@ -48,7 +60,10 @@ def _radial_edges_cached(
         # Physical units: one index bin in physical units along axis i: Δk_i = 1/(n_i·spacing_i)
         dk_min = min(1.0 / (n * sp) for n, sp in zip(shape, spacing_key))
         step = float(bin_delta) * dk_min
-        kmax = _kmax_phys(shape, spacing_key)
+        if use_max_nyquist:
+            kmax = _kmax_phys_max(shape, spacing_key)
+        else:
+            kmax = _kmax_phys(shape, spacing_key)
 
     # Build edges from 0 to kmax with step size
     nb = max(1, int(np.ceil(kmax / step)))
@@ -66,6 +81,7 @@ def radial_edges(
     shape: tuple[int, ...],
     bin_delta: float = 1.0,
     spacing: Sequence[float] | None = None,
+    use_max_nyquist: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Build uniform radial bin edges and centers for 2D/3D unshifted FFT grids.
@@ -78,6 +94,10 @@ def radial_edges(
         bin_delta: Bin width in index bins (default: 1.0)
         spacing: Physical spacing per axis. None uses index units,
                  given uses physical frequency (cycles per length).
+        use_max_nyquist: If True, use maximum Nyquist frequency across all axes
+                         instead of minimum. Useful for sectioned FSC where
+                         XY-dominant sectors need to extend to XY Nyquist.
+                         Default False (use minimum Nyquist for 2D FRC/3D FSC).
 
     Returns
     -------
@@ -95,7 +115,7 @@ def radial_edges(
 
     # Convert to hashable types and call cached implementation
     return _radial_edges_cached(
-        tuple(int(n) for n in shape), float(bin_delta), spacing_key
+        tuple(int(n) for n in shape), float(bin_delta), spacing_key, use_max_nyquist
     )
 
 
@@ -300,3 +320,161 @@ def frc_from_sums(
     # np.sqrt, np.maximum, np.clip all preserve device
     denom = np.sqrt(np.maximum(Sx2, 0.0) * np.maximum(Sy2, 0.0)) + eps
     return np.clip(Sxy / denom, -1.0, 1.0)
+
+
+# --- Angular sectioning for 3D FSC ---
+
+
+def sectioned_bin_id(
+    shape: tuple[int, int, int],
+    radial_edges: np.ndarray,
+    angle_edges: np.ndarray,
+    spacing: Sequence[float] | None = None,
+    exclude_axis_angle: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute combined radial+angular bin IDs for 3D sectioned FSC.
+
+    Bins are indexed as: combined_id = angle_id * n_radial_bins + radial_id
+
+    Parameters
+    ----------
+    shape : tuple
+        3D image shape (Z, Y, X)
+    radial_edges : ndarray
+        Radial frequency bin edges
+    angle_edges : ndarray
+        Angular bin edges in degrees (0° = Z axis, 90° = XY plane)
+    spacing : sequence of float, optional
+        Physical spacing per axis [z, y, x]. If None, uses index units.
+    exclude_axis_angle : float, optional
+        Exclude frequencies within this angle (in degrees) from the Z axis.
+        This follows Koho et al. 2019 to avoid piezo/interpolation artifacts
+        near the optical axis. Default: 0.0 (no exclusion).
+
+    Returns
+    -------
+    radial_id : ndarray
+        Flattened radial bin IDs
+    angle_id : ndarray
+        Flattened angular bin IDs (angle from Z axis)
+    """
+    xp = get_array_module(radial_edges)
+
+    if len(shape) != 3:
+        raise ValueError("sectioned_bin_id requires 3D shape")
+
+    # Check if spacing is effectively "no scaling" (all 1.0)
+    if spacing is not None:
+        if len(spacing) != 3:
+            raise ValueError("spacing must have 3 elements for 3D")
+        if all(abs(sp - 1.0) < 1e-10 for sp in spacing):
+            spacing = None
+
+    if spacing is not None:
+        axes = [
+            xp.fft.fftfreq(n, d=sp).astype(np.float32) for n, sp in zip(shape, spacing)
+        ]
+    else:
+        axes = [xp.fft.fftfreq(n).astype(np.float32) * n for n in shape]
+
+    # Build frequency grids with broadcasting
+    kz = axes[0][:, None, None]
+    ky = axes[1][None, :, None]
+    kx = axes[2][None, None, :]
+
+    # Radial frequency magnitude
+    k_xy = np.sqrt(ky * ky + kx * kx)
+    k_radius = np.sqrt(kz * kz + k_xy * k_xy).ravel()
+
+    # Angle from Z axis (0° = along Z, 90° = in XY plane)
+    # arctan2(k_xy, |kz|) gives angle from Z axis
+    theta = np.degrees(np.arctan2(k_xy, np.abs(kz))).ravel()
+
+    # Radial binning
+    n_radial = int(radial_edges.size) - 1
+    radial_id = np.digitize(k_radius, radial_edges) - 1
+    radial_id = np.clip(radial_id, 0, n_radial - 1).astype(np.int32)
+
+    # Angular binning
+    n_angle = int(angle_edges.size) - 1
+    angle_id = np.digitize(theta, angle_edges) - 1
+    angle_id = np.clip(angle_id, 0, n_angle - 1).astype(np.int32)
+
+    # Exclude DC
+    tiny = np.finfo(k_radius.dtype).tiny if hasattr(k_radius, "dtype") else 1e-12
+    radial_id[k_radius < tiny] = -1
+    angle_id[k_radius < tiny] = -1
+
+    # Exclude frequencies near Z axis (theta < exclude_axis_angle)
+    # Following Koho et al. 2019 to avoid piezo/interpolation artifacts
+    if exclude_axis_angle > 0:
+        axis_mask = theta < exclude_axis_angle
+        radial_id[axis_mask] = -1
+        angle_id[axis_mask] = -1
+
+    return radial_id, angle_id
+
+
+def reduce_power_sectioned(
+    F: np.ndarray,
+    radial_id: np.ndarray,
+    angle_id: np.ndarray,
+    n_radial: int,
+    n_angle: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Sum per-bin power for sectioned FSC: Σ|F|² per (angle, radius) bin.
+
+    Returns
+    -------
+    S2 : ndarray, shape (n_angle, n_radial)
+        Power sum per bin
+    N : ndarray, shape (n_angle, n_radial)
+        Count per bin
+    """
+    valid = (radial_id >= 0) & (angle_id >= 0)
+    rid = radial_id[valid]
+    aid = angle_id[valid]
+    a = np.abs(F).ravel()[valid]
+
+    # Combined bin index
+    combined_id = aid * n_radial + rid
+    n_combined = n_angle * n_radial
+
+    S2_flat = np.bincount(combined_id, weights=a * a, minlength=n_combined)
+    N_flat = np.bincount(combined_id, minlength=n_combined)
+
+    return S2_flat.reshape(n_angle, n_radial), N_flat.reshape(n_angle, n_radial)
+
+
+def reduce_cross_sectioned(
+    FX: np.ndarray,
+    FY: np.ndarray,
+    radial_id: np.ndarray,
+    angle_id: np.ndarray,
+    n_radial: int,
+    n_angle: int,
+) -> np.ndarray:
+    """
+    Sum per-bin cross-spectrum for sectioned FSC: Σ Re{X·conj(Y)}.
+
+    Returns
+    -------
+    Sxy : ndarray, shape (n_angle, n_radial)
+        Cross-spectrum sum per bin
+    """
+    valid = (radial_id >= 0) & (angle_id >= 0)
+    rid = radial_id[valid]
+    aid = angle_id[valid]
+    X = FX.ravel()[valid]
+    Y = FY.ravel()[valid]
+
+    combined_id = aid * n_radial + rid
+    n_combined = n_angle * n_radial
+
+    Sxy_flat = np.bincount(
+        combined_id, weights=X.real * Y.real + X.imag * Y.imag, minlength=n_combined
+    )
+
+    return Sxy_flat.reshape(n_angle, n_radial)

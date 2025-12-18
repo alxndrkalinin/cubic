@@ -1,6 +1,6 @@
 """Expose FRC functions."""
 
-from .dcr import dcr_resolution, dcr_curve
+from .dcr import dcr_curve, dcr_resolution
 from .frc import (
     calculate_frc,
     frc_resolution,

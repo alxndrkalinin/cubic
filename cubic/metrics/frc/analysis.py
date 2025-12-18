@@ -401,13 +401,25 @@ class FourierCorrelationAnalysis(object):
 
         def first_guess(x, y, thr):
             difference = y - thr
-            return x[np.where(difference <= 0)[0][0] - 1]
+            crossings = np.where(difference <= 0)[0]
+            if len(crossings) == 0:
+                return None  # No threshold crossing found
+            return x[crossings[0] - 1] if crossings[0] > 0 else x[0]
 
         fit_start = first_guess(
             data_set.correlation["frequency"],
             data_set.correlation["correlation"],
             np.mean(data_set.resolution["threshold"]),
         )
+
+        # Handle case where correlation never crosses threshold
+        if fit_start is None:
+            data_set.resolution["resolution-point"] = (np.nan, np.nan)
+            data_set.resolution["criterion"] = criterion
+            data_set.resolution["resolution"] = np.nan
+            data_set.resolution["spacing"] = self.spacing
+            return data_set
+
         if verbose:
             print(f"Fit starts at {fit_start}")
             disp = 1

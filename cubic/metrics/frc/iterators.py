@@ -197,7 +197,9 @@ class FourierRingIterator:
         """Number of available rings."""
         return self._nbins
 
-    def get_points_on_ring(self, ring_start: float, ring_stop: float, is_last: bool = False) -> np.ndarray:
+    def get_points_on_ring(
+        self, ring_start: float, ring_stop: float, is_last: bool = False
+    ) -> np.ndarray:
         """Return boolean mask for points on a ring. DC term (r==0) is excluded.
 
         Args:
@@ -225,11 +227,11 @@ class FourierRingIterator:
     def __next__(self):  # -> tuple[tuple[np.ndarray, np.ndarray], int]
         """Return mask and index for the next ring."""
         if self.current_ring < self._nbins:
-            is_last = (self.current_ring == self._nbins - 1)
+            is_last = self.current_ring == self._nbins - 1
             ring = self.get_points_on_ring(
                 self.edges[self.current_ring],
                 self.edges[self.current_ring + 1],
-                is_last=is_last
+                is_last=is_last,
             )
         else:
             raise StopIteration
@@ -298,7 +300,7 @@ class FourierShellIterator:
     def __init__(
         self, shape: Iterable[int], d_bin: int, spacing: Sequence[float] | None = None
     ) -> None:
-        from .radial import radial_edges
+        from .radial import _kmax_phys, _kmax_index, radial_edges
 
         self.d_bin = d_bin
         shape = tuple(shape)
@@ -319,7 +321,11 @@ class FourierShellIterator:
         self.r = np.sqrt(x**2 + y**2 + z**2)
 
         self.current_shell = self.shell_start
-        self.freq_nyq = int(np.floor(shape[0] / 2.0))
+        # Compute Nyquist frequency using same functions as radial_edges
+        if spacing is not None:
+            self.freq_nyq = _kmax_phys(shape, spacing)
+        else:
+            self.freq_nyq = _kmax_index(shape)
 
     @property
     def steps(self) -> np.ndarray:
@@ -327,11 +333,13 @@ class FourierShellIterator:
         return self.radii
 
     @property
-    def nyquist(self) -> int:
-        """Nyquist frequency for the current shape."""
+    def nyquist(self) -> float:
+        """Nyquist frequency for the current shape (physical or index units)."""
         return self.freq_nyq
 
-    def get_points_on_shell(self, shell_start: float, shell_stop: float, is_last: bool = False) -> np.ndarray:
+    def get_points_on_shell(
+        self, shell_start: float, shell_stop: float, is_last: bool = False
+    ) -> np.ndarray:
         """Return boolean mask for points within a shell. DC term (r==0) is excluded.
 
         Args:
@@ -366,11 +374,11 @@ class FourierShellIterator:
         """Return mask and index for the next shell."""
         shell_idx = self.current_shell
         if shell_idx <= self.shell_stop:
-            is_last = (shell_idx == self.shell_stop)
+            is_last = shell_idx == self.shell_stop
             shell = self.get_points_on_shell(
                 self.edges[self.current_shell],
                 self.edges[self.current_shell + 1],
-                is_last=is_last
+                is_last=is_last,
             )
         else:
             raise StopIteration
@@ -453,7 +461,9 @@ class HollowSectionedFourierShellIterator(SectionedFourierShellIterator):
         d_extract_angle: int = 5,
         spacing: Sequence[float] | None = None,
     ) -> None:
-        SectionedFourierShellIterator.__init__(self, shape, d_bin, d_angle, spacing=spacing)
+        SectionedFourierShellIterator.__init__(
+            self, shape, d_bin, d_angle, spacing=spacing
+        )
         self.d_extract_angle = np.deg2rad(d_extract_angle)
 
     def get_angle_sector(self, phi_min: float, phi_max: float) -> np.ndarray:
