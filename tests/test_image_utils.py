@@ -123,10 +123,12 @@ def test_checkerboard_split() -> None:
     img_float64 = np.random.rand(4, 4, 4).astype(np.float64)
     img1_f64, img2_f64 = checkerboard_split(img_float64, preserve_range=False)
     assert img1_f64.dtype == np.float64
+    assert img2_f64.dtype == np.float64
     img1_f64_preserve, img2_f64_preserve = checkerboard_split(
         img_float64, preserve_range=True
     )
     assert img1_f64_preserve.dtype == np.float64
+    assert img2_f64_preserve.dtype == np.float64
 
     # Reverse with 3D Z-summing
     img1_rev_3d, img2_rev_3d = reverse_checkerboard_split(img_3d, disable_3d_sum=False)
