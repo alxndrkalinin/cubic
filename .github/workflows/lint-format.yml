@@ -1,9 +1,32 @@
-# tests.yml
-name: tests
+name: CI
 
 on: [push, pull_request]
 
 jobs:
+  lint:
+    name: lint and format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: install uv
+        uses: astral-sh/setup-uv@v5
+      
+      - name: set up python
+        run: uv python install 3.10
+      
+      - name: install project with dev dependencies
+        run: uv sync --extra dev
+      
+      - name: run ruff linter
+        run: uv run ruff check .
+      
+      - name: run ruff formatter check
+        run: uv run ruff format --check .
+      
+      - name: run mypy
+        run: uv run mypy --ignore-missing-imports cubic/
+  
   test:
     name: test on python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
