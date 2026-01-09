@@ -533,6 +533,8 @@ def _dcr_curve_3d_sectioned(
 
             all_peaks[sector_name].append(r_peak)
 
+        del filtered_image
+
     # Compute resolution for each sector
     resolutions = {}
     for sector_name in ["xy", "z"]:

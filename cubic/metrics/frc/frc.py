@@ -611,6 +611,9 @@ def _calculate_fsc_sectioned_hist(
         fft_image1, fft_image2, radial_id, angle_id, n_radial, n_angle
     )
 
+    del fft_image1, fft_image2
+    del radial_id, angle_id, r_edges, angle_edges
+
     # Compute FSC for each angle
     results = {}
 
