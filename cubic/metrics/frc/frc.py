@@ -586,9 +586,11 @@ def _calculate_fsc_sectioned_hist(
     r_edges = xp.asarray(r_edges)
     n_radial = len(radii)
 
-    # Angular edges: 0°=Z axis, 90°=XY plane
-    # Build edges from 0 to 90 degrees with angle_delta step
-    n_angle = 90 // angle_delta
+    # Angular edges: azimuthal angle in Y-Z plane (0-360°)
+    # Following Koho et al. 2019 SFSC methodology:
+    # - phi ≈ 0° or 180° = Z-dominated frequencies → Z resolution
+    # - phi ≈ 90° or 270° = Y-dominated frequencies → XY resolution
+    n_angle = 360 // angle_delta
     angle_edges = xp.asarray(
         [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
     )
@@ -628,23 +630,14 @@ def _calculate_fsc_sectioned_hist(
 
     spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
 
-    # Map bin index to output angle following Koho et al. 2019 convention:
-    # - angle=0° = XY plane (lateral)
-    # - angle=90° = Z axis (axial)
+    # Map bin index to output angle (azimuthal angle in Y-Z plane):
+    # - phi ≈ 0° or 180° = Z-dominated frequencies → Z resolution
+    # - phi ≈ 90° or 270° = Y-dominated frequencies → XY resolution
     #
-    # Internally, bins are indexed by polar angle from Z axis:
-    # - aid=0 covers polar 0° to angle_delta° (near Z axis)
-    # - aid=n_angle-1 covers polar (90-angle_delta)° to 90° (near XY plane)
-    #
-    # Transform: output_angle = 90 - polar_angle
-    # Using bin center: output_angle = 90 - (aid + 0.5) * angle_delta
-    # Rounded to integer for dict key
+    # Output angle is the bin center in azimuthal coordinates (0-360°)
     for aid in range(n_angle):
-        # Transform polar angle to paper convention
-        # Bin center in polar coords: (aid + 0.5) * angle_delta
-        # Paper convention: 90 - polar_center
-        polar_center = (aid + 0.5) * angle_delta
-        output_angle = int(round(90 - polar_center))
+        # Bin center in azimuthal coords
+        output_angle = int(round((aid + 0.5) * angle_delta))
 
         fsc = frc_from_sums(
             asnumpy(Sx2[aid]),
@@ -723,6 +716,11 @@ def fsc_resolution(
         zero_padding = backend == "mask"
 
     # Resample to isotropic voxel size if requested
+    # Save original Z spacing for Z-sector resolution calculation
+    # (needed because isotropic resampling creates artificial high-frequency
+    # correlation beyond the original Z Nyquist)
+    original_spacing_z = None
+
     if resample_isotropic:
         if spacing is None:
             raise ValueError("resample_isotropic=True requires spacing to be provided")
@@ -732,6 +730,9 @@ def fsc_resolution(
             spacing_tuple = (float(spacing),) * image1.ndim
         else:
             spacing_tuple = tuple(spacing)
+
+        # Save original Z spacing before resampling
+        original_spacing_z = spacing_tuple[0]
 
         # Calculate target Z size (must be even for checkerboard split)
         iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
@@ -889,28 +890,81 @@ def fsc_resolution(
         spacing_xy = 1.0
         spacing_z = 1.0
 
-    # Find min/max angles to determine XY and Z sectors
-    # hist backend uses theta = arctan2(k_xy, |kz|):
-    #   - theta ≈ 0° → frequency vector along Z axis → measures Z resolution
-    #   - theta ≈ 90° → frequency vector in XY plane → measures XY resolution
+    # Select XY and Z sectors based on azimuthal angle convention:
+    # - phi ≈ 90° or 270° = Y-dominated (ky >> kz) → XY resolution
+    # - phi ≈ 0° or 180° = Z-dominated (kz >> ky) → Z resolution
+    #
+    # Find sectors closest to these target angles
     angles = sorted(fsc_data.keys())
-    angle_xy = angles[
-        -1
-    ]  # High angle (near 90°) → XY plane frequencies → XY resolution
-    angle_z = angles[0]  # Low angle (near 0°) → Z axis frequencies → Z resolution
+
+    # For XY resolution: find sector closest to 90° or 270°
+    def dist_to_xy(a):
+        return min(abs(a - 90), abs(a - 270))
+
+    angle_xy = min(angles, key=dist_to_xy)
+
+    # For Z resolution: find all sectors near 0° or 180° (Z-dominated)
+    # and average them for better statistics (following Koho et al. 2019)
+    def dist_to_z(a):
+        return min(a, abs(a - 180), abs(a - 360))
+
+    z_angle_threshold = 30  # Include sectors within 30° of Z-dominant directions
+    z_sectors = [a for a in angles if dist_to_z(a) <= z_angle_threshold]
+    angle_z = min(angles, key=dist_to_z)  # Primary Z sector for labeling
 
     results = {}
-    for angle, data_set in fsc_data.items():
-        # Select appropriate spacing for this angle
-        # XY resolution uses XY (lateral) spacing, Z resolution uses Z (axial) spacing
-        analyzer_spacing = spacing_xy if angle == angle_xy else spacing_z
 
-        # Create data collection properly
+    # Process XY sector
+    data_xy = fsc_data[angle_xy]
+    data_collection = FourierCorrelationDataCollection()
+    data_collection[0] = data_xy
+    analyzer = FourierCorrelationAnalysis(
+        data_collection,
+        spacing_xy,
+        resolution_threshold="one-bit",
+        curve_fit_type="spline",
+    )
+    try:
+        analyzed = analyzer.execute()[0]
+        results["xy"] = analyzed.resolution["resolution"]
+    except Exception:
+        results["xy"] = float("nan")
+
+    # Process Z resolution by averaging multiple Z-relevant sectors
+    if z_sectors and len(z_sectors) > 0:
+        # Get reference frequency grid from first Z sector
+        ref_data = fsc_data[z_sectors[0]]
+        ref_freq = np.asarray(ref_data.correlation["frequency"])
+
+        # Average correlations weighted by point counts
+        sum_corr = np.zeros_like(ref_freq)
+        sum_weights = np.zeros_like(ref_freq)
+        for angle in z_sectors:
+            data = fsc_data[angle]
+            corr = np.asarray(data.correlation["correlation"])
+            n_pts = np.asarray(data.correlation["points-x-bin"])
+            sum_corr += corr * n_pts
+            sum_weights += n_pts
+        avg_corr = sum_corr / np.maximum(sum_weights, 1)
+
+        # Create averaged Z data set
+        z_data_set = FourierCorrelationData()
+        z_data_set.correlation["correlation"] = avg_corr
+        z_data_set.correlation["frequency"] = ref_freq
+        z_data_set.correlation["points-x-bin"] = sum_weights
+
+        # Determine spacing and frequency limit for Z
+        if original_spacing_z is not None:
+            z_freq_limit = spacing_xy / original_spacing_z
+            analyzer_spacing = original_spacing_z
+        else:
+            z_freq_limit = 1.0
+            analyzer_spacing = spacing_z
+
+        # Try to find resolution with the averaged Z data
+        # First attempt: use full frequency range (may extrapolate beyond Z Nyquist)
         data_collection = FourierCorrelationDataCollection()
-        data_collection[0] = data_set
-
-        # Use one-bit threshold for 3D FSC as recommended by Koho et al. 2019
-        # (SNRe = 0.5, varies with number of voxels per bin)
+        data_collection[0] = z_data_set
         analyzer = FourierCorrelationAnalysis(
             data_collection,
             analyzer_spacing,
@@ -919,16 +973,22 @@ def fsc_resolution(
         )
         try:
             analyzed = analyzer.execute()[0]
-            resolution = analyzed.resolution["resolution"]
+            z_resolution = analyzed.resolution["resolution"]
         except Exception:
-            # Fitting can fail with insufficient data points
-            resolution = float("nan")
+            z_resolution = float("nan")
 
-        if angle == angle_xy:
-            results["xy"] = resolution
-        elif angle == angle_z:
-            results["z"] = resolution
-        # Intermediate angles are computed but not returned
+        # Fallback: simple threshold crossing if spline failed
+        if np.isnan(z_resolution):
+            below_threshold = avg_corr < 0.5
+            if np.any(below_threshold):
+                first_below = int(np.argmax(below_threshold))
+                freq_at_crossing = float(ref_freq[first_below])
+                if freq_at_crossing > 0:
+                    z_resolution = analyzer_spacing / freq_at_crossing
+
+        results["z"] = z_resolution
+    else:
+        results["z"] = float("nan")
 
     return results
 
