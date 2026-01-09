@@ -3,13 +3,92 @@
 from collections.abc import Sequence
 
 import numpy as np
-from scipy.signal import find_peaks
-
 from cubic.cuda import asnumpy, get_array_module
 from cubic.skimage import filters
 from cubic.image_utils import rescale_isotropic
 
 from .radial import _kmax_phys, radial_edges, radial_k_grid, sectioned_bin_id
+
+
+def _find_peak_in_curve(
+    radii: np.ndarray,
+    d_curve: np.ndarray,
+    r_min: float = 0.0,
+    r_max: float = 0.9,
+    min_prominence: float = 0.001,
+) -> tuple[float, float]:
+    """
+    Find peak position in decorrelation curve following Descloux et al. 2019.
+
+    Implements the algorithm from Supplementary Note 1.1:
+    1. Find the global maximum of d(r)
+    2. If max is at boundary (r >= r_max), iteratively exclude and retry
+    3. Apply prominence check: peak must exceed subsequent minimum by min_prominence
+
+    Parameters
+    ----------
+    radii : np.ndarray
+        Normalized frequency values (0 to 1)
+    d_curve : np.ndarray
+        Decorrelation values d(r)
+    r_min : float
+        Minimum valid frequency (exclude very low frequencies). Default: 0.0
+    r_max : float
+        Maximum valid frequency (exclude boundary artifacts). Default: 0.9
+    min_prominence : float
+        Minimum prominence required (peak must exceed subsequent min by this).
+        Default: 0.001 following the original paper.
+
+    Returns
+    -------
+    r_peak : float
+        Peak position (normalized frequency), or 0.0 if no valid peak
+    a_peak : float
+        Peak amplitude (d(r) value at peak), or 0.0 if no valid peak
+    """
+    # Create a working copy to allow iterative exclusion
+    d_work = d_curve.copy()
+    n = len(d_work)
+
+    # Mask out invalid frequency regions (set to -inf so they won't be selected)
+    for i in range(n):
+        if radii[i] < r_min or radii[i] >= r_max:
+            d_work[i] = -np.inf
+
+    # Iteratively find global maximum, excluding boundary artifacts
+    max_iterations = 20  # Prevent infinite loop
+    for _ in range(max_iterations):
+        # Find global maximum in valid region
+        peak_idx = int(np.argmax(d_work))
+
+        # Check if no valid peak exists
+        if d_work[peak_idx] == -np.inf:
+            return 0.0, 0.0
+
+        r_peak = radii[peak_idx]
+        a_peak = d_curve[peak_idx]  # Use original curve for amplitude
+
+        # Check if peak is at the boundary of the valid region
+        # (last non-excluded index before r_max cutoff)
+        if peak_idx >= n - 1 or radii[peak_idx] >= r_max - 0.01:
+            # Exclude this position and retry
+            d_work[peak_idx] = -np.inf
+            continue
+
+        # Prominence check: peak must exceed minimum value after it by min_prominence
+        # This filters out noisy local maxima
+        if peak_idx < n - 1:
+            min_after = np.min(d_curve[peak_idx + 1 :])
+            if a_peak - min_after < min_prominence:
+                # Peak is not prominent enough, exclude and retry
+                d_work[peak_idx] = -np.inf
+                continue
+
+        # Valid peak found
+        return r_peak, a_peak
+
+    # No valid peak found after all iterations
+    return 0.0, 0.0
 
 
 def dcr_curve(
@@ -18,6 +97,7 @@ def dcr_curve(
     spacing: float | Sequence[float] | None = None,
     num_radii: int = 100,
     num_highpass: int = 10,
+    windowing: bool = True,
 ) -> tuple[float, np.ndarray, list[np.ndarray], np.ndarray]:
     """
     Compute decorrelation curve using algorithm from Descloux et al. 2019.
@@ -33,6 +113,10 @@ def dcr_curve(
     num_highpass : int
         Number of Gaussian high-pass filters to apply (default: 10).
         Following NanoPyx convention, uses logarithmically-spaced sigmas.
+    windowing : bool
+        If True (default), apply internal Tukey window for edge apodization.
+        Set to False when windowing is applied externally for consistent
+        preprocessing across different methods.
 
     Returns
     -------
@@ -65,8 +149,9 @@ def dcr_curve(
     image = image.astype(np.float32)
     image -= np.mean(image)
 
-    # Optional: Apply Tukey window for edge apodization
-    image = _apply_tukey_window(image, alpha=0.1)
+    # Apply Tukey window for edge apodization (unless externally handled)
+    if windowing:
+        image = _apply_tukey_window(image, alpha=0.1)
 
     # Normalize spacing
     if spacing is None:
@@ -101,18 +186,9 @@ def dcr_curve(
             spacing=spacing_arr if spacing is not None else None,
         )
 
-        # Find local maximum
-        peaks, properties = find_peaks(d_curve, plateau_size=(1, None))
-
-        if len(peaks) > 0:
-            # Take first peak (highest correlation maximum)
-            peak_idx = peaks[0]
-            r_peak = radii[peak_idx]
-            a_peak = d_curve[peak_idx]
-        else:
-            # No peak found - too much filtering
-            r_peak = 0.0
-            a_peak = 0.0
+        # Find peak using algorithm from Descloux et al. 2019 Supplementary Note 1.1
+        # Finds global maximum with iterative boundary exclusion and prominence check
+        r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
 
         all_curves.append(d_curve)
         all_peaks.append([r_peak, a_peak])
@@ -380,6 +456,7 @@ def _dcr_curve_3d_sectioned(
     num_highpass: int = 10,
     angle_delta: int = 45,
     exclude_axis_angle: float = 0.0,
+    windowing: bool = True,
 ) -> dict[str, float]:
     """
     Compute 3D DCR with angular sectioning for XY and Z directions.
@@ -399,6 +476,8 @@ def _dcr_curve_3d_sectioned(
         Angular bin width in degrees (default: 45)
     exclude_axis_angle : float
         Exclude frequencies near Z axis (degrees)
+    windowing : bool
+        If True (default), apply internal Tukey window for edge apodization.
 
     Returns
     -------
@@ -411,8 +490,9 @@ def _dcr_curve_3d_sectioned(
     image = image.astype(np.float32)
     image -= np.mean(image)
 
-    # Apply Tukey window for edge apodization
-    image = _apply_tukey_window(image, alpha=0.1)
+    # Apply Tukey window for edge apodization (unless externally handled)
+    if windowing:
+        image = _apply_tukey_window(image, alpha=0.1)
 
     # Normalize spacing
     if spacing is None:
@@ -443,21 +523,13 @@ def _dcr_curve_3d_sectioned(
             exclude_axis_angle=exclude_axis_angle,
         )
 
-        # Find peaks for each sector
+        # Find peaks for each sector using algorithm from Descloux et al. 2019
         for sector_name in ["xy", "z"]:
             radii, d_curve, k_max = sector_results[sector_name]
 
-            # Find local maximum, excluding boundary artifacts
-            # Peaks at r > 0.9 are typically boundary artifacts from the
-            # cumulative sum reaching the edge of the frequency range
-            peaks, _ = find_peaks(d_curve, plateau_size=(1, None))
-
-            r_peak = 0.0
-            for peak_idx in peaks:
-                r_candidate = radii[peak_idx]
-                if r_candidate < 0.9:  # Exclude boundary artifacts
-                    r_peak = r_candidate
-                    break
+            # Find peak using global maximum with iterative boundary exclusion
+            # and prominence check (Supplementary Note 1.1)
+            r_peak, _ = _find_peak_in_curve(radii, d_curve)
 
             all_peaks[sector_name].append(r_peak)
 
@@ -633,6 +705,7 @@ def dcr_resolution(
     resample_isotropic: bool = False,
     exclude_axis_angle: float = 0.0,
     use_sectioned: bool = True,
+    windowing: bool = True,
 ) -> float | dict[str, float]:
     """
     Calculate resolution using DCR algorithm (Descloux et al. 2019).
@@ -663,6 +736,10 @@ def dcr_resolution(
     use_sectioned : bool
         If True (default), use full 3D angular sectioning for 3D images.
         If False, use legacy 2D slice-based approach.
+    windowing : bool
+        If True (default), apply internal Tukey window for edge apodization.
+        Set to False when windowing is applied externally for consistent
+        preprocessing across different methods.
 
     Returns
     -------
@@ -691,6 +768,7 @@ def dcr_resolution(
             spacing=spacing,
             num_radii=num_radii,
             num_highpass=num_highpass,
+            windowing=windowing,
         )
         return resolution
 
@@ -740,6 +818,7 @@ def dcr_resolution(
                 num_highpass=num_highpass,
                 angle_delta=45,
                 exclude_axis_angle=exclude_axis_angle,
+                windowing=windowing,
             )
         else:
             # Legacy: compute directional resolutions from 2D slices
@@ -757,6 +836,7 @@ def dcr_resolution(
                 spacing=xy_spacing,
                 num_radii=num_radii,
                 num_highpass=num_highpass,
+                windowing=windowing,
             )
 
             # Z resolution: analyze middle XZ slice
@@ -768,6 +848,7 @@ def dcr_resolution(
                 spacing=xz_spacing,
                 num_radii=num_radii,
                 num_highpass=num_highpass,
+                windowing=windowing,
             )
 
             return {"xy": res_xy, "z": res_xz}
