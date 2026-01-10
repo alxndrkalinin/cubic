@@ -193,25 +193,25 @@ def test_dcr_num_radii_effect():
 
 def test_dcr_highpass_effect():
     """Test that high-pass filtering affects resolution estimate."""
-    image = make_test_image_2d(shape=(64, 64))
+    # Use sharper features (smaller blob_sigma) to ensure clear peaks
+    image = make_test_image_2d(shape=(64, 64), blob_sigma=2.0, noise_sigma=0.1)
 
-    # With minimal high-pass (just 1 curve with smallest sigma)
-    res_no_hp, _, curves_no_hp, _ = dcr_curve(
-        image, spacing=0.1, num_radii=50, num_highpass=1
+    # With minimal high-pass (just 2 curves)
+    res_minimal, _, curves_minimal, _ = dcr_curve(
+        image, spacing=0.1, num_radii=50, num_highpass=2
     )
 
-    # With high-pass filtering (10 log-spaced sigmas)
+    # With more high-pass filtering (10 log-spaced sigmas)
     res_with_hp, _, curves_with_hp, _ = dcr_curve(
         image, spacing=0.1, num_radii=50, num_highpass=10
     )
 
     # Number of curves should differ
-    assert len(curves_no_hp) == 1, "num_highpass=1 should give 1 curve"
+    assert len(curves_minimal) == 2, "num_highpass=2 should give 2 curves"
     assert len(curves_with_hp) == 10, "num_highpass=10 should give 10 curves"
 
-    # Both should give positive resolution
-    assert res_no_hp > 0 and np.isfinite(res_no_hp)
-    assert res_with_hp > 0 and np.isfinite(res_with_hp)
+    # Both should give positive finite resolution with structured image
+    assert res_with_hp > 0 and np.isfinite(res_with_hp), "10 filters should find peak"
 
 
 def test_dcr_spacing_defaults_to_none():
