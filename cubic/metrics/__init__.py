@@ -1,6 +1,8 @@
 """Expose metrics functions."""
 
 from .frc import (
+    dcr_curve,
+    dcr_resolution,
     frc_resolution,
     fsc_resolution,
     five_crop_resolution,
@@ -21,5 +23,7 @@ __all__ = [
     "five_crop_resolution",
     "grid_crop_resolution",
     "frc_resolution_difference",
+    "dcr_resolution",
+    "dcr_curve",
     "morphology_correlations",
 ]

@@ -14,6 +14,17 @@ This file provides guidance for AI agents working with the **cubic** repository.
 - `build/` – build artefacts (should not be modified)
 - `.github/workflows/` – CI configuration
 
+## Key Implementation Details
+
+### FRC/FSC (Fourier Ring/Shell Correlation)
+
+Located in `cubic/metrics/frc/`. Two backends with identical binning but different algorithms:
+
+- **Mask backend** (default): Iterator-based, float64 precision, CPU-only. Uses `FourierRingIterator` (2D) and `FourierShellIterator` (3D) classes in `iterators.py`.
+- **Hist backend**: Histogram-based, float32 precision, CPU/GPU support. Uses `radial_bin_id()` + `np.bincount()` in `radial.py`.
+
+Both backends use `radial_edges()` from `radial.py` for consistent bin edge definitions (divides Nyquist range evenly). Results differ by ~1-2% due to precision/order-of-operations. When modifying FRC/FSC code, ensure both backends remain consistent and test with `backend` parameter.
+
 ## Coding Conventions
 
 - Target Python version is **3.10+** and type annotations are required.
