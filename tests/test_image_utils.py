@@ -5,10 +5,10 @@ import pytest
 
 from cubic.cuda import ascupy, asnumpy
 from cubic.image_utils import (
-    checkerboard_split,
-    reverse_checkerboard_split,
     rotate_image,
     pad_image_to_cube,
+    checkerboard_split,
+    reverse_checkerboard_split,
     select_max_contrast_slices,
 )
 

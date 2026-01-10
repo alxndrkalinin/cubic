@@ -418,7 +418,7 @@ def _checkerboard_split_impl(
     preserve_range: bool,
     reverse: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Internal implementation for checkerboard splitting.
+    """Split image using checkerboard pattern.
 
     Parameters
     ----------

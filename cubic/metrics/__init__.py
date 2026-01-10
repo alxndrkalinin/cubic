@@ -1,13 +1,13 @@
 """Expose metrics functions."""
 
 from .frc import (
+    dcr_curve,
+    dcr_resolution,
     frc_resolution,
     fsc_resolution,
     five_crop_resolution,
     grid_crop_resolution,
     frc_resolution_difference,
-    dcr_resolution,
-    dcr_curve,
 )
 from .feature import cosine_median, morphology_correlations
 from .skimage_metrics import psnr, ssim
