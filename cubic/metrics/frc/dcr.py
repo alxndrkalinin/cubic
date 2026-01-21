@@ -13,7 +13,6 @@ from .radial import (
     _kmax_phys,
     radial_edges,
     radial_k_grid,
-    _kmax_phys_max,
     sectioned_bin_id,
 )
 
@@ -300,8 +299,8 @@ def _compute_decorrelation_curve_sectioned(
     """
     Compute sectioned decorrelation curves for 3D images.
 
-    Uses azimuthal angle in Y-Z plane (0-360°) following Koho et al. 2019:
-    phi ≈ 0°/180° → Z resolution, phi ≈ 90°/270° → XY resolution.
+    Uses polar angle from Z axis (0-90°):
+    theta ≈ 0° → Z resolution, theta ≈ 90° → XY resolution.
     """
     if image.ndim != 3:
         raise ValueError("Sectioned DCR requires 3D images")
@@ -313,54 +312,42 @@ def _compute_decorrelation_curve_sectioned(
     absF = np.abs(F)
     absF_flat = absF.ravel()
 
-    # Separate radial edges for anisotropic data
-    r_edges_z, radii_z = radial_edges(
+    # Single radial edges (use min Nyquist for consistent comparison)
+    r_edges_raw, radii_raw = radial_edges(
         shape, bin_delta=bin_delta, spacing=spacing, use_max_nyquist=False
     )
-    r_edges_xy, radii_xy = radial_edges(
-        shape, bin_delta=bin_delta, spacing=spacing, use_max_nyquist=True
-    )
+    n_radial_raw = len(radii_raw)
+    r_edges = xp.asarray(r_edges_raw) if xp is not np else r_edges_raw
 
-    # Angular edges (azimuthal 0-360°)
-    n_angle = 360 // angle_delta
+    # Angular edges (polar 0-90°)
+    n_angle = 90 // angle_delta
     angle_edges_cpu = np.array(
         [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
     )
     angle_edges = xp.asarray(angle_edges_cpu) if xp is not np else angle_edges_cpu
 
-    # k_max for resolution conversion
+    # Single k_max for resolution conversion
     if spacing is not None:
-        k_max_z, k_max_xy = _kmax_phys(shape, spacing), _kmax_phys_max(shape, spacing)
+        k_max = _kmax_phys(shape, spacing)
     else:
-        k_max_z, k_max_xy = min(n // 2 for n in shape), max(n // 2 for n in shape)
+        k_max = min(n // 2 for n in shape)
 
-    # Group angular sectors by direction
-    sector_groups = {"z": [], "xy": []}
-    for aid in range(n_angle):
-        center = (aid + 0.5) * angle_delta
-        dist_z = min(center, abs(center - 180), abs(center - 360))
-        dist_xy = min(abs(center - 90), abs(center - 270))
-        sector_groups["z" if dist_z <= dist_xy else "xy"].append(aid)
+    # Get sectioned bin IDs
+    radial_id, angle_id = sectioned_bin_id(
+        shape,
+        r_edges,
+        angle_edges,
+        spacing=list(spacing) if spacing is not None else None,
+        exclude_axis_angle=exclude_axis_angle,
+    )
 
     results = {}
-    for sector_name, sector_ids in sector_groups.items():
-        r_edges_raw, radii_raw = (
-            (r_edges_xy, radii_xy) if sector_name == "xy" else (r_edges_z, radii_z)
-        )
-        k_max = k_max_xy if sector_name == "xy" else k_max_z
-        n_radial_raw = len(radii_raw)
-        r_edges = xp.asarray(r_edges_raw) if xp is not np else r_edges_raw
 
-        radial_id, angle_id = sectioned_bin_id(
-            shape,
-            r_edges,
-            angle_edges,
-            spacing=list(spacing) if spacing is not None else None,
-            exclude_axis_angle=exclude_axis_angle,
-        )
-
-        # Mask for all angular sectors in this group
-        sector_mask = np.isin(angle_id, sector_ids) & (radial_id >= 0)
+    # Process each angular sector
+    # With angle_delta=45: aid=0 (0-45°) → 'z', aid=1 (45-90°) → 'xy'
+    for aid in range(n_angle):
+        sector_name = "z" if aid == 0 else "xy"
+        sector_mask = (angle_id == aid) & (radial_id >= 0)
 
         if not np.any(sector_mask):
             radii_norm = np.linspace(0, 1, num_radii, dtype=np.float32)

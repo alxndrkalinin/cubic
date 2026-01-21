@@ -344,10 +344,10 @@ def sectioned_bin_id(
     radial_edges : ndarray
         Radial frequency bin edges
     angle_edges : ndarray
-        Angular bin edges in degrees (azimuthal angle in Y-Z plane, 0-360°).
-        - 0°/180° = Z-dominated frequencies (kz >> ky) → Z resolution
-        - 90°/270° = Y-dominated frequencies (ky >> kz) → XY resolution
-        This matches Koho et al. 2019 SFSC methodology.
+        Angular bin edges in degrees (polar angle from Z axis, 0-90°).
+        - 0° = Z-dominated frequencies (|kz| >> k_xy) → Z resolution
+        - 90° = XY-dominated frequencies (k_xy >> |kz|) → XY resolution
+        where k_xy = sqrt(kx² + ky²). This captures all lateral frequencies.
     spacing : sequence of float, optional
         Physical spacing per axis [z, y, x]. If None, uses index units.
     exclude_axis_angle : float, optional
@@ -360,7 +360,7 @@ def sectioned_bin_id(
     radial_id : ndarray
         Flattened radial bin IDs
     angle_id : ndarray
-        Flattened angular bin IDs (azimuthal angle in Y-Z plane, 0-360°)
+        Flattened angular bin IDs (polar angle from Z axis, 0-90°)
     """
     xp = get_array_module(radial_edges)
 
@@ -390,14 +390,14 @@ def sectioned_bin_id(
     k_xy = np.sqrt(ky * ky + kx * kx)
     k_radius = np.sqrt(kz * kz + k_xy * k_xy).ravel()
 
-    # Azimuthal angle in Y-Z plane (matches Koho et al. 2019 SFSC)
-    # arctan2(ky, kz) gives angle in the (ky, kz) plane:
-    # - phi ≈ 0° or 180° when |kz| >> |ky| → Z-dominated → Z resolution
-    # - phi ≈ 90° or 270° when |ky| >> |kz| → Y-dominated → XY resolution
-    # Range: [-180°, 180°] → shift to [0°, 360°]
-    # Note: Add 0*kx to ensure proper broadcasting to full 3D shape
-    phi = np.degrees(np.arctan2(ky + 0 * kx, kz + 0 * kx)).ravel()
-    phi = (phi + 360) % 360  # Shift to [0, 360) range
+    # Polar angle from Z axis:
+    # - theta ≈ 0° when |kz| >> k_xy → Z-dominated → Z resolution
+    # - theta ≈ 90° when k_xy >> |kz| → XY-dominated → XY resolution
+    # Range: [0°, 90°] (always positive since we use |kz|)
+    # Broadcast k_xy to full 3D shape: k_xy has shape (1,Y,X), add 0*kz to get (Z,Y,X)
+    k_xy_3d = k_xy + 0 * kz  # Broadcasts to (Z, Y, X)
+    kz_abs_3d = np.abs(kz) + 0 * k_xy  # Broadcasts to (Z, Y, X)
+    theta = np.degrees(np.arctan2(k_xy_3d.ravel(), kz_abs_3d.ravel()))
 
     # Radial binning
     n_radial = int(radial_edges.size) - 1
@@ -406,7 +406,7 @@ def sectioned_bin_id(
 
     # Angular binning
     n_angle = int(angle_edges.size) - 1
-    angle_id = np.digitize(phi, angle_edges) - 1
+    angle_id = np.digitize(theta, angle_edges) - 1
     angle_id = np.clip(angle_id, 0, n_angle - 1).astype(np.int32)
 
     # Exclude DC
@@ -414,12 +414,10 @@ def sectioned_bin_id(
     radial_id[k_radius < tiny] = -1
     angle_id[k_radius < tiny] = -1
 
-    # Exclude frequencies near Z axis (for azimuthal angle, this means
-    # phi near 0° or 180° with small ky). We compute polar angle from Z axis
-    # to apply exclusion as in Koho et al. 2019.
+    # Exclude frequencies near Z axis (theta near 0°)
+    # Following Koho et al. 2019 to avoid piezo/interpolation artifacts
     if exclude_axis_angle > 0:
-        polar_angle = np.degrees(np.arctan2(k_xy.ravel(), np.abs(kz + 0 * kx).ravel()))
-        axis_mask = polar_angle < exclude_axis_angle
+        axis_mask = theta < exclude_axis_angle
         radial_id[axis_mask] = -1
         angle_id[axis_mask] = -1
 

@@ -433,7 +433,12 @@ class FourierCorrelationAnalysis(object):
         data_set.resolution["criterion"] = criterion
 
         angle = np.deg2rad(int(key))
-        z_multiplier = 1 + (z_correction - 1) * np.abs(np.sin(angle))
+        # k(θ) correction from Koho et al. 2019, equation (5)
+        # Paper defines θ from XY plane, but our convention is polar angle from Z axis
+        # So we use cos(θ) instead of sin(θ) to get:
+        #   - θ=0° (Z axis): cos(0)=1 → maximum correction (k=z_correction)
+        #   - θ=90° (XY plane): cos(90)=0 → no correction (k=1)
+        z_multiplier = 1 + (z_correction - 1) * np.abs(np.cos(angle))
         resolution = z_multiplier * (2 * self.spacing / root)
 
         data_set.resolution["resolution"] = resolution

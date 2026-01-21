@@ -540,11 +540,9 @@ def _calculate_fsc_sectioned_hist(
     """
     Calculate sectioned FSC using vectorized histogram approach.
 
-    Uses angular binning following Koho et al. 2019 convention:
-    - angle=0° corresponds to XY plane (lateral resolution)
-    - angle=90° corresponds to Z axis (axial resolution)
-
-    Internally bins by polar angle from Z axis, then transforms to paper convention.
+    Uses polar angle from Z axis (0-90°):
+    - theta ≈ 0° = Z-dominated frequencies → Z resolution
+    - theta ≈ 90° = XY-dominated frequencies → XY resolution
 
     Parameters
     ----------
@@ -586,11 +584,10 @@ def _calculate_fsc_sectioned_hist(
     r_edges = xp.asarray(r_edges)
     n_radial = len(radii)
 
-    # Angular edges: azimuthal angle in Y-Z plane (0-360°)
-    # Following Koho et al. 2019 SFSC methodology:
-    # - phi ≈ 0° or 180° = Z-dominated frequencies → Z resolution
-    # - phi ≈ 90° or 270° = Y-dominated frequencies → XY resolution
-    n_angle = 360 // angle_delta
+    # Angular edges: polar angle from Z axis (0-90°)
+    # - theta ≈ 0° = Z-dominated frequencies → Z resolution
+    # - theta ≈ 90° = XY-dominated frequencies → XY resolution
+    n_angle = 90 // angle_delta
     angle_edges = xp.asarray(
         [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
     )
@@ -633,13 +630,13 @@ def _calculate_fsc_sectioned_hist(
 
     spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
 
-    # Map bin index to output angle (azimuthal angle in Y-Z plane):
-    # - phi ≈ 0° or 180° = Z-dominated frequencies → Z resolution
-    # - phi ≈ 90° or 270° = Y-dominated frequencies → XY resolution
+    # Map bin index to output angle (polar angle from Z axis):
+    # - theta ≈ 0° = Z-dominated frequencies → Z resolution
+    # - theta ≈ 90° = XY-dominated frequencies → XY resolution
     #
-    # Output angle is the bin center in azimuthal coordinates (0-360°)
+    # Output angle is the bin center in polar coordinates (0-90°)
     for aid in range(n_angle):
-        # Bin center in azimuthal coords
+        # Bin center in polar coords
         output_angle = int(round((aid + 0.5) * angle_delta))
 
         fsc = frc_from_sums(
@@ -883,9 +880,9 @@ def fsc_resolution(
     # Analyze results to get resolution
     # spacing_list is [Z, Y, X] order
     #
-    # Hist backend uses Koho et al. 2019 convention:
-    #   - angle=0° = XY plane (lateral) → use XY spacing
-    #   - angle=90° = Z axis (axial) → use Z spacing
+    # Polar angle convention (0-90°):
+    #   - angle ≈ 0° = Z-dominated → use Z spacing
+    #   - angle ≈ 90° = XY-dominated → use XY spacing
     if spacing_list is not None:
         spacing_xy = spacing_list[1]  # Y spacing (assumes Y==X)
         spacing_z = spacing_list[0]  # Z spacing
@@ -893,27 +890,20 @@ def fsc_resolution(
         spacing_xy = 1.0
         spacing_z = 1.0
 
-    # Select XY and Z sectors based on azimuthal angle convention:
-    # - phi ≈ 90° or 270° = Y-dominated (ky >> kz) → XY resolution
-    # - phi ≈ 0° or 180° = Z-dominated (kz >> ky) → Z resolution
+    # Select XY and Z sectors based on polar angle convention:
+    # - theta ≈ 0° = Z-dominated (|kz| >> k_xy) → Z resolution
+    # - theta ≈ 90° = XY-dominated (k_xy >> |kz|) → XY resolution
     #
-    # Find sectors closest to these target angles
+    # With angle_delta=45: angles = [22, 67] (bin centers)
+    # With angle_delta=15: angles = [7, 22, 37, 52, 67, 82]
     angles = sorted(fsc_data.keys())
 
-    # For XY resolution: find sector closest to 90° or 270°
-    def dist_to_xy(a):
-        return min(abs(a - 90), abs(a - 270))
+    # For XY resolution: find sector closest to 90°
+    angle_xy = max(angles)  # Highest angle is most XY-dominated
 
-    angle_xy = min(angles, key=dist_to_xy)
-
-    # For Z resolution: find all sectors near 0° or 180° (Z-dominated)
-    # and average them for better statistics (following Koho et al. 2019)
-    def dist_to_z(a):
-        return min(a, abs(a - 180), abs(a - 360))
-
-    z_angle_threshold = 30  # Include sectors within 30° of Z-dominant directions
-    z_sectors = [a for a in angles if dist_to_z(a) <= z_angle_threshold]
-    angle_z = min(angles, key=dist_to_z)  # Primary Z sector for labeling
+    # For Z resolution: find sector closest to 0°
+    angle_z = min(angles)  # Lowest angle is most Z-dominated
+    z_sectors = [angle_z]  # Single Z sector in polar convention
 
     results = {}
 
@@ -957,17 +947,40 @@ def fsc_resolution(
         z_data_set.correlation["points-x-bin"] = sum_weights
 
         # Determine spacing and frequency limit for Z
+        # For isotropic resampling: frequency is normalized to isotropic Nyquist,
+        # but Z only has valid data up to original Z Nyquist (z_freq_limit).
+        # For non-isotropic: frequency is normalized to min(XY,Z) Nyquist = Z Nyquist,
+        # so no filtering is needed.
         if original_spacing_z is not None:
+            # Isotropic resampling: filter to valid Z frequencies
             z_freq_limit = spacing_xy / original_spacing_z
-            analyzer_spacing = original_spacing_z
+            analyzer_spacing = spacing_xy  # Frequencies in isotropic units
         else:
+            # Non-isotropic: use all frequencies, Z spacing for resolution
             z_freq_limit = 1.0
-            analyzer_spacing = spacing_z
+            analyzer_spacing = spacing_z  # Frequencies normalized to Z Nyquist
 
-        # Try to find resolution with the averaged Z data
-        # First attempt: use full frequency range (may extrapolate beyond Z Nyquist)
+        # Filter to valid Z frequencies (only applies for isotropic resampling)
+        valid_z_mask = ref_freq <= z_freq_limit
+        if np.any(valid_z_mask):
+            z_freq_filtered = ref_freq[valid_z_mask]
+            z_corr_filtered = avg_corr[valid_z_mask]
+            z_weights_filtered = sum_weights[valid_z_mask]
+        else:
+            # No valid Z data (shouldn't happen, but handle gracefully)
+            z_freq_filtered = ref_freq
+            z_corr_filtered = avg_corr
+            z_weights_filtered = sum_weights
+
+        # Create filtered Z data set
+        z_data_set_filtered = FourierCorrelationData()
+        z_data_set_filtered.correlation["correlation"] = z_corr_filtered
+        z_data_set_filtered.correlation["frequency"] = z_freq_filtered
+        z_data_set_filtered.correlation["points-x-bin"] = z_weights_filtered
+
+        # Try to find resolution with the filtered Z data
         data_collection = FourierCorrelationDataCollection()
-        data_collection[0] = z_data_set
+        data_collection[0] = z_data_set_filtered
         analyzer = FourierCorrelationAnalysis(
             data_collection,
             analyzer_spacing,
@@ -982,10 +995,10 @@ def fsc_resolution(
 
         # Fallback: simple threshold crossing if spline failed
         if np.isnan(z_resolution):
-            below_threshold = avg_corr < 0.5
+            below_threshold = z_corr_filtered < 0.5
             if np.any(below_threshold):
                 first_below = int(np.argmax(below_threshold))
-                freq_at_crossing = float(ref_freq[first_below])
+                freq_at_crossing = float(z_freq_filtered[first_below])
                 if freq_at_crossing > 0:
                     z_resolution = analyzer_spacing / freq_at_crossing
 
