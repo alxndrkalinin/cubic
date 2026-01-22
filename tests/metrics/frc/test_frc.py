@@ -9,7 +9,8 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.frc import calculate_frc
+from cubic.metrics.frc import calculate_frc, fsc_resolution
+from cubic.metrics.frc.frc import _calibration_factor
 
 
 def _fractional_to_absolute(
@@ -252,3 +253,58 @@ def test_frc_all_backends_devices(
             atol=atol_freq,
             rtol=rtol_freq,
         ), f"Frequency mismatch: mask-cpu vs {backend}-{device}"
+
+
+def test_calibration_factor() -> None:
+    """Test the one-image FRC/FSC calibration factor function."""
+    # The calibration factor should be > 1 for frequencies in the typical range
+    # At the 1/7 threshold, typical crossing frequencies are 0.1-0.5
+    for freq in [0.1, 0.2, 0.3, 0.4, 0.5]:
+        factor = _calibration_factor(freq)
+        # Correction factor should be roughly between 0.5 and 1.0
+        # (dividing by it increases the resolution value)
+        assert 0.4 < factor < 1.1, f"Unexpected calibration factor {factor} at freq {freq}"
+
+    # At very low frequencies, the exponential term dominates
+    factor_low = _calibration_factor(0.05)
+    assert factor_low > 0, "Calibration factor should be positive"
+
+    # The calibration curve is monotonically increasing
+    factors = [_calibration_factor(f) for f in [0.1, 0.2, 0.3, 0.4]]
+    assert all(
+        factors[i] <= factors[i + 1] for i in range(len(factors) - 1)
+    ), "Calibration factor should increase with frequency"
+
+
+def test_fsc_resolution_single_image(
+    cells_volume: tuple[np.ndarray, list[float]],
+) -> None:
+    """Test FSC resolution with single-image mode (checkerboard split)."""
+    volume, spacing = cells_volume
+
+    # Single-image FSC should return positive resolution values
+    result = fsc_resolution(
+        volume,
+        bin_delta=10,
+        angle_delta=45,
+        spacing=spacing,
+        backend="hist",
+    )
+
+    assert "xy" in result, "FSC result should have 'xy' key"
+    assert "z" in result, "FSC result should have 'z' key"
+
+    # Resolution values should be positive and finite
+    assert result["xy"] > 0, "XY resolution should be positive"
+    assert result["z"] > 0, "Z resolution should be positive"
+    assert np.isfinite(result["xy"]), "XY resolution should be finite"
+    assert np.isfinite(result["z"]), "Z resolution should be finite"
+
+    # Resolution should be in a reasonable range (in microns for cells3d)
+    # cells3d has ~0.26 um XY spacing, typical XY resolution 0.3-1.0 um
+    # cells3d has ~0.29 um Z spacing, typical Z resolution varies depending on
+    # threshold and analysis method. With 1/7 fixed threshold and calibration
+    # correction, values can be quite small for well-sampled data.
+    if spacing != [1.0, 1.0, 1.0]:  # Skip if using synthetic fallback
+        assert 0.1 < result["xy"] < 5.0, f"XY resolution {result['xy']} out of expected range"
+        assert 0.1 < result["z"] < 20.0, f"Z resolution {result['z']} out of expected range"
