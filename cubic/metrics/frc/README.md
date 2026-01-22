@@ -163,21 +163,23 @@ res = dcr_resolution(image_3d, spacing=[0.2, 0.065, 0.065], use_sectioned=False)
 
 ## 3D Angular Sectoring
 
-Both FSC and DCR use azimuthal angular sectoring in the Y-Z plane following Koho et al. 2019:
+Both FSC and DCR use polar angle from the Z axis (0-90°):
 
-- **phi ≈ 0° or 180°**: Z-dominated frequencies → Z resolution
-- **phi ≈ 90° or 270°**: Y-dominated frequencies → XY resolution
+- **theta ≈ 0°**: Z-dominated frequencies (|kz| >> k_xy) → Z resolution
+- **theta ≈ 90°**: XY-dominated frequencies (k_xy >> |kz|) → XY resolution
 
-With `angle_delta=45°`, 8 sectors are created and grouped:
-- Z sectors: 0-45°, 135-180°, 180-225°, 315-360° (near Z axis)
-- XY sectors: 45-90°, 90-135°, 225-270°, 270-315° (near XY plane)
+where k_xy = sqrt(kx² + ky²).
+
+With the default `angle_delta=45°`, 2 sectors are created:
+- Z sector: 0-45° (centered at 22.5°)
+- XY sector: 45-90° (centered at 67.5°)
 
 ### Anisotropic Data Handling
 
 For anisotropic voxels (e.g., Z spacing >> XY spacing):
 
-- **FSC**: Uses `use_max_nyquist=True` to extend radial bins to XY Nyquist
-- **DCR**: Automatically uses sector-specific radial binning (XY Nyquist for XY sectors, Z Nyquist for Z sectors)
+- **FSC**: Use `use_max_nyquist=True` to extend radial bins to XY Nyquist
+- **DCR**: Uses min Nyquist for consistent Z/XY comparison
 
 ## Threshold Conventions
 

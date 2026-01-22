@@ -775,15 +775,14 @@ def fsc_resolution(
         # Save original Z spacing before resampling
         original_spacing_z = spacing_tuple[0]
 
-        # NOTE: When using isotropic resampling, we do NOT apply k(θ) correction.
-        # The k(θ) correction compensates for anisotropic pixel sizes, but after
-        # resampling the image IS isotropic, so z_factor=1.0 (no correction).
-        # This matches miplib's methodology where z_correction=1 (default) when
-        # the image has been resampled to isotropic spacing.
-        # z_factor remains 1.0 (set above)
-
         # Calculate target Z size (must be even for checkerboard split)
         iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
+
+        # Calculate z_factor from ORIGINAL spacing for k(θ) correction.
+        # Even after isotropic resampling, Z frequencies have lower information
+        # density due to the original anisotropic acquisition.
+        # miplib applies z_correction this way (see Koho et al. 2019 notebook).
+        z_factor = original_spacing_z / iso_spacing
         target_z_size = int(round(image1.shape[0] * spacing_tuple[0] / iso_spacing))
         if target_z_size % 2 != 0:
             target_z_size -= 1  # Make even for checkerboard split
