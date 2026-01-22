@@ -401,13 +401,25 @@ class FourierCorrelationAnalysis(object):
 
         def first_guess(x, y, thr):
             difference = y - thr
-            return x[np.where(difference <= 0)[0][0] - 1]
+            crossings = np.where(difference <= 0)[0]
+            if len(crossings) == 0:
+                return None  # No threshold crossing found
+            return x[crossings[0] - 1] if crossings[0] > 0 else x[0]
 
         fit_start = first_guess(
             data_set.correlation["frequency"],
             data_set.correlation["correlation"],
             np.mean(data_set.resolution["threshold"]),
         )
+
+        # Handle case where correlation never crosses threshold
+        if fit_start is None:
+            data_set.resolution["resolution-point"] = (np.nan, np.nan)
+            data_set.resolution["criterion"] = criterion
+            data_set.resolution["resolution"] = np.nan
+            data_set.resolution["spacing"] = self.spacing
+            return data_set
+
         if verbose:
             print(f"Fit starts at {fit_start}")
             disp = 1
@@ -421,7 +433,12 @@ class FourierCorrelationAnalysis(object):
         data_set.resolution["criterion"] = criterion
 
         angle = np.deg2rad(int(key))
-        z_multiplier = 1 + (z_correction - 1) * np.abs(np.sin(angle))
+        # k(θ) correction from Koho et al. 2019, equation (5)
+        # Paper defines θ from XY plane, but our convention is polar angle from Z axis
+        # So we use cos(θ) instead of sin(θ) to get:
+        #   - θ=0° (Z axis): cos(0)=1 → maximum correction (k=z_correction)
+        #   - θ=90° (XY plane): cos(90)=0 → no correction (k=1)
+        z_multiplier = 1 + (z_correction - 1) * np.abs(np.cos(angle))
         resolution = z_multiplier * (2 * self.spacing / root)
 
         data_set.resolution["resolution"] = resolution

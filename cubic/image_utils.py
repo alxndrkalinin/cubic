@@ -1,5 +1,6 @@
 """Implements utility functions that operate on 3D images."""
 
+import warnings
 from typing import Any
 from collections.abc import Callable, Sequence
 
@@ -411,82 +412,134 @@ def hamming_window(data: np.ndarray) -> np.ndarray:
     return _nd_window(data, xp.hamming, xp.power)
 
 
-def checkerboard_split(
-    img: np.ndarray, disable_3d_sum: bool = False
+def _checkerboard_split_impl(
+    img: np.ndarray,
+    disable_3d_sum: bool,
+    preserve_range: bool,
+    reverse: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Split an image in two, by using a checkerboard pattern."""
-    # Make an index chess board structure
-    shape = img.shape
-    odd_index = [np.arange(1, shape[i], 2) for i in range(len(shape))]
-    even_index = [np.arange(0, shape[i], 2) for i in range(len(shape))]
+    """Split image using checkerboard pattern.
 
-    # Create the two pseudo images
-    if img.ndim == 2:
-        image1 = img[odd_index[0], :][:, odd_index[1]]
-        image2 = img[even_index[0], :][:, even_index[1]]
-    elif disable_3d_sum:
-        image1 = img[odd_index[0], :, :][:, odd_index[1], :][:, :, odd_index[2]]
-        image2 = img[even_index[0], :, :][:, even_index[1], :][:, :, even_index[2]]
+    Parameters
+    ----------
+    img : np.ndarray
+        Input 2D or 3D image array
+    disable_3d_sum : bool
+        If True, use full 3D checkerboard without Z-summing.
+    preserve_range : bool
+        If True, keep the original range of values and data type.
+    reverse : bool
+        If True, use reverse checkerboard pattern (other diagonal).
 
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Two split images with half the size in each spatial dimension.
+    """
+    # Determine safe dtype and warn if needed
+    needs_z_summing = img.ndim == 3 and not disable_3d_sum
+    is_integer = np.issubdtype(img.dtype, np.integer)
+
+    if preserve_range:
+        safe_dtype = img.dtype
+        if needs_z_summing and is_integer:
+            warnings.warn(
+                f"preserve_range=True with integer dtype {img.dtype} may cause "
+                "overflow when summing consecutive Z pairs. Consider using "
+                "preserve_range=False to convert to float32 for safe computation.",
+                UserWarning,
+                stacklevel=3,
+            )
     else:
-        image1 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, odd_index[1], :][
-                :, :, odd_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, odd_index[1], :][
-                :, :, odd_index[2]
-            ]
-        )
+        safe_dtype = np.float32 if is_integer else img.dtype
 
-        image2 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, even_index[1], :][
-                :, :, odd_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, even_index[1], :][
-                :, :, even_index[2]
-            ]
-        )
+    # Apply dtype conversion if needed
+    img_safe = img if img.dtype == safe_dtype else img.astype(safe_dtype)
+
+    # Define slicing patterns based on reverse flag
+    if reverse:
+        # Reverse pattern: (odd, even) vs (even, odd)
+        pattern1_y, pattern1_x = 1, 0
+        pattern2_y, pattern2_x = 0, 1
+    else:
+        # Regular pattern: (odd, odd) vs (even, even)
+        pattern1_y, pattern1_x = 1, 1
+        pattern2_y, pattern2_x = 0, 0
+
+    if img.ndim == 2:
+        image1 = img_safe[pattern1_y::2, pattern1_x::2]
+        image2 = img_safe[pattern2_y::2, pattern2_x::2]
+    elif disable_3d_sum:
+        image1 = img_safe[1::2, pattern1_y::2, pattern1_x::2]
+        image2 = img_safe[0::2, pattern2_y::2, pattern2_x::2]
+    else:
+        # Z-summing: sum consecutive Z pairs, then apply 2D checkerboard
+        z_summed = img_safe[0::2] + img_safe[1::2]
+        image1 = z_summed[:, pattern1_y::2, pattern1_x::2]
+        image2 = z_summed[:, pattern2_y::2, pattern2_x::2]
+        if preserve_range:
+            image1 = image1.astype(img.dtype)
+            image2 = image2.astype(img.dtype)
 
     return image1, image2
+
+
+def checkerboard_split(
+    img: np.ndarray,
+    disable_3d_sum: bool = False,
+    preserve_range: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split an image in two using checkerboard pattern.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Input 2D or 3D image array
+    disable_3d_sum : bool, optional
+        If True, use full 3D checkerboard without Z-summing.
+        Default False uses Koho et al. 2019 strategy.
+    preserve_range : bool, optional
+        If True, keep the original range of values and data type.
+        If False (default), integer types are converted to float32 to avoid
+        overflow when summing consecutive Z pairs. Float types are preserved.
+        When True with integer types, overflow may occur if the sum exceeds
+        the dtype range. Default False.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Two split images with half the size in each spatial dimension.
+    """
+    return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=False)
 
 
 def reverse_checkerboard_split(
-    img: np.ndarray, disable_3d_sum: bool = False
+    img: np.ndarray,
+    disable_3d_sum: bool = False,
+    preserve_range: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Split an image in two, by using a checkerboard pattern."""
-    # Make an index chess board structure
-    shape = img.shape
-    odd_index = [np.arange(1, shape[i], 2) for i in range(len(shape))]
-    even_index = [np.arange(0, shape[i], 2) for i in range(len(shape))]
+    """Split an image using reverse checkerboard pattern (other diagonal).
 
-    # Create the two pseudo images
-    if img.ndim == 2:
-        image1 = img[odd_index[0], :][:, even_index[1]]
-        image2 = img[even_index[0], :][:, odd_index[1]]
-    elif disable_3d_sum:
-        image1 = img[odd_index[0], :, :][:, odd_index[1], :][:, :, even_index[2]]
-        image2 = img[even_index[0], :, :][:, even_index[1], :][:, :, odd_index[2]]
+    Parameters
+    ----------
+    img : np.ndarray
+        Input 2D or 3D image array
+    disable_3d_sum : bool, optional
+        If True, use full 3D checkerboard without Z-summing.
+        Default False uses Koho et al. 2019 strategy.
+    preserve_range : bool, optional
+        If True, keep the original range of values and data type.
+        If False (default), integer types are converted to float32 to avoid
+        overflow when summing consecutive Z pairs. Float types are preserved.
+        When True with integer types, overflow may occur if the sum exceeds
+        the dtype range. Default False.
 
-    else:
-        image1 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, odd_index[1], :][
-                :, :, even_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, even_index[1], :][
-                :, :, odd_index[2]
-            ]
-        )
-
-        image2 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, even_index[1], :][
-                :, :, odd_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, odd_index[1], :][
-                :, :, even_index[2]
-            ]
-        )
-
-    return image1, image2
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Two split images with half the size in each spatial dimension.
+    """
+    return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=True)
 
 
 def label(img: npt.ArrayLike, **kwargs: Any) -> npt.ArrayLike:
