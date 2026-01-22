@@ -239,15 +239,40 @@ def _calculate_frc_core(
     return frc_data
 
 
-def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
-    """Apply cut-off correction for single image FRC."""
+def _calibration_factor(freq_at_crossing: float) -> float:
+    """Calculate calibration factor for one-image FRC/FSC.
 
-    def func(x, a, b, c, d):
+    The checkerboard split creates a diagonal shift between subimage pairs that
+    causes frequency compression in the FRC/FSC curve due to the Fourier shift
+    theorem (Supplementary Note 1, Koho et al. 2019).
+
+    This correction was empirically calibrated against two-image FRC at the 1/7
+    threshold by imaging the same field of view at different pixel sizes
+    (Supplementary Note 2, Supplementary Fig. 3, Koho et al. 2019).
+
+    Parameters
+    ----------
+    freq_at_crossing : float
+        Normalized frequency (0-1) at threshold crossing.
+
+    Returns
+    -------
+    float
+        Calibration factor. Divide raw resolution by this to get corrected value.
+    """
+
+    def calibration_func(x: float, a: float, b: float, c: float, d: float) -> float:
         return a * np.exp(c * (x - b)) + d
 
+    # Parameters from miplib calibration (Koho et al. 2019)
     params = [0.95988146, 0.97979108, 13.90441896, 0.55146136]
+    return calibration_func(freq_at_crossing, *params)
+
+
+def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
+    """Apply cut-off correction for single image FRC."""
     point = result.resolution["resolution-point"][1]
-    cut_off_correction = func(point, *params)
+    cut_off_correction = _calibration_factor(point)
     result.resolution["spacing"] /= cut_off_correction
     result.resolution["resolution"] /= cut_off_correction
 
@@ -672,9 +697,12 @@ def fsc_resolution(
     zero_padding: bool | None = None,
     spacing: float | Sequence[float] | None = None,
     resample_isotropic: bool = False,
+    resample_order: int = 1,
     average: bool = True,
     exclude_axis_angle: float = 0.0,
     use_max_nyquist: bool = False,
+    resolution_threshold: str = "fixed",
+    threshold_value: float = 0.143,
     backend: str = "hist",
 ) -> dict[str, float]:
     """
@@ -693,6 +721,9 @@ def fsc_resolution(
                             FSC calculation. This matches the methodology in Koho et al.
                             2019 and is recommended for anisotropic volumes with limited
                             Z extent. Requires spacing to be provided. Default: False.
+        resample_order: Interpolation order for isotropic resampling (0=nearest neighbor,
+                        1=linear, 3=cubic). The miplib paper uses order=0 (nearest neighbor).
+                        Default: 1 (linear interpolation).
         average: If True and single-image mode, average results from both diagonal
                  checkerboard splits (forward and reverse) to reduce variance.
                  Following Koho et al. 2019 methodology. Default: True.
@@ -705,6 +736,13 @@ def fsc_resolution(
                          allows XY-dominant sectors to measure higher frequencies for
                          better XY resolution estimates on anisotropic data.
                          Default: False.
+        resolution_threshold: Threshold criterion for resolution calculation.
+                              Options: "fixed", "one-bit", "half-bit", "three-sigma".
+                              Default: "fixed" (uses threshold_value).
+        threshold_value: Fixed threshold value when resolution_threshold="fixed".
+                         Default: 0.143 (1/7 threshold). Note: The one-image calibration
+                         correction was empirically calibrated for the 1/7 threshold
+                         (Koho et al. 2019), so using other values may affect accuracy.
         backend: "hist" (vectorized, GPU-accelerated) or "mask" (deprecated)
     """
     import warnings
@@ -720,6 +758,9 @@ def fsc_resolution(
     # (needed because isotropic resampling creates artificial high-frequency
     # correlation beyond the original Z Nyquist)
     original_spacing_z = None
+    # z_factor for k(θ) correction (Koho et al. 2019, equation 5)
+    # Will be set from original spacing before isotropic resampling overwrites it
+    z_factor = 1.0
 
     if resample_isotropic:
         if spacing is None:
@@ -734,6 +775,13 @@ def fsc_resolution(
         # Save original Z spacing before resampling
         original_spacing_z = spacing_tuple[0]
 
+        # NOTE: When using isotropic resampling, we do NOT apply k(θ) correction.
+        # The k(θ) correction compensates for anisotropic pixel sizes, but after
+        # resampling the image IS isotropic, so z_factor=1.0 (no correction).
+        # This matches miplib's methodology where z_correction=1 (default) when
+        # the image has been resampled to isotropic spacing.
+        # z_factor remains 1.0 (set above)
+
         # Calculate target Z size (must be even for checkerboard split)
         iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
         target_z_size = int(round(image1.shape[0] * spacing_tuple[0] / iso_spacing))
@@ -741,12 +789,12 @@ def fsc_resolution(
             target_z_size -= 1  # Make even for checkerboard split
 
         # Resample image1 to isotropic (upscale Z to match XY resolution)
-        # Use linear interpolation as in Koho et al. 2019
+        # miplib paper uses order=0 (nearest neighbor), default here is order=1 (linear)
         image1 = rescale_isotropic(
             image1,
             spacing_tuple,
             downscale_xy=False,
-            order=1,
+            order=resample_order,
             preserve_range=True,
             target_z_size=target_z_size,
         ).astype(image1.dtype)
@@ -757,7 +805,7 @@ def fsc_resolution(
                 image2,
                 spacing_tuple,
                 downscale_xy=False,
-                order=1,
+                order=resample_order,
                 preserve_range=True,
                 target_z_size=target_z_size,
             ).astype(image2.dtype)
@@ -890,6 +938,14 @@ def fsc_resolution(
         spacing_xy = 1.0
         spacing_z = 1.0
 
+    # Calculate anisotropy factor for k(θ) correction (Koho et al. 2019, equation 5)
+    # z_factor = spacing_z / spacing_xy (how many XY pixels fit in one Z step)
+    # Note: If resample_isotropic=True, z_factor was already calculated from original
+    # spacing before the spacing was overwritten to isotropic values.
+    if not resample_isotropic and spacing_list is not None:
+        z_factor = spacing_z / spacing_xy
+    # If resample_isotropic=False and no spacing, z_factor remains 1.0 (no correction)
+
     # Select XY and Z sectors based on polar angle convention:
     # - theta ≈ 0° = Z-dominated (|kz| >> k_xy) → Z resolution
     # - theta ≈ 90° = XY-dominated (k_xy >> |kz|) → XY resolution
@@ -914,11 +970,15 @@ def fsc_resolution(
     analyzer = FourierCorrelationAnalysis(
         data_collection,
         spacing_xy,
-        resolution_threshold="one-bit",
+        resolution_threshold=resolution_threshold,
+        threshold_value=threshold_value,
         curve_fit_type="spline",
     )
     try:
         analyzed = analyzer.execute()[0]
+        # Apply calibration correction for single-image mode
+        if single_image:
+            _apply_cutoff_correction(analyzed)
         results["xy"] = analyzed.resolution["resolution"]
     except Exception:
         results["xy"] = float("nan")
@@ -984,11 +1044,15 @@ def fsc_resolution(
         analyzer = FourierCorrelationAnalysis(
             data_collection,
             analyzer_spacing,
-            resolution_threshold="one-bit",
+            resolution_threshold=resolution_threshold,
+            threshold_value=threshold_value,
             curve_fit_type="spline",
         )
         try:
             analyzed = analyzer.execute()[0]
+            # Apply calibration correction for single-image mode
+            if single_image:
+                _apply_cutoff_correction(analyzed)
             z_resolution = analyzed.resolution["resolution"]
         except Exception:
             z_resolution = float("nan")
@@ -1001,6 +1065,15 @@ def fsc_resolution(
                 freq_at_crossing = float(z_freq_filtered[first_below])
                 if freq_at_crossing > 0:
                     z_resolution = analyzer_spacing / freq_at_crossing
+                    # Apply calibration correction for single-image fallback
+                    if single_image:
+                        z_resolution /= _calibration_factor(freq_at_crossing)
+
+        # Apply k(θ) correction to Z resolution (Koho et al. 2019, equation 5)
+        # Using bin edge (0°) for Z sector to get maximum correction: k(0°) = z_factor
+        # k(θ) = 1 + (z_factor-1) × |cos(θ)|, at θ=0°: k = z_factor
+        if not np.isnan(z_resolution) and z_factor > 1.0:
+            z_resolution = z_resolution * z_factor
 
         results["z"] = z_resolution
     else:

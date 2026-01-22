@@ -344,9 +344,10 @@ def _compute_decorrelation_curve_sectioned(
     results = {}
 
     # Process each angular sector
-    # With angle_delta=45: aid=0 (0-45°) → 'z', aid=1 (45-90°) → 'xy'
+    # Sectors with center < 45° are Z-dominated, >= 45° are XY-dominated
     for aid in range(n_angle):
-        sector_name = "z" if aid == 0 else "xy"
+        center_angle = (aid + 0.5) * angle_delta
+        sector_name = "z" if center_angle < 45 else "xy"
         sector_mask = (angle_id == aid) & (radial_id >= 0)
 
         if not np.any(sector_mask):
