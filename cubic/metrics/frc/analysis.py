@@ -401,30 +401,40 @@ class FourierCorrelationAnalysis(object):
 
         def first_guess(x, y, thr):
             difference = y - thr
-            return x[np.where(difference <= 0)[0][0] - 1]
+            indices = np.where(difference <= 0)[0]
+            if len(indices) == 0:
+                return np.nan
+            return x[max(indices[0] - 1, 0)]
 
         fit_start = first_guess(
             data_set.correlation["frequency"],
             data_set.correlation["correlation"],
             np.mean(data_set.resolution["threshold"]),
         )
-        if verbose:
-            print(f"Fit starts at {fit_start}")
-            disp = 1
+
+        if np.isnan(fit_start):
+            data_set.resolution["resolution-point"] = (np.nan, np.nan)
+            data_set.resolution["criterion"] = criterion
+            data_set.resolution["resolution"] = np.nan
+            data_set.resolution["spacing"] = self.spacing
         else:
-            disp = 0
-        root = optimize.fmin(
-            pdiff2 if criterion == "fixed" else pdiff1, fit_start, disp=disp
-        )[0]
+            if verbose:
+                print(f"Fit starts at {fit_start}")
+                disp = 1
+            else:
+                disp = 0
+            root = optimize.fmin(
+                pdiff2 if criterion == "fixed" else pdiff1, fit_start, disp=disp
+            )[0]
 
-        data_set.resolution["resolution-point"] = (frc_eq(root), root)
-        data_set.resolution["criterion"] = criterion
+            data_set.resolution["resolution-point"] = (frc_eq(root), root)
+            data_set.resolution["criterion"] = criterion
 
-        angle = np.deg2rad(int(key))
-        z_multiplier = 1 + (z_correction - 1) * np.abs(np.sin(angle))
-        resolution = z_multiplier * (2 * self.spacing / root)
+            angle = np.deg2rad(int(key))
+            z_multiplier = 1 + (z_correction - 1) * np.abs(np.sin(angle))
+            resolution = z_multiplier * (2 * self.spacing / root)
 
-        data_set.resolution["resolution"] = resolution
-        data_set.resolution["spacing"] = self.spacing * z_multiplier
+            data_set.resolution["resolution"] = resolution
+            data_set.resolution["spacing"] = self.spacing * z_multiplier
 
         return data_set
