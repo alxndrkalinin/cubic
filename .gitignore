@@ -130,3 +130,6 @@ dmypy.json
 
 # images
 *.tif
+
+# macOS
+.DS_Store

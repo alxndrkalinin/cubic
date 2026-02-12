@@ -24,7 +24,13 @@ quality assesement, and other.
 
 Install optional CUDA dependencies if GPU support is needed.
 
-Clone the repository and install the base library:
+Install from PyPI:
+
+```bash
+pip install cubic
+```
+
+Or install from source:
 
 ```bash
 git clone https://github.com/alxndrkalinin/cubic.git
