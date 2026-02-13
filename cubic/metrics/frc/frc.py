@@ -491,7 +491,7 @@ def calculate_sectioned_fsc(
     image1: np.ndarray,
     image2: np.ndarray | None = None,
     *,
-    bin_delta: int = 10,
+    bin_delta: int = 1,
     angle_delta: int = 15,
     extract_angle_delta: float = 0.1,
     resolution_threshold: str = "fixed",
@@ -556,7 +556,7 @@ def _calculate_fsc_sectioned_hist(
     image1: np.ndarray,
     image2: np.ndarray,
     *,
-    bin_delta: int = 10,
+    bin_delta: int = 1,
     angle_delta: int = 45,
     spacing: Sequence[float] | None = None,
     exclude_axis_angle: float = 0.0,
@@ -692,7 +692,7 @@ def fsc_resolution(
     image1: np.ndarray,
     image2: np.ndarray | None = None,
     *,
-    bin_delta: int = 10,
+    bin_delta: int = 1,
     angle_delta: int = 15,
     zero_padding: bool | None = None,
     spacing: float | Sequence[float] | None = None,
@@ -704,6 +704,7 @@ def fsc_resolution(
     resolution_threshold: str = "fixed",
     threshold_value: float = 0.143,
     backend: str = "hist",
+    z_xy_boundary: float = 30.0,
 ) -> dict[str, float]:
     """
     Calculate either single- or two-image FSC-based 3D image resolution.
@@ -711,7 +712,8 @@ def fsc_resolution(
     Args:
         image1: First 3D input image
         image2: Second 3D input image (optional, uses checkerboard split if None)
-        bin_delta: Bin width for radial binning
+        bin_delta: Bin width for radial binning. Default 1 matches the miplib
+                      paper methodology (Koho et al. 2019).
         angle_delta: Angular bin width in degrees (default 15, same as mask backend)
         zero_padding: Whether to pad image to cube. Default: True for mask backend,
                       False for hist backend. The hist backend handles anisotropic
@@ -744,6 +746,10 @@ def fsc_resolution(
                          correction was empirically calibrated for the 1/7 threshold
                          (Koho et al. 2019), so using other values may affect accuracy.
         backend: "hist" (vectorized, GPU-accelerated) or "mask" (deprecated)
+        z_xy_boundary: Polar angle boundary (degrees) for Z-candidate sectors in the
+                       hist backend. Sectors with center below this are tried for Z
+                       resolution in order from narrowest to widest. Default: 30.0
+                       (matches mask backend Z wedge coverage of ~8% of Fourier space).
     """
     import warnings
 
@@ -956,9 +962,12 @@ def fsc_resolution(
     # For XY resolution: find sector closest to 90°
     angle_xy = max(angles)  # Highest angle is most XY-dominated
 
-    # For Z resolution: find sector closest to 0°
-    angle_z = min(angles)  # Lowest angle is most Z-dominated
-    z_sectors = [angle_z]  # Single Z sector in polar convention
+    # For Z resolution: fallback cascade over Z-candidate sectors
+    # Try each sector individually from most Z-dominated to least, stopping at
+    # the first one that yields a finite resolution.
+    z_candidates = [a for a in angles if a < z_xy_boundary]
+    if not z_candidates:
+        z_candidates = [min(angles)]
 
     results = {}
 
@@ -982,101 +991,48 @@ def fsc_resolution(
     except Exception:
         results["xy"] = float("nan")
 
-    # Process Z resolution by averaging multiple Z-relevant sectors
-    if z_sectors and len(z_sectors) > 0:
-        # Get reference frequency grid from first Z sector
-        ref_data = fsc_data[z_sectors[0]]
-        ref_freq = np.asarray(ref_data.correlation["frequency"])
+    # Determine spacing for Z resolution calculation
+    # For isotropic resampling: frequencies are in isotropic units, use XY spacing
+    # For non-isotropic: use Z spacing (frequencies normalized to Z Nyquist)
+    if original_spacing_z is not None:
+        analyzer_spacing = spacing_xy  # Frequencies in isotropic units
+    else:
+        analyzer_spacing = spacing_z  # Frequencies normalized to Z Nyquist
 
-        # Average correlations weighted by point counts
-        sum_corr = np.zeros_like(ref_freq)
-        sum_weights = np.zeros_like(ref_freq)
-        for angle in z_sectors:
-            data = fsc_data[angle]
-            corr = np.asarray(data.correlation["correlation"])
-            n_pts = np.asarray(data.correlation["points-x-bin"])
-            sum_corr += corr * n_pts
-            sum_weights += n_pts
-        avg_corr = sum_corr / np.maximum(sum_weights, 1)
+    # Process Z resolution: try each Z-candidate sector individually
+    z_resolution = float("nan")
+    z_angle_used = z_candidates[0]
 
-        # Create averaged Z data set
-        z_data_set = FourierCorrelationData()
-        z_data_set.correlation["correlation"] = avg_corr
-        z_data_set.correlation["frequency"] = ref_freq
-        z_data_set.correlation["points-x-bin"] = sum_weights
-
-        # Determine spacing and frequency limit for Z
-        # For isotropic resampling: frequency is normalized to isotropic Nyquist,
-        # but Z only has valid data up to original Z Nyquist (z_freq_limit).
-        # For non-isotropic: frequency is normalized to min(XY,Z) Nyquist = Z Nyquist,
-        # so no filtering is needed.
-        if original_spacing_z is not None:
-            # Isotropic resampling: filter to valid Z frequencies
-            z_freq_limit = spacing_xy / original_spacing_z
-            analyzer_spacing = spacing_xy  # Frequencies in isotropic units
-        else:
-            # Non-isotropic: use all frequencies, Z spacing for resolution
-            z_freq_limit = 1.0
-            analyzer_spacing = spacing_z  # Frequencies normalized to Z Nyquist
-
-        # Filter to valid Z frequencies (only applies for isotropic resampling)
-        valid_z_mask = ref_freq <= z_freq_limit
-        if np.any(valid_z_mask):
-            z_freq_filtered = ref_freq[valid_z_mask]
-            z_corr_filtered = avg_corr[valid_z_mask]
-            z_weights_filtered = sum_weights[valid_z_mask]
-        else:
-            # No valid Z data (shouldn't happen, but handle gracefully)
-            z_freq_filtered = ref_freq
-            z_corr_filtered = avg_corr
-            z_weights_filtered = sum_weights
-
-        # Create filtered Z data set
-        z_data_set_filtered = FourierCorrelationData()
-        z_data_set_filtered.correlation["correlation"] = z_corr_filtered
-        z_data_set_filtered.correlation["frequency"] = z_freq_filtered
-        z_data_set_filtered.correlation["points-x-bin"] = z_weights_filtered
-
-        # Try to find resolution with the filtered Z data
+    for z_angle in z_candidates:
+        z_data = fsc_data[z_angle]
         data_collection = FourierCorrelationDataCollection()
-        data_collection[0] = z_data_set_filtered
+        data_collection[0] = z_data
         analyzer = FourierCorrelationAnalysis(
             data_collection,
             analyzer_spacing,
             resolution_threshold=resolution_threshold,
             threshold_value=threshold_value,
-            curve_fit_type="spline",
+            curve_fit_type="smooth-spline",
         )
         try:
             analyzed = analyzer.execute()[0]
-            # Apply calibration correction for single-image mode
             if single_image:
                 _apply_cutoff_correction(analyzed)
-            z_resolution = analyzed.resolution["resolution"]
+            candidate_res = analyzed.resolution["resolution"]
+            if np.isfinite(candidate_res) and candidate_res > 0:
+                z_resolution = candidate_res
+                z_angle_used = z_angle
+                break
         except Exception:
-            z_resolution = float("nan")
+            continue
 
-        # Fallback: simple threshold crossing if spline failed
-        if np.isnan(z_resolution):
-            below_threshold = z_corr_filtered < 0.5
-            if np.any(below_threshold):
-                first_below = int(np.argmax(below_threshold))
-                freq_at_crossing = float(z_freq_filtered[first_below])
-                if freq_at_crossing > 0:
-                    z_resolution = analyzer_spacing / freq_at_crossing
-                    # Apply calibration correction for single-image fallback
-                    if single_image:
-                        z_resolution /= _calibration_factor(freq_at_crossing)
+    # Apply k(θ) correction using actual sector angle (Koho et al. 2019, equation 5)
+    # k(θ) = 1 + (z_factor-1) × |cos(θ)|
+    if np.isfinite(z_resolution) and z_factor > 1.0:
+        k_theta = 1.0 + (z_factor - 1.0) * np.abs(np.cos(np.deg2rad(z_angle_used)))
+        z_resolution = z_resolution * k_theta
 
-        # Apply k(θ) correction to Z resolution (Koho et al. 2019, equation 5)
-        # Using bin edge (0°) for Z sector to get maximum correction: k(0°) = z_factor
-        # k(θ) = 1 + (z_factor-1) × |cos(θ)|, at θ=0°: k = z_factor
-        if not np.isnan(z_resolution) and z_factor > 1.0:
-            z_resolution = z_resolution * z_factor
-
-        results["z"] = z_resolution
-    else:
-        results["z"] = float("nan")
+    results["z"] = z_resolution
 
     return results
 
