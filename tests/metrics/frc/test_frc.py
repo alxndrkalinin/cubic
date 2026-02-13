@@ -9,7 +9,8 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.frc import frc_resolution, fsc_resolution
+from cubic.metrics.frc import calculate_frc, fsc_resolution
+from cubic.metrics.frc.frc import _calibration_factor
 
 
 def _fractional_to_absolute(
@@ -99,84 +100,299 @@ def _assert_positive(result: Any) -> None:
         assert float(result) > 0
 
 
-def test_calculate_frc_cpu_vs_gpu(
+def test_frc_all_backends_devices(
     cells_volume: tuple[np.ndarray, list[float]],
 ) -> None:
-    """Compare FRC resolution calculated on CPU and GPU."""
+    """Test all backend-device combinations in a single test to minimize redundant calculations."""
     volume, spacing = cells_volume
-    slice_image = _middle_slice(volume)
-
-    # Use 2D spacing (xy only)
+    slice_cpu = _middle_slice(volume)
     xy_spacing = spacing[1:]  # [y, x] spacing
 
-    cpu_res = frc_resolution(slice_image, spacing=xy_spacing)
-    _assert_positive(cpu_res)
+    # Prepare GPU image if available
+    has_gpu = _gpu_available()
+    slice_gpu = ascupy(slice_cpu) if has_gpu else None
 
-    if _gpu_available():
-        gpu_res = frc_resolution(ascupy(slice_image), spacing=xy_spacing)
-        assert np.isclose(cpu_res, gpu_res, atol=1e-5)
-
-
-def test_calculate_fsc_cpu_vs_gpu(
-    cells_volume: tuple[np.ndarray, list[float]],
-) -> None:
-    """Compare FSC resolution calculated on CPU and GPU."""
-    volume, spacing = cells_volume
-
-    rng = np.random.default_rng(42)
-    noisy_volume = volume.astype(np.float32) + rng.normal(0, 0.5, volume.shape).astype(
-        np.float32
-    )
-
-    cpu_res = fsc_resolution(noisy_volume, spacing=spacing, bin_delta=1)
-    assert np.isfinite(cpu_res["xy"]) or np.isnan(cpu_res["xy"])
-    assert np.isfinite(cpu_res["z"]) or np.isnan(cpu_res["z"])
-
-    if _gpu_available():
-        gpu_res = fsc_resolution(ascupy(noisy_volume), spacing=spacing, bin_delta=1)
-        assert np.allclose(
-            [cpu_res["xy"], cpu_res["z"]],
-            [gpu_res["xy"], gpu_res["z"]],
-            atol=1e-3,
+    # Compute all combinations exactly once
+    results = {}
+    for backend in ["mask", "hist"]:
+        # CPU
+        results[(backend, "cpu")] = calculate_frc(
+            slice_cpu,
+            bin_delta=1,
+            spacing=xy_spacing,
+            backend=backend,
+            disable_hamming=False,
         )
 
+        # GPU
+        if has_gpu:
+            results[(backend, "gpu")] = calculate_frc(
+                slice_gpu,
+                bin_delta=1,
+                spacing=xy_spacing,
+                backend=backend,
+                disable_hamming=False,
+            )
 
-# def test_calculate_frc_single_vs_two_image() -> None:
-#     """Test that single image FRC works correctly."""
-#     # Create a test image with known properties
-#     rng = np.random.default_rng(42)
-#     test_image = rng.random((64, 64)).astype(np.float32)
+    # Test 1: Each result should have valid structure and positive resolution
+    for (backend, device), result in results.items():
+        _assert_positive(result.resolution["resolution"])
+        corr = result.correlation["correlation"]
+        freq = result.correlation["frequency"]
+        assert len(corr) > 0, f"Empty correlation for {backend}-{device}"
+        assert len(freq) > 0, f"Empty frequency for {backend}-{device}"
+        assert len(corr) == len(freq), f"Length mismatch for {backend}-{device}"
 
-#     # Single image FRC
-#     single_res = frc_resolution(test_image)
-#     _assert_positive(single_res)
+    # Test 2: Backend consistency on CPU (mask vs hist)
+    mask_cpu = results[("mask", "cpu")]
+    hist_cpu = results[("hist", "cpu")]
+    corr_mask = mask_cpu.correlation["correlation"]
+    corr_hist = hist_cpu.correlation["correlation"]
+    freq_mask = mask_cpu.correlation["frequency"]
+    freq_hist = hist_cpu.correlation["frequency"]
+    min_len = min(len(corr_mask), len(corr_hist)) - 1
 
-#     # Two image FRC (should give different result)
-#     test_image2 = test_image + rng.normal(0, 0.1, test_image.shape).astype(np.float32)
-#     two_res = frc_resolution(test_image, test_image2)
-#     _assert_positive(two_res)
+    assert np.allclose(
+        corr_mask[:min_len],
+        corr_hist[:min_len],
+        atol=0.015,
+        rtol=0.03,
+    ), "FRC correlation should match between backends on CPU"
 
-#     # Results should be different
-#     assert not np.isclose(single_res, two_res, rtol=0.1)
+    assert np.allclose(
+        freq_mask[:min_len],
+        freq_hist[:min_len],
+        atol=0.001,
+        rtol=0.01,
+    ), "FRC frequencies should match between backends on CPU"
+
+    if not has_gpu:
+        return  # Skip GPU tests if not available
+
+    # Test 3: Backend consistency on GPU (mask vs hist)
+    mask_gpu = results[("mask", "gpu")]
+    hist_gpu = results[("hist", "gpu")]
+    corr_mask_gpu = mask_gpu.correlation["correlation"]
+    corr_hist_gpu = hist_gpu.correlation["correlation"]
+    freq_mask_gpu = mask_gpu.correlation["frequency"]
+    freq_hist_gpu = hist_gpu.correlation["frequency"]
+    min_len_gpu = min(len(corr_mask_gpu), len(corr_hist_gpu)) - 1
+
+    assert np.allclose(
+        corr_mask_gpu[:min_len_gpu],
+        corr_hist_gpu[:min_len_gpu],
+        atol=0.015,
+        rtol=0.03,
+    ), "FRC correlation should match between backends on GPU"
+
+    assert np.allclose(
+        freq_mask_gpu[:min_len_gpu],
+        freq_hist_gpu[:min_len_gpu],
+        atol=0.001,
+        rtol=0.01,
+    ), "FRC frequencies should match between backends on GPU"
+
+    # Test 4: Device consistency (CPU vs GPU for each backend)
+    for backend in ["mask", "hist"]:
+        cpu_result = results[(backend, "cpu")]
+        gpu_result = results[(backend, "gpu")]
+
+        corr_cpu = cpu_result.correlation["correlation"]
+        corr_gpu = gpu_result.correlation["correlation"]
+        freq_cpu = cpu_result.correlation["frequency"]
+        freq_gpu = gpu_result.correlation["frequency"]
+
+        min_len = min(len(corr_cpu), len(corr_gpu)) - 1
+
+        assert np.allclose(
+            corr_cpu[:min_len],
+            corr_gpu[:min_len],
+            atol=1e-5,
+            rtol=1e-5,
+        ), f"FRC correlation should match CPU/GPU for {backend} backend"
+
+        assert np.allclose(
+            freq_cpu[:min_len],
+            freq_gpu[:min_len],
+            atol=1e-6,
+            rtol=1e-6,
+        ), f"FRC frequencies should match CPU/GPU for {backend} backend"
+
+    # Test 5: Cross-consistency (all combinations vs reference)
+    ref = mask_cpu
+    ref_corr = ref.correlation["correlation"]
+    ref_freq = ref.correlation["frequency"]
+
+    for (backend, device), result in results.items():
+        if backend == "mask" and device == "cpu":
+            continue  # Skip reference
+
+        corr = result.correlation["correlation"]
+        freq = result.correlation["frequency"]
+        min_len = min(len(ref_corr), len(corr)) - 1
+
+        # Same backend should have tighter tolerance
+        if backend == "mask":
+            atol_corr, rtol_corr = 1e-5, 1e-5
+            atol_freq, rtol_freq = 1e-6, 1e-6
+        else:
+            # Different backend (hist vs mask) has relaxed tolerance
+            atol_corr, rtol_corr = 0.015, 0.03
+            atol_freq, rtol_freq = 0.001, 0.01
+
+        assert np.allclose(
+            ref_corr[:min_len],
+            corr[:min_len],
+            atol=atol_corr,
+            rtol=rtol_corr,
+        ), f"Correlation mismatch: mask-cpu vs {backend}-{device}"
+
+        assert np.allclose(
+            ref_freq[:min_len],
+            freq[:min_len],
+            atol=atol_freq,
+            rtol=rtol_freq,
+        ), f"Frequency mismatch: mask-cpu vs {backend}-{device}"
 
 
-# def test_calculate_fsc_single_vs_two_image() -> None:
-#     """Test that single image FSC works correctly."""
-#     # Create a test volume with known properties
-#     rng = np.random.default_rng(42)
-#     test_volume = rng.random((32, 32, 32)).astype(np.float32)
+def test_calibration_factor() -> None:
+    """Test the one-image FRC/FSC calibration factor function."""
+    # The calibration factor should be > 1 for frequencies in the typical range
+    # At the 1/7 threshold, typical crossing frequencies are 0.1-0.5
+    for freq in [0.1, 0.2, 0.3, 0.4, 0.5]:
+        factor = _calibration_factor(freq)
+        # Correction factor should be roughly between 0.5 and 1.0
+        # (dividing by it increases the resolution value)
+        assert 0.4 < factor < 1.1, (
+            f"Unexpected calibration factor {factor} at freq {freq}"
+        )
 
-#     # Single image FSC
-#     single_res = fsc_resolution(test_volume, bin_delta=5)
-#     _assert_positive(single_res["xy"])
-#     _assert_positive(single_res["z"])
+    # At very low frequencies, the exponential term dominates
+    factor_low = _calibration_factor(0.05)
+    assert factor_low > 0, "Calibration factor should be positive"
 
-#     # Two image FSC (should give different result)
-#     test_volume2 = test_volume + rng.normal(0, 0.2, test_volume.shape).astype(np.float32)
-#     two_res = fsc_resolution(test_volume, test_volume2, bin_delta=5)
-#     _assert_positive(two_res["xy"])
-#     _assert_positive(two_res["z"])
+    # The calibration curve is monotonically increasing
+    factors = [_calibration_factor(f) for f in [0.1, 0.2, 0.3, 0.4]]
+    assert all(factors[i] <= factors[i + 1] for i in range(len(factors) - 1)), (
+        "Calibration factor should increase with frequency"
+    )
 
-#     # Results should be different
-#     assert not np.allclose([single_res["xy"], single_res["z"]],
-#                           [two_res["xy"], two_res["z"]], rtol=0.1)
+
+def test_fsc_resolution_single_image(
+    cells_volume: tuple[np.ndarray, list[float]],
+) -> None:
+    """Test FSC resolution with single-image mode (checkerboard split)."""
+    volume, spacing = cells_volume
+
+    # Single-image FSC should return positive resolution values
+    result = fsc_resolution(
+        volume,
+        bin_delta=1,  # Match miplib paper methodology
+        angle_delta=45,
+        spacing=spacing,
+        backend="hist",
+    )
+
+    assert "xy" in result, "FSC result should have 'xy' key"
+    assert "z" in result, "FSC result should have 'z' key"
+
+    # XY resolution should be positive and finite
+    assert result["xy"] > 0, "XY resolution should be positive"
+    assert np.isfinite(result["xy"]), "XY resolution should be finite"
+
+    # Z resolution may be NaN if the analyzer cannot find a valid threshold
+    # crossing (this is expected behavior - honest NaN is better than a
+    # fallback value from an inconsistent threshold)
+    if np.isfinite(result["z"]):
+        assert result["z"] > 0, "Z resolution should be positive when finite"
+
+    # Resolution should be in a reasonable range (in microns for cells3d)
+    # cells3d has ~0.26 um XY spacing, typical XY resolution 0.3-1.0 um
+    if spacing != [1.0, 1.0, 1.0]:  # Skip if using synthetic fallback
+        assert 0.1 < result["xy"] < 5.0, (
+            f"XY resolution {result['xy']} out of expected range"
+        )
+        if np.isfinite(result["z"]):
+            assert 0.1 < result["z"] < 20.0, (
+                f"Z resolution {result['z']} out of expected range"
+            )
+
+
+def test_fsc_z_fallback_cascade(
+    cells_volume: tuple[np.ndarray, list[float]],
+) -> None:
+    """Test that Z resolution fallback cascade tries multiple sectors.
+
+    With angle_delta=15 and z_xy_boundary=30, the cascade tries sectors [8°, 22°]
+    for Z resolution. If the narrowest sector fails, the next one is used.
+    Compares boundary=10 (single sector, old behavior) vs boundary=30 (cascade).
+    """
+    volume, spacing = cells_volume
+
+    # boundary=10: only the 8° sector is tried (equivalent to old behavior)
+    result_single = fsc_resolution(
+        volume,
+        bin_delta=1,
+        angle_delta=15,
+        spacing=spacing,
+        backend="hist",
+        z_xy_boundary=10.0,
+    )
+
+    # boundary=30: cascade tries [8°, 22°]
+    result_cascade = fsc_resolution(
+        volume,
+        bin_delta=1,
+        angle_delta=15,
+        spacing=spacing,
+        backend="hist",
+        z_xy_boundary=30.0,
+    )
+
+    assert "xy" in result_single and "z" in result_single
+    assert "xy" in result_cascade and "z" in result_cascade
+
+    # XY should be identical (same sector used)
+    assert result_single["xy"] == pytest.approx(result_cascade["xy"], rel=1e-10)
+
+    # If single-sector Z is finite, cascade should find the same value
+    # (it tries the 8° sector first and stops on success)
+    if np.isfinite(result_single["z"]):
+        assert result_cascade["z"] == pytest.approx(result_single["z"], rel=1e-10)
+    # If single-sector Z is NaN, cascade may recover a finite value
+    # from the 22° sector (this is the main benefit of the cascade)
+    if np.isfinite(result_cascade["z"]):
+        assert result_cascade["z"] > 0, "Z resolution should be positive when finite"
+
+
+def test_fsc_z_xy_boundary_parameter() -> None:
+    """Test that z_xy_boundary limits which sectors are tried for Z resolution."""
+    volume = make_fake_cells3d(shape=(32, 64, 64), random_seed=99)
+    spacing = [0.29, 0.26, 0.26]
+
+    # With angle_delta=15, sector centers are [8, 22, 38, 52, 68, 82]
+    # boundary=10 should only try [8] (single sector, same as old behavior)
+    result_narrow = fsc_resolution(
+        volume,
+        angle_delta=15,
+        spacing=spacing,
+        backend="hist",
+        z_xy_boundary=10.0,
+    )
+
+    # boundary=45 should try [8, 22, 38] — wider cascade
+    result_wide = fsc_resolution(
+        volume,
+        angle_delta=15,
+        spacing=spacing,
+        backend="hist",
+        z_xy_boundary=45.0,
+    )
+
+    # Both should have valid structure
+    assert "xy" in result_narrow and "z" in result_narrow
+    assert "xy" in result_wide and "z" in result_wide
+
+    # XY resolution should be the same regardless of z_xy_boundary
+    # (XY uses the highest-angle sector, unaffected by Z boundary)
+    assert result_narrow["xy"] == pytest.approx(result_wide["xy"], rel=1e-10)

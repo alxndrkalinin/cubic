@@ -14,6 +14,7 @@ from cubic.image_utils import (
     crop_center,
     hamming_window,
     pad_image_to_cube,
+    rescale_isotropic,
     checkerboard_split,
     get_xy_block_coords,
     reverse_checkerboard_split,
@@ -33,13 +34,24 @@ def _empty_aggregate(*args: np.ndarray, **kwargs) -> np.ndarray:
 
 
 def frc_checkerboard_split(
-    image: np.ndarray, reverse: bool = False, disable_3d_sum: bool = False
+    image: np.ndarray,
+    reverse: bool = False,
+    disable_3d_sum: bool = False,
+    preserve_range: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Split image into two by checkerboard pattern."""
     if reverse:
-        return reverse_checkerboard_split(image, disable_3d_sum=disable_3d_sum)
+        return reverse_checkerboard_split(
+            image,
+            disable_3d_sum=disable_3d_sum,
+            preserve_range=preserve_range,
+        )
     else:
-        return checkerboard_split(image, disable_3d_sum=disable_3d_sum)
+        return checkerboard_split(
+            image,
+            disable_3d_sum=disable_3d_sum,
+            preserve_range=preserve_range,
+        )
 
 
 def preprocess_images(
@@ -77,9 +89,9 @@ def preprocess_images(
 
 
 class FRC(object):
-    """A class for calculating 2D Fourier ring correlation."""
+    """A class for calculating 2D Fourier ring correlation (unshifted FFT)."""
 
-    def __init__(self, image1: np.ndarray, image2: np.ndarray, iterator):
+    def __init__(self, image1: np.ndarray, image2: np.ndarray, iterator, spacing=None):
         """Create new FRC executable object and perform FFT on input images."""
         if image1.shape != image2.shape:
             raise ValueError("The image dimensions do not match")
@@ -87,12 +99,12 @@ class FRC(object):
             raise ValueError("Fourier ring correlation requires 2D images.")
 
         self.iterator = iterator
-        # Calculate power spectra for the input images.
-        self.fft_image1 = np.fft.fftshift(np.fft.fft2(image1))
-        self.fft_image2 = np.fft.fftshift(np.fft.fft2(image2))
-
-        # Get the Nyquist frequency
+        self.spacing = spacing
+        # Compute unshifted FFT (mean-subtracted, no fftshift)
+        self.fft_image1 = np.fft.fftn(image1 - image1.mean())
+        self.fft_image2 = np.fft.fftn(image2 - image2.mean())
         self.freq_nyq = int(np.floor(image1.shape[0] / 2.0))
+        self.shape = image1.shape
 
     def execute(self):
         """Calculate the FRC."""
@@ -112,7 +124,14 @@ class FRC(object):
             points[idx] = len(subset1)
 
         # Calculate FRC
-        spatial_freq = asnumpy(radii.astype(np.float32) / self.freq_nyq)
+        # If spacing was provided, radii are in physical units; normalize to [0,1]
+        # If spacing was None, radii are in index units; normalize by Nyquist
+        if self.spacing is None:
+            spatial_freq = asnumpy(radii.astype(np.float32) / self.freq_nyq)
+        else:
+            # radii are in physical units; normalize to max frequency
+            max_freq = float(np.max(radii))
+            spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
         c1 = asnumpy(c1)
         c2 = asnumpy(c2)
         c3 = asnumpy(c3)
@@ -137,26 +156,123 @@ class FRC(object):
 
 
 def _calculate_frc_core(
-    image1: np.ndarray, image2: np.ndarray, bin_delta: int
+    image1: np.ndarray,
+    image2: np.ndarray,
+    bin_delta: int,
+    *,
+    backend: str = "mask",
+    spacing: Sequence[float] | None = None,
 ) -> FourierCorrelationDataCollection:
-    """Core FRC calculation logic."""
+    """
+    Core FRC calculation logic.
+
+    Args:
+        image1: First input image
+        image2: Second input image
+        bin_delta: Bin width (step size between bins). Controls binning resolution
+                   for both backends.
+        backend: "mask" (existing iterators) or "hist" (radial histogram)
+        spacing: Physical spacing per axis. If None, uses index units.
+    """
     assert image1.shape == image2.shape
     frc_data = FourierCorrelationDataCollection()
-    iterator = FourierRingIterator(image1.shape, bin_delta)
-    frc_task = FRC(image1, image2, iterator)
-    frc_data[0] = frc_task.execute()
+
+    if backend == "hist":
+        # Histogram backend using radial binning
+        from cubic.cuda import get_array_module
+
+        from .radial import radial_edges, reduce_cross, reduce_power, radial_bin_id
+
+        # Compute unshifted FFT
+        fft_image1 = np.fft.fftn(image1 - image1.mean())
+        fft_image2 = np.fft.fftn(image2 - image2.mean())
+
+        # Build radial bins
+        shape = fft_image1.shape
+        edges, radii = radial_edges(shape, bin_delta, spacing=spacing)
+        xp = get_array_module(fft_image1)
+        edges = xp.asarray(edges)
+
+        bin_id = radial_bin_id(shape, edges, spacing=spacing)
+
+        Sx2, Nx = reduce_power(fft_image1, bin_id)
+        Sy2, Ny = reduce_power(fft_image2, bin_id)
+        Sxy_re, _ = reduce_cross(fft_image1, fft_image2, bin_id, numerator="real")
+
+        # Compute FRC: abs(Sxy) / sqrt(Sx2 * Sy2) in log domain for stability
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            eps = np.finfo(np.float32).tiny
+            Sx2_safe = np.clip(Sx2, eps, None)
+            Sy2_safe = np.clip(Sy2, eps, None)
+            Sxy_re_safe = np.clip(np.abs(Sxy_re), eps, None)
+
+            frc = np.exp(
+                np.log(Sxy_re_safe) - 0.5 * (np.log(Sx2_safe) + np.log(Sy2_safe))
+            )
+            frc[frc == np.inf] = 0.0
+            frc = np.nan_to_num(frc)
+
+        # Convert radii to normalized spatial frequency
+        # If spacing was provided, radii are in physical units; normalize to [0,1]
+        # If spacing was None, radii are in index units; normalize by Nyquist
+        freq_nyq = int(np.floor(shape[0] / 2.0))
+        if spacing is None:
+            spatial_freq = radii.astype(np.float32) / freq_nyq
+        else:
+            # radii are in physical units; normalize to max frequency
+            max_freq = float(np.max(radii))
+            spatial_freq = radii.astype(np.float32) / max_freq
+        frc = asnumpy(frc)
+        n_points = asnumpy(Nx.astype(np.float32))
+
+        data_set = FourierCorrelationData()
+        data_set.correlation["correlation"] = frc
+        data_set.correlation["frequency"] = spatial_freq
+        data_set.correlation["points-x-bin"] = n_points
+        frc_data[0] = data_set
+    else:
+        # Default mask/iterator backend
+        iterator = FourierRingIterator(image1.shape, bin_delta, spacing=spacing)
+        frc_task = FRC(image1, image2, iterator, spacing=spacing)
+        frc_data[0] = frc_task.execute()
+
     return frc_data
+
+
+def _calibration_factor(freq_at_crossing: float) -> float:
+    """Calculate calibration factor for one-image FRC/FSC.
+
+    The checkerboard split creates a diagonal shift between subimage pairs that
+    causes frequency compression in the FRC/FSC curve due to the Fourier shift
+    theorem (Supplementary Note 1, Koho et al. 2019).
+
+    This correction was empirically calibrated against two-image FRC at the 1/7
+    threshold by imaging the same field of view at different pixel sizes
+    (Supplementary Note 2, Supplementary Fig. 3, Koho et al. 2019).
+
+    Parameters
+    ----------
+    freq_at_crossing : float
+        Normalized frequency (0-1) at threshold crossing.
+
+    Returns
+    -------
+    float
+        Calibration factor. Divide raw resolution by this to get corrected value.
+    """
+
+    def calibration_func(x: float, a: float, b: float, c: float, d: float) -> float:
+        return a * np.exp(c * (x - b)) + d
+
+    # Parameters from miplib calibration (Koho et al. 2019)
+    params = [0.95988146, 0.97979108, 13.90441896, 0.55146136]
+    return calibration_func(freq_at_crossing, *params)
 
 
 def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
     """Apply cut-off correction for single image FRC."""
-
-    def func(x, a, b, c, d):
-        return a * np.exp(c * (x - b)) + d
-
-    params = [0.95988146, 0.97979108, 13.90441896, 0.55146136]
     point = result.resolution["resolution-point"][1]
-    cut_off_correction = func(point, *params)
+    cut_off_correction = _calibration_factor(point)
     result.resolution["spacing"] /= cut_off_correction
     result.resolution["resolution"] /= cut_off_correction
 
@@ -174,15 +290,25 @@ def calculate_frc(
     disable_hamming: bool = False,
     average: bool = True,
     z_correction: float = 1.0,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
+    backend: str = "mask",
 ) -> FourierCorrelationData:
-    """Calculate a regular FRC with single or two image inputs."""
+    """
+    Calculate a regular FRC with single or two image inputs.
+
+    Args:
+        bin_delta: Bin width (step size between bins). Controls binning resolution
+                   for both backends. Default: 1.
+        backend: "mask" (existing iterators) or "hist" (radial histogram)
+    """
     single_image = image2 is None
     reverse = average and single_image
     original_image1 = image1.copy() if reverse else None
 
-    if isinstance(spacing, (int, float)):
+    if spacing is None:
+        spacing = None
+    elif isinstance(spacing, (int, float)):
         spacing = [spacing] * image1.ndim
     else:
         spacing = list(spacing)
@@ -194,7 +320,20 @@ def calculate_frc(
         disable_hamming=disable_hamming,
     )
 
-    frc_data = _calculate_frc_core(image1, image2, bin_delta)
+    # Adjust spacing to match preprocessed image shape (padding may have changed dimensions)
+    # For padded dimensions, use the spacing from the first dimension
+    if spacing is not None and len(spacing) != image1.ndim:
+        if len(spacing) < image1.ndim:
+            # Extend spacing if needed (use first spacing value for new dimensions)
+            spacing = list(spacing) + [spacing[0]] * (image1.ndim - len(spacing))
+        else:
+            # Truncate if too long (shouldn't happen, but be safe)
+            spacing = list(spacing[: image1.ndim])
+
+    # Pass spacing to core calculation (for histogram backend)
+    frc_data = _calculate_frc_core(
+        image1, image2, bin_delta, backend=backend, spacing=spacing
+    )
 
     # Average with reverse pattern (only for single image mode)
     if reverse:
@@ -207,7 +346,9 @@ def calculate_frc(
             disable_hamming=disable_hamming,
         )
 
-        frc_data_rev = _calculate_frc_core(image1, image2, bin_delta)
+        frc_data_rev = _calculate_frc_core(
+            image1, image2, bin_delta, backend=backend, spacing=spacing
+        )
 
         # Average the two results
         frc_data[0].correlation["correlation"] = (
@@ -218,7 +359,7 @@ def calculate_frc(
     # Analyze results
     analyzer = FourierCorrelationAnalysis(
         frc_data,
-        spacing[0],
+        spacing[0] if spacing is not None else 1.0,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         snr_value=snr_value,
@@ -239,9 +380,10 @@ def frc_resolution(
     image2: np.ndarray | None = None,
     *,
     bin_delta: int = 1,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
     curve_fit_type: str = "smooth-spline",
+    backend: str = "mask",
 ) -> float:
     """Calculate either single- or two-image FRC-based 2D image resolution."""
     frc_result = calculate_frc(
@@ -251,13 +393,14 @@ def frc_resolution(
         curve_fit_type=curve_fit_type,
         spacing=spacing,
         zero_padding=zero_padding,
+        backend=backend,
     )
 
     return frc_result.resolution["resolution"]
 
 
 class DirectionalFSC(object):
-    """Calculate the directional FSC between two images."""
+    """Calculate the directional FSC between two images (unshifted FFT)."""
 
     def __init__(
         self,
@@ -274,8 +417,9 @@ class DirectionalFSC(object):
             raise ValueError("Image dimensions do not match")
 
         self.iterator = iterator
-        self.fft_image1 = np.fft.fftshift(np.fft.fftn(image1))
-        self.fft_image2 = np.fft.fftshift(np.fft.fftn(image2))
+        # Compute unshifted FFT (mean-subtracted, no fftshift)
+        self.fft_image1 = np.fft.fftn(image1 - image1.mean())
+        self.fft_image2 = np.fft.fftn(image2 - image2.mean())
         if normalize_power:
             pixels = image1.shape[0] ** 3
             self.fft_image1 /= np.array(pixels * np.mean(image1))
@@ -347,7 +491,7 @@ def calculate_sectioned_fsc(
     image1: np.ndarray,
     image2: np.ndarray | None = None,
     *,
-    bin_delta: int = 10,
+    bin_delta: int = 1,
     angle_delta: int = 15,
     extract_angle_delta: float = 0.1,
     resolution_threshold: str = "fixed",
@@ -358,13 +502,15 @@ def calculate_sectioned_fsc(
     disable_hamming: bool = False,
     z_correction: float = 1.0,
     disable_3d_sum: bool = False,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
 ) -> FourierCorrelationDataCollection:
     """Calculate sectioned FSC for one or two images."""
     single_image = image2 is None
 
-    if isinstance(spacing, (int, float)):
+    if spacing is None:
+        spacing = None
+    elif isinstance(spacing, (int, float)):
         spacing = [spacing] * image1.ndim
     else:
         spacing = list(spacing)
@@ -382,6 +528,7 @@ def calculate_sectioned_fsc(
         bin_delta,
         angle_delta,
         extract_angle_delta,
+        spacing=spacing,
     )
     fsc_task = DirectionalFSC(image1, image2, iterator)
     data = fsc_task.execute()
@@ -405,35 +552,496 @@ def calculate_sectioned_fsc(
     return result
 
 
+def _calculate_fsc_sectioned_hist(
+    image1: np.ndarray,
+    image2: np.ndarray,
+    *,
+    bin_delta: int = 1,
+    angle_delta: int = 45,
+    spacing: Sequence[float] | None = None,
+    exclude_axis_angle: float = 0.0,
+    use_max_nyquist: bool = False,
+) -> dict[int, FourierCorrelationData]:
+    """
+    Calculate sectioned FSC using vectorized histogram approach.
+
+    Uses polar angle from Z axis (0-90°):
+    - theta ≈ 0° = Z-dominated frequencies → Z resolution
+    - theta ≈ 90° = XY-dominated frequencies → XY resolution
+
+    Parameters
+    ----------
+    angle_delta : int
+        Angular bin width in degrees. Default 45 gives 2 bins.
+        Use 15 to match mask backend's angular resolution.
+    exclude_axis_angle : float
+        Exclude frequencies within this angle (in degrees) from the Z axis.
+        Following Koho et al. 2019 to avoid piezo/interpolation artifacts.
+        Default: 0.0 (no exclusion).
+    use_max_nyquist : bool
+        If True, extend radial frequency range to maximum Nyquist (typically XY)
+        instead of minimum Nyquist (typically Z). This allows XY-dominant sectors
+        to measure higher frequencies for better XY resolution estimates.
+        Default: False.
+    """
+    from cubic.cuda import asnumpy, get_array_module
+
+    from .radial import (
+        radial_edges,
+        frc_from_sums,
+        sectioned_bin_id,
+        reduce_cross_sectioned,
+        reduce_power_sectioned,
+    )
+
+    xp = get_array_module(image1)
+
+    # Compute FFT
+    fft_image1 = np.fft.fftn(image1 - image1.mean())
+    fft_image2 = np.fft.fftn(image2 - image2.mean())
+
+    shape = image1.shape
+
+    # Build radial edges
+    r_edges, radii = radial_edges(
+        shape, bin_delta, spacing=spacing, use_max_nyquist=use_max_nyquist
+    )
+    r_edges = xp.asarray(r_edges)
+    n_radial = len(radii)
+
+    # Angular edges: polar angle from Z axis (0-90°)
+    # - theta ≈ 0° = Z-dominated frequencies → Z resolution
+    # - theta ≈ 90° = XY-dominated frequencies → XY resolution
+    n_angle = 90 // angle_delta
+    angle_edges = xp.asarray(
+        [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
+    )
+
+    # Get bin IDs
+    radial_id, angle_id = sectioned_bin_id(
+        shape,
+        r_edges,
+        angle_edges,
+        spacing=spacing,
+        exclude_axis_angle=exclude_axis_angle,
+    )
+
+    # Compute per-bin sums
+    Sx2, Nx = reduce_power_sectioned(fft_image1, radial_id, angle_id, n_radial, n_angle)
+    Sy2, Ny = reduce_power_sectioned(fft_image2, radial_id, angle_id, n_radial, n_angle)
+    Sxy = reduce_cross_sectioned(
+        fft_image1, fft_image2, radial_id, angle_id, n_radial, n_angle
+    )
+
+    del fft_image1, fft_image2
+    del radial_id, angle_id, r_edges, angle_edges
+
+    # Compute FSC for each angle
+    results = {}
+
+    # Nyquist for normalization
+    if spacing is not None:
+        from .radial import _kmax_phys, _kmax_phys_max
+
+        if use_max_nyquist:
+            max_freq = _kmax_phys_max(shape, spacing)
+        else:
+            max_freq = _kmax_phys(shape, spacing)
+    else:
+        if use_max_nyquist:
+            max_freq = max(n // 2 for n in shape)
+        else:
+            max_freq = min(n // 2 for n in shape)
+
+    spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
+
+    # Map bin index to output angle (polar angle from Z axis):
+    # - theta ≈ 0° = Z-dominated frequencies → Z resolution
+    # - theta ≈ 90° = XY-dominated frequencies → XY resolution
+    #
+    # Output angle is the bin center in polar coordinates (0-90°)
+    for aid in range(n_angle):
+        # Bin center in polar coords
+        output_angle = int(round((aid + 0.5) * angle_delta))
+
+        fsc = frc_from_sums(
+            asnumpy(Sx2[aid]),
+            asnumpy(Sy2[aid]),
+            asnumpy(Sxy[aid]),
+        )
+        n_points = asnumpy(Nx[aid].astype(np.float32))
+
+        # Filter out bins with no points (can happen at low frequencies
+        # where angular sectors may have no data, e.g., DC is purely Z-like)
+        valid_mask = n_points > 0
+        fsc_valid = fsc[valid_mask]
+        freq_valid = spatial_freq[valid_mask]
+        n_points_valid = n_points[valid_mask]
+
+        data_set = FourierCorrelationData()
+        data_set.correlation["correlation"] = fsc_valid
+        data_set.correlation["frequency"] = freq_valid
+        data_set.correlation["points-x-bin"] = n_points_valid
+
+        results[output_angle] = data_set
+
+    return results
+
+
 def fsc_resolution(
     image1: np.ndarray,
     image2: np.ndarray | None = None,
     *,
-    bin_delta: int = 10,
-    zero_padding: bool = True,
-    spacing: float | Sequence[float] = 1.0,
+    bin_delta: int = 1,
+    angle_delta: int = 15,
+    zero_padding: bool | None = None,
+    spacing: float | Sequence[float] | None = None,
+    resample_isotropic: bool = False,
+    resample_order: int = 1,
+    average: bool = True,
+    exclude_axis_angle: float = 0.0,
+    use_max_nyquist: bool = False,
+    resolution_threshold: str = "fixed",
+    threshold_value: float = 0.143,
+    backend: str = "hist",
+    z_xy_boundary: float = 30.0,
 ) -> dict[str, float]:
-    """Calculate either single- or two-image FSC-based 3D image resolution."""
-    fsc_result = calculate_sectioned_fsc(
+    """
+    Calculate either single- or two-image FSC-based 3D image resolution.
+
+    Args:
+        image1: First 3D input image
+        image2: Second 3D input image (optional, uses checkerboard split if None)
+        bin_delta: Bin width for radial binning. Default 1 matches the miplib
+                      paper methodology (Koho et al. 2019).
+        angle_delta: Angular bin width in degrees (default 15, same as mask backend)
+        zero_padding: Whether to pad image to cube. Default: True for mask backend,
+                      False for hist backend. The hist backend handles anisotropic
+                      volumes correctly using physical frequency coordinates.
+        spacing: Physical spacing per axis [z, y, x]. If None, uses index units.
+        resample_isotropic: If True, resample images to isotropic voxel size before
+                            FSC calculation. This matches the methodology in Koho et al.
+                            2019 and is recommended for anisotropic volumes with limited
+                            Z extent. Requires spacing to be provided. Default: False.
+        resample_order: Interpolation order for isotropic resampling (0=nearest neighbor,
+                        1=linear, 3=cubic). The miplib paper uses order=0 (nearest neighbor).
+                        Default: 1 (linear interpolation).
+        average: If True and single-image mode, average results from both diagonal
+                 checkerboard splits (forward and reverse) to reduce variance.
+                 Following Koho et al. 2019 methodology. Default: True.
+        exclude_axis_angle: Exclude frequencies within this angle (in degrees) from
+                            the Z axis. Following Koho et al. 2019 to avoid artifacts
+                            from piezo stage motion and interpolation near the optical
+                            axis. Default: 0.0 (no exclusion). Typical value: 5.0.
+        use_max_nyquist: If True (hist backend only), extend frequency range to maximum
+                         Nyquist (typically XY) instead of minimum (typically Z). This
+                         allows XY-dominant sectors to measure higher frequencies for
+                         better XY resolution estimates on anisotropic data.
+                         Default: False.
+        resolution_threshold: Threshold criterion for resolution calculation.
+                              Options: "fixed", "one-bit", "half-bit", "three-sigma".
+                              Default: "fixed" (uses threshold_value).
+        threshold_value: Fixed threshold value when resolution_threshold="fixed".
+                         Default: 0.143 (1/7 threshold). Note: The one-image calibration
+                         correction was empirically calibrated for the 1/7 threshold
+                         (Koho et al. 2019), so using other values may affect accuracy.
+        backend: "hist" (vectorized, GPU-accelerated) or "mask" (deprecated)
+        z_xy_boundary: Polar angle boundary (degrees) for Z-candidate sectors in the
+                       hist backend. Sectors with center below this are tried for Z
+                       resolution in order from narrowest to widest. Default: 30.0
+                       (matches mask backend Z wedge coverage of ~8% of Fourier space).
+    """
+    import warnings
+
+    # Set default zero_padding based on backend:
+    # - mask backend requires padding to cube (iterator assumes isotropic shells)
+    # - hist backend handles anisotropic volumes correctly using spacing
+    if zero_padding is None:
+        zero_padding = backend == "mask"
+
+    # Resample to isotropic voxel size if requested
+    # Save original Z spacing for Z-sector resolution calculation
+    # (needed because isotropic resampling creates artificial high-frequency
+    # correlation beyond the original Z Nyquist)
+    original_spacing_z = None
+    # z_factor for k(θ) correction (Koho et al. 2019, equation 5)
+    # Will be set from original spacing before isotropic resampling overwrites it
+    z_factor = 1.0
+
+    if resample_isotropic:
+        if spacing is None:
+            raise ValueError("resample_isotropic=True requires spacing to be provided")
+
+        # Convert spacing to list if needed
+        if isinstance(spacing, (int, float)):
+            spacing_tuple = (float(spacing),) * image1.ndim
+        else:
+            spacing_tuple = tuple(spacing)
+
+        # Save original Z spacing before resampling
+        original_spacing_z = spacing_tuple[0]
+
+        # Calculate target Z size (must be even for checkerboard split)
+        iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
+
+        # Calculate z_factor from ORIGINAL spacing for k(θ) correction.
+        # Even after isotropic resampling, Z frequencies have lower information
+        # density due to the original anisotropic acquisition.
+        # miplib applies z_correction this way (see Koho et al. 2019 notebook).
+        z_factor = original_spacing_z / iso_spacing
+        target_z_size = int(round(image1.shape[0] * spacing_tuple[0] / iso_spacing))
+        if target_z_size % 2 != 0:
+            target_z_size -= 1  # Make even for checkerboard split
+
+        # Resample image1 to isotropic (upscale Z to match XY resolution)
+        # miplib paper uses order=0 (nearest neighbor), default here is order=1 (linear)
+        image1 = rescale_isotropic(
+            image1,
+            spacing_tuple,
+            downscale_xy=False,
+            order=resample_order,
+            preserve_range=True,
+            target_z_size=target_z_size,
+        ).astype(image1.dtype)
+
+        # Resample image2 if provided
+        if image2 is not None:
+            image2 = rescale_isotropic(
+                image2,
+                spacing_tuple,
+                downscale_xy=False,
+                order=resample_order,
+                preserve_range=True,
+                target_z_size=target_z_size,
+            ).astype(image2.dtype)
+
+        # Crop to even dimensions (required for checkerboard split)
+        # This is needed because rescale_isotropic may produce odd shapes
+        even_shape = tuple(s - (s % 2) for s in image1.shape)
+        if image1.shape != even_shape:
+            slices = tuple(slice(0, es) for es in even_shape)
+            image1 = image1[slices]
+            if image2 is not None:
+                image2 = image2[slices]
+
+        # Update spacing to isotropic (use XY spacing for all axes)
+        spacing = [iso_spacing] * image1.ndim
+
+    if backend == "mask":
+        warnings.warn(
+            "backend='mask' is deprecated and will be removed in a future version. "
+            "Use backend='hist' (default) for faster GPU-accelerated computation.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Original sectioned FSC with iterators (mask backend)
+        # Use one-bit threshold for 3D FSC as recommended by Koho et al. 2019
+        fsc_result = calculate_sectioned_fsc(
+            image1,
+            image2,
+            bin_delta=bin_delta,
+            angle_delta=angle_delta,
+            resolution_threshold="one-bit",
+            spacing=spacing,
+            zero_padding=zero_padding,
+        )
+
+        angle_to_resolution = {
+            int(angle): dataset.resolution["resolution"]
+            for angle, dataset in fsc_result
+        }
+
+        # Mask backend uses phi=arctan2(y,z):
+        #   phi=0°/180° → frequency along Z axis → Z resolution
+        #   phi=90°/270° → frequency in XY plane → XY resolution
+        # Average opposite angles for better statistics
+        z_res = 0.5 * (
+            angle_to_resolution.get(0, np.nan) + angle_to_resolution.get(180, np.nan)
+        )
+        xy_res = 0.5 * (
+            angle_to_resolution.get(90, np.nan) + angle_to_resolution.get(270, np.nan)
+        )
+        return {"xy": xy_res, "z": z_res}
+
+    # hist backend: vectorized sectioned FSC
+    if spacing is None:
+        spacing_list = None
+    elif isinstance(spacing, (int, float)):
+        spacing_list = [float(spacing)] * image1.ndim
+    else:
+        spacing_list = list(spacing)
+
+    # Determine if we should average both splits (only for single-image mode)
+    single_image = image2 is None
+    do_average = average and single_image
+
+    # Save original for reverse split if averaging
+    original_image1 = image1.copy() if do_average else None
+
+    # Preprocess images (forward split)
+    image1_proc, image2_proc = preprocess_images(
         image1,
         image2,
-        bin_delta=bin_delta,
-        spacing=spacing,
         zero_padding=zero_padding,
+        disable_hamming=False,
+        disable_3d_sum=False,
     )
 
-    angle_to_resolution = {
-        int(angle): dataset.resolution["resolution"] for angle, dataset in fsc_result
-    }
+    # Calculate sectioned FSC using hist backend (forward split)
+    fsc_data = _calculate_fsc_sectioned_hist(
+        image1_proc,
+        image2_proc,
+        bin_delta=bin_delta,
+        angle_delta=angle_delta,
+        spacing=spacing_list,
+        exclude_axis_angle=exclude_axis_angle,
+        use_max_nyquist=use_max_nyquist,
+    )
 
-    return {"xy": angle_to_resolution[0], "z": angle_to_resolution[90]}
+    # Average with reverse split if enabled
+    if do_average:
+        # Preprocess with reverse split
+        image1_rev, image2_rev = preprocess_images(
+            original_image1,
+            None,
+            zero_padding=zero_padding,
+            disable_hamming=False,
+            disable_3d_sum=False,
+            reverse_split=True,
+        )
+
+        # Calculate FSC with reverse split
+        fsc_data_rev = _calculate_fsc_sectioned_hist(
+            image1_rev,
+            image2_rev,
+            bin_delta=bin_delta,
+            angle_delta=angle_delta,
+            spacing=spacing_list,
+            exclude_axis_angle=exclude_axis_angle,
+            use_max_nyquist=use_max_nyquist,
+        )
+
+        # Average correlation arrays for each angle
+        for angle in fsc_data.keys():
+            if angle in fsc_data_rev:
+                corr_fwd = np.asarray(fsc_data[angle].correlation["correlation"])
+                corr_rev = np.asarray(fsc_data_rev[angle].correlation["correlation"])
+                fsc_data[angle].correlation["correlation"] = (
+                    0.5 * corr_fwd + 0.5 * corr_rev
+                )
+
+    # Analyze results to get resolution
+    # spacing_list is [Z, Y, X] order
+    #
+    # Polar angle convention (0-90°):
+    #   - angle ≈ 0° = Z-dominated → use Z spacing
+    #   - angle ≈ 90° = XY-dominated → use XY spacing
+    if spacing_list is not None:
+        spacing_xy = spacing_list[1]  # Y spacing (assumes Y==X)
+        spacing_z = spacing_list[0]  # Z spacing
+    else:
+        spacing_xy = 1.0
+        spacing_z = 1.0
+
+    # Calculate anisotropy factor for k(θ) correction (Koho et al. 2019, equation 5)
+    # z_factor = spacing_z / spacing_xy (how many XY pixels fit in one Z step)
+    # Note: If resample_isotropic=True, z_factor was already calculated from original
+    # spacing before the spacing was overwritten to isotropic values.
+    if not resample_isotropic and spacing_list is not None:
+        z_factor = spacing_z / spacing_xy
+    # If resample_isotropic=False and no spacing, z_factor remains 1.0 (no correction)
+
+    # Select XY and Z sectors based on polar angle convention:
+    # - theta ≈ 0° = Z-dominated (|kz| >> k_xy) → Z resolution
+    # - theta ≈ 90° = XY-dominated (k_xy >> |kz|) → XY resolution
+    #
+    # With angle_delta=45: angles = [22, 67] (bin centers)
+    # With angle_delta=15: angles = [7, 22, 37, 52, 67, 82]
+    angles = sorted(fsc_data.keys())
+
+    # For XY resolution: find sector closest to 90°
+    angle_xy = max(angles)  # Highest angle is most XY-dominated
+
+    # For Z resolution: fallback cascade over Z-candidate sectors
+    # Try each sector individually from most Z-dominated to least, stopping at
+    # the first one that yields a finite resolution.
+    z_candidates = [a for a in angles if a < z_xy_boundary]
+    if not z_candidates:
+        z_candidates = [min(angles)]
+
+    results = {}
+
+    # Process XY sector
+    data_xy = fsc_data[angle_xy]
+    data_collection = FourierCorrelationDataCollection()
+    data_collection[0] = data_xy
+    analyzer = FourierCorrelationAnalysis(
+        data_collection,
+        spacing_xy,
+        resolution_threshold=resolution_threshold,
+        threshold_value=threshold_value,
+        curve_fit_type="spline",
+    )
+    try:
+        analyzed = analyzer.execute()[0]
+        # Apply calibration correction for single-image mode
+        if single_image:
+            _apply_cutoff_correction(analyzed)
+        results["xy"] = analyzed.resolution["resolution"]
+    except Exception:
+        results["xy"] = float("nan")
+
+    # Determine spacing for Z resolution calculation
+    # For isotropic resampling: frequencies are in isotropic units, use XY spacing
+    # For non-isotropic: use Z spacing (frequencies normalized to Z Nyquist)
+    if original_spacing_z is not None:
+        analyzer_spacing = spacing_xy  # Frequencies in isotropic units
+    else:
+        analyzer_spacing = spacing_z  # Frequencies normalized to Z Nyquist
+
+    # Process Z resolution: try each Z-candidate sector individually
+    z_resolution = float("nan")
+    z_angle_used = z_candidates[0]
+
+    for z_angle in z_candidates:
+        z_data = fsc_data[z_angle]
+        data_collection = FourierCorrelationDataCollection()
+        data_collection[0] = z_data
+        analyzer = FourierCorrelationAnalysis(
+            data_collection,
+            analyzer_spacing,
+            resolution_threshold=resolution_threshold,
+            threshold_value=threshold_value,
+            curve_fit_type="smooth-spline",
+        )
+        try:
+            analyzed = analyzer.execute()[0]
+            if single_image:
+                _apply_cutoff_correction(analyzed)
+            candidate_res = analyzed.resolution["resolution"]
+            if np.isfinite(candidate_res) and candidate_res > 0:
+                z_resolution = candidate_res
+                z_angle_used = z_angle
+                break
+        except Exception:
+            continue
+
+    # Apply k(θ) correction using actual sector angle (Koho et al. 2019, equation 5)
+    # k(θ) = 1 + (z_factor-1) × |cos(θ)|
+    if np.isfinite(z_resolution) and z_factor > 1.0:
+        k_theta = 1.0 + (z_factor - 1.0) * np.abs(np.cos(np.deg2rad(z_angle_used)))
+        z_resolution = z_resolution * k_theta
+
+    results["z"] = z_resolution
+
+    return results
 
 
 def grid_crop_resolution(
     image: np.ndarray,
     *,
     bin_delta: int = 1,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     crop_size: int = 512,
     pad_mode: str = "reflect",
     return_resolution: bool = True,
@@ -512,7 +1120,7 @@ def five_crop_resolution(
     image: np.ndarray,
     *,
     bin_delta: int = 1,
-    spacing: float | Sequence[float] = 1.0,
+    spacing: float | Sequence[float] | None = None,
     crop_size: int = 512,
     pad_mode: str = "reflect",
     return_resolution: bool = True,
@@ -589,12 +1197,17 @@ def frc_resolution_difference(
     image2: np.ndarray,
     *,
     bin_delta: int = 3,
-    spacing: float | tuple[float, float] = 1.0,
+    spacing: float | tuple[float, float] | None = None,
+    backend: str = "mask",
 ) -> float:
     """Calculate difference between FRC-based resulutions of two images."""
     if isinstance(spacing, (int, float)):
         spacing = (spacing, spacing)
 
-    image1_res = frc_resolution(image1, bin_delta=bin_delta, spacing=spacing)
-    image2_res = frc_resolution(image2, bin_delta=bin_delta, spacing=spacing)
+    image1_res = frc_resolution(
+        image1, bin_delta=bin_delta, spacing=spacing, backend=backend
+    )
+    image2_res = frc_resolution(
+        image2, bin_delta=bin_delta, spacing=spacing, backend=backend
+    )
     return (image2_res - image1_res) * 1000  # return diff in nm
