@@ -285,3 +285,60 @@ def test_dcr_3d_legacy_mode():
     # Both modes should give reasonable results (not necessarily identical)
     assert res_sectioned["xy"] > 0 and np.isfinite(res_sectioned["xy"])
     assert res_sectioned["z"] > 0 and np.isfinite(res_sectioned["z"])
+
+
+def test_dcr_refine_returns_expected_format():
+    """Refinement returns coarse + refined curves and peaks."""
+    image = make_test_image_2d(shape=(64, 64))
+    resolution, radii, all_curves, all_peaks = dcr_curve(
+        image,
+        spacing=0.1,
+        num_radii=50,
+        num_highpass=5,
+        refine=True,
+    )
+    assert resolution > 0
+    # Should have 2 * num_highpass curves (coarse + refined)
+    assert len(all_curves) == 10
+    assert all_peaks.shape == (10, 2)
+
+
+def test_dcr_refine_deterministic():
+    """Refined DCR gives same result for same input."""
+    image = make_test_image_2d(shape=(64, 64), random_seed=42)
+    res1, _, _, _ = dcr_curve(
+        image,
+        spacing=0.1,
+        num_radii=50,
+        num_highpass=5,
+        refine=True,
+    )
+    res2, _, _, _ = dcr_curve(
+        image,
+        spacing=0.1,
+        num_radii=50,
+        num_highpass=5,
+        refine=True,
+    )
+    assert np.isclose(res1, res2)
+
+
+def test_dcr_refine_changes_resolution():
+    """Refined result may differ from single-pass."""
+    image = make_test_image_2d(shape=(128, 128), blob_sigma=3.0, noise_sigma=0.05)
+    res_single, _, _, _ = dcr_curve(
+        image,
+        spacing=0.1,
+        num_radii=50,
+        num_highpass=10,
+    )
+    res_refined, _, _, _ = dcr_curve(
+        image,
+        spacing=0.1,
+        num_radii=50,
+        num_highpass=10,
+        refine=True,
+    )
+    # Both should be positive and finite
+    assert res_single > 0 and np.isfinite(res_single)
+    assert res_refined > 0 and np.isfinite(res_refined)

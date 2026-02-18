@@ -5,7 +5,7 @@ from collections.abc import Sequence
 import numpy as np
 from scipy.signal import savgol_filter
 
-from cubic.cuda import asnumpy, get_array_module
+from cubic.cuda import asnumpy, to_same_device, get_array_module
 from cubic.skimage import filters
 from cubic.image_utils import rescale_isotropic
 
@@ -90,6 +90,7 @@ def dcr_curve(
     num_highpass: int = 10,
     smoothing: int | None = 11,
     windowing: bool = True,
+    refine: bool = False,
 ) -> tuple[float, np.ndarray, list[np.ndarray], np.ndarray]:
     """
     Compute decorrelation curve using algorithm from Descloux et al. 2019.
@@ -113,6 +114,11 @@ def dcr_curve(
         If True (default), apply internal Tukey window for edge apodization.
         Set to False when windowing is applied externally for consistent
         preprocessing across different methods.
+    refine : bool
+        If True, run a second refinement pass with narrowed frequency and
+        sigma ranges around the coarse peaks. This follows the NanoPyx
+        two-pass strategy and often yields a higher k_c (better resolution
+        estimate). Default: False.
 
     Returns
     -------
@@ -121,9 +127,11 @@ def dcr_curve(
     radii : np.ndarray
         Normalized frequency values for mask radii
     all_curves : list of np.ndarray
-        List of d(r) curves for each high-pass filtered version
+        List of d(r) curves for each high-pass filtered version.
+        When refine=True, contains coarse + refined curves (2 * num_highpass).
     all_peaks : np.ndarray
-        Array of [r_i, A_i] pairs (peak position and amplitude), shape (N, 2)
+        Array of [r_i, A_i] pairs (peak position and amplitude), shape (N, 2).
+        When refine=True, contains coarse + refined peaks.
 
     Notes
     -----
@@ -136,6 +144,10 @@ def dcr_curve(
     The high-pass filter sigmas are logarithmically spaced from 0.5 pixels
     to min(image_shape)/2 pixels, following the NanoPyx/ImageJ DecorrAnalysis
     convention from Descloux et al. 2019.
+
+    When refine=True, a second pass narrows both the frequency range and
+    sigma range around the coarse peaks (following NanoPyx convention),
+    then recomputes with finer effective sampling.
     """
     # Validate dimensions
     if image.ndim not in (2, 3):
@@ -190,13 +202,77 @@ def dcr_curve(
         all_curves.append(d_curve)
         all_peaks.append([r_peak, a_peak])
 
-    # Extract peak positions
-    all_peaks = np.array(all_peaks)
-    r_peaks = all_peaks[:, 0]
+    # Extract peak positions from coarse pass
+    all_peaks_arr = np.array(all_peaks)
+    r_peaks = all_peaks_arr[:, 0]
 
-    # Resolution is the MAXIMUM peak frequency (Equation 2 in paper)
-    # k_c is in normalized units (0 to 1), where 1 = Nyquist = k_max
-    k_c_norm = np.max(r_peaks)
+    # --- Two-pass refinement (NanoPyx convention) ---
+    if refine and np.any(r_peaks > 0):
+        a_peaks = all_peaks_arr[:, 1]
+
+        # Two scoring strategies to pick anchor points
+        valid = r_peaks > 0
+        # best_score: max of k_c * A (balances frequency and amplitude)
+        gm = np.where(valid, r_peaks * a_peaks, 0.0)
+        gm_idx = int(np.argmax(gm))
+        kc_gm = r_peaks[gm_idx]
+        # max_score: highest frequency peak
+        max_idx = int(np.argmax(np.where(valid, r_peaks, 0.0)))
+        kc_max_coarse = r_peaks[max_idx]
+
+        # Narrow frequency range
+        r_min2 = max(0.0, min(kc_gm, kc_max_coarse) - 0.05)
+        r_max2 = min(1.0, max(kc_gm, kc_max_coarse) + 0.3)
+
+        # Narrow sigma range
+        idx_lo = max(0, min(gm_idx, max_idx) - 1)
+        idx_hi = max(gm_idx, max_idx)
+        if idx_hi < len(sigmas):
+            sigma_min_r = float(sigmas[idx_lo])
+            sigma_max_r = float(sigmas[idx_hi])
+        else:
+            # Edge case: best index beyond sigma array (d0 had best peak)
+            sigma_min_r = 2.0 / min(image.shape)
+            sigma_max_r = float(sigmas[0]) if len(sigmas) > 0 else 0.5
+        sigmas_refined = _generate_highpass_sigmas(
+            image.shape,
+            num_highpass,
+            sigma_min=sigma_min_r,
+            sigma_max=sigma_max_r,
+        )
+
+        # Second pass with narrowed ranges
+        for sigma_hp in sigmas_refined:
+            filtered = (
+                _highpass_filter(image, sigma_hp) if sigma_hp > 0 else image.copy()
+            )
+            radii_ref, d_ref, _ = _compute_decorrelation_curve(
+                filtered,
+                num_radii,
+                spacing=spacing_arr if spacing is not None else None,
+                smoothing=smoothing,
+                r_min=r_min2,
+                r_max=r_max2,
+            )
+            r_peak, a_peak = _find_peak_in_curve(radii_ref, d_ref)
+            all_curves.append(d_ref)
+            all_peaks.append([r_peak, a_peak])
+
+        # Rebuild peaks array with coarse + refined
+        all_peaks_arr = np.array(all_peaks)
+        r_peaks = all_peaks_arr[:, 0]
+
+        # Use max_score from refined pass for final k_c
+        refined_r_peaks = all_peaks_arr[num_highpass:, 0]
+        if np.any(refined_r_peaks > 0):
+            k_c_norm = float(np.max(refined_r_peaks))
+        else:
+            k_c_norm = float(np.max(r_peaks))
+
+        # Use refined radii for return value
+        radii = radii_ref
+    else:
+        k_c_norm = float(np.max(r_peaks))
 
     # Convert normalized k_c to physical frequency, then to resolution
     # k_c_physical = k_c_norm * k_max (in cycles per unit length)
@@ -207,7 +283,7 @@ def dcr_curve(
     else:
         resolution = float("inf")
 
-    return resolution, radii, all_curves, all_peaks
+    return resolution, radii, all_curves, all_peaks_arr
 
 
 def _compute_decorrelation_curve(
@@ -215,6 +291,8 @@ def _compute_decorrelation_curve(
     num_radii: int = 100,
     spacing: np.ndarray | None = None,
     smoothing: int | None = 11,
+    r_min: float = 0.0,
+    r_max: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Compute decorrelation curve d(r) for a single image (vectorized).
@@ -245,8 +323,6 @@ def _compute_decorrelation_curve(
     k_max : float
         Maximum frequency (Nyquist limit) in physical or index units
     """
-    xp = get_array_module(image)
-
     # Compute FFT (dispatches to cupy.fft if input is on GPU)
     F = np.fft.fftn(image)
 
@@ -257,15 +333,13 @@ def _compute_decorrelation_curve(
     k_radius, k_max = radial_k_grid(image.shape, spacing=spacing)
 
     # Transfer k_radius to same device as image
-    if xp is not np:
-        k_radius = xp.asarray(k_radius)
-
+    k_radius = to_same_device(k_radius, image)
     k_radius_norm = k_radius / k_max
 
     # Build radial bins
-    radii_cpu = np.linspace(0, 1, num_radii, dtype=np.float32)
-    edges_cpu = np.concatenate([[0], radii_cpu]).astype(np.float32)
-    edges = xp.asarray(edges_cpu) if xp is not np else edges_cpu
+    radii_cpu = np.linspace(r_min, r_max, num_radii, dtype=np.float32)
+    edges_cpu = np.concatenate([[r_min], radii_cpu]).astype(np.float32)
+    edges = to_same_device(edges_cpu, image)
 
     # Assign pixels to radial bins
     k_flat = k_radius_norm.ravel()
@@ -305,7 +379,6 @@ def _compute_decorrelation_curve_sectioned(
     if image.ndim != 3:
         raise ValueError("Sectioned DCR requires 3D images")
 
-    xp = get_array_module(image)
     shape = image.shape
 
     F = np.fft.fftn(image)
@@ -317,14 +390,14 @@ def _compute_decorrelation_curve_sectioned(
         shape, bin_delta=bin_delta, spacing=spacing, use_max_nyquist=False
     )
     n_radial_raw = len(radii_raw)
-    r_edges = xp.asarray(r_edges_raw) if xp is not np else r_edges_raw
+    r_edges = to_same_device(r_edges_raw, image)
 
     # Angular edges (polar 0-90°)
     n_angle = 90 // angle_delta
     angle_edges_cpu = np.array(
         [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
     )
-    angle_edges = xp.asarray(angle_edges_cpu) if xp is not np else angle_edges_cpu
+    angle_edges = to_same_device(angle_edges_cpu, image)
 
     # Single k_max for resolution conversion
     if spacing is not None:
@@ -516,6 +589,7 @@ def dcr_resolution(
     exclude_axis_angle: float = 0.0,
     use_sectioned: bool = True,
     windowing: bool = True,
+    refine: bool = False,
 ) -> float | dict[str, float]:
     """
     Calculate resolution using DCR algorithm (Descloux et al. 2019).
@@ -550,6 +624,10 @@ def dcr_resolution(
         If True (default), apply internal Tukey window for edge apodization.
         Set to False when windowing is applied externally for consistent
         preprocessing across different methods.
+    refine : bool
+        If True, run a second refinement pass with narrowed frequency and
+        sigma ranges around the coarse peaks (NanoPyx two-pass strategy).
+        Only used for 2D images. Default: False.
 
     Returns
     -------
@@ -579,6 +657,7 @@ def dcr_resolution(
             num_radii=num_radii,
             num_highpass=num_highpass,
             windowing=windowing,
+            refine=refine,
         )
         return resolution
 
@@ -620,7 +699,7 @@ def dcr_resolution(
             spacing_list = [iso_spacing] * 3
 
         if use_sectioned:
-            # Full 3D analysis with angular sectioning
+            # Full 3D analysis with angular sectoring
             return _dcr_curve_3d_sectioned(
                 image,
                 spacing=np.array(spacing_list) if spacing_list else None,
