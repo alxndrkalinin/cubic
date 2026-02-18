@@ -75,7 +75,7 @@ def test_select_max_contrast_edge_cases() -> None:
 
 def test_checkerboard_split() -> None:
     """Test checkerboard_split and reverse_checkerboard_split functions."""
-    # 2D regular checkerboard
+    # 2D regular checkerboard - matches miplib implementation (Koho et al. 2019)
     img_2d = np.arange(16, dtype=np.float32).reshape(4, 4)
     img1, img2 = checkerboard_split(img_2d)
     assert img1.shape == (2, 2)

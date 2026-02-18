@@ -457,24 +457,40 @@ def _checkerboard_split_impl(
     img_safe = img if img.dtype == safe_dtype else img.astype(safe_dtype)
 
     # Define slicing patterns based on reverse flag
+    # Pattern matches miplib implementation (Koho et al. 2019)
+    # Both images sample from the same diagonal parity for proper FSC calculation
     if reverse:
         # Reverse pattern: (odd, even) vs (even, odd)
         pattern1_y, pattern1_x = 1, 0
         pattern2_y, pattern2_x = 0, 1
     else:
-        # Regular pattern: (odd, odd) vs (even, even)
+        # Regular pattern: (odd, odd) vs (even, even) - matches miplib
         pattern1_y, pattern1_x = 1, 1
         pattern2_y, pattern2_x = 0, 0
 
     if img.ndim == 2:
-        image1 = img_safe[pattern1_y::2, pattern1_x::2]
-        image2 = img_safe[pattern2_y::2, pattern2_x::2]
+        # Truncate to even dimensions to ensure matching shapes
+        h_even = img_safe.shape[0] // 2 * 2
+        w_even = img_safe.shape[1] // 2 * 2
+        img_even = img_safe[:h_even, :w_even]
+        image1 = img_even[pattern1_y::2, pattern1_x::2]
+        image2 = img_even[pattern2_y::2, pattern2_x::2]
     elif disable_3d_sum:
-        image1 = img_safe[1::2, pattern1_y::2, pattern1_x::2]
-        image2 = img_safe[0::2, pattern2_y::2, pattern2_x::2]
+        # Truncate all dimensions to even to ensure matching shapes
+        z_even = img_safe.shape[0] // 2 * 2
+        h_even = img_safe.shape[1] // 2 * 2
+        w_even = img_safe.shape[2] // 2 * 2
+        img_even = img_safe[:z_even, :h_even, :w_even]
+        image1 = img_even[1::2, pattern1_y::2, pattern1_x::2]
+        image2 = img_even[0::2, pattern2_y::2, pattern2_x::2]
     else:
         # Z-summing: sum consecutive Z pairs, then apply 2D checkerboard
-        z_summed = img_safe[0::2] + img_safe[1::2]
+        # Truncate all dimensions to even to ensure matching shapes
+        z_even = img_safe.shape[0] // 2 * 2
+        h_even = img_safe.shape[1] // 2 * 2
+        w_even = img_safe.shape[2] // 2 * 2
+        img_even = img_safe[:z_even, :h_even, :w_even]
+        z_summed = img_even[0::2] + img_even[1::2]
         image1 = z_summed[:, pattern1_y::2, pattern1_x::2]
         image2 = z_summed[:, pattern2_y::2, pattern2_x::2]
         if preserve_range:
