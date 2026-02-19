@@ -412,6 +412,65 @@ def hamming_window(data: np.ndarray) -> np.ndarray:
     return _nd_window(data, xp.hamming, xp.power)
 
 
+def _tukey_window_1d(n: int, alpha: float, xp) -> np.ndarray:
+    """Create 1D Tukey window (device-agnostic, matches scipy exactly).
+
+    Parameters
+    ----------
+    n : int
+        Window length.
+    alpha : float
+        Taper fraction (0 = rectangular, 1 = Hann).
+    xp : module
+        Array module (numpy or cupy).
+
+    Returns
+    -------
+    np.ndarray
+        1D Tukey window of length *n*, dtype float32.
+    """
+    if alpha <= 0:
+        return xp.ones(n, dtype=np.float32)
+    if alpha >= 1:
+        idx = xp.arange(n, dtype=np.float64)
+        return (0.5 * (1 - xp.cos(2 * np.pi * idx / (n - 1)))).astype(np.float32)
+
+    width = int(np.floor(alpha * (n - 1) / 2.0))
+    n1 = xp.arange(0, width + 1, dtype=np.float64)
+    w1 = 0.5 * (1 + xp.cos(np.pi * (-1 + 2.0 * n1 / alpha / (n - 1))))
+    n_middle = (n - width - 1) - (width + 1)
+    w2 = xp.ones(max(n_middle, 0), dtype=np.float64)
+    n3 = xp.arange(n - width - 1, n, dtype=np.float64)
+    w3 = 0.5 * (1 + xp.cos(np.pi * (-2.0 / alpha + 1 + 2.0 * n3 / alpha / (n - 1))))
+    return xp.concatenate([w1, w2, w3]).astype(np.float32)
+
+
+def tukey_window(data: np.ndarray, alpha: float = 0.1) -> np.ndarray:
+    """Apply separable Tukey window for edge apodization.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        N-dimensional input array (numpy or cupy).
+    alpha : float
+        Taper fraction (0 = rectangular, 1 = Hann). Default 0.1.
+
+    Returns
+    -------
+    np.ndarray
+        Windowed copy of *data*.
+    """
+    xp = get_array_module(data)
+    result = data.copy()
+    for axis in range(result.ndim):
+        w = _tukey_window_1d(result.shape[axis], alpha, xp)
+        shape = [1] * result.ndim
+        shape[axis] = result.shape[axis]
+        w = w.reshape(shape)
+        result *= w
+    return result
+
+
 def _checkerboard_split_impl(
     img: np.ndarray,
     disable_3d_sum: bool,

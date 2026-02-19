@@ -7,7 +7,7 @@ from scipy.signal import savgol_filter
 
 from cubic.cuda import asnumpy, to_same_device, get_array_module
 from cubic.skimage import filters
-from cubic.image_utils import rescale_isotropic
+from cubic.image_utils import tukey_window, rescale_isotropic
 
 from .radial import (
     _kmax_phys,
@@ -159,7 +159,7 @@ def dcr_curve(
 
     # Apply Tukey window for edge apodization (unless externally handled)
     if windowing:
-        image = _apply_tukey_window(image, alpha=0.1)
+        image = tukey_window(image, alpha=0.1)
 
     # Normalize spacing
     if spacing is None:
@@ -475,7 +475,7 @@ def _dcr_curve_3d_sectioned(
     image = image.astype(np.float32)
     image -= np.mean(image)
     if windowing:
-        image = _apply_tukey_window(image, alpha=0.1)
+        image = tukey_window(image, alpha=0.1)
 
     spacing_arr = np.array(spacing, dtype=np.float32) if spacing is not None else None
     sigmas = _generate_highpass_sigmas(image.shape, num_highpass)
@@ -542,41 +542,6 @@ def _generate_highpass_sigmas(
     log_min = np.log(max(sigma_min, 0.1))
     log_max = np.log(sigma_max)
     return np.exp(np.linspace(log_min, log_max, num_highpass)).astype(np.float32)
-
-
-def _tukey_window_1d(n: int, alpha: float, xp) -> np.ndarray:
-    """Create 1D Tukey window (device-agnostic, matches scipy exactly)."""
-    if alpha <= 0:
-        return xp.ones(n, dtype=np.float32)
-    if alpha >= 1:
-        idx = xp.arange(n, dtype=np.float64)
-        return (0.5 * (1 - xp.cos(2 * np.pi * idx / (n - 1)))).astype(np.float32)
-
-    width = int(np.floor(alpha * (n - 1) / 2.0))
-    n1 = xp.arange(0, width + 1, dtype=np.float64)
-    w1 = 0.5 * (1 + xp.cos(np.pi * (-1 + 2.0 * n1 / alpha / (n - 1))))
-    n_middle = (n - width - 1) - (width + 1)
-    w2 = xp.ones(max(n_middle, 0), dtype=np.float64)
-    n3 = xp.arange(n - width - 1, n, dtype=np.float64)
-    w3 = 0.5 * (1 + xp.cos(np.pi * (-2.0 / alpha + 1 + 2.0 * n3 / alpha / (n - 1))))
-    return xp.concatenate([w1, w2, w3]).astype(np.float32)
-
-
-def _apply_tukey_window(image: np.ndarray, alpha: float = 0.1) -> np.ndarray:
-    """Apply separable Tukey window for edge apodization (in-place)."""
-    xp = get_array_module(image)
-    for axis in range(image.ndim):
-        w = _tukey_window_1d(image.shape[axis], alpha, xp)
-
-        # Reshape for broadcasting: [1, 1, ..., N, ..., 1]
-        shape = [1] * image.ndim
-        shape[axis] = image.shape[axis]
-        w = w.reshape(shape)
-
-        # In-place multiply
-        image *= w
-
-    return image
 
 
 def dcr_resolution(
