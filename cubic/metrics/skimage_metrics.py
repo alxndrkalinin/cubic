@@ -135,7 +135,13 @@ def ssim(
 
         effective_win = win_size if win_size is not None else 7
         r = effective_win // 2
-        valid = morphology.erosion(mask.astype(bool), morphology.square(2 * r + 1))
+        if mask.ndim == 2:
+            footprint = morphology.square(2 * r + 1)
+        elif mask.ndim == 3:
+            footprint = morphology.cube(2 * r + 1)
+        else:
+            raise ValueError(f"Unsupported mask dimensions: {mask.ndim}")
+        valid = morphology.erosion(mask.astype(bool), footprint)
         mssim_masked = float(np.mean(ssim_map[valid]))
 
         if full:

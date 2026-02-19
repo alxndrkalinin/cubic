@@ -542,6 +542,9 @@ def _checkerboard_split_impl(
         img_even = img_safe[:z_even, :h_even, :w_even]
         image1 = img_even[1::2, pattern1_y::2, pattern1_x::2]
         image2 = img_even[0::2, pattern2_y::2, pattern2_x::2]
+        if preserve_range:
+            image1 = image1.astype(img.dtype)
+            image2 = image2.astype(img.dtype)
     else:
         # Z-summing: sum consecutive Z pairs, then apply 2D checkerboard
         # Truncate all dimensions to even to ensure matching shapes
