@@ -74,7 +74,11 @@ def test_psnr(
     result_scale_inv = psnr(
         img1, img2_scaled, data_range=data_range, scale_invariant=True
     )
-    assert result_scale_inv == float("inf")
+    # After scale-invariant normalization, arrays are algebraically identical but
+    # float64 rounding produces MSE ≈ 7.7e-34, giving PSNR ≈ 341 dB instead of inf.
+    # Threshold: PSNR must exceed what you'd get if MSE were at machine epsilon.
+    min_psnr = -10 * np.log10(np.finfo(img1.dtype).eps)
+    assert result_scale_inv > min_psnr
 
     # (iii) Masked version
     img2_masked = img2.copy()
@@ -86,7 +90,7 @@ def test_psnr(
     result_scale_inv_masked = psnr(
         img1, img2_scaled, mask=test_mask, scale_invariant=True, data_range=data_range
     )
-    assert result_scale_inv_masked == float("inf")
+    assert result_scale_inv_masked > min_psnr
 
 
 def test_ssim(
