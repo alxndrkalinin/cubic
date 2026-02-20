@@ -633,6 +633,7 @@ def _calculate_fsc_sectioned_hist(
         fft_image1, fft_image2, radial_id, angle_id, n_radial, n_angle
     )
 
+    angle_edges_cpu = asnumpy(angle_edges).copy()
     del fft_image1, fft_image2
     del radial_id, angle_id, r_edges, angle_edges
 
@@ -661,8 +662,10 @@ def _calculate_fsc_sectioned_hist(
     #
     # Output angle is the bin center in polar coordinates (0-90°)
     for aid in range(n_angle):
-        # Bin center in polar coords
-        output_angle = int(round((aid + 0.5) * angle_delta))
+        # Bin center in polar coords (midpoint of actual edge values)
+        output_angle = int(
+            round(0.5 * (float(angle_edges_cpu[aid]) + float(angle_edges_cpu[aid + 1])))
+        )
 
         fsc = frc_from_sums(
             asnumpy(Sx2[aid]),
