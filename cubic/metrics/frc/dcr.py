@@ -7,7 +7,7 @@ from scipy.signal import savgol_filter
 
 from cubic.cuda import asnumpy, to_same_device, get_array_module
 from cubic.skimage import filters
-from cubic.image_utils import tukey_window, rescale_isotropic
+from cubic.image_utils import tukey_window
 
 from .radial import (
     _kmax_phys,
@@ -550,7 +550,6 @@ def dcr_resolution(
     spacing: float | Sequence[float] | None = None,
     num_radii: int = 100,
     num_highpass: int = 10,
-    resample_isotropic: bool = False,
     exclude_axis_angle: float = 0.0,
     use_sectioned: bool = True,
     windowing: bool = True,
@@ -574,10 +573,6 @@ def dcr_resolution(
     num_highpass : int
         Number of high-pass filters (default: 10).
         Uses logarithmically-spaced sigmas following NanoPyx convention.
-    resample_isotropic : bool
-        If True, resample 3D images to isotropic voxel size before analysis.
-        This matches the methodology in Koho et al. 2019 and is recommended
-        for anisotropic volumes. Requires spacing to be provided. Default: False.
     exclude_axis_angle : float
         Exclude frequencies within this angle (degrees) from the Z axis.
         Following Koho et al. 2019 to avoid artifacts from piezo stage motion.
@@ -611,7 +606,7 @@ def dcr_resolution(
     >>> # 3D image with full sectioned analysis
     >>> image_3d = np.random.randn(30, 64, 64)
     >>> res = dcr_resolution(image_3d, spacing=[0.2, 0.065, 0.065],
-    ...                      resample_isotropic=True, exclude_axis_angle=5.0)
+    ...                      exclude_axis_angle=5.0)
     >>> print(f"XY: {res['xy']:.2f} μm, Z: {res['z']:.2f} μm")
     """
     if image.ndim == 2:
@@ -634,34 +629,6 @@ def dcr_resolution(
             spacing_list = [float(spacing)] * 3
         else:
             spacing_list = list(spacing)
-
-        # Resample to isotropic voxel size if requested
-        if resample_isotropic:
-            if spacing_list is None:
-                raise ValueError(
-                    "resample_isotropic=True requires spacing to be provided"
-                )
-
-            spacing_tuple = tuple(spacing_list)
-            iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
-
-            # Calculate target Z size
-            target_z_size = int(round(image.shape[0] * spacing_tuple[0] / iso_spacing))
-            if target_z_size % 2 != 0:
-                target_z_size -= 1  # Make even
-
-            # Resample image to isotropic
-            image = rescale_isotropic(
-                image,
-                spacing_tuple,
-                downscale_xy=False,
-                order=1,
-                preserve_range=True,
-                target_z_size=target_z_size,
-            ).astype(image.dtype)
-
-            # Update spacing to isotropic
-            spacing_list = [iso_spacing] * 3
 
         if use_sectioned:
             # Full 3D analysis with angular sectoring
