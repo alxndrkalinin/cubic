@@ -509,3 +509,61 @@ def test_stability_estimate_cutoff_deterministic() -> None:
     c1 = estimate_cutoff(img, spacing=0.065)
     c2 = estimate_cutoff(img, spacing=0.065)
     assert c1 == c2
+
+
+# ===================================================================
+# Tests — method parameter (FRC / FSC cutoff estimation)
+# ===================================================================
+
+
+def test_estimate_cutoff_method_dcr_default() -> None:
+    """method='dcr' matches the default (no method arg) behaviour."""
+    rng = np.random.default_rng(60)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    c_default = estimate_cutoff(img, spacing=0.065)
+    c_dcr = estimate_cutoff(img, spacing=0.065, method="dcr")
+    assert c_default == c_dcr
+
+
+def test_estimate_cutoff_method_frc_2d() -> None:
+    """method='frc' returns a finite positive cutoff for 2-D images."""
+    rng = np.random.default_rng(61)
+    img = rng.standard_normal((128, 128)).astype(np.float32)
+    c = estimate_cutoff(img, spacing=0.065, method="frc")
+    assert np.isfinite(c) and c > 0
+
+
+def test_estimate_cutoff_method_frc_3d() -> None:
+    """method='frc' uses FSC for 3-D images and returns finite positive."""
+    rng = np.random.default_rng(62)
+    img = rng.standard_normal((16, 64, 64)).astype(np.float32)
+    c = estimate_cutoff(img, spacing=[0.2, 0.065, 0.065], method="frc")
+    assert np.isfinite(c) and c > 0
+
+
+def test_estimate_cutoff_method_both() -> None:
+    """method='both' cutoff <= each individual method's cutoff."""
+    rng = np.random.default_rng(63)
+    img = rng.standard_normal((128, 128)).astype(np.float32)
+    c_dcr = estimate_cutoff(img, spacing=0.065, method="dcr")
+    c_frc = estimate_cutoff(img, spacing=0.065, method="frc")
+    c_both = estimate_cutoff(img, spacing=0.065, method="both")
+    # "both" takes the minimum of all bounds, so it should be <= each
+    assert c_both <= c_dcr + 1e-6
+    assert c_both <= c_frc + 1e-6
+
+
+def test_bl_pcc_method_frc() -> None:
+    """band_limited_pcc with method='frc' gives identity = 1.0."""
+    rng = np.random.default_rng(64)
+    img = rng.standard_normal((128, 128)).astype(np.float32)
+    r = band_limited_pcc(img, img, spacing=0.065, method="frc")
+    assert r == pytest.approx(1.0, abs=1e-4)
+
+
+def test_bl_ssim_method_frc() -> None:
+    """band_limited_ssim with method='frc' gives identity ~ 1.0."""
+    rng = np.random.default_rng(65)
+    img = rng.standard_normal((128, 128)).astype(np.float32)
+    s = band_limited_ssim(img, img, spacing=0.065, method="frc")
+    assert s == pytest.approx(1.0, abs=1e-3)

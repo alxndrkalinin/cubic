@@ -151,16 +151,20 @@ def estimate_cutoff(
     numerical_aperture: float | None = None,
     wavelength_emission: float | None = None,
     modality: str = "widefield",
+    method: str = "dcr",
     dcr_safety: float = 1.0,
     otf_safety: float = 0.95,
     nyquist_safety: float = 0.9,
+    frc_safety: float = 1.0,
     dcr_kwargs: dict | None = None,
+    frc_kwargs: dict | None = None,
 ) -> float:
     """Data-driven cutoff frequency estimation.
 
-    Computes up to three independent bounds and returns their minimum:
+    Computes up to four independent bounds and returns their minimum:
 
     * **DCR bound** — ``dcr_safety / dcr_resolution(image)`` (data-driven).
+    * **FRC/FSC bound** — ``frc_safety / frc_resolution(image)`` (data-driven).
     * **OTF bound** — ``otf_safety * otf_cutoff(NA, λ)`` (physics).
     * **Nyquist bound** — ``nyquist_safety * nyquist_cutoff(spacing)``.
 
@@ -170,7 +174,7 @@ def estimate_cutoff(
     Parameters
     ----------
     image : np.ndarray
-        2-D or 3-D image used for the DCR estimate.
+        2-D or 3-D image used for data-driven estimates.
     spacing : float or sequence of float
         Physical pixel / voxel spacing.
     numerical_aperture, wavelength_emission : float, optional
@@ -178,10 +182,17 @@ def estimate_cutoff(
         *spacing*).  Both must be given for the OTF bound.
     modality : str
         Passed to :func:`otf_cutoff`.
-    dcr_safety, otf_safety, nyquist_safety : float
+    method : ``"dcr"`` | ``"frc"`` | ``"both"``
+        Data-driven estimation method.  ``"dcr"`` (default) uses
+        decorrelation analysis; ``"frc"`` uses FRC (2-D) or FSC (3-D);
+        ``"both"`` computes both and takes the minimum.
+    dcr_safety, otf_safety, nyquist_safety, frc_safety : float
         Safety factors applied to each bound.
     dcr_kwargs : dict, optional
         Extra keyword arguments forwarded to ``dcr_resolution``.
+    frc_kwargs : dict, optional
+        Extra keyword arguments forwarded to ``frc_resolution`` /
+        ``fsc_resolution``.
 
     Returns
     -------
@@ -194,23 +205,45 @@ def estimate_cutoff(
         If no bound can be computed (should not happen — Nyquist is always
         available).
     """
-    from .frc.dcr import dcr_resolution
-
     bounds: list[float] = []
 
     # --- DCR (data-driven) bound ---
-    try:
-        dcr_kw = dict(dcr_kwargs) if dcr_kwargs else {}
-        dcr_res = dcr_resolution(image, spacing=spacing, **dcr_kw)
-        if isinstance(dcr_res, dict):
-            # 3-D: use XY resolution
-            dcr_val = dcr_res.get("xy", float("inf"))
-        else:
-            dcr_val = dcr_res
-        if np.isfinite(dcr_val) and dcr_val > 0:
-            bounds.append(dcr_safety / dcr_val)
-    except Exception:
-        pass  # DCR failure → skip
+    if method in ("dcr", "both"):
+        try:
+            from .frc.dcr import dcr_resolution
+
+            dcr_kw = dict(dcr_kwargs) if dcr_kwargs else {}
+            dcr_res = dcr_resolution(image, spacing=spacing, **dcr_kw)
+            if isinstance(dcr_res, dict):
+                # 3-D: use XY resolution
+                dcr_val = dcr_res.get("xy", float("inf"))
+            else:
+                dcr_val = dcr_res
+            if np.isfinite(dcr_val) and dcr_val > 0:
+                bounds.append(dcr_safety / dcr_val)
+        except Exception:
+            pass  # DCR failure → skip
+
+    # --- FRC / FSC (data-driven) bound ---
+    if method in ("frc", "both"):
+        try:
+            frc_kw = dict(frc_kwargs) if frc_kwargs else {}
+            if "spacing" not in frc_kw:
+                frc_kw["spacing"] = spacing
+            if image.ndim == 2:
+                from .frc.frc import frc_resolution
+
+                frc_res = frc_resolution(image, **frc_kw)
+            elif image.ndim == 3:
+                from .frc.frc import fsc_resolution
+
+                frc_res = fsc_resolution(image, **frc_kw).get("xy", float("nan"))
+            else:
+                frc_res = float("nan")
+            if np.isfinite(frc_res) and frc_res > 0:
+                bounds.append(frc_safety / frc_res)
+        except Exception:
+            pass  # FRC/FSC failure → skip
 
     # --- OTF (physics) bound ---
     if numerical_aperture is not None and wavelength_emission is not None:
@@ -415,9 +448,11 @@ def band_limited_pcc(
     numerical_aperture: float | None = None,
     wavelength_emission: float | None = None,
     modality: str = "widefield",
+    method: str = "dcr",
     filter_order: int = 2,
     apodization: str = "tukey",
     dcr_kwargs: dict | None = None,
+    frc_kwargs: dict | None = None,
 ) -> float:
     """Band-limited Pearson correlation coefficient.
 
@@ -438,12 +473,17 @@ def band_limited_pcc(
         Passed to :func:`estimate_cutoff` when *cutoff* is ``None``.
     modality : str
         Passed to :func:`estimate_cutoff`.
+    method : str
+        Data-driven estimation method (``"dcr"``, ``"frc"``, or
+        ``"both"``).  Passed to :func:`estimate_cutoff`.
     filter_order : int
         Butterworth order.
     apodization : str
         Window function (``"tukey"`` or ``"hamming"``).
     dcr_kwargs : dict, optional
         Extra keyword arguments for DCR resolution estimation.
+    frc_kwargs : dict, optional
+        Extra keyword arguments for FRC/FSC resolution estimation.
 
     Returns
     -------
@@ -465,7 +505,9 @@ def band_limited_pcc(
             numerical_aperture=numerical_aperture,
             wavelength_emission=wavelength_emission,
             modality=modality,
+            method=method,
             dcr_kwargs=dcr_kwargs,
+            frc_kwargs=frc_kwargs,
         )
 
     pred_f = _apply_lowpass(
@@ -491,11 +533,13 @@ def band_limited_ssim(
     numerical_aperture: float | None = None,
     wavelength_emission: float | None = None,
     modality: str = "widefield",
+    method: str = "dcr",
     filter_order: int = 2,
     apodization: str = "tukey",
     win_size: int | None = None,
     data_range: float | None = None,
     dcr_kwargs: dict | None = None,
+    frc_kwargs: dict | None = None,
 ) -> float:
     """Band-limited structural similarity index (SSIM).
 
@@ -514,6 +558,9 @@ def band_limited_ssim(
         Passed to :func:`estimate_cutoff`.
     modality : str
         Passed to :func:`estimate_cutoff`.
+    method : str
+        Data-driven estimation method (``"dcr"``, ``"frc"``, or
+        ``"both"``).  Passed to :func:`estimate_cutoff`.
     filter_order : int
         Butterworth order.
     apodization : str
@@ -524,6 +571,8 @@ def band_limited_ssim(
         SSIM data range.  If ``None``, computed from filtered target.
     dcr_kwargs : dict, optional
         Extra keyword arguments for DCR resolution estimation.
+    frc_kwargs : dict, optional
+        Extra keyword arguments for FRC/FSC resolution estimation.
 
     Returns
     -------
@@ -547,7 +596,9 @@ def band_limited_ssim(
             numerical_aperture=numerical_aperture,
             wavelength_emission=wavelength_emission,
             modality=modality,
+            method=method,
             dcr_kwargs=dcr_kwargs,
+            frc_kwargs=frc_kwargs,
         )
 
     pred_f = _apply_lowpass(
