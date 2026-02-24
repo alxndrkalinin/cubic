@@ -100,9 +100,9 @@ def dcr_curve(
     spacing: float | Sequence[float] | None = None,
     num_radii: int = 100,
     num_highpass: int = 10,
-    smoothing: int | None = 11,
+    smoothing: int | None = None,
     windowing: bool = True,
-    refine: bool = False,
+    refine: bool = True,
 ) -> tuple[float, np.ndarray, list[np.ndarray], np.ndarray]:
     """
     Compute decorrelation curve using algorithm from Descloux et al. 2019.
@@ -120,8 +120,8 @@ def dcr_curve(
         Following NanoPyx convention, uses logarithmically-spaced sigmas.
     smoothing : int or None
         Savitzky-Golay filter window length for curve smoothing.
-        Default: 11 reduces noise while preserving peak shape.
-        Set to None to disable smoothing.
+        Default: None (disabled). The decorrelation curve is intrinsically
+        smooth (Descloux et al. 2019, Supplementary Note 1).
     windowing : bool
         If True (default), apply internal Tukey window for edge apodization.
         Set to False when windowing is applied externally for consistent
@@ -130,7 +130,7 @@ def dcr_curve(
         If True, run a second refinement pass with narrowed frequency and
         sigma ranges around the coarse peaks. This follows the NanoPyx
         two-pass strategy and often yields a higher k_c (better resolution
-        estimate). Default: False.
+        estimate). Default: True.
 
     Returns
     -------
@@ -153,7 +153,7 @@ def dcr_curve(
     3. Apply N_g high-pass filters and repeat
     4. Resolution = max(r_0, r_1, ..., r_Ng)
 
-    The high-pass filter sigmas are logarithmically spaced from 0.5 pixels
+    The high-pass filter sigmas are logarithmically spaced from 1.0 pixels
     to min(image_shape)/2 pixels, following the NanoPyx/ImageJ DecorrAnalysis
     convention from Descloux et al. 2019.
 
@@ -244,7 +244,7 @@ def dcr_curve(
             sigma_max_r = float(sigmas[idx_hi])
         else:
             # Edge case: best index beyond sigma array (d0 had best peak)
-            sigma_min_r = 2.0 / min(image.shape)
+            sigma_min_r = max(2.0 / min(image.shape), 1.0)
             sigma_max_r = float(sigmas[0]) if len(sigmas) > 0 else 0.5
         sigmas_refined = _generate_highpass_sigmas(
             image.shape,
@@ -302,7 +302,7 @@ def _compute_decorrelation_curve(
     image: np.ndarray,
     num_radii: int = 100,
     spacing: np.ndarray | None = None,
-    smoothing: int | None = 11,
+    smoothing: int | None = None,
     r_min: float = 0.0,
     r_max: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -323,8 +323,8 @@ def _compute_decorrelation_curve(
         Physical spacing per axis. If None, uses index units.
     smoothing : int or None
         Savitzky-Golay filter window length for curve smoothing.
-        Default: 11 reduces noise while preserving peak shape.
-        Set to None to disable smoothing.
+        Default: None (disabled). The decorrelation curve is intrinsically
+        smooth (Descloux et al. 2019, Supplementary Note 1).
 
     Returns
     -------
@@ -380,7 +380,7 @@ def _compute_decorrelation_curve_sectioned(
     bin_delta: int = 1,
     spacing: np.ndarray | None = None,
     exclude_axis_angle: float = 0.0,
-    smoothing: int | None = 11,
+    smoothing: int | None = None,
 ) -> dict[str, tuple[np.ndarray, np.ndarray, float]]:
     """
     Compute sectioned decorrelation curves for 3D images.
@@ -476,7 +476,7 @@ def _dcr_curve_3d_sectioned(
     num_highpass: int = 10,
     angle_delta: int = 45,
     bin_delta: int = 1,
-    smoothing: int | None = 11,
+    smoothing: int | None = None,
     exclude_axis_angle: float = 0.0,
     windowing: bool = True,
 ) -> dict[str, float]:
@@ -546,12 +546,18 @@ def _generate_highpass_sigmas(
     sigma_min: float = 0.5,
     sigma_max: float | None = None,
 ) -> np.ndarray:
-    """Generate log-spaced high-pass sigmas (NanoPyx convention)."""
+    """Generate log-spaced high-pass sigmas (NanoPyx convention).
+
+    The floor is 1.0 pixel because spatial-domain Gaussian subtraction
+    (image - gaussian(image, σ)) becomes degenerate when σ < ~1 px: the
+    discrete kernel collapses to near-identity and the high-pass filter
+    removes almost no signal.
+    """
     if sigma_max is None:
         sigma_max = min(image_shape) / 2.0
     if num_highpass <= 1:
         return np.array([sigma_min], dtype=np.float32)
-    log_min = np.log(max(sigma_min, 0.1))
+    log_min = np.log(max(sigma_min, 1.0))
     log_max = np.log(sigma_max)
     return np.exp(np.linspace(log_min, log_max, num_highpass)).astype(np.float32)
 
@@ -565,7 +571,7 @@ def dcr_resolution(
     exclude_axis_angle: float = 0.0,
     use_sectioned: bool = True,
     windowing: bool = True,
-    refine: bool = False,
+    refine: bool = True,
 ) -> float | dict[str, float]:
     """
     Calculate resolution using DCR algorithm (Descloux et al. 2019).

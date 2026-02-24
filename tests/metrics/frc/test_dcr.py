@@ -175,9 +175,10 @@ def test_dcr_curve_returns_expected_format():
     # Check values
     assert resolution > 0, "Resolution should be positive"
     assert len(radii) == 50, "Should have num_radii sampling points"
-    assert len(all_curves) == 10, "Should have num_highpass curves"
-    assert len(all_peaks) == 10, "Should have num_highpass peaks"
-    assert all_peaks.shape == (10, 2), "All peaks should be (N, 2) array"
+    # With refine=True (default), curves include coarse + refined passes
+    assert len(all_curves) >= 10, "Should have at least num_highpass curves"
+    assert len(all_peaks) >= 10, "Should have at least num_highpass peaks"
+    assert all_peaks.shape[1] == 2, "All peaks should be (N, 2) array"
 
 
 def test_dcr_num_radii_effect():
@@ -206,9 +207,10 @@ def test_dcr_highpass_effect():
         image, spacing=0.1, num_radii=50, num_highpass=10
     )
 
-    # Number of curves should differ
-    assert len(curves_minimal) == 2, "num_highpass=2 should give 2 curves"
-    assert len(curves_with_hp) == 10, "num_highpass=10 should give 10 curves"
+    # More HP filters should produce more curves (with refinement, 2x)
+    assert len(curves_minimal) >= 2, "num_highpass=2 should give at least 2 curves"
+    assert len(curves_with_hp) >= 10, "num_highpass=10 should give at least 10 curves"
+    assert len(curves_with_hp) > len(curves_minimal), "More HP filters = more curves"
 
     # Both should give positive finite resolution with structured image
     assert res_with_hp > 0 and np.isfinite(res_with_hp), "10 filters should find peak"
