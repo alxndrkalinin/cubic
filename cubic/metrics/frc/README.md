@@ -158,7 +158,7 @@ res = dcr_resolution(image_3d, spacing=[0.2, 0.065, 0.065], use_sectioned=False)
 | `spacing` | None | Physical spacing [Z, Y, X] in microns |
 | `num_radii` | 100 | Number of radial sampling points |
 | `num_highpass` | 10 | Number of high-pass filter levels |
-| `smoothing` | 11 | Savitzky-Golay filter window for curve smoothing (None to disable) |
+| `smoothing` | None | Savitzky-Golay filter window for curve smoothing (None to disable) |
 | `use_sectioned` | True | Use full 3D angular sectoring |
 
 ## 3D Angular Sectoring
@@ -173,6 +173,52 @@ where k_xy = sqrt(kx² + ky²).
 With the default `angle_delta=45°`, 2 sectors are created:
 - Z sector: 0-45° (centered at 22.5°)
 - XY sector: 45-90° (centered at 67.5°)
+
+### Polar Cone vs Azimuthal Wedge Geometry
+
+To compute SFSC, 3D Fourier space must be divided into angular sectors so that
+a separate correlation curve can be calculated for each direction. There are two
+ways to do this:
+
+**Azimuthal Wedge** (miplib / Koho et al. 2019): `phi = arctan2(ky, kz)`, 0-360°
+
+The miplib approach creates interchangeable "Fourier Shell iterators" that walk
+through spherical shells in 3D Fourier space. For SFSC, the shell is further
+divided into angular **wedge** sections defined by the azimuthal angle phi in the
+Y-Z plane. Each wedge is a vertical slice through the sphere (like cutting an
+orange), spanning from pole to pole and extending through all kx. A wedge at
+phi=0° captures Z-axis frequencies; at phi=90° it captures Y-axis frequencies.
+Paired opposite wedges (e.g., 0° and 180°) are combined for symmetry, giving
+24 sectors at 15° spacing over the full 360°. Special iterators can exclude
+frequencies near the optical axis (Z) to avoid artifacts from piezo scanning
+and interpolation. The same iterator design is used for 2D FRC in polar
+coordinates, where rings replace shells and only one correlation curve is
+computed per image.
+
+**Polar Cone** (hist backend): `theta = arctan2(k_xy, |kz|)`, 0-90°
+
+The hist backend takes a different approach: instead of azimuthal wedges, it
+bins voxels by their **polar angle** theta from the Z axis, where
+k_xy = sqrt(kx² + ky²). This creates conical bands around Z (like latitude
+lines on a globe). Each cone captures all azimuthal directions equally,
+exploiting the cylindrical symmetry of the microscope PSF. With |kz| folding,
+only 0-90° is needed, giving 6 sectors at 15° spacing. Axis exclusion
+(`exclude_axis_angle`) removes voxels near theta=0° (the Z axis) to avoid
+the same piezo/interpolation artifacts.
+
+**Comparison**:
+
+| | Azimuthal Wedge | Polar Cone |
+|---|---|---|
+| Sectors at 15° | 24 (0-360°) | 6 (0-90°) |
+| Voxels per sector | Fewer | More (rotationally averaged) |
+| Lateral directions | Resolves X vs Y | Averages all lateral |
+| GPU vectorization | Requires iterator | Natural with histogram binning |
+
+For standard fluorescence microscopy with rotationally symmetric PSFs (confocal,
+widefield, STED), both approaches produce equivalent XY and Z resolution estimates.
+The polar cone approach is preferred for its better per-sector statistics and natural
+compatibility with vectorized GPU computation.
 
 ### Anisotropic Data Handling
 
@@ -209,6 +255,25 @@ For anisotropic voxels (e.g., Z spacing >> XY spacing):
 1. **Power-weighted**: Underestimates resolution when high-frequency signal has low power
 2. **Not ideal for super-resolution**: STED, PALM, STORM data often gives worse estimates than FSC
 3. **Monotonic curves**: Low-SNR data may show no peak → returns infinity
+
+## DCR Implementation Comparison
+
+Comparison of DCR implementations across ImDecorr (original MATLAB), NanoPyx, and cubic:
+
+| Aspect | ImDecorr (original MATLAB) | NanoPyx | cubic |
+|---|---|---|---|
+| Nr (num_radii) | 50 | 50 | 100 |
+| Ng (num_highpass) | 10 | 10 | 2D: 10; 3D: 10+1 (extra weak entry) |
+| g_min (weakest HP) | size(im)/4 (~128 for 512px) | 0.14 | 2D: 0.5; 3D: max(shape)/4·2/π + adaptive from d₀ |
+| g_max (strongest HP) | 0.15 | auto | 2D: min(shape)/2; 3D: floor at σ=1.0 px |
+| HP filter domain | Fourier: 1 - exp(-2g²R²) | Spatial: im - gaussian(im, σ) | Spatial: im - gaussian(im, σ) |
+| Refinement | Always 2-pass | Always 2-pass | Always 2-pass (default) |
+| Edge handling | Cosine apod (20px) | Apodize + pad to power-of-2 | Tukey window (α=0.1) |
+| Peak prominence | 0.0005 (getDcorrLocalMax) | 0.001 | 0.001 |
+| Correlation rounding | floor(1000*cc)/1000 (3 dec) | None | None |
+| SNR gate | kc(SNR < 0.05) = 0 | None explicit | None |
+| Scoring | max(kc) | Two: kc*A and kc | Two: kc*A and kc for refinement, max(kc) final |
+| d(r) formula | Per-radius Pearson CC | Per-radius Pearson CC | Cumulative bincount |
 
 ## References
 
