@@ -192,7 +192,9 @@ def estimate_cutoff(
         Extra keyword arguments forwarded to ``dcr_resolution``.
     frc_kwargs : dict, optional
         Extra keyword arguments forwarded to ``frc_resolution`` /
-        ``fsc_resolution``.
+        ``fsc_resolution``.  For 3-D inputs, ``zero_padding=True`` and
+        ``resample_isotropic=True`` (when spacing is anisotropic) are set
+        by default unless explicitly overridden here.
 
     Returns
     -------
@@ -236,6 +238,14 @@ def estimate_cutoff(
                 frc_res = frc_resolution(image, **frc_kw)
             elif image.ndim == 3:
                 from .frc.frc import fsc_resolution
+
+                # FSC defaults: hist backend uses zero_padding=False, but
+                # padding improves shell-binning accuracy; isotropic
+                # resampling helps anisotropic volumes (e.g. Z >> XY spacing).
+                if "zero_padding" not in frc_kw:
+                    frc_kw["zero_padding"] = True
+                if "resample_isotropic" not in frc_kw:
+                    frc_kw["resample_isotropic"] = _is_anisotropic(spacing)
 
                 frc_res = fsc_resolution(image, **frc_kw).get("xy", float("nan"))
             else:
@@ -741,6 +751,19 @@ def _normalize_spacing(
     if len(sp) != ndim:
         raise ValueError(f"spacing length {len(sp)} != image ndim {ndim}")
     return sp
+
+
+def _is_anisotropic(
+    spacing: float | Sequence[float],
+    ratio_threshold: float = 1.5,
+) -> bool:
+    """Return True if max/min spacing ratio exceeds *ratio_threshold*."""
+    if isinstance(spacing, (int, float)):
+        return False
+    values = [float(s) for s in spacing]
+    if len(values) <= 1:
+        return False
+    return max(values) / min(values) > ratio_threshold
 
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:

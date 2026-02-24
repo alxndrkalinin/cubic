@@ -567,3 +567,99 @@ def test_bl_ssim_method_frc() -> None:
     img = rng.standard_normal((128, 128)).astype(np.float32)
     s = band_limited_ssim(img, img, spacing=0.065, method="frc")
     assert s == pytest.approx(1.0, abs=1e-3)
+
+
+# ===================================================================
+# Tests — FSC default preprocessing in estimate_cutoff
+# ===================================================================
+
+
+def test_estimate_cutoff_fsc_defaults_anisotropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anisotropic 3-D: FSC gets zero_padding=True, resample_isotropic=True."""
+    captured: dict = {}
+
+    def fake_fsc(image, **kwargs):
+        captured.update(kwargs)
+        return {"xy": 0.5, "z": 1.0}
+
+    import cubic.metrics.frc.frc as _frc_mod
+
+    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+
+    rng = np.random.default_rng(70)
+    img = rng.standard_normal((16, 64, 64)).astype(np.float32)
+    estimate_cutoff(img, spacing=[0.3, 0.065, 0.065], method="frc")
+
+    assert captured["zero_padding"] is True
+    assert captured["resample_isotropic"] is True
+
+
+def test_estimate_cutoff_fsc_user_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """User frc_kwargs override the FSC defaults."""
+    captured: dict = {}
+
+    def fake_fsc(image, **kwargs):
+        captured.update(kwargs)
+        return {"xy": 0.5, "z": 1.0}
+
+    import cubic.metrics.frc.frc as _frc_mod
+
+    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+
+    rng = np.random.default_rng(71)
+    img = rng.standard_normal((16, 64, 64)).astype(np.float32)
+    estimate_cutoff(
+        img,
+        spacing=[0.3, 0.065, 0.065],
+        method="frc",
+        frc_kwargs={"zero_padding": False, "resample_isotropic": False},
+    )
+
+    assert captured["zero_padding"] is False
+    assert captured["resample_isotropic"] is False
+
+
+def test_estimate_cutoff_fsc_isotropic_no_resample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Isotropic 3-D: FSC gets resample_isotropic=False."""
+    captured: dict = {}
+
+    def fake_fsc(image, **kwargs):
+        captured.update(kwargs)
+        return {"xy": 0.5, "z": 1.0}
+
+    import cubic.metrics.frc.frc as _frc_mod
+
+    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+
+    rng = np.random.default_rng(72)
+    img = rng.standard_normal((32, 32, 32)).astype(np.float32)
+    estimate_cutoff(img, spacing=[0.065, 0.065, 0.065], method="frc")
+
+    assert captured["zero_padding"] is True
+    assert captured["resample_isotropic"] is False
+
+
+def test_estimate_cutoff_fsc_defaults_with_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """method='both' still applies FSC defaults for the FSC branch."""
+    captured: dict = {}
+
+    def fake_fsc(image, **kwargs):
+        captured.update(kwargs)
+        return {"xy": 0.5, "z": 1.0}
+
+    import cubic.metrics.frc.frc as _frc_mod
+
+    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+
+    rng = np.random.default_rng(73)
+    img = rng.standard_normal((16, 64, 64)).astype(np.float32)
+    estimate_cutoff(img, spacing=[0.3, 0.065, 0.065], method="both")
+
+    assert captured["zero_padding"] is True
+    assert captured["resample_isotropic"] is True
