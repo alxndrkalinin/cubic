@@ -13,6 +13,7 @@ from .radial import (
     _kmax_phys,
     radial_edges,
     radial_k_grid,
+    _kmax_phys_max,
     sectioned_bin_id,
 )
 
@@ -397,9 +398,10 @@ def _compute_decorrelation_curve_sectioned(
     absF = np.abs(F)
     absF_flat = absF.ravel()
 
-    # Single radial edges (use min Nyquist for consistent comparison)
+    # Use max Nyquist so radial bins extend to XY frequencies.
+    # Per-sector k_max handles the different normalization for Z vs XY.
     r_edges_raw, radii_raw = radial_edges(
-        shape, bin_delta=bin_delta, spacing=spacing, use_max_nyquist=False
+        shape, bin_delta=bin_delta, spacing=spacing, use_max_nyquist=True
     )
     n_radial_raw = len(radii_raw)
     r_edges = to_same_device(r_edges_raw, image)
@@ -411,11 +413,14 @@ def _compute_decorrelation_curve_sectioned(
     )
     angle_edges = to_same_device(angle_edges_cpu, image)
 
-    # Single k_max for resolution conversion
+    # Per-sector k_max for resolution conversion
+    # XY sector uses XY-Nyquist (max), Z sector uses Z-Nyquist (min)
     if spacing is not None:
-        k_max = _kmax_phys(shape, spacing)
+        k_max_z = _kmax_phys(shape, spacing)
+        k_max_xy = _kmax_phys_max(shape, spacing)
     else:
-        k_max = min(n // 2 for n in shape)
+        k_max_z = min(n // 2 for n in shape)
+        k_max_xy = max(n // 2 for n in shape)
 
     # Get sectioned bin IDs
     radial_id, angle_id = sectioned_bin_id(
@@ -433,6 +438,7 @@ def _compute_decorrelation_curve_sectioned(
     for aid in range(n_angle):
         center_angle = (aid + 0.5) * angle_delta
         sector_name = "z" if center_angle < 45 else "xy"
+        sector_k_max = k_max_z if sector_name == "z" else k_max_xy
         sector_mask = (angle_id == aid) & (radial_id >= 0)
 
         if not np.any(sector_mask):
@@ -440,7 +446,7 @@ def _compute_decorrelation_curve_sectioned(
             results[sector_name] = (
                 radii_norm,
                 np.zeros(num_radii, dtype=np.float32),
-                k_max,
+                sector_k_max,
             )
             continue
 
@@ -457,13 +463,19 @@ def _compute_decorrelation_curve_sectioned(
         power = np.sum(sector_absF**2)
         d_curve_raw = cross_cumsum / (np.sqrt(power * count_cumsum) + 1e-10)
 
-        # Resample to num_radii points
+        # Resample to num_radii points, normalized to sector-specific k_max
         radii_norm = np.linspace(0, 1, num_radii, dtype=np.float32)
         d_curve = np.interp(
-            radii_norm, radii_raw / k_max, asnumpy(d_curve_raw).astype(np.float32)
+            radii_norm,
+            radii_raw / sector_k_max,
+            asnumpy(d_curve_raw).astype(np.float32),
         )
 
-        results[sector_name] = (radii_norm, _smooth_curve(d_curve, smoothing), k_max)
+        results[sector_name] = (
+            radii_norm,
+            _smooth_curve(d_curve, smoothing),
+            sector_k_max,
+        )
 
     return results
 
@@ -479,8 +491,16 @@ def _dcr_curve_3d_sectioned(
     smoothing: int | None = None,
     exclude_axis_angle: float = 0.0,
     windowing: bool = True,
+    refine: bool = True,
 ) -> dict[str, float]:
-    """Compute 3D DCR with angular sectoring for XY and Z directions."""
+    """Compute 3D DCR with angular sectoring for XY and Z directions.
+
+    Follows Descloux et al. 2019 algorithm:
+    1. Compute d₀ (unfiltered) per sector to find initial peak r₀
+    2. Use r₀ to set adaptive HP sigma range (ImDecorr convention)
+    3. Sweep HP filters, find peaks per sector
+    4. Optional 2-pass refinement (default: on)
+    """
     if image.ndim != 3:
         raise ValueError("3D sectioned DCR requires 3D images")
 
@@ -490,39 +510,120 @@ def _dcr_curve_3d_sectioned(
         image = tukey_window(image, alpha=0.1)
 
     spacing_arr = np.array(spacing, dtype=np.float32) if spacing is not None else None
-    sigmas = _generate_highpass_sigmas(image.shape, num_highpass)
-    all_peaks = {"xy": [], "z": []}
 
-    for sigma_hp in sigmas:
-        filtered_image = (
-            _highpass_filter(image, sigma_hp) if sigma_hp > 0 else image.copy()
+    common_kwargs = dict(
+        num_radii=num_radii,
+        angle_delta=angle_delta,
+        bin_delta=bin_delta,
+        spacing=spacing_arr,
+        exclude_axis_angle=exclude_axis_angle,
+        smoothing=smoothing,
+    )
+
+    # --- Step 1: Compute d₀ (unfiltered) to anchor sigma range ---
+    d0_results = _compute_decorrelation_curve_sectioned(image, **common_kwargs)
+
+    r0 = {}
+    all_peaks: dict[str, list[tuple[float, float]]] = {"xy": [], "z": []}
+    for sector_name in ["xy", "z"]:
+        radii, d_curve, _ = d0_results[sector_name]
+        r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
+        r0[sector_name] = r_peak
+        all_peaks[sector_name].append((r_peak, a_peak))
+
+    # --- Step 2: Adaptive sigma range per sector ---
+    # ImDecorr: g from gMax=2/r₀ (weak HP) to 0.15 (strong HP)
+    # Conversion: σ_cubic ≈ 2g/π
+    # Plus extra weak-HP entry at g=size(im)/4 → σ≈2*(max(shape)/4)/π
+    sector_sigmas: dict[str, np.ndarray] = {}
+    for sector_name in ["xy", "z"]:
+        r0_val = r0[sector_name]
+        if r0_val > 0:
+            g_max = 2.0 / r0_val
+            sigma_max_adaptive = 2.0 * g_max / np.pi
+        else:
+            # Fallback if no d₀ peak
+            sigma_max_adaptive = max(image.shape) / 4.0
+        # Spatial Gaussians with σ < 1 pixel are degenerate on discrete grids.
+        # ImDecorr's g=0.15 maps to σ≈0.096, but we floor at 1.0 pixel.
+        sigma_min_adaptive = 1.0
+        # Extra weak-HP entry (ImDecorr: g=size(im)/4)
+        sigma_extra_weak = 2.0 * (max(image.shape) / 4.0) / np.pi
+        # Generate log-spaced sigmas from strong to weak
+        base_sigmas = _generate_highpass_sigmas(
+            image.shape,
+            num_highpass,
+            sigma_min=sigma_min_adaptive,
+            sigma_max=max(sigma_max_adaptive, sigma_min_adaptive + 0.1),
         )
+        # Prepend extra weak-HP entry (like ImDecorr line 111)
+        sector_sigmas[sector_name] = np.concatenate([[sigma_extra_weak], base_sigmas])
 
+    # --- Step 3: Coarse pass with adaptive sigmas ---
+    # Use the union of both sector sigma sets
+    all_sigmas_set = set(sector_sigmas["xy"].tolist() + sector_sigmas["z"].tolist())
+    all_sigmas = np.array(sorted(all_sigmas_set), dtype=np.float32)
+
+    for sigma_hp in all_sigmas:
+        filtered_image = _highpass_filter(image, sigma_hp)
         sector_results = _compute_decorrelation_curve_sectioned(
-            filtered_image,
-            num_radii=num_radii,
-            angle_delta=angle_delta,
-            bin_delta=bin_delta,
-            spacing=spacing_arr,
-            exclude_axis_angle=exclude_axis_angle,
-            smoothing=smoothing,
+            filtered_image, **common_kwargs
         )
-
         for sector_name in ["xy", "z"]:
             radii, d_curve, _ = sector_results[sector_name]
-            r_peak, _ = _find_peak_in_curve(radii, d_curve)
-            all_peaks[sector_name].append(r_peak)
-
+            r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
+            all_peaks[sector_name].append((r_peak, a_peak))
         del filtered_image
 
-    # Compute resolution for each sector
+    # --- Step 4: Optional 2-pass refinement ---
+    if refine:
+        for sector_name in ["xy", "z"]:
+            peaks = np.array(all_peaks[sector_name])
+            r_peaks = peaks[:, 0]
+            a_peaks = peaks[:, 1]
+            valid = r_peaks > 0
+            if not np.any(valid):
+                continue
+
+            # Two scoring strategies (ImDecorr convention)
+            gm = np.where(valid, r_peaks * a_peaks, 0.0)
+            kc_gm = r_peaks[int(np.argmax(gm))]
+            kc_max = np.max(r_peaks[valid])
+
+            # Narrow frequency range (ImDecorr line 183)
+            r_min2 = max(0.0, min(kc_gm, kc_max) - 0.05)
+            r_max2 = min(1.0, max(kc_gm, kc_max) + 0.4)
+
+            # Narrow sigma range around best peaks
+            s_arr = sector_sigmas[sector_name]
+            gm_idx = int(np.argmax(gm))
+            max_idx = int(np.argmax(np.where(valid, r_peaks, 0.0)))
+            # Indices are offset by 1 (d₀ is at index 0)
+            s_lo = max(0, min(gm_idx, max_idx) - 1)
+            s_hi = min(len(s_arr) - 1, max(gm_idx, max_idx))
+            refined_sigmas = _generate_highpass_sigmas(
+                image.shape,
+                num_highpass,
+                sigma_min=float(s_arr[s_lo]) if s_lo < len(s_arr) else 1.0,
+                sigma_max=float(s_arr[s_hi]) if s_hi < len(s_arr) else 1.0,
+            )
+
+            for sigma_hp in refined_sigmas:
+                filtered = _highpass_filter(image, sigma_hp)
+                sr = _compute_decorrelation_curve_sectioned(filtered, **common_kwargs)
+                radii, d_curve, _ = sr[sector_name]
+                r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
+                all_peaks[sector_name].append((r_peak, a_peak))
+                del filtered
+
+    # --- Step 5: Compute resolution for each sector ---
     resolutions = {}
     for sector_name in ["xy", "z"]:
-        r_peaks = np.array(all_peaks[sector_name])
-        k_c_norm = np.max(r_peaks)
+        peaks = np.array(all_peaks[sector_name])
+        r_peaks = peaks[:, 0]
+        k_c_norm = float(np.max(r_peaks))
 
-        # Get k_max from last computation
-        _, _, k_max = sector_results[sector_name]
+        _, _, k_max = d0_results[sector_name]
 
         if k_c_norm > 0 and k_max > 0:
             k_c_physical = k_c_norm * k_max
@@ -658,6 +759,7 @@ def dcr_resolution(
                 angle_delta=45,
                 exclude_axis_angle=exclude_axis_angle,
                 windowing=windowing,
+                refine=refine,
             )
         else:
             # Legacy: compute directional resolutions from 2D slices
