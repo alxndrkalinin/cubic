@@ -49,7 +49,7 @@ def _find_peak_in_curve(
     # Mask invalid frequency regions
     d_work[(radii < r_min) | (radii >= r_max)] = -np.inf
 
-    for _ in range(20):  # Max iterations to prevent infinite loop
+    for _ in range(n):  # Match ImDecorr: iterate until peak found or all exhausted
         peak_idx = int(np.argmax(d_work))
         if d_work[peak_idx] == -np.inf:
             return 0.0, 0.0
@@ -62,6 +62,17 @@ def _find_peak_in_curve(
             d_work[peak_idx] = -np.inf
             continue
 
+        # Local maximum check: curve must actually decrease after the peak.
+        # Without this, a point on a monotonically increasing slope can be
+        # accepted as a "peak" when all higher-frequency candidates are
+        # rejected by the boundary check.
+        lookahead = max(3, n // 20)
+        end_idx = min(peak_idx + lookahead, n)
+        if peak_idx + 1 < end_idx:
+            if np.all(d_curve[peak_idx + 1 : end_idx] >= a_peak):
+                d_work[peak_idx] = -np.inf
+                continue
+
         # For peaks near boundary, reject if curve is mostly increasing (>80%)
         if r_peak > boundary_threshold:
             valid_start = int(np.searchsorted(radii, r_min))
@@ -71,9 +82,10 @@ def _find_peak_in_curve(
                     d_work[peak_idx] = -np.inf
                     continue
 
-        # Prominence check: peak must exceed subsequent minimum
+        # Prominence check: peak must exceed subsequent local minimum
         if peak_idx < n - 1:
-            if a_peak - np.min(d_curve[peak_idx + 1 :]) < min_prominence:
+            prom_end = min(peak_idx + max(10, n // 5), n)
+            if a_peak - np.min(d_curve[peak_idx + 1 : prom_end]) < min_prominence:
                 d_work[peak_idx] = -np.inf
                 continue
 
