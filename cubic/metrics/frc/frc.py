@@ -287,6 +287,7 @@ def calculate_frc(
     snr_value: float = 7.0,
     curve_fit_type: str = "spline",
     curve_fit_degree: int = 3,
+    smoothing_factor: float = 0.05,
     disable_hamming: bool = False,
     average: bool = True,
     z_correction: float = 1.0,
@@ -365,6 +366,7 @@ def calculate_frc(
         snr_value=snr_value,
         curve_fit_type=curve_fit_type,
         curve_fit_degree=curve_fit_degree,
+        smoothing_factor=smoothing_factor,
     )
     result = analyzer.execute(z_correction=z_correction)[0]
 
@@ -383,6 +385,7 @@ def frc_resolution(
     spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
     curve_fit_type: str = "smooth-spline",
+    smoothing_factor: float = 0.05,
     backend: str = "mask",
 ) -> float:
     """Calculate either single- or two-image FRC-based 2D image resolution."""
@@ -391,6 +394,7 @@ def frc_resolution(
         image2,
         bin_delta=bin_delta,
         curve_fit_type=curve_fit_type,
+        smoothing_factor=smoothing_factor,
         spacing=spacing,
         zero_padding=zero_padding,
         backend=backend,
@@ -499,6 +503,7 @@ def calculate_sectioned_fsc(
     snr_value: float = 7.0,
     curve_fit_type: str = "spline",
     curve_fit_degree: int = 3,
+    smoothing_factor: float = 0.05,
     disable_hamming: bool = False,
     z_correction: float = 1.0,
     disable_3d_sum: bool = False,
@@ -541,6 +546,7 @@ def calculate_sectioned_fsc(
         snr_value=snr_value,
         curve_fit_type=curve_fit_type,
         curve_fit_degree=curve_fit_degree,
+        smoothing_factor=smoothing_factor,
     )
     result = analyzer.execute(z_correction=z_correction)
 

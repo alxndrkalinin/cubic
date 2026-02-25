@@ -69,6 +69,7 @@ def get_frc_options(
     extract_angle_delta: float = 0.1,
     resolution_threshold: str = "fixed",
     curve_fit_type: str = "spline",
+    smoothing_factor: float = 0.05,
     disable_hamming: bool = False,
     verbose: bool = False,
 ) -> Namespace:
@@ -83,6 +84,7 @@ def get_frc_options(
         resolution_snr_value=7.0,
         frc_curve_fit_degree=3,
         frc_curve_fit_type=curve_fit_type,
+        smoothing_factor=smoothing_factor,
         verbose=verbose,
     )
 
@@ -210,7 +212,7 @@ class FourierCorrelationData(object):
                     raise ValueError("Unknown key found in the initialization data")
 
 
-def fit_frc_curve(data_set, degree, fit_type="spline"):
+def fit_frc_curve(data_set, degree, fit_type="spline", smoothing_factor=0.05):
     """Return curve-fitting function for the provided FRC data."""
     assert isinstance(data_set, FourierCorrelationData)
 
@@ -218,7 +220,7 @@ def fit_frc_curve(data_set, degree, fit_type="spline"):
 
     if fit_type == "smooth-spline":
         equation = UnivariateSpline(data_set.correlation["frequency"], data)
-        equation.set_smoothing_factor(0.25)
+        equation.set_smoothing_factor(smoothing_factor)
         # equation = interp1d(data_set.correlation["frequency"],
         #                     data, kind='slinear')
 
@@ -318,6 +320,7 @@ class FourierCorrelationAnalysis(object):
         snr_value: float = 7.0,
         curve_fit_type: str = "spline",
         curve_fit_degree: int = 3,
+        smoothing_factor: float = 0.05,
         verbose: bool = False,
     ) -> None:
         """Store configuration for subsequent analysis."""
@@ -330,6 +333,7 @@ class FourierCorrelationAnalysis(object):
         self.snr_value = snr_value
         self.curve_fit_type = curve_fit_type
         self.curve_fit_degree = curve_fit_degree
+        self.smoothing_factor = smoothing_factor
         self.verbose = verbose
 
     def execute(self, z_correction=1):
@@ -353,6 +357,7 @@ class FourierCorrelationAnalysis(object):
                 snr,
                 z_correction,
                 verbose,
+                self.smoothing_factor,
             )
 
             # # # Find intersection
@@ -383,12 +388,13 @@ class FourierCorrelationAnalysis(object):
         snr,
         z_correction,
         verbose,
+        smoothing_factor=0.05,
     ):
         """Process a single dataset and return updated data."""
         if verbose:
             print(f"Calculating resolution point for dataset {key}")
 
-        frc_eq = fit_frc_curve(data_set, degree, fit_type)
+        frc_eq = fit_frc_curve(data_set, degree, fit_type, smoothing_factor)
         two_sigma_eq = calculate_resolution_threshold_curve(
             data_set, criterion, threshold, snr
         )

@@ -354,14 +354,20 @@ def _compute_decorrelation_curve(
     edges_cpu = np.concatenate([[r_min], radii_cpu]).astype(np.float32)
     edges = to_same_device(edges_cpu, image)
 
-    # Assign pixels to radial bins
+    # Assign pixels to radial bins.
+    # Low-end clip (raw < 0 → 0): frequencies below r_min contribute to the
+    # cumulative baseline in bin 0, preserving d(r)'s cumulative semantics.
+    # High-end exclude (raw >= num_radii): frequencies above r_max are dropped
+    # to avoid a boundary spike in the last bin.
     k_flat = k_radius_norm.ravel()
-    bin_id = np.clip(np.digitize(k_flat, edges) - 1, 0, num_radii - 1).astype(np.int32)
+    raw_bin_id = np.digitize(k_flat, edges) - 1
+    below_max = raw_bin_id < num_radii
+    bin_id = np.clip(raw_bin_id[below_max], 0, num_radii - 1).astype(np.int32)
     absF_flat = absF.ravel()
 
     # Compute d(r) = cumsum(|F|) / sqrt(total_power * cumsum(count))
     cross_cumsum = np.cumsum(
-        np.bincount(bin_id, weights=absF_flat, minlength=num_radii)
+        np.bincount(bin_id, weights=absF_flat[below_max], minlength=num_radii)
     )
     count_cumsum = np.cumsum(
         np.bincount(bin_id, minlength=num_radii).astype(np.float32)
@@ -492,7 +498,8 @@ def _dcr_curve_3d_sectioned(
     exclude_axis_angle: float = 0.0,
     windowing: bool = True,
     refine: bool = True,
-) -> dict[str, float]:
+    return_curves: bool = False,
+) -> dict[str, float] | dict[str, dict]:
     """Compute 3D DCR with angular sectoring for XY and Z directions.
 
     Follows Descloux et al. 2019 algorithm:
@@ -500,6 +507,8 @@ def _dcr_curve_3d_sectioned(
     2. Use r₀ to set adaptive HP sigma range (ImDecorr convention)
     3. Sweep HP filters, find peaks per sector
     4. Optional 2-pass refinement (default: on)
+
+    When *return_curves* is True, returns per-sector dicts with full curve data.
     """
     if image.ndim != 3:
         raise ValueError("3D sectioned DCR requires 3D images")
@@ -525,11 +534,14 @@ def _dcr_curve_3d_sectioned(
 
     r0 = {}
     all_peaks: dict[str, list[tuple[float, float]]] = {"xy": [], "z": []}
+    all_curves: dict[str, list[np.ndarray]] = {"xy": [], "z": []}
     for sector_name in ["xy", "z"]:
         radii, d_curve, _ = d0_results[sector_name]
         r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
         r0[sector_name] = r_peak
         all_peaks[sector_name].append((r_peak, a_peak))
+        if return_curves:
+            all_curves[sector_name].append(asnumpy(d_curve))
 
     # --- Step 2: Adaptive sigma range per sector ---
     # ImDecorr: g from gMax=2/r₀ (weak HP) to 0.15 (strong HP)
@@ -573,6 +585,8 @@ def _dcr_curve_3d_sectioned(
             radii, d_curve, _ = sector_results[sector_name]
             r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
             all_peaks[sector_name].append((r_peak, a_peak))
+            if return_curves:
+                all_curves[sector_name].append(asnumpy(d_curve))
         del filtered_image
 
     # --- Step 4: Optional 2-pass refinement ---
@@ -617,21 +631,101 @@ def _dcr_curve_3d_sectioned(
                 del filtered
 
     # --- Step 5: Compute resolution for each sector ---
-    resolutions = {}
+    results: dict[str, dict] = {}
     for sector_name in ["xy", "z"]:
-        peaks = np.array(all_peaks[sector_name])
-        r_peaks = peaks[:, 0]
+        peaks_arr = np.array(all_peaks[sector_name])
+        r_peaks = peaks_arr[:, 0]
         k_c_norm = float(np.max(r_peaks))
 
-        _, _, k_max = d0_results[sector_name]
+        radii_cpu, _, k_max = d0_results[sector_name]
+        radii_cpu = asnumpy(radii_cpu)
 
         if k_c_norm > 0 and k_max > 0:
             k_c_physical = k_c_norm * k_max
-            resolutions[sector_name] = 1.0 / k_c_physical
+            resolution = 1.0 / k_c_physical
         else:
-            resolutions[sector_name] = float("inf")
+            resolution = float("inf")
 
-    return resolutions
+        results[sector_name] = {
+            "resolution": resolution,
+            "radii": radii_cpu,
+            "peaks": peaks_arr,
+            "k_max": float(k_max),
+        }
+        if return_curves:
+            results[sector_name]["curves"] = all_curves[sector_name]
+
+    if not return_curves:
+        # Backwards-compatible: return dict[str, float]
+        return {k: v["resolution"] for k, v in results.items()}
+
+    return results
+
+
+def dcr_curve_3d_sectioned(
+    image: np.ndarray,
+    *,
+    spacing: float | Sequence[float] | None = None,
+    num_radii: int = 100,
+    num_highpass: int = 10,
+    angle_delta: int = 45,
+    exclude_axis_angle: float = 0.0,
+    windowing: bool = True,
+    refine: bool = True,
+) -> dict[str, dict]:
+    """Compute 3D DCR with angular sectoring, returning full curve data.
+
+    Like :func:`dcr_resolution` with ``use_sectioned=True``, but returns
+    per-sector curves and peaks for plotting.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        3D input image (numpy or cupy array).
+    spacing : float or sequence of floats, optional
+        Physical spacing per axis [z, y, x]. If None, uses index units.
+    num_radii : int
+        Number of radial sampling points (default: 100).
+    num_highpass : int
+        Number of high-pass filters (default: 10).
+    angle_delta : int
+        Angular sector width in degrees (default: 45).
+    exclude_axis_angle : float
+        Exclude frequencies within this angle from Z axis (default: 0.0).
+    windowing : bool
+        Apply Tukey window for edge apodization (default: True).
+    refine : bool
+        Two-pass refinement (default: True).
+
+    Returns
+    -------
+    dict[str, dict]
+        Keys ``"xy"`` and ``"z"``, each containing:
+
+        - ``"resolution"`` : float — estimated resolution in physical units
+        - ``"radii"`` : np.ndarray — normalized frequencies (0..1)
+        - ``"curves"`` : list[np.ndarray] — decorrelation curves (d₀ + highpass)
+        - ``"peaks"`` : np.ndarray, shape (N, 2) — [r_peak, amplitude] per curve
+        - ``"k_max"`` : float — physical k_max for the sector
+    """
+    if spacing is None:
+        spacing_arr = None
+    elif isinstance(spacing, (int, float)):
+        spacing_arr = np.array([float(spacing)] * 3, dtype=np.float32)
+    else:
+        spacing_arr = np.array(spacing, dtype=np.float32)
+
+    return _dcr_curve_3d_sectioned(
+        image,
+        spacing=spacing_arr,
+        num_radii=num_radii,
+        num_highpass=num_highpass,
+        angle_delta=angle_delta,
+        exclude_axis_angle=exclude_axis_angle,
+        windowing=windowing,
+        refine=refine,
+        return_curves=True,
+    )
 
 
 def _highpass_filter(image: np.ndarray, sigma: float) -> np.ndarray:
