@@ -5,7 +5,7 @@ from collections.abc import Sequence
 import numpy as np
 from scipy.signal import savgol_filter
 
-from cubic.cuda import asnumpy, to_same_device, get_array_module
+from cubic.cuda import asnumpy, to_same_device
 from cubic.skimage import filters
 from cubic.image_utils import tukey_window
 
@@ -15,7 +15,97 @@ from .radial import (
     radial_k_grid,
     _kmax_phys_max,
     sectioned_bin_id,
+    _normalize_spacing,
 )
+
+
+def _preprocess_dcr_image(image: np.ndarray, windowing: bool = True) -> np.ndarray:
+    """Center and optionally window an image for DCR analysis.
+
+    Consolidates the repeated pattern of float32 cast, mean subtraction, and
+    optional Tukey windowing used at the start of dcr_curve and
+    _dcr_curve_3d_sectioned.
+    """
+    image = image.astype(np.float32)
+    image -= np.mean(image)
+    if windowing:
+        image = tukey_window(image, alpha=0.1)
+    return image
+
+
+def _kc_to_resolution(k_c_norm: float, k_max: float) -> float:
+    """Convert normalized cutoff frequency to physical resolution.
+
+    Parameters
+    ----------
+    k_c_norm : float
+        Normalized cutoff frequency (0-1 range).
+    k_max : float
+        Maximum physical frequency (Nyquist limit).
+
+    Returns
+    -------
+    float
+        Physical resolution = 1 / (k_c_norm * k_max), or inf if either is zero.
+    """
+    if k_c_norm > 0 and k_max > 0:
+        return 1.0 / (k_c_norm * k_max)
+    return float("inf")
+
+
+def _refinement_ranges(
+    peaks: np.ndarray,
+    sigmas: np.ndarray,
+    *,
+    r_max_pad: float = 0.3,
+) -> tuple[float, float, float, float] | None:
+    """Compute narrowed frequency and sigma ranges for the DCR refinement pass.
+
+    Implements the two-scoring-strategy logic (best_score = k_c * A, max_score =
+    max k_c) from NanoPyx/ImDecorr and returns the narrowed ranges for a second
+    pass.
+
+    Parameters
+    ----------
+    peaks : np.ndarray, shape (N, 2)
+        Array of [r_peak, amplitude] pairs from the coarse pass.
+    sigmas : np.ndarray
+        High-pass sigma array used in the coarse pass.
+    r_max_pad : float
+        Padding added above the maximum peak frequency for the refined range.
+
+    Returns
+    -------
+    (r_min, r_max, sigma_min, sigma_max) or None if no valid peaks exist.
+    """
+    r_peaks = peaks[:, 0]
+    a_peaks = peaks[:, 1]
+    valid = r_peaks > 0
+    if not np.any(valid):
+        return None
+
+    # Two scoring strategies to pick anchor points
+    gm = np.where(valid, r_peaks * a_peaks, 0.0)
+    gm_idx = int(np.argmax(gm))
+    kc_gm = r_peaks[gm_idx]
+    max_idx = int(np.argmax(np.where(valid, r_peaks, 0.0)))
+    kc_max = r_peaks[max_idx]
+
+    # Narrow frequency range
+    r_min = max(0.0, min(kc_gm, kc_max) - 0.05)
+    r_max = min(1.0, max(kc_gm, kc_max) + r_max_pad)
+
+    # Narrow sigma range
+    idx_lo = max(0, min(gm_idx, max_idx) - 1)
+    idx_hi = max(gm_idx, max_idx)
+    if idx_hi < len(sigmas):
+        sigma_min = float(sigmas[idx_lo])
+        sigma_max = float(sigmas[idx_hi])
+    else:
+        sigma_min = 1.0
+        sigma_max = float(sigmas[0]) if len(sigmas) > 0 else 0.5
+
+    return r_min, r_max, sigma_min, sigma_max
 
 
 def _smooth_curve(d_curve: np.ndarray, window: int | None) -> np.ndarray:
@@ -166,21 +256,14 @@ def dcr_curve(
     if image.ndim not in (2, 3):
         raise ValueError(f"DCR requires 2D or 3D images, got {image.ndim}D")
 
-    # Ensure float32 and center (copy to avoid modifying input)
-    image = image.astype(np.float32)
-    image -= np.mean(image)
-
-    # Apply Tukey window for edge apodization (unless externally handled)
-    if windowing:
-        image = tukey_window(image, alpha=0.1)
+    image = _preprocess_dcr_image(image, windowing=windowing)
 
     # Normalize spacing
-    if spacing is None:
-        spacing_arr = np.ones(image.ndim, dtype=np.float32)
-    elif isinstance(spacing, (int, float)):
-        spacing_arr = np.full(image.ndim, float(spacing), dtype=np.float32)
+    spacing_list = _normalize_spacing(spacing, image.ndim)
+    if spacing_list is not None:
+        spacing_arr = np.array(spacing_list, dtype=np.float32)
     else:
-        spacing_arr = np.array(spacing, dtype=np.float32)
+        spacing_arr = np.ones(image.ndim, dtype=np.float32)
 
     # Generate log-spaced high-pass filter sigmas (in pixels)
     # Following NanoPyx convention: sigma from 0.5 to min(shape)/2
@@ -220,33 +303,9 @@ def dcr_curve(
     r_peaks = all_peaks_arr[:, 0]
 
     # --- Two-pass refinement (NanoPyx convention) ---
-    if refine and np.any(r_peaks > 0):
-        a_peaks = all_peaks_arr[:, 1]
-
-        # Two scoring strategies to pick anchor points
-        valid = r_peaks > 0
-        # best_score: max of k_c * A (balances frequency and amplitude)
-        gm = np.where(valid, r_peaks * a_peaks, 0.0)
-        gm_idx = int(np.argmax(gm))
-        kc_gm = r_peaks[gm_idx]
-        # max_score: highest frequency peak
-        max_idx = int(np.argmax(np.where(valid, r_peaks, 0.0)))
-        kc_max_coarse = r_peaks[max_idx]
-
-        # Narrow frequency range
-        r_min2 = max(0.0, min(kc_gm, kc_max_coarse) - 0.05)
-        r_max2 = min(1.0, max(kc_gm, kc_max_coarse) + 0.3)
-
-        # Narrow sigma range
-        idx_lo = max(0, min(gm_idx, max_idx) - 1)
-        idx_hi = max(gm_idx, max_idx)
-        if idx_hi < len(sigmas):
-            sigma_min_r = float(sigmas[idx_lo])
-            sigma_max_r = float(sigmas[idx_hi])
-        else:
-            # Edge case: best index beyond sigma array (d0 had best peak)
-            sigma_min_r = max(2.0 / min(image.shape), 1.0)
-            sigma_max_r = float(sigmas[0]) if len(sigmas) > 0 else 0.5
+    refined = _refinement_ranges(all_peaks_arr, sigmas) if refine else None
+    if refined is not None:
+        r_min2, r_max2, sigma_min_r, sigma_max_r = refined
         sigmas_refined = _generate_highpass_sigmas(
             image.shape,
             num_highpass,
@@ -287,14 +346,9 @@ def dcr_curve(
     else:
         k_c_norm = float(np.max(r_peaks))
 
-    # Convert normalized k_c to physical frequency, then to resolution
-    # k_c_physical = k_c_norm * k_max (in cycles per unit length)
-    # Resolution = 1 / k_c_physical
-    if k_c_norm > 0 and k_max is not None:
-        k_c_physical = k_c_norm * k_max
-        resolution = 1.0 / k_c_physical
-    else:
-        resolution = float("inf")
+    resolution = (
+        _kc_to_resolution(k_c_norm, k_max) if k_max is not None else float("inf")
+    )
 
     return resolution, radii, all_curves, all_peaks_arr
 
@@ -513,10 +567,7 @@ def _dcr_curve_3d_sectioned(
     if image.ndim != 3:
         raise ValueError("3D sectioned DCR requires 3D images")
 
-    image = image.astype(np.float32)
-    image -= np.mean(image)
-    if windowing:
-        image = tukey_window(image, alpha=0.1)
+    image = _preprocess_dcr_image(image, windowing=windowing)
 
     spacing_arr = np.array(spacing, dtype=np.float32) if spacing is not None else None
 
@@ -593,33 +644,17 @@ def _dcr_curve_3d_sectioned(
     if refine:
         for sector_name in ["xy", "z"]:
             peaks = np.array(all_peaks[sector_name])
-            r_peaks = peaks[:, 0]
-            a_peaks = peaks[:, 1]
-            valid = r_peaks > 0
-            if not np.any(valid):
+            s_arr = sector_sigmas[sector_name]
+            refined = _refinement_ranges(peaks, s_arr, r_max_pad=0.4)
+            if refined is None:
                 continue
 
-            # Two scoring strategies (ImDecorr convention)
-            gm = np.where(valid, r_peaks * a_peaks, 0.0)
-            kc_gm = r_peaks[int(np.argmax(gm))]
-            kc_max = np.max(r_peaks[valid])
-
-            # Narrow frequency range (ImDecorr line 183)
-            r_min2 = max(0.0, min(kc_gm, kc_max) - 0.05)
-            r_max2 = min(1.0, max(kc_gm, kc_max) + 0.4)
-
-            # Narrow sigma range around best peaks
-            s_arr = sector_sigmas[sector_name]
-            gm_idx = int(np.argmax(gm))
-            max_idx = int(np.argmax(np.where(valid, r_peaks, 0.0)))
-            # Indices are offset by 1 (d₀ is at index 0)
-            s_lo = max(0, min(gm_idx, max_idx) - 1)
-            s_hi = min(len(s_arr) - 1, max(gm_idx, max_idx))
+            r_min2, r_max2, sigma_min_r, sigma_max_r = refined
             refined_sigmas = _generate_highpass_sigmas(
                 image.shape,
                 num_highpass,
-                sigma_min=float(s_arr[s_lo]) if s_lo < len(s_arr) else 1.0,
-                sigma_max=float(s_arr[s_hi]) if s_hi < len(s_arr) else 1.0,
+                sigma_min=sigma_min_r,
+                sigma_max=sigma_max_r,
             )
 
             for sigma_hp in refined_sigmas:
@@ -640,11 +675,7 @@ def _dcr_curve_3d_sectioned(
         radii_cpu, _, k_max = d0_results[sector_name]
         radii_cpu = asnumpy(radii_cpu)
 
-        if k_c_norm > 0 and k_max > 0:
-            k_c_physical = k_c_norm * k_max
-            resolution = 1.0 / k_c_physical
-        else:
-            resolution = float("inf")
+        resolution = _kc_to_resolution(k_c_norm, k_max)
 
         results[sector_name] = {
             "resolution": resolution,
@@ -708,12 +739,8 @@ def dcr_curve_3d_sectioned(
         - ``"peaks"`` : np.ndarray, shape (N, 2) — [r_peak, amplitude] per curve
         - ``"k_max"`` : float — physical k_max for the sector
     """
-    if spacing is None:
-        spacing_arr = None
-    elif isinstance(spacing, (int, float)):
-        spacing_arr = np.array([float(spacing)] * 3, dtype=np.float32)
-    else:
-        spacing_arr = np.array(spacing, dtype=np.float32)
+    spacing_list = _normalize_spacing(spacing, 3)
+    spacing_arr = np.array(spacing_list, dtype=np.float32) if spacing_list else None
 
     return _dcr_curve_3d_sectioned(
         image,
@@ -835,13 +862,7 @@ def dcr_resolution(
         return resolution
 
     elif image.ndim == 3:
-        # Normalize spacing
-        if spacing is None:
-            spacing_list = None
-        elif isinstance(spacing, (int, float)):
-            spacing_list = [float(spacing)] * 3
-        else:
-            spacing_list = list(spacing)
+        spacing_list = _normalize_spacing(spacing, 3)
 
         if use_sectioned:
             # Full 3D analysis with angular sectoring

@@ -8,6 +8,22 @@ import numpy as np
 from cubic.cuda import get_array_module
 
 
+def _normalize_spacing(
+    spacing: float | Sequence[float] | None,
+    ndim: int,
+) -> list[float] | None:
+    """Normalize spacing to a list of floats or None.
+
+    Consolidates the repeated pattern of converting scalar/sequence/None spacing
+    into a uniform list used across FRC, FSC, and DCR functions.
+    """
+    if spacing is None:
+        return None
+    if isinstance(spacing, (int, float)):
+        return [float(spacing)] * ndim
+    return [float(s) for s in spacing]
+
+
 def _kmax_index(shape: tuple[int, ...]) -> float:
     """Compute minimum Nyquist frequency in index units (unshifted FFT)."""
     return float(min(n // 2 for n in shape))

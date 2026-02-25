@@ -341,7 +341,6 @@ class FourierCorrelationAnalysis(object):
         criterion = self.resolution_threshold
         threshold = self.threshold_value
         snr = self.snr_value
-        # tolerance = self.resolution_point_sigma
         degree = self.curve_fit_degree
         fit_type = self.curve_fit_type
         verbose = self.verbose
@@ -359,21 +358,6 @@ class FourierCorrelationAnalysis(object):
                 verbose,
                 self.smoothing_factor,
             )
-
-            # # # Find intersection
-            # root, result = optimize.brentq(
-            #     pdiff2 if criterion == 'fixed' else pdiff1,
-            #     0.0, 1.0, xtol=tolerance, full_output=True)
-            #
-            # # Save result, if intersection was found
-            # if result.converged is True:
-            #     data_set.resolution["resolution-point"] = (frc_eq(root), root)
-            #     data_set.resolution["criterion"] = criterion
-            #     resolution = 2 * self.spacing / root
-            #     data_set.resolution["resolution"] = resolution
-            #     self.data_collection[int(key)] = data_set
-            # else:
-            #     print "Could not find an intersection for the curves for the dataset %s." % key
 
         return self.data_collection
 

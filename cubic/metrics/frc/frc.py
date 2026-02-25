@@ -20,6 +20,7 @@ from cubic.image_utils import (
     reverse_checkerboard_split,
 )
 
+from .radial import _normalize_spacing
 from .analysis import (
     FourierCorrelationData,
     FourierCorrelationAnalysis,
@@ -307,12 +308,7 @@ def calculate_frc(
     reverse = average and single_image
     original_image1 = image1.copy() if reverse else None
 
-    if spacing is None:
-        spacing = None
-    elif isinstance(spacing, (int, float)):
-        spacing = [spacing] * image1.ndim
-    else:
-        spacing = list(spacing)
+    spacing = _normalize_spacing(spacing, image1.ndim)
 
     image1, image2 = preprocess_images(
         image1,
@@ -513,12 +509,7 @@ def calculate_sectioned_fsc(
     """Calculate sectioned FSC for one or two images."""
     single_image = image2 is None
 
-    if spacing is None:
-        spacing = None
-    elif isinstance(spacing, (int, float)):
-        spacing = [spacing] * image1.ndim
-    else:
-        spacing = list(spacing)
+    spacing = _normalize_spacing(spacing, image1.ndim)
 
     image1, image2 = preprocess_images(
         image1,
@@ -697,6 +688,282 @@ def _calculate_fsc_sectioned_hist(
     return results
 
 
+def _resample_isotropic_for_fsc(
+    image1: np.ndarray,
+    image2: np.ndarray | None,
+    spacing: list[float],
+    resample_order: int = 1,
+) -> tuple[np.ndarray, np.ndarray | None, list[float], float, float]:
+    """Resample images to isotropic voxel size for FSC calculation.
+
+    Extracts the isotropic resampling block from fsc_resolution. Handles
+    target_z_size calculation, rescale_isotropic calls for image1/image2,
+    even-dim cropping, and z_factor computation.
+
+    Parameters
+    ----------
+    image1 : np.ndarray
+        First 3D image.
+    image2 : np.ndarray or None
+        Second 3D image (optional).
+    spacing : list[float]
+        Physical spacing per axis [z, y, x].
+    resample_order : int
+        Interpolation order (0=nearest, 1=linear, 3=cubic).
+
+    Returns
+    -------
+    image1 : np.ndarray
+        Resampled first image.
+    image2 : np.ndarray or None
+        Resampled second image (if provided).
+    spacing_iso : list[float]
+        Isotropic spacing (XY spacing for all axes).
+    z_factor : float
+        Anisotropy factor for k(theta) correction.
+    original_spacing_z : float
+        Original Z spacing before resampling.
+    """
+    spacing_tuple = tuple(spacing)
+    original_spacing_z = spacing_tuple[0]
+    iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
+
+    # z_factor from ORIGINAL spacing for k(theta) correction
+    z_factor = original_spacing_z / iso_spacing
+    target_z_size = int(round(image1.shape[0] * spacing_tuple[0] / iso_spacing))
+    if target_z_size % 2 != 0:
+        target_z_size -= 1  # Make even for checkerboard split
+
+    image1 = rescale_isotropic(
+        image1,
+        spacing_tuple,
+        downscale_xy=False,
+        order=resample_order,
+        preserve_range=True,
+        target_z_size=target_z_size,
+    ).astype(image1.dtype)
+
+    if image2 is not None:
+        image2 = rescale_isotropic(
+            image2,
+            spacing_tuple,
+            downscale_xy=False,
+            order=resample_order,
+            preserve_range=True,
+            target_z_size=target_z_size,
+        ).astype(image2.dtype)
+
+    # Crop to even dimensions (required for checkerboard split)
+    even_shape = tuple(s - (s % 2) for s in image1.shape)
+    if image1.shape != even_shape:
+        slices = tuple(slice(0, es) for es in even_shape)
+        image1 = image1[slices]
+        if image2 is not None:
+            image2 = image2[slices]
+
+    spacing_iso = [iso_spacing] * image1.ndim
+    return image1, image2, spacing_iso, z_factor, original_spacing_z
+
+
+def _fsc_hist_compute(
+    image1: np.ndarray,
+    image2: np.ndarray | None,
+    *,
+    bin_delta: int,
+    angle_delta: int,
+    spacing_list: list[float] | None,
+    exclude_axis_angle: float,
+    use_max_nyquist: bool,
+    zero_padding: bool,
+    average: bool,
+) -> dict[int, FourierCorrelationData]:
+    """Compute sectioned FSC data using the hist backend.
+
+    Handles single-image detection, forward checkerboard split, and optional
+    reverse-split averaging.
+
+    Returns
+    -------
+    dict[int, FourierCorrelationData]
+        Per-sector FSC data keyed by polar angle (degrees).
+    """
+    single_image = image2 is None
+    do_average = average and single_image
+
+    # Save original for reverse split if averaging
+    original_image1 = image1.copy() if do_average else None
+
+    # Preprocess images (forward split)
+    image1_proc, image2_proc = preprocess_images(
+        image1,
+        image2,
+        zero_padding=zero_padding,
+        disable_hamming=False,
+        disable_3d_sum=False,
+    )
+
+    # Calculate sectioned FSC (forward split)
+    fsc_data = _calculate_fsc_sectioned_hist(
+        image1_proc,
+        image2_proc,
+        bin_delta=bin_delta,
+        angle_delta=angle_delta,
+        spacing=spacing_list,
+        exclude_axis_angle=exclude_axis_angle,
+        use_max_nyquist=use_max_nyquist,
+    )
+
+    # Average with reverse split if enabled
+    if do_average:
+        image1_rev, image2_rev = preprocess_images(
+            original_image1,
+            None,
+            zero_padding=zero_padding,
+            disable_hamming=False,
+            disable_3d_sum=False,
+            reverse_split=True,
+        )
+
+        fsc_data_rev = _calculate_fsc_sectioned_hist(
+            image1_rev,
+            image2_rev,
+            bin_delta=bin_delta,
+            angle_delta=angle_delta,
+            spacing=spacing_list,
+            exclude_axis_angle=exclude_axis_angle,
+            use_max_nyquist=use_max_nyquist,
+        )
+
+        for angle in fsc_data.keys():
+            if angle in fsc_data_rev:
+                corr_fwd = np.asarray(fsc_data[angle].correlation["correlation"])
+                corr_rev = np.asarray(fsc_data_rev[angle].correlation["correlation"])
+                fsc_data[angle].correlation["correlation"] = (
+                    0.5 * corr_fwd + 0.5 * corr_rev
+                )
+
+    return fsc_data
+
+
+def _fsc_extract_resolution(
+    fsc_data: dict[int, FourierCorrelationData],
+    *,
+    spacing_list: list[float] | None,
+    single_image: bool,
+    z_factor: float,
+    original_spacing_z: float | None,
+    resolution_threshold: str,
+    threshold_value: float,
+    z_xy_boundary: float,
+) -> dict[str, float]:
+    """Extract XY and Z resolution from sectioned FSC data.
+
+    Handles XY sector selection, Z fallback cascade, FourierCorrelationAnalysis
+    invocation, cutoff correction, and k(theta) anisotropy correction.
+
+    Parameters
+    ----------
+    fsc_data : dict
+        Per-sector FSC data from _fsc_hist_compute.
+    spacing_list : list[float] or None
+        Physical spacing [z, y, x]. None for index units.
+    single_image : bool
+        Whether single-image mode (for cutoff correction).
+    z_factor : float
+        Anisotropy factor for k(theta) correction.
+    original_spacing_z : float or None
+        Original Z spacing (set when isotropic resampling was used).
+    resolution_threshold : str
+        Threshold criterion for resolution calculation.
+    threshold_value : float
+        Fixed threshold value.
+    z_xy_boundary : float
+        Polar angle boundary for Z-candidate sectors.
+
+    Returns
+    -------
+    dict[str, float]
+        Resolution values with 'xy' and 'z' keys.
+    """
+    if spacing_list is not None:
+        spacing_xy = spacing_list[1]  # Y spacing (assumes Y==X)
+        spacing_z = spacing_list[0]  # Z spacing
+    else:
+        spacing_xy = 1.0
+        spacing_z = 1.0
+
+    # Select XY and Z sectors based on polar angle convention
+    angles = sorted(fsc_data.keys())
+    angle_xy = max(angles)  # Highest angle = most XY-dominated
+
+    # Z resolution: fallback cascade over Z-candidate sectors
+    z_candidates = [a for a in angles if a < z_xy_boundary]
+    if not z_candidates:
+        z_candidates = [min(angles)]
+
+    results: dict[str, float] = {}
+
+    # Process XY sector
+    data_xy = fsc_data[angle_xy]
+    data_collection = FourierCorrelationDataCollection()
+    data_collection[0] = data_xy
+    analyzer = FourierCorrelationAnalysis(
+        data_collection,
+        spacing_xy,
+        resolution_threshold=resolution_threshold,
+        threshold_value=threshold_value,
+        curve_fit_type="spline",
+    )
+    try:
+        analyzed = analyzer.execute()[0]
+        if single_image:
+            _apply_cutoff_correction(analyzed)
+        results["xy"] = analyzed.resolution["resolution"]
+    except Exception:
+        results["xy"] = float("nan")
+
+    # Determine spacing for Z resolution calculation
+    if original_spacing_z is not None:
+        analyzer_spacing = spacing_xy  # Frequencies in isotropic units
+    else:
+        analyzer_spacing = spacing_z  # Frequencies normalized to Z Nyquist
+
+    # Process Z resolution: try each Z-candidate sector individually
+    z_resolution = float("nan")
+    z_angle_used = z_candidates[0]
+
+    for z_angle in z_candidates:
+        z_data = fsc_data[z_angle]
+        data_collection = FourierCorrelationDataCollection()
+        data_collection[0] = z_data
+        analyzer = FourierCorrelationAnalysis(
+            data_collection,
+            analyzer_spacing,
+            resolution_threshold=resolution_threshold,
+            threshold_value=threshold_value,
+            curve_fit_type="smooth-spline",
+        )
+        try:
+            analyzed = analyzer.execute()[0]
+            if single_image:
+                _apply_cutoff_correction(analyzed)
+            candidate_res = analyzed.resolution["resolution"]
+            if np.isfinite(candidate_res) and candidate_res > 0:
+                z_resolution = candidate_res
+                z_angle_used = z_angle
+                break
+        except Exception:
+            continue
+
+    # Apply k(theta) correction (Koho et al. 2019, equation 5)
+    if np.isfinite(z_resolution) and z_factor > 1.0:
+        k_theta = 1.0 + (z_factor - 1.0) * np.abs(np.cos(np.deg2rad(z_angle_used)))
+        z_resolution = z_resolution * k_theta
+
+    results["z"] = z_resolution
+    return results
+
+
 def fsc_resolution(
     image1: np.ndarray,
     image2: np.ndarray | None = None,
@@ -762,80 +1029,24 @@ def fsc_resolution(
     """
     import warnings
 
-    # Set default zero_padding based on backend:
-    # - mask backend requires padding to cube (iterator assumes isotropic shells)
-    # - hist backend handles anisotropic volumes correctly using spacing
+    # Set default zero_padding based on backend
     if zero_padding is None:
         zero_padding = backend == "mask"
 
-    # Resample to isotropic voxel size if requested
-    # Save original Z spacing for Z-sector resolution calculation
-    # (needed because isotropic resampling creates artificial high-frequency
-    # correlation beyond the original Z Nyquist)
+    # --- Isotropic resampling (optional) ---
     original_spacing_z = None
-    # z_factor for k(θ) correction (Koho et al. 2019, equation 5)
-    # Will be set from original spacing before isotropic resampling overwrites it
     z_factor = 1.0
 
     if resample_isotropic:
         if spacing is None:
             raise ValueError("resample_isotropic=True requires spacing to be provided")
+        spacing_list = _normalize_spacing(spacing, image1.ndim)
+        image1, image2, spacing_list, z_factor, original_spacing_z = (
+            _resample_isotropic_for_fsc(image1, image2, spacing_list, resample_order)
+        )
+        spacing = spacing_list
 
-        # Convert spacing to list if needed
-        if isinstance(spacing, (int, float)):
-            spacing_tuple = (float(spacing),) * image1.ndim
-        else:
-            spacing_tuple = tuple(spacing)
-
-        # Save original Z spacing before resampling
-        original_spacing_z = spacing_tuple[0]
-
-        # Calculate target Z size (must be even for checkerboard split)
-        iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
-
-        # Calculate z_factor from ORIGINAL spacing for k(θ) correction.
-        # Even after isotropic resampling, Z frequencies have lower information
-        # density due to the original anisotropic acquisition.
-        # miplib applies z_correction this way (see Koho et al. 2019 notebook).
-        z_factor = original_spacing_z / iso_spacing
-        target_z_size = int(round(image1.shape[0] * spacing_tuple[0] / iso_spacing))
-        if target_z_size % 2 != 0:
-            target_z_size -= 1  # Make even for checkerboard split
-
-        # Resample image1 to isotropic (upscale Z to match XY resolution)
-        # miplib paper uses order=0 (nearest neighbor), default here is order=1 (linear)
-        image1 = rescale_isotropic(
-            image1,
-            spacing_tuple,
-            downscale_xy=False,
-            order=resample_order,
-            preserve_range=True,
-            target_z_size=target_z_size,
-        ).astype(image1.dtype)
-
-        # Resample image2 if provided
-        if image2 is not None:
-            image2 = rescale_isotropic(
-                image2,
-                spacing_tuple,
-                downscale_xy=False,
-                order=resample_order,
-                preserve_range=True,
-                target_z_size=target_z_size,
-            ).astype(image2.dtype)
-
-        # Crop to even dimensions (required for checkerboard split)
-        # This is needed because rescale_isotropic may produce odd shapes
-        even_shape = tuple(s - (s % 2) for s in image1.shape)
-        if image1.shape != even_shape:
-            slices = tuple(slice(0, es) for es in even_shape)
-            image1 = image1[slices]
-            if image2 is not None:
-                image2 = image2[slices]
-
-        # Update spacing to isotropic (use XY spacing for all axes)
-        spacing = [iso_spacing] * image1.ndim
-
+    # --- Mask backend (deprecated) ---
     if backend == "mask":
         warnings.warn(
             "backend='mask' is deprecated and will be removed in a future version. "
@@ -843,8 +1054,6 @@ def fsc_resolution(
             DeprecationWarning,
             stacklevel=2,
         )
-        # Original sectioned FSC with iterators (mask backend)
-        # Use one-bit threshold for 3D FSC as recommended by Koho et al. 2019
         fsc_result = calculate_sectioned_fsc(
             image1,
             image2,
@@ -860,10 +1069,6 @@ def fsc_resolution(
             for angle, dataset in fsc_result
         }
 
-        # Mask backend uses phi=arctan2(y,z):
-        #   phi=0°/180° → frequency along Z axis → Z resolution
-        #   phi=90°/270° → frequency in XY plane → XY resolution
-        # Average opposite angles for better statistics
         z_res = 0.5 * (
             angle_to_resolution.get(0, np.nan) + angle_to_resolution.get(180, np.nan)
         )
@@ -872,178 +1077,36 @@ def fsc_resolution(
         )
         return {"xy": xy_res, "z": z_res}
 
-    # hist backend: vectorized sectioned FSC
-    if spacing is None:
-        spacing_list = None
-    elif isinstance(spacing, (int, float)):
-        spacing_list = [float(spacing)] * image1.ndim
-    else:
-        spacing_list = list(spacing)
-
-    # Determine if we should average both splits (only for single-image mode)
+    # --- Hist backend ---
+    spacing_list = _normalize_spacing(spacing, image1.ndim)
     single_image = image2 is None
-    do_average = average and single_image
 
-    # Save original for reverse split if averaging
-    original_image1 = image1.copy() if do_average else None
+    # Calculate z_factor from spacing if not already set by isotropic resampling
+    if not resample_isotropic and spacing_list is not None:
+        z_factor = spacing_list[0] / spacing_list[1]
 
-    # Preprocess images (forward split)
-    image1_proc, image2_proc = preprocess_images(
+    fsc_data = _fsc_hist_compute(
         image1,
         image2,
-        zero_padding=zero_padding,
-        disable_hamming=False,
-        disable_3d_sum=False,
-    )
-
-    # Calculate sectioned FSC using hist backend (forward split)
-    fsc_data = _calculate_fsc_sectioned_hist(
-        image1_proc,
-        image2_proc,
         bin_delta=bin_delta,
         angle_delta=angle_delta,
-        spacing=spacing_list,
+        spacing_list=spacing_list,
         exclude_axis_angle=exclude_axis_angle,
         use_max_nyquist=use_max_nyquist,
+        zero_padding=zero_padding,
+        average=average,
     )
 
-    # Average with reverse split if enabled
-    if do_average:
-        # Preprocess with reverse split
-        image1_rev, image2_rev = preprocess_images(
-            original_image1,
-            None,
-            zero_padding=zero_padding,
-            disable_hamming=False,
-            disable_3d_sum=False,
-            reverse_split=True,
-        )
-
-        # Calculate FSC with reverse split
-        fsc_data_rev = _calculate_fsc_sectioned_hist(
-            image1_rev,
-            image2_rev,
-            bin_delta=bin_delta,
-            angle_delta=angle_delta,
-            spacing=spacing_list,
-            exclude_axis_angle=exclude_axis_angle,
-            use_max_nyquist=use_max_nyquist,
-        )
-
-        # Average correlation arrays for each angle
-        for angle in fsc_data.keys():
-            if angle in fsc_data_rev:
-                corr_fwd = np.asarray(fsc_data[angle].correlation["correlation"])
-                corr_rev = np.asarray(fsc_data_rev[angle].correlation["correlation"])
-                fsc_data[angle].correlation["correlation"] = (
-                    0.5 * corr_fwd + 0.5 * corr_rev
-                )
-
-    # Analyze results to get resolution
-    # spacing_list is [Z, Y, X] order
-    #
-    # Polar angle convention (0-90°):
-    #   - angle ≈ 0° = Z-dominated → use Z spacing
-    #   - angle ≈ 90° = XY-dominated → use XY spacing
-    if spacing_list is not None:
-        spacing_xy = spacing_list[1]  # Y spacing (assumes Y==X)
-        spacing_z = spacing_list[0]  # Z spacing
-    else:
-        spacing_xy = 1.0
-        spacing_z = 1.0
-
-    # Calculate anisotropy factor for k(θ) correction (Koho et al. 2019, equation 5)
-    # z_factor = spacing_z / spacing_xy (how many XY pixels fit in one Z step)
-    # Note: If resample_isotropic=True, z_factor was already calculated from original
-    # spacing before the spacing was overwritten to isotropic values.
-    if not resample_isotropic and spacing_list is not None:
-        z_factor = spacing_z / spacing_xy
-    # If resample_isotropic=False and no spacing, z_factor remains 1.0 (no correction)
-
-    # Select XY and Z sectors based on polar angle convention:
-    # - theta ≈ 0° = Z-dominated (|kz| >> k_xy) → Z resolution
-    # - theta ≈ 90° = XY-dominated (k_xy >> |kz|) → XY resolution
-    #
-    # With angle_delta=45: angles = [22, 67] (bin centers)
-    # With angle_delta=15: angles = [7, 22, 37, 52, 67, 82]
-    angles = sorted(fsc_data.keys())
-
-    # For XY resolution: find sector closest to 90°
-    angle_xy = max(angles)  # Highest angle is most XY-dominated
-
-    # For Z resolution: fallback cascade over Z-candidate sectors
-    # Try each sector individually from most Z-dominated to least, stopping at
-    # the first one that yields a finite resolution.
-    z_candidates = [a for a in angles if a < z_xy_boundary]
-    if not z_candidates:
-        z_candidates = [min(angles)]
-
-    results = {}
-
-    # Process XY sector
-    data_xy = fsc_data[angle_xy]
-    data_collection = FourierCorrelationDataCollection()
-    data_collection[0] = data_xy
-    analyzer = FourierCorrelationAnalysis(
-        data_collection,
-        spacing_xy,
+    return _fsc_extract_resolution(
+        fsc_data,
+        spacing_list=spacing_list,
+        single_image=single_image,
+        z_factor=z_factor,
+        original_spacing_z=original_spacing_z,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
-        curve_fit_type="spline",
+        z_xy_boundary=z_xy_boundary,
     )
-    try:
-        analyzed = analyzer.execute()[0]
-        # Apply calibration correction for single-image mode
-        if single_image:
-            _apply_cutoff_correction(analyzed)
-        results["xy"] = analyzed.resolution["resolution"]
-    except Exception:
-        results["xy"] = float("nan")
-
-    # Determine spacing for Z resolution calculation
-    # For isotropic resampling: frequencies are in isotropic units, use XY spacing
-    # For non-isotropic: use Z spacing (frequencies normalized to Z Nyquist)
-    if original_spacing_z is not None:
-        analyzer_spacing = spacing_xy  # Frequencies in isotropic units
-    else:
-        analyzer_spacing = spacing_z  # Frequencies normalized to Z Nyquist
-
-    # Process Z resolution: try each Z-candidate sector individually
-    z_resolution = float("nan")
-    z_angle_used = z_candidates[0]
-
-    for z_angle in z_candidates:
-        z_data = fsc_data[z_angle]
-        data_collection = FourierCorrelationDataCollection()
-        data_collection[0] = z_data
-        analyzer = FourierCorrelationAnalysis(
-            data_collection,
-            analyzer_spacing,
-            resolution_threshold=resolution_threshold,
-            threshold_value=threshold_value,
-            curve_fit_type="smooth-spline",
-        )
-        try:
-            analyzed = analyzer.execute()[0]
-            if single_image:
-                _apply_cutoff_correction(analyzed)
-            candidate_res = analyzed.resolution["resolution"]
-            if np.isfinite(candidate_res) and candidate_res > 0:
-                z_resolution = candidate_res
-                z_angle_used = z_angle
-                break
-        except Exception:
-            continue
-
-    # Apply k(θ) correction using actual sector angle (Koho et al. 2019, equation 5)
-    # k(θ) = 1 + (z_factor-1) × |cos(θ)|
-    if np.isfinite(z_resolution) and z_factor > 1.0:
-        k_theta = 1.0 + (z_factor - 1.0) * np.abs(np.cos(np.deg2rad(z_angle_used)))
-        z_resolution = z_resolution * k_theta
-
-    results["z"] = z_resolution
-
-    return results
 
 
 def grid_crop_resolution(
