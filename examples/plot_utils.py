@@ -187,3 +187,109 @@ def plot_dcr_sectors(
         ax.grid(True, alpha=0.3)
 
     return fig
+
+
+def plot_frc_curve(
+    frc_data: FourierCorrelationData,
+    ax: Axes,
+) -> None:
+    """Plot FRC correlation curve with threshold and resolution crossing.
+
+    Parameters
+    ----------
+    frc_data : FourierCorrelationData
+        Analyzed FRC result from :func:`calculate_frc`.
+    ax : Axes
+        Matplotlib axes to plot on.
+    """
+    freq = np.asarray(frc_data.correlation["frequency"])
+    corr = np.asarray(frc_data.correlation["correlation"])
+    thr = np.asarray(frc_data.resolution["threshold"])
+    res = frc_data.resolution["resolution"]
+
+    ax.plot(freq, corr, "-", color="steelblue", linewidth=2, label="FRC")
+    if "curve-fit" in frc_data.correlation.keys:
+        curve_fit = np.asarray(frc_data.correlation["curve-fit"])
+        ax.plot(
+            freq, curve_fit, ":", color="steelblue", linewidth=1, alpha=0.7, label="fit"
+        )
+    ax.plot(freq, thr, "--", color="gray", linewidth=1, label="fixed (1/7)")
+
+    if np.isfinite(res):
+        cross_freq = frc_data.resolution["resolution-point"][1]
+        ax.axvline(
+            x=cross_freq,
+            color="red",
+            linestyle="--",
+            alpha=0.7,
+            label=f"f_c = {cross_freq:.3f}",
+        )
+        ax.set_title(f"FRC \u2014 {res * 1000:.1f} nm")
+    else:
+        ax.set_title("FRC \u2014 no crossing")
+
+    ax.set_xlabel("Normalized frequency")
+    ax.set_ylabel("FRC")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-0.1, 1.1)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+
+def plot_dcr_curves(
+    radii_refined: np.ndarray,
+    all_curves: list[np.ndarray],
+    all_peaks: np.ndarray,
+    ax: Axes,
+    num_highpass: int = 10,
+) -> None:
+    """Plot DCR decorrelation curves with correct x-axes.
+
+    ``dcr_curve(refine=True)`` returns coarse curves (x in 0..1) followed by
+    refined curves (x in the narrowed range given by *radii_refined*).
+
+    Parameters
+    ----------
+    radii_refined : ndarray
+        Radii array returned by :func:`dcr_curve`.
+    all_curves : list of ndarray
+        All decorrelation curves (coarse + refined).
+    all_peaks : ndarray
+        Peak positions array from :func:`dcr_curve`.
+    ax : Axes
+        Matplotlib axes to plot on.
+    num_highpass : int
+        Number of coarse (high-pass) curves before refined curves begin.
+    """
+    n_coarse = num_highpass
+    n_total = len(all_curves)
+    has_refined = n_total > n_coarse
+    num_points = len(all_curves[0])
+
+    # Coarse curves span full 0..1 range
+    radii_coarse = np.linspace(0, 1, num_points, dtype=np.float32)
+
+    for i, d_curve in enumerate(all_curves):
+        is_refined = has_refined and i >= n_coarse
+        r = radii_refined if is_refined else radii_coarse
+        alpha = 0.2 + 0.8 * (i / max(n_total - 1, 1))
+        clr = "darkorange" if is_refined else "steelblue"
+        ax.plot(r, d_curve, "-", color=clr, linewidth=1, alpha=alpha)
+
+    # Find the overall peak (max r among all peaks)
+    valid_peaks = all_peaks[all_peaks[:, 0] > 0]
+    if len(valid_peaks) > 0:
+        k_c_norm = float(np.max(valid_peaks[:, 0]))
+        ax.axvline(
+            x=k_c_norm,
+            color="red",
+            linestyle="--",
+            alpha=0.7,
+            label=f"k_c = {k_c_norm:.3f}",
+        )
+
+    ax.set_xlabel("Normalized frequency")
+    ax.set_ylabel("Decorrelation")
+    ax.set_xlim(0, 1)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
