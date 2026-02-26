@@ -45,6 +45,8 @@ import numpy as np
 from cubic.skimage import exposure
 from cubic.image_utils import rotate_image
 
+from .radial import _kmax_phys, _kmax_index, radial_edges
+
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
@@ -163,8 +165,6 @@ class FourierRingIterator:
     ) -> None:
         if len(shape) != 2:
             raise AssertionError("shape must be 2D")
-
-        from .radial import radial_edges
 
         self.d_bin = d_bin
         self.ring_start = 0
@@ -300,8 +300,6 @@ class FourierShellIterator:
     def __init__(
         self, shape: Iterable[int], d_bin: int, spacing: Sequence[float] | None = None
     ) -> None:
-        from .radial import _kmax_phys, _kmax_index, radial_edges
-
         self.d_bin = d_bin
         shape = tuple(shape)
 

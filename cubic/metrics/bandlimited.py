@@ -32,12 +32,15 @@ import numpy as np
 from cubic.cuda import asnumpy, to_same_device, get_array_module, check_same_device
 from cubic.image_utils import tukey_window, hamming_window
 
+from .frc.dcr import dcr_resolution
+from .frc.frc import frc_resolution, fsc_resolution
 from .frc.radial import (
     radial_edges,
     reduce_power,
     radial_bin_id,
     radial_k_grid,
 )
+from .skimage_metrics import ssim as _ssim
 
 # ---------------------------------------------------------------------------
 # 1  Core building blocks
@@ -212,8 +215,6 @@ def estimate_cutoff(
     # --- DCR (data-driven) bound ---
     if method in ("dcr", "both"):
         try:
-            from .frc.dcr import dcr_resolution
-
             dcr_kw = dict(dcr_kwargs) if dcr_kwargs else {}
             dcr_res = dcr_resolution(image, spacing=spacing, **dcr_kw)
             if isinstance(dcr_res, dict):
@@ -233,12 +234,8 @@ def estimate_cutoff(
             if "spacing" not in frc_kw:
                 frc_kw["spacing"] = spacing
             if image.ndim == 2:
-                from .frc.frc import frc_resolution
-
                 frc_res = frc_resolution(image, **frc_kw)
             elif image.ndim == 3:
-                from .frc.frc import fsc_resolution
-
                 # FSC defaults: hist backend uses zero_padding=False, but
                 # padding improves shell-binning accuracy; isotropic
                 # resampling helps anisotropic volumes (e.g. Z >> XY spacing).
@@ -589,8 +586,6 @@ def band_limited_ssim(
     float
         SSIM value.
     """
-    from .skimage_metrics import ssim as _ssim
-
     check_same_device(prediction, target)
     if prediction.shape != target.shape:
         raise ValueError(

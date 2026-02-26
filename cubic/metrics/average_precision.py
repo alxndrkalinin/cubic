@@ -11,6 +11,8 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 https://github.com/MouseLand/cellpose/blob/509ffca33737058b0b4e2e96d506514e10620eb3/cellpose/metrics.py
 """
 
+import warnings
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -27,8 +29,6 @@ def _label_overlap_gpu(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
     Copyright (c) 2024 Alexandr Kalinin
     """
-    import warnings
-
     from cupyx import jit
 
     x = x.ravel().astype(np.uint32)

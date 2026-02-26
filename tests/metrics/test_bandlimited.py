@@ -584,9 +584,9 @@ def test_estimate_cutoff_fsc_defaults_anisotropic(
         captured.update(kwargs)
         return {"xy": 0.5, "z": 1.0}
 
-    import cubic.metrics.frc.frc as _frc_mod
+    import cubic.metrics.bandlimited as _bl_mod
 
-    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+    monkeypatch.setattr(_bl_mod, "fsc_resolution", fake_fsc)
 
     rng = np.random.default_rng(70)
     img = rng.standard_normal((16, 64, 64)).astype(np.float32)
@@ -604,9 +604,9 @@ def test_estimate_cutoff_fsc_user_override(monkeypatch: pytest.MonkeyPatch) -> N
         captured.update(kwargs)
         return {"xy": 0.5, "z": 1.0}
 
-    import cubic.metrics.frc.frc as _frc_mod
+    import cubic.metrics.bandlimited as _bl_mod
 
-    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+    monkeypatch.setattr(_bl_mod, "fsc_resolution", fake_fsc)
 
     rng = np.random.default_rng(71)
     img = rng.standard_normal((16, 64, 64)).astype(np.float32)
@@ -631,9 +631,9 @@ def test_estimate_cutoff_fsc_isotropic_no_resample(
         captured.update(kwargs)
         return {"xy": 0.5, "z": 1.0}
 
-    import cubic.metrics.frc.frc as _frc_mod
+    import cubic.metrics.bandlimited as _bl_mod
 
-    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+    monkeypatch.setattr(_bl_mod, "fsc_resolution", fake_fsc)
 
     rng = np.random.default_rng(72)
     img = rng.standard_normal((32, 32, 32)).astype(np.float32)
@@ -653,9 +653,9 @@ def test_estimate_cutoff_fsc_defaults_with_both(
         captured.update(kwargs)
         return {"xy": 0.5, "z": 1.0}
 
-    import cubic.metrics.frc.frc as _frc_mod
+    import cubic.metrics.bandlimited as _bl_mod
 
-    monkeypatch.setattr(_frc_mod, "fsc_resolution", fake_fsc)
+    monkeypatch.setattr(_bl_mod, "fsc_resolution", fake_fsc)
 
     rng = np.random.default_rng(73)
     img = rng.standard_normal((16, 64, 64)).astype(np.float32)

@@ -1,10 +1,11 @@
 """Implements 2D/3D Fourier Ring/Shell Correlation."""
 
+import warnings
 from collections.abc import Callable, Sequence
 
 import numpy as np
 
-from cubic.cuda import asnumpy
+from cubic.cuda import asnumpy, get_array_module
 from cubic.image_utils import (
     crop_bl,
     crop_br,
@@ -20,7 +21,19 @@ from cubic.image_utils import (
     reverse_checkerboard_split,
 )
 
-from .radial import _normalize_spacing
+from .radial import (
+    _kmax_phys,
+    radial_edges,
+    reduce_cross,
+    reduce_power,
+    frc_from_sums,
+    radial_bin_id,
+    _kmax_phys_max,
+    sectioned_bin_id,
+    _normalize_spacing,
+    reduce_cross_sectioned,
+    reduce_power_sectioned,
+)
 from .analysis import (
     FourierCorrelationData,
     FourierCorrelationAnalysis,
@@ -180,10 +193,6 @@ def _calculate_frc_core(
 
     if backend == "hist":
         # Histogram backend using radial binning
-        from cubic.cuda import get_array_module
-
-        from .radial import radial_edges, reduce_cross, reduce_power, radial_bin_id
-
         # Compute unshifted FFT
         fft_image1 = np.fft.fftn(image1 - image1.mean())
         fft_image2 = np.fft.fftn(image2 - image2.mean())
@@ -581,16 +590,6 @@ def _calculate_fsc_sectioned_hist(
         to measure higher frequencies for better XY resolution estimates.
         Default: False.
     """
-    from cubic.cuda import asnumpy, get_array_module
-
-    from .radial import (
-        radial_edges,
-        frc_from_sums,
-        sectioned_bin_id,
-        reduce_cross_sectioned,
-        reduce_power_sectioned,
-    )
-
     xp = get_array_module(image1)
 
     # Compute FFT
@@ -639,8 +638,6 @@ def _calculate_fsc_sectioned_hist(
 
     # Nyquist for normalization
     if spacing is not None:
-        from .radial import _kmax_phys, _kmax_phys_max
-
         if use_max_nyquist:
             max_freq = _kmax_phys_max(shape, spacing)
         else:
@@ -1027,8 +1024,6 @@ def fsc_resolution(
                        resolution in order from narrowest to widest. Default: 30.0
                        (matches mask backend Z wedge coverage of ~8% of Fourier space).
     """
-    import warnings
-
     # Set default zero_padding based on backend
     if zero_padding is None:
         zero_padding = backend == "mask"
