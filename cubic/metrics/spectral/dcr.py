@@ -127,12 +127,19 @@ def _find_peak_in_curve(
     r_max: float = 0.9,
     min_prominence: float = 0.001,
     boundary_threshold: float = 0.8,
+    min_amplitude: float = 0.0,
 ) -> tuple[float, float]:
     """
     Find peak in decorrelation curve (Descloux et al. 2019, Supplementary Note 1.1).
 
     Iteratively finds global maximum, excluding boundary artifacts and checking
     prominence. Rejects peaks near boundary if curve is monotonically increasing.
+
+    Parameters
+    ----------
+    min_amplitude : float
+        Reject peaks with amplitude below this value (SNR gate).
+        ImDecorr uses 0.05. Default 0.0 (disabled).
     """
     d_work = d_curve.copy()
     n = len(d_work)
@@ -180,6 +187,12 @@ def _find_peak_in_curve(
                 d_work[peak_idx] = -np.inf
                 continue
 
+        # SNR gate: reject peaks with amplitude below threshold
+        # (ImDecorr: kc(SNR < 0.05) = 0)
+        if min_amplitude > 0 and a_peak < min_amplitude:
+            d_work[peak_idx] = -np.inf
+            continue
+
         return r_peak, a_peak
 
     return 0.0, 0.0
@@ -194,6 +207,8 @@ def dcr_curve(
     smoothing: int | None = None,
     windowing: bool = True,
     refine: bool = True,
+    quantize: bool = False,
+    min_amplitude: float = 0.0,
 ) -> tuple[float, np.ndarray, list[np.ndarray], np.ndarray]:
     """
     Compute decorrelation curve using algorithm from Descloux et al. 2019.
@@ -222,6 +237,12 @@ def dcr_curve(
         sigma ranges around the coarse peaks. This follows the NanoPyx
         two-pass strategy and often yields a higher k_c (better resolution
         estimate). Default: True.
+    quantize : bool
+        If True, truncate d(r) values to 3 decimal places via
+        ``floor(1000 * d) / 1000`` (ImDecorr convention). Default: False.
+    min_amplitude : float
+        Reject peaks with amplitude below this value (ImDecorr SNR gate
+        uses 0.05). Default: 0.0 (disabled).
 
     Returns
     -------
@@ -289,11 +310,14 @@ def dcr_curve(
             num_radii,
             spacing=spacing_arr if spacing is not None else None,
             smoothing=smoothing,
+            quantize=quantize,
         )
 
         # Find peak using algorithm from Descloux et al. 2019 Supplementary Note 1.1
         # Finds global maximum with iterative boundary exclusion and prominence check
-        r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
+        r_peak, a_peak = _find_peak_in_curve(
+            radii, d_curve, min_amplitude=min_amplitude
+        )
 
         all_curves.append(d_curve)
         all_peaks.append([r_peak, a_peak])
@@ -325,8 +349,11 @@ def dcr_curve(
                 smoothing=smoothing,
                 r_min=r_min2,
                 r_max=r_max2,
+                quantize=quantize,
             )
-            r_peak, a_peak = _find_peak_in_curve(radii_ref, d_ref)
+            r_peak, a_peak = _find_peak_in_curve(
+                radii_ref, d_ref, min_amplitude=min_amplitude
+            )
             all_curves.append(d_ref)
             all_peaks.append([r_peak, a_peak])
 
@@ -360,6 +387,7 @@ def _compute_decorrelation_curve(
     smoothing: int | None = None,
     r_min: float = 0.0,
     r_max: float = 1.0,
+    quantize: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Compute decorrelation curve d(r) for a single image (vectorized).
@@ -380,6 +408,11 @@ def _compute_decorrelation_curve(
         Savitzky-Golay filter window length for curve smoothing.
         Default: None (disabled). The decorrelation curve is intrinsically
         smooth (Descloux et al. 2019, Supplementary Note 1).
+    quantize : bool
+        If True, truncate d(r) values to 3 decimal places via
+        ``floor(1000 * d) / 1000`` (ImDecorr convention). This suppresses
+        spurious peaks on monotonically-increasing curves where per-step
+        increments are smaller than 0.001. Default: False.
 
     Returns
     -------
@@ -430,6 +463,8 @@ def _compute_decorrelation_curve(
 
     d_curve = cross_cumsum / (np.sqrt(power * count_cumsum) + 1e-10)
     d_curve = asnumpy(d_curve).astype(np.float32)
+    if quantize:
+        d_curve = np.floor(1000.0 * d_curve) / 1000.0
 
     return radii_cpu, _smooth_curve(d_curve, smoothing), k_max
 
@@ -442,6 +477,7 @@ def _compute_decorrelation_curve_sectioned(
     spacing: np.ndarray | None = None,
     exclude_axis_angle: float = 0.0,
     smoothing: int | None = None,
+    quantize: bool = False,
 ) -> dict[str, tuple[np.ndarray, np.ndarray, float]]:
     """
     Compute sectioned decorrelation curves for 3D images.
@@ -530,6 +566,8 @@ def _compute_decorrelation_curve_sectioned(
             radii_raw / sector_k_max,
             asnumpy(d_curve_raw).astype(np.float32),
         )
+        if quantize:
+            d_curve = np.floor(1000.0 * d_curve) / 1000.0
 
         results[sector_name] = (
             radii_norm,
@@ -553,6 +591,8 @@ def _dcr_curve_3d_sectioned(
     windowing: bool = True,
     refine: bool = True,
     return_curves: bool = False,
+    quantize: bool = False,
+    min_amplitude: float = 0.0,
 ) -> dict[str, float] | dict[str, dict]:
     """Compute 3D DCR with angular sectoring for XY and Z directions.
 
@@ -578,6 +618,7 @@ def _dcr_curve_3d_sectioned(
         spacing=spacing_arr,
         exclude_axis_angle=exclude_axis_angle,
         smoothing=smoothing,
+        quantize=quantize,
     )
 
     # --- Step 1: Compute d₀ (unfiltered) to anchor sigma range ---
@@ -588,7 +629,9 @@ def _dcr_curve_3d_sectioned(
     all_curves: dict[str, list[np.ndarray]] = {"xy": [], "z": []}
     for sector_name in ["xy", "z"]:
         radii, d_curve, _ = d0_results[sector_name]
-        r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
+        r_peak, a_peak = _find_peak_in_curve(
+            radii, d_curve, min_amplitude=min_amplitude
+        )
         r0[sector_name] = r_peak
         all_peaks[sector_name].append((r_peak, a_peak))
         if return_curves:
@@ -634,7 +677,9 @@ def _dcr_curve_3d_sectioned(
         )
         for sector_name in ["xy", "z"]:
             radii, d_curve, _ = sector_results[sector_name]
-            r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
+            r_peak, a_peak = _find_peak_in_curve(
+                radii, d_curve, min_amplitude=min_amplitude
+            )
             all_peaks[sector_name].append((r_peak, a_peak))
             if return_curves:
                 all_curves[sector_name].append(asnumpy(d_curve))
@@ -661,7 +706,9 @@ def _dcr_curve_3d_sectioned(
                 filtered = _highpass_filter(image, sigma_hp)
                 sr = _compute_decorrelation_curve_sectioned(filtered, **common_kwargs)
                 radii, d_curve, _ = sr[sector_name]
-                r_peak, a_peak = _find_peak_in_curve(radii, d_curve)
+                r_peak, a_peak = _find_peak_in_curve(
+                    radii, d_curve, min_amplitude=min_amplitude
+                )
                 all_peaks[sector_name].append((r_peak, a_peak))
                 del filtered
 
@@ -703,6 +750,8 @@ def dcr_curve_3d_sectioned(
     exclude_axis_angle: float = 0.0,
     windowing: bool = True,
     refine: bool = True,
+    quantize: bool = False,
+    min_amplitude: float = 0.0,
 ) -> dict[str, dict]:
     """Compute 3D DCR with angular sectoring, returning full curve data.
 
@@ -727,6 +776,12 @@ def dcr_curve_3d_sectioned(
         Apply Tukey window for edge apodization (default: True).
     refine : bool
         Two-pass refinement (default: True).
+    quantize : bool
+        Truncate d(r) to 3 decimal places (ImDecorr convention).
+        Default: False.
+    min_amplitude : float
+        Reject peaks below this amplitude (ImDecorr SNR gate: 0.05).
+        Default: 0.0 (disabled).
 
     Returns
     -------
@@ -752,6 +807,8 @@ def dcr_curve_3d_sectioned(
         windowing=windowing,
         refine=refine,
         return_curves=True,
+        quantize=quantize,
+        min_amplitude=min_amplitude,
     )
 
 
@@ -806,6 +863,8 @@ def dcr_resolution(
     use_sectioned: bool = True,
     windowing: bool = True,
     refine: bool = True,
+    quantize: bool = False,
+    min_amplitude: float = 0.0,
 ) -> float | dict[str, float]:
     """
     Calculate resolution using DCR algorithm (Descloux et al. 2019).
@@ -840,6 +899,13 @@ def dcr_resolution(
         If True, run a second refinement pass with narrowed frequency and
         sigma ranges around the coarse peaks (NanoPyx two-pass strategy).
         Default: True.
+    quantize : bool
+        If True, truncate d(r) values to 3 decimal places via
+        ``floor(1000 * d) / 1000`` (ImDecorr convention). This suppresses
+        spurious peaks on monotonically-increasing curves. Default: False.
+    min_amplitude : float
+        Reject peaks with amplitude below this value (ImDecorr SNR gate
+        uses 0.05). Default: 0.0 (disabled).
 
     Returns
     -------
@@ -870,6 +936,8 @@ def dcr_resolution(
             num_highpass=num_highpass,
             windowing=windowing,
             refine=refine,
+            quantize=quantize,
+            min_amplitude=min_amplitude,
         )
         return resolution
 
@@ -887,6 +955,8 @@ def dcr_resolution(
                 exclude_axis_angle=exclude_axis_angle,
                 windowing=windowing,
                 refine=refine,
+                quantize=quantize,
+                min_amplitude=min_amplitude,
             )
         else:
             # Legacy: compute directional resolutions from 2D slices
@@ -905,6 +975,8 @@ def dcr_resolution(
                 num_radii=num_radii,
                 num_highpass=num_highpass,
                 windowing=windowing,
+                quantize=quantize,
+                min_amplitude=min_amplitude,
             )
 
             # Z resolution: analyze middle XZ slice
@@ -917,6 +989,8 @@ def dcr_resolution(
                 num_radii=num_radii,
                 num_highpass=num_highpass,
                 windowing=windowing,
+                quantize=quantize,
+                min_amplitude=min_amplitude,
             )
 
             return {"xy": res_xy, "z": res_xz}
