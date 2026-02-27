@@ -25,6 +25,7 @@ Descloux, A., et al. (2019). Parameter-free image resolution estimation
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 
 import numpy as np
@@ -224,8 +225,8 @@ def estimate_cutoff(
                 dcr_val = dcr_res
             if np.isfinite(dcr_val) and dcr_val > 0:
                 bounds.append(dcr_safety / dcr_val)
-        except Exception:
-            pass  # DCR failure → skip
+        except Exception as exc:
+            warnings.warn(f"DCR resolution estimation failed: {exc}", stacklevel=2)
 
     # --- FRC / FSC (data-driven) bound ---
     if method in ("frc", "both"):
@@ -249,8 +250,8 @@ def estimate_cutoff(
                 frc_res = float("nan")
             if np.isfinite(frc_res) and frc_res > 0:
                 bounds.append(frc_safety / frc_res)
-        except Exception:
-            pass  # FRC/FSC failure → skip
+        except Exception as exc:
+            warnings.warn(f"FRC/FSC resolution estimation failed: {exc}", stacklevel=2)
 
     # --- OTF (physics) bound ---
     if numerical_aperture is not None and wavelength_emission is not None:
@@ -433,9 +434,7 @@ def _apply_lowpass(
     H = butterworth_lowpass(img.shape, cutoff, spacing=spacing, order=order)
 
     # Move filter to same device as data
-    xp = get_array_module(img)
-    if xp is not np:
-        H = xp.asarray(H)
+    H = to_same_device(H, img)
 
     F *= H
     return np.fft.ifftn(F).real.astype(np.float32)

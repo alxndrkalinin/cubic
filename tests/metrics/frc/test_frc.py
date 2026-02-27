@@ -11,6 +11,11 @@ from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
 from cubic.metrics.frc import calculate_frc, fsc_resolution
 from cubic.metrics.frc.frc import _calibration_factor
+from cubic.metrics.frc.analysis import (
+    FourierCorrelationData,
+    FourierCorrelationAnalysis,
+    FourierCorrelationDataCollection,
+)
 
 
 def _fractional_to_absolute(
@@ -396,3 +401,51 @@ def test_fsc_z_xy_boundary_parameter() -> None:
     # XY resolution should be the same regardless of z_xy_boundary
     # (XY uses the highest-angle sector, unaffected by Z boundary)
     assert result_narrow["xy"] == pytest.approx(result_wide["xy"], rel=1e-10)
+
+
+def test_z_correction_at_boundary_angles() -> None:
+    """Verify z_correction multiplier at theta=0 (Z) and theta=90 (XY).
+
+    The z_multiplier formula (analysis.py) is:
+        z_multiplier = 1 + (z_correction - 1) * |cos(angle)|
+
+    At polar angle 0 (Z axis): cos(0)=1 -> multiplier = z_correction
+    At polar angle 90 (XY plane): cos(90)=0 -> multiplier = 1.0
+    """
+    from cubic.metrics.frc.analysis import FourierCorrelationAnalysis
+
+    z_corr = 2.5
+
+    # Build minimal single-bin data for two sectors: 0 (Z) and 90 (XY)
+    for angle_deg, expected_mult in [(0, z_corr), (90, 1.0)]:
+        coll = FourierCorrelationDataCollection()
+        ds = FourierCorrelationData()
+        # Monotonically decreasing correlation that crosses any threshold
+        freq = np.linspace(0, 1, 50)
+        corr = np.maximum(1.0 - 2.0 * freq, -0.1)
+        ds.correlation["correlation"] = corr
+        ds.correlation["frequency"] = freq
+        ds.correlation["points-x-bin"] = np.ones(50)
+        coll[angle_deg] = ds
+
+        spacing = 0.1  # arbitrary
+        analyzer = FourierCorrelationAnalysis(
+            coll,
+            spacing,
+            resolution_threshold="fixed",
+            threshold_value=1 / 7,
+        )
+        result = analyzer.execute(z_correction=z_corr)
+        analyzed = result[angle_deg]
+
+        # Extract resolution-point crossing frequency
+        cross_freq = analyzed.resolution["resolution-point"][1]
+        resolution = analyzed.resolution["resolution"]
+
+        # Resolution = z_multiplier * (2 * spacing / cross_freq)
+        # So z_multiplier = resolution * cross_freq / (2 * spacing)
+        actual_mult = resolution * cross_freq / (2 * spacing)
+        assert actual_mult == pytest.approx(expected_mult, rel=1e-3), (
+            f"At angle={angle_deg}, expected multiplier={expected_mult}, "
+            f"got {actual_mult}"
+        )

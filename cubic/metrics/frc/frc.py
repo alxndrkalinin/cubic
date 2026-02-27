@@ -724,6 +724,11 @@ def _resample_isotropic_for_fsc(
     spacing_tuple = tuple(spacing)
     original_spacing_z = spacing_tuple[0]
     iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
+    if not np.isclose(spacing_tuple[1], spacing_tuple[2], rtol=1e-3):
+        raise ValueError(
+            f"Isotropic resampling requires equal XY spacing, "
+            f"got Y={spacing_tuple[1]}, X={spacing_tuple[2]}"
+        )
 
     # z_factor from ORIGINAL spacing for k(theta) correction
     z_factor = original_spacing_z / iso_spacing
@@ -1054,7 +1059,7 @@ def fsc_resolution(
             image2,
             bin_delta=bin_delta,
             angle_delta=angle_delta,
-            resolution_threshold="one-bit",
+            resolution_threshold=resolution_threshold,
             spacing=spacing,
             zero_padding=zero_padding,
         )

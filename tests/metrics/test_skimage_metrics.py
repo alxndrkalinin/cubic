@@ -10,9 +10,9 @@ from cubic.metrics.skimage_metrics import psnr, ssim, nrmse
 @pytest.fixture
 def test_images() -> tuple[np.ndarray, np.ndarray]:
     """Create test images for metric comparison."""
-    np.random.seed(42)
-    img1 = np.random.rand(8, 8).astype(float)
-    img2 = img1 + 0.1 * np.random.rand(8, 8).astype(float)
+    rng = np.random.default_rng(42)
+    img1 = rng.random((8, 8)).astype(float)
+    img2 = img1 + 0.1 * rng.random((8, 8)).astype(float)
     return img1, img2
 
 

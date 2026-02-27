@@ -98,6 +98,7 @@ def plot_fsc_sectors(
             curve_fit_type=curve_fit_type,
             smoothing_factor=smoothing_factor,
         )
+        analyzed = None
         try:
             analyzed = analyzer.execute()[0]
             res_val = analyzed.resolution["resolution"]
@@ -107,7 +108,7 @@ def plot_fsc_sectors(
             thr_curve = None
 
         ax.plot(freq, corr, "-", color="steelblue", linewidth=0.75, label="FSC")
-        if "curve-fit" in analyzed.correlation.keys:
+        if analyzed is not None and "curve-fit" in analyzed.correlation.keys:
             curve_fit = np.asarray(analyzed.correlation["curve-fit"])
             ax.plot(
                 freq,
@@ -120,7 +121,7 @@ def plot_fsc_sectors(
             )
         if thr_curve is not None:
             ax.plot(freq, thr_curve, "--", color="gray", linewidth=1, label=threshold)
-        if np.isfinite(res_val):
+        if np.isfinite(res_val) and analyzed is not None:
             cross_freq = analyzed.resolution["resolution-point"][1]
             ax.axvline(
                 x=cross_freq,

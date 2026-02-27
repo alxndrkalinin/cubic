@@ -102,8 +102,8 @@ def _refinement_ranges(
         sigma_min = float(sigmas[idx_lo])
         sigma_max = float(sigmas[idx_hi])
     else:
-        sigma_min = 1.0
-        sigma_max = float(sigmas[0]) if len(sigmas) > 0 else 0.5
+        sigma_min = float(sigmas[0]) if len(sigmas) > 0 else 1.0
+        sigma_max = float(sigmas[-1]) if len(sigmas) > 0 else 1.0
 
     return r_min, r_max, sigma_min, sigma_max
 
@@ -765,7 +765,7 @@ def _highpass_filter(image: np.ndarray, sigma: float) -> np.ndarray:
 def _generate_highpass_sigmas(
     image_shape: tuple[int, ...],
     num_highpass: int,
-    sigma_min: float = 0.5,
+    sigma_min: float = 1.0,
     sigma_max: float | None = None,
 ) -> np.ndarray:
     """Generate log-spaced high-pass sigmas (NanoPyx convention).
@@ -774,12 +774,24 @@ def _generate_highpass_sigmas(
     (image - gaussian(image, σ)) becomes degenerate when σ < ~1 px: the
     discrete kernel collapses to near-identity and the high-pass filter
     removes almost no signal.
+
+    Parameters
+    ----------
+    image_shape : tuple of int
+        Shape of the image.
+    num_highpass : int
+        Number of high-pass sigmas to generate.
+    sigma_min : float
+        Minimum sigma (floor at 1.0 pixel).
+    sigma_max : float or None
+        Maximum sigma. If None, uses min(image_shape) / 2.
     """
+    sigma_min = max(sigma_min, 1.0)
     if sigma_max is None:
         sigma_max = min(image_shape) / 2.0
     if num_highpass <= 1:
         return np.array([sigma_min], dtype=np.float32)
-    log_min = np.log(max(sigma_min, 1.0))
+    log_min = np.log(sigma_min)
     log_max = np.log(sigma_max)
     return np.exp(np.linspace(log_min, log_max, num_highpass)).astype(np.float32)
 
@@ -827,7 +839,7 @@ def dcr_resolution(
     refine : bool
         If True, run a second refinement pass with narrowed frequency and
         sigma ranges around the coarse peaks (NanoPyx two-pass strategy).
-        Only used for 2D images. Default: False.
+        Default: True.
 
     Returns
     -------

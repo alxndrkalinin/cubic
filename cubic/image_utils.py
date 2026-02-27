@@ -432,6 +432,8 @@ def _tukey_window_1d(n: int, alpha: float, xp) -> np.ndarray:
     if alpha <= 0:
         return xp.ones(n, dtype=np.float32)
     if alpha >= 1:
+        if n <= 1:
+            return xp.ones(max(n, 0), dtype=np.float32)
         idx = xp.arange(n, dtype=np.float64)
         return (0.5 * (1 - xp.cos(2 * np.pi * idx / (n - 1)))).astype(np.float32)
 

@@ -143,20 +143,6 @@ print(f"Both cutoff: {cutoff_both:.2f} cycles/um (min of all bounds)")
 
 For 3-D inputs, `estimate_cutoff` sets `zero_padding=True` and `resample_isotropic=True` (when `max(spacing)/min(spacing) > 1.5`) by default. These can be overridden via `frc_kwargs`.
 
-## Preprocessing Differences by Method
-
-`estimate_cutoff()` applies method-appropriate preprocessing defaults when calling the underlying resolution estimators:
-
-| Step | DCR | FRC (2-D) | FSC (3-D) |
-|---|---|---|---|
-| Apodization | Tukey (alpha=0.1) | Hamming | Hamming |
-| Zero-padding | No | Yes (to cube) | Yes (forced by `estimate_cutoff`) |
-| Image splitting | No | Checkerboard | Checkerboard + Z-summing |
-| Isotropic resampling | No | N/A | Auto (if anisotropic spacing) |
-| Mean subtraction | Yes | Yes (before FFT) | Yes (before FFT) |
-
-For 3-D inputs, `estimate_cutoff` sets `zero_padding=True` and `resample_isotropic=True` (when `max(spacing)/min(spacing) > 1.5`) by default. These can be overridden via `frc_kwargs`.
-
 ## Math Background
 
 ### Cutoff-resolution conversion
