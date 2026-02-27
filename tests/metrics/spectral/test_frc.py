@@ -9,9 +9,9 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.frc import calculate_frc, fsc_resolution
-from cubic.metrics.frc.frc import _calibration_factor
-from cubic.metrics.frc.analysis import (
+from cubic.metrics.spectral import calculate_frc, fsc_resolution
+from cubic.metrics.spectral.frc import _calibration_factor
+from cubic.metrics.spectral.analysis import (
     FourierCorrelationData,
     FourierCorrelationAnalysis,
     FourierCorrelationDataCollection,
@@ -412,7 +412,7 @@ def test_z_correction_at_boundary_angles() -> None:
     At polar angle 0 (Z axis): cos(0)=1 -> multiplier = z_correction
     At polar angle 90 (XY plane): cos(90)=0 -> multiplier = 1.0
     """
-    from cubic.metrics.frc.analysis import FourierCorrelationAnalysis
+    from cubic.metrics.spectral.analysis import FourierCorrelationAnalysis
 
     z_corr = 2.5
 

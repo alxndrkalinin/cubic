@@ -9,7 +9,7 @@ This module provides implementations of resolution estimation methods for fluore
 ## Quick Start
 
 ```python
-from cubic.metrics.frc import frc_resolution, fsc_resolution, dcr_resolution
+from cubic.metrics.spectral import frc_resolution, fsc_resolution, dcr_resolution
 
 # 2D FRC (requires two images or uses checkerboard split)
 res = frc_resolution(image_2d, spacing=0.065)

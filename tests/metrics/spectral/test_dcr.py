@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from cubic.metrics.frc import dcr_curve, dcr_resolution
+from cubic.metrics.spectral import dcr_curve, dcr_resolution
 
 
 def make_test_image_2d(

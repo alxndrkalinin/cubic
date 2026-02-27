@@ -33,15 +33,15 @@ import numpy as np
 from cubic.cuda import asnumpy, to_same_device, get_array_module, check_same_device
 from cubic.image_utils import tukey_window, hamming_window
 
-from .frc.dcr import dcr_resolution
-from .frc.frc import frc_resolution, fsc_resolution
-from .frc.radial import (
+from .spectral.dcr import dcr_resolution
+from .spectral.frc import frc_resolution, fsc_resolution
+from .skimage_metrics import ssim as _ssim
+from .spectral.radial import (
     radial_edges,
     reduce_power,
     radial_bin_id,
     radial_k_grid,
 )
-from .skimage_metrics import ssim as _ssim
 
 # ---------------------------------------------------------------------------
 # 1  Core building blocks

@@ -35,9 +35,9 @@ Core utilities for device-agnostic computation:
 - `get_array_module()` should only be used when creating new arrays that must be on a specific device. For most operations, use `np.` directly - NumPy functions work on both NumPy and CuPy arrays through duck typing.
 - **Always use `cubic.cuda` functions** for device operations (moving arrays, checking devices) rather than directly calling CuPy functions. This maintains the abstraction layer and ensures consistent behavior.
 
-### Resolution Metrics (`cubic/metrics/frc/`)
+### Resolution Metrics (`cubic/metrics/spectral/`)
 
-FRC (Fourier Ring Correlation), FSC (Fourier Shell Correlation), and DCR (Decorrelation Analysis) for image resolution estimation. See `cubic/metrics/frc/README.md` for detailed documentation and API usage.
+FRC (Fourier Ring Correlation), FSC (Fourier Shell Correlation), and DCR (Decorrelation Analysis) for image resolution estimation. See `cubic/metrics/spectral/README.md` for detailed documentation and API usage.
 
 ### Preprocessing (`cubic/preprocessing/`)
 
@@ -162,4 +162,4 @@ Key paper for understanding the library:
 
 - **cubic**: Kalinin et al. (2025) "cubic: CUDA-accelerated 3D BioImage Computing", ICCV Workshop.
 
-For resolution metrics (FRC/FSC/DCR), see `cubic/metrics/frc/README.md` for detailed documentation and references.
+For resolution metrics (FRC/FSC/DCR), see `cubic/metrics/spectral/README.md` for detailed documentation and references.
