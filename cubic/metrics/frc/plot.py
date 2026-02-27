@@ -1,16 +1,36 @@
-"""Shared plotting utilities for resolution estimation examples."""
+"""Plotting utilities for FRC/FSC/DCR resolution curves.
+
+Requires matplotlib (install with ``pip install cubic[plot]``).
+"""
 
 from __future__ import annotations
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
+from typing import TYPE_CHECKING
 
-from cubic.metrics.frc.analysis import (
+import numpy as np
+
+from .analysis import (
     FourierCorrelationData,
     FourierCorrelationAnalysis,
     FourierCorrelationDataCollection,
 )
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
+
+def _import_matplotlib():
+    """Import matplotlib, raising a clear error if unavailable."""
+    try:
+        import matplotlib.pyplot as plt
+
+        return plt
+    except ImportError:
+        raise ImportError(
+            "matplotlib is required for plotting functions. "
+            "Install it with: pip install cubic[plot]"
+        ) from None
 
 
 def plot_fsc_sectors(
@@ -18,8 +38,10 @@ def plot_fsc_sectors(
     spacing_iso: float,
     *,
     threshold: str = "one-bit",
+    curve_fit_type: str = "smooth-spline",
+    smoothing_factor: float = 0.2,
     axes: tuple[Axes, Axes] | None = None,
-) -> plt.Figure | None:
+) -> Figure | None:
     """Plot FSC correlation curves for XY and Z sectors.
 
     Parameters
@@ -30,6 +52,10 @@ def plot_fsc_sectors(
         Isotropic spacing in physical units (used for resolution calculation).
     threshold : str
         Threshold type for resolution curve ("one-bit", "half-bit", "fixed").
+    curve_fit_type : str
+        Curve fitting method ("spline", "smooth-spline", "polynomial").
+    smoothing_factor : float
+        Smoothing factor for smooth-spline fitting.
     axes : tuple of two Axes, optional
         If provided, plot onto these axes. Otherwise create a new figure.
 
@@ -38,6 +64,8 @@ def plot_fsc_sectors(
     Figure or None
         The created figure, or None if axes were provided.
     """
+    plt = _import_matplotlib()
+
     angles = sorted(fsc_data.keys())
     angle_xy = max(angles)
     angle_z = min(angles)
@@ -64,7 +92,11 @@ def plot_fsc_sectors(
         coll[0] = ds
 
         analyzer = FourierCorrelationAnalysis(
-            coll, spacing_iso, resolution_threshold=threshold, curve_fit_type="spline"
+            coll,
+            spacing_iso,
+            resolution_threshold=threshold,
+            curve_fit_type=curve_fit_type,
+            smoothing_factor=smoothing_factor,
         )
         try:
             analyzed = analyzer.execute()[0]
@@ -74,7 +106,7 @@ def plot_fsc_sectors(
             res_val = np.nan
             thr_curve = None
 
-        ax.plot(freq, corr, "-", color="steelblue", linewidth=2, label="FSC")
+        ax.plot(freq, corr, "-", color="steelblue", linewidth=0.75, label="FSC")
         if "curve-fit" in analyzed.correlation.keys:
             curve_fit = np.asarray(analyzed.correlation["curve-fit"])
             ax.plot(
@@ -82,7 +114,7 @@ def plot_fsc_sectors(
                 curve_fit,
                 ":",
                 color="steelblue",
-                linewidth=1,
+                linewidth=0.75,
                 alpha=0.7,
                 label="fit",
             )
@@ -129,7 +161,7 @@ def plot_dcr_sectors(
     sector_data: dict[str, dict],
     *,
     axes: tuple[Axes, Axes] | None = None,
-) -> plt.Figure | None:
+) -> Figure | None:
     """Plot DCR decorrelation curves for XY and Z sectors.
 
     Parameters
@@ -146,6 +178,8 @@ def plot_dcr_sectors(
     Figure or None
         The created figure, or None if axes were provided.
     """
+    plt = _import_matplotlib()
+
     fig = None
     if axes is None:
         fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
@@ -202,16 +236,24 @@ def plot_frc_curve(
     ax : Axes
         Matplotlib axes to plot on.
     """
+    _import_matplotlib()
+
     freq = np.asarray(frc_data.correlation["frequency"])
     corr = np.asarray(frc_data.correlation["correlation"])
     thr = np.asarray(frc_data.resolution["threshold"])
     res = frc_data.resolution["resolution"]
 
-    ax.plot(freq, corr, "-", color="steelblue", linewidth=2, label="FRC")
+    ax.plot(freq, corr, "-", color="steelblue", linewidth=0.75, label="FRC")
     if "curve-fit" in frc_data.correlation.keys:
         curve_fit = np.asarray(frc_data.correlation["curve-fit"])
         ax.plot(
-            freq, curve_fit, ":", color="steelblue", linewidth=1, alpha=0.7, label="fit"
+            freq,
+            curve_fit,
+            ":",
+            color="steelblue",
+            linewidth=0.75,
+            alpha=0.7,
+            label="fit",
         )
     ax.plot(freq, thr, "--", color="gray", linewidth=1, label="fixed (1/7)")
 
@@ -261,6 +303,8 @@ def plot_dcr_curves(
     num_highpass : int
         Number of coarse (high-pass) curves before refined curves begin.
     """
+    _import_matplotlib()
+
     n_coarse = num_highpass
     n_total = len(all_curves)
     has_refined = n_total > n_coarse

@@ -398,7 +398,7 @@ class FourierCorrelationAnalysis(object):
 
         fit_start = first_guess(
             data_set.correlation["frequency"],
-            data_set.correlation["correlation"],
+            data_set.correlation["curve-fit"],
             np.mean(data_set.resolution["threshold"]),
         )
 

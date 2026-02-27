@@ -42,6 +42,9 @@ cellpose = [
 mesh = [
     "trimesh>=3.3.0",
 ]
+plot = [
+    "matplotlib>=3.5",
+]
 dev = [
     "ruff",
     "mypy",
@@ -52,6 +55,7 @@ dev = [
 all = [
     "cubic[cellpose]",
     "cubic[mesh]",
+    "cubic[plot]",
     "cubic[dev]",
 ]
 

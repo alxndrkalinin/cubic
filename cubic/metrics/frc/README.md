@@ -241,6 +241,7 @@ For anisotropic voxels (e.g., Z spacing >> XY spacing):
 - `dcr.py` – DCR (Decorrelation Analysis) following Descloux et al. 2019
 - `radial.py` – Shared radial binning utilities
 - `analysis.py` – Curve fitting and resolution extraction
+- `plot.py` – Plotting utilities for FRC/FSC/DCR curves (requires matplotlib)
 
 ## Limitations
 
