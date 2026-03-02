@@ -14,9 +14,10 @@ Uses published preprocessing conventions:
 Requires GPU (CuPy) for execution.
 
 Usage:
-    python benchmark_resolution_methods.py                  # default settings
+    python benchmark_resolution_methods.py                  # default settings (STED)
     python benchmark_resolution_methods.py crop.size=1024   # different crop size
-    python benchmark_resolution_methods.py data_name=astrocyte image_path=path/to/image.tif
+    python benchmark_resolution_methods.py --config-name=astrocyte  # astrocyte benchmarks
+    python benchmark_resolution_methods.py --config-name=astrocyte crop.size=1024
 """
 
 import gc
@@ -91,6 +92,77 @@ def load_single_image(image_path):
 
     img = io.imread(image_path)
     return img.astype(np.float32)
+
+
+def astrocyte_cell_region_crop(
+    shape_zyx: tuple[int, ...], size_xy: int
+) -> tuple[slice, slice, slice]:
+    """Return (z_slice, y_slice, x_slice) for a crop of size_xy that captures cells.
+
+    For the astrocyte image (astr_vpa_hoechst.tif):
+    - Cells are located roughly at Y=1000:end, X=1300:end
+    - Top-left and bottom-right ~512x512 corners are empty
+    - This function returns a smart crop that maximizes cell content
+
+    Parameters
+    ----------
+    shape_zyx : tuple
+        Shape of the image (Z, Y, X) or (Y, X)
+    size_xy : int
+        Crop size in pixels (e.g., 256, 512, 1024)
+
+    Returns
+    -------
+    tuple of slices
+        (z_slice, y_slice, x_slice) for indexing the image
+    """
+    if len(shape_zyx) == 2:
+        z, y, x = 1, shape_zyx[0], shape_zyx[1]
+    else:
+        z, y, x = shape_zyx[0], shape_zyx[1], shape_zyx[2]
+
+    # Cell region boundaries (avoiding empty corners)
+    y_lo, y_hi = 1000, y - 512
+    x_lo, x_hi = 1300, x - 512
+
+    if size_xy <= (y_hi - y_lo) and size_xy <= (x_hi - x_lo):
+        # Crop fits within cell region — center it
+        cy, cx = (y_lo + y_hi) / 2, (x_lo + x_hi) / 2
+        y0 = int(cy - size_xy / 2)
+        x0 = int(cx - size_xy / 2)
+
+        # Shift right to avoid empty left edge for smaller crops
+        x_shift = 50 if size_xy == 256 else (300 if size_xy == 512 else 0)
+        x0 += x_shift
+
+        # Clamp to valid range
+        y0 = max(y_lo, min(y0, y_hi - size_xy))
+        x0 = max(x_lo, min(x0, x - size_xy))
+    else:
+        # Large crop (1024+): anchor at cell-region start to maximize cell content
+        y0, x0 = y_lo, x_lo
+
+    z_slice = slice(0, z)
+    y_slice = slice(y0, y0 + size_xy)
+    x_slice = slice(x0, x0 + size_xy)
+
+    # Verify crop produces the expected size
+    crop_y = y_slice.stop - y_slice.start
+    crop_x = x_slice.stop - x_slice.start
+    if crop_y != size_xy or crop_x != size_xy:
+        raise ValueError(
+            f"Crop size mismatch: expected {size_xy}x{size_xy}, "
+            f"got {crop_y}x{crop_x} (y={y_slice}, x={x_slice})"
+        )
+
+    # Verify crop is within image bounds
+    if y_slice.stop > y or x_slice.stop > x:
+        raise ValueError(
+            f"Crop exceeds image bounds: image is {y}x{x}, "
+            f"crop ends at y={y_slice.stop}, x={x_slice.stop}"
+        )
+
+    return z_slice, y_slice, x_slice
 
 
 def save_results_csv(results, output_path, data_name="", crop_size=None):
@@ -578,6 +650,7 @@ def run_benchmark(
     methods_cfg,
     timing_cfg,
     plots_cfg,
+    preprocessing_cfg=None,
     image_path=None,
     single_image_only=False,
     data_name="",
@@ -624,17 +697,24 @@ def run_benchmark(
 
     # Crop
     if crop_cfg.get("enabled", True):
-        z, y, x = img_a.shape
-        cy, cx = y // 2, x // 2
         size = crop_cfg.get("size", 512)
-        half = size // 2
-        img_a_crop = img_a[:, cy - half : cy + half, cx - half : cx + half]
-        img_b_crop = (
-            img_b[:, cy - half : cy + half, cx - half : cx + half]
-            if img_b is not None
-            else None
-        )
-        print(f"Cropped shape: {img_a_crop.shape}")
+        mode = crop_cfg.get("mode", "center")
+
+        if mode == "cell_region":
+            slices = astrocyte_cell_region_crop(img_a.shape, size)
+            img_a_crop = img_a[slices]
+            img_b_crop = img_b[slices] if img_b is not None else None
+        else:  # center (default)
+            z, y, x = img_a.shape
+            cy, cx = y // 2, x // 2
+            half = size // 2
+            img_a_crop = img_a[:, cy - half : cy + half, cx - half : cx + half]
+            img_b_crop = (
+                img_b[:, cy - half : cy + half, cx - half : cx + half]
+                if img_b is not None
+                else None
+            )
+        print(f"Cropped shape: {img_a_crop.shape} (mode={mode})")
     else:
         img_a_crop = img_a
         img_b_crop = img_b
@@ -665,15 +745,21 @@ def run_benchmark(
     fsc_method = method_cfg.get("fsc", {})
     dcr_method = method_cfg.get("dcr", {})
 
+    # Get preprocessing configs (fall back to published defaults)
+    pre = preprocessing_cfg or {}
+    fsc_pre = pre.get("fsc", {})
+
     n_runs = timing_cfg.get("n_runs", 3)
 
     # ==================== COMPUTE ALL RESULTS ====================
-    # Using published preprocessing conventions:
-    #   FRC/FSC: Hamming window, zero padding
-    #   DCR: Tukey window (alpha=0.1), no padding
+    fsc_zero_padding = fsc_pre.get("zero_padding", True)
+    fsc_resample_iso = fsc_pre.get("resample_isotropic", True)
     print("\nComputing resolution estimates...")
     print("  FRC: Hamming window, zero padding")
-    print("  FSC: Hamming window, isotropic resampling")
+    print(
+        f"  FSC: Hamming window, resample_isotropic={fsc_resample_iso},"
+        f" zero_padding={fsc_zero_padding}"
+    )
     print("  DCR: Tukey window, no padding")
     results = []
 
@@ -814,8 +900,8 @@ def run_benchmark(
             img_a_gpu,
             img_b_gpu,
             spacing=spacing_3d,
-            resample_isotropic=True,
-            zero_padding=True,
+            resample_isotropic=fsc_resample_iso,
+            zero_padding=fsc_zero_padding,
             backend="hist",
             resolution_threshold="one-bit",
             bin_delta=fsc_method.get("bin_delta", 10),
@@ -830,8 +916,8 @@ def run_benchmark(
             fsc_resolution,
             img_a_gpu,
             spacing=spacing_3d,
-            resample_isotropic=True,
-            zero_padding=True,
+            resample_isotropic=fsc_resample_iso,
+            zero_padding=fsc_zero_padding,
             average=True,
             backend="hist",
             resolution_threshold="one-bit",
@@ -852,8 +938,8 @@ def run_benchmark(
                 img_a_gpu,
                 img_b_gpu,
                 spacing=spacing_3d,
-                resample_isotropic=True,
-                zero_padding=True,
+                resample_isotropic=fsc_resample_iso,
+                zero_padding=fsc_zero_padding,
                 backend="mask",
                 bin_delta=fsc_method.get("bin_delta", 10),
                 angle_delta=fsc_method.get("angle_delta", 15),
@@ -871,8 +957,8 @@ def run_benchmark(
                 fsc_resolution,
                 img_a_gpu,
                 spacing=spacing_3d,
-                resample_isotropic=True,
-                zero_padding=True,
+                resample_isotropic=fsc_resample_iso,
+                zero_padding=fsc_zero_padding,
                 average=True,
                 backend="mask",
                 bin_delta=fsc_method.get("bin_delta", 10),
@@ -1112,6 +1198,7 @@ def main(cfg: DictConfig) -> None:
         methods_cfg=OmegaConf.to_container(cfg.methods),
         timing_cfg=OmegaConf.to_container(cfg.timing),
         plots_cfg=OmegaConf.to_container(cfg.plots),
+        preprocessing_cfg=OmegaConf.to_container(cfg.preprocessing),
         image_path=cfg.get("image_path"),
         single_image_only=cfg.get("single_image_only", False),
         data_name=cfg.get("data_name", ""),
