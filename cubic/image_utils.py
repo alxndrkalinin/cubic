@@ -114,7 +114,7 @@ def pad_image(
 def pad_image_to_cube(
     img: np.ndarray,
     cube_size: int | None = None,
-    mode: str = "reflect",
+    mode: str = "constant",
     axes: Sequence[int] | None = None,
 ) -> np.ndarray:
     """Pad all image axes up to cubic shape."""

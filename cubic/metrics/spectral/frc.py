@@ -73,6 +73,7 @@ def preprocess_images(
     image2: np.ndarray | None = None,
     *,
     zero_padding: bool = True,
+    pad_mode: str = "constant",
     reverse_split: bool = False,
     disable_hamming: bool = False,
     disable_3d_sum: bool = False,
@@ -82,7 +83,7 @@ def preprocess_images(
 
     # Apply padding to first image
     if len(set(image1.shape)) > 1 and zero_padding:
-        image1 = pad_image_to_cube(image1)
+        image1 = pad_image_to_cube(image1, mode=pad_mode)
 
     if single_image:
         # Split single image using checkerboard pattern
@@ -92,7 +93,7 @@ def preprocess_images(
     else:
         # Apply padding to second image
         if len(set(image2.shape)) > 1 and zero_padding:
-            image2 = pad_image_to_cube(image2)
+            image2 = pad_image_to_cube(image2, mode=pad_mode)
 
     # Apply Hamming windowing to both images independently
     if not disable_hamming:
@@ -303,6 +304,7 @@ def calculate_frc(
     z_correction: float = 1.0,
     spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
+    pad_mode: str = "constant",
     backend: str = "mask",
 ) -> FourierCorrelationData:
     """
@@ -323,6 +325,7 @@ def calculate_frc(
         image1,
         image2,
         zero_padding=zero_padding,
+        pad_mode=pad_mode,
         disable_hamming=disable_hamming,
     )
 
@@ -349,6 +352,7 @@ def calculate_frc(
             None,
             reverse_split=reverse,
             zero_padding=zero_padding,
+            pad_mode=pad_mode,
             disable_hamming=disable_hamming,
         )
 
@@ -389,6 +393,7 @@ def frc_resolution(
     bin_delta: int = 1,
     spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
+    pad_mode: str = "constant",
     curve_fit_type: str = "smooth-spline",
     smoothing_factor: float = 0.05,
     backend: str = "mask",
@@ -402,6 +407,7 @@ def frc_resolution(
         smoothing_factor=smoothing_factor,
         spacing=spacing,
         zero_padding=zero_padding,
+        pad_mode=pad_mode,
         backend=backend,
     )
 
@@ -514,6 +520,7 @@ def calculate_sectioned_fsc(
     disable_3d_sum: bool = False,
     spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
+    pad_mode: str = "constant",
 ) -> FourierCorrelationDataCollection:
     """Calculate sectioned FSC for one or two images."""
     single_image = image2 is None
@@ -524,6 +531,7 @@ def calculate_sectioned_fsc(
         image1,
         image2,
         zero_padding=zero_padding,
+        pad_mode=pad_mode,
         disable_hamming=disable_hamming,
         disable_3d_sum=disable_3d_sum,
     )
@@ -777,6 +785,7 @@ def _fsc_hist_compute(
     exclude_axis_angle: float,
     use_max_nyquist: bool,
     zero_padding: bool,
+    pad_mode: str = "constant",
     average: bool,
 ) -> dict[int, FourierCorrelationData]:
     """Compute sectioned FSC data using the hist backend.
@@ -800,6 +809,7 @@ def _fsc_hist_compute(
         image1,
         image2,
         zero_padding=zero_padding,
+        pad_mode=pad_mode,
         disable_hamming=False,
         disable_3d_sum=False,
     )
@@ -821,6 +831,7 @@ def _fsc_hist_compute(
             original_image1,
             None,
             zero_padding=zero_padding,
+            pad_mode=pad_mode,
             disable_hamming=False,
             disable_3d_sum=False,
             reverse_split=True,
@@ -856,12 +867,24 @@ def _fsc_extract_resolution(
     original_spacing_z: float | None,
     resolution_threshold: str,
     threshold_value: float,
-    z_xy_boundary: float,
 ) -> dict[str, float]:
     """Extract XY and Z resolution from sectioned FSC data.
 
-    Handles XY sector selection, Z fallback cascade, FourierCorrelationAnalysis
-    invocation, cutoff correction, and k(theta) anisotropy correction.
+    XY and Z are processed separately to handle k(theta) anisotropy correction
+    correctly:
+
+    - **XY**: The highest-angle sector (most XY-dominated) is processed with
+      ``z_correction=1`` (no correction).  At ~82-90° polar angle, k(theta)≈1
+      so no correction is needed; applying one inflates the result.
+    - **Z**: Sectors are processed with full ``z_correction=z_factor``.  The
+      cascade starts from the highest angle below 45° and moves downward (where
+      k(theta) is large and statistics are reasonable), then falls back to
+      angles above 45° if no crossing is found below.
+
+    This matches the miplib approach where the mask backend has sectors at
+    exactly 90° (k=1 for XY) and 0° (k=z for Z).  Our hist backend doesn't
+    reach 90°/0°, so we emulate by skipping correction for XY and applying it
+    for Z sectors.
 
     Parameters
     ----------
@@ -872,15 +895,13 @@ def _fsc_extract_resolution(
     single_image : bool
         Whether single-image mode (for cutoff correction).
     z_factor : float
-        Anisotropy factor for k(theta) correction.
+        Anisotropy factor for k(theta) correction (z_spacing / xy_spacing).
     original_spacing_z : float or None
         Original Z spacing (set when isotropic resampling was used).
     resolution_threshold : str
         Threshold criterion for resolution calculation.
     threshold_value : float
         Fixed threshold value.
-    z_xy_boundary : float
-        Polar angle boundary for Z-candidate sectors.
 
     Returns
     -------
@@ -889,81 +910,61 @@ def _fsc_extract_resolution(
     """
     if spacing_list is not None:
         spacing_xy = spacing_list[1]  # Y spacing (assumes Y==X)
-        spacing_z = spacing_list[0]  # Z spacing
     else:
         spacing_xy = 1.0
-        spacing_z = 1.0
 
-    # Select XY and Z sectors based on polar angle convention
     angles = sorted(fsc_data.keys())
-    angle_xy = max(angles)  # Highest angle = most XY-dominated
 
-    # Z resolution: fallback cascade over Z-candidate sectors
-    z_candidates = [a for a in angles if a < z_xy_boundary]
-    if not z_candidates:
-        z_candidates = [min(angles)]
-
-    results: dict[str, float] = {}
-
-    # Process XY sector
-    data_xy = fsc_data[angle_xy]
-    data_collection = FourierCorrelationDataCollection()
-    data_collection[0] = data_xy
-    analyzer = FourierCorrelationAnalysis(
-        data_collection,
-        spacing_xy,
-        resolution_threshold=resolution_threshold,
-        threshold_value=threshold_value,
-        curve_fit_type="spline",
-    )
-    try:
-        analyzed = analyzer.execute()[0]
-        if single_image:
-            _apply_cutoff_correction(analyzed)
-        results["xy"] = analyzed.resolution["resolution"]
-    except Exception:
-        results["xy"] = float("nan")
-
-    # Determine spacing for Z resolution calculation
-    if original_spacing_z is not None:
-        analyzer_spacing = spacing_xy  # Frequencies in isotropic units
-    else:
-        analyzer_spacing = spacing_z  # Frequencies normalized to Z Nyquist
-
-    # Process Z resolution: try each Z-candidate sector individually
-    z_resolution = float("nan")
-    z_angle_used = z_candidates[0]
-
-    for z_angle in z_candidates:
-        z_data = fsc_data[z_angle]
-        data_collection = FourierCorrelationDataCollection()
-        data_collection[0] = z_data
+    # --- XY: no k(theta) correction ---
+    # Process highest-angle sector (most XY-like) with z_correction=1.
+    # At ~82° polar angle k(theta)≈1.3, so applying the full correction
+    # inflates XY by ~30%.  Using z_correction=1 gives the raw (correct) XY.
+    xy_resolution = float("nan")
+    for angle in reversed(angles):  # highest angle first
+        coll = FourierCorrelationDataCollection()
+        coll[angle] = fsc_data[angle]
         analyzer = FourierCorrelationAnalysis(
-            data_collection,
-            analyzer_spacing,
+            coll,
+            spacing_xy,
             resolution_threshold=resolution_threshold,
             threshold_value=threshold_value,
             curve_fit_type="smooth-spline",
         )
-        try:
-            analyzed = analyzer.execute()[0]
-            if single_image:
-                _apply_cutoff_correction(analyzed)
-            candidate_res = analyzed.resolution["resolution"]
-            if np.isfinite(candidate_res) and candidate_res > 0:
-                z_resolution = candidate_res
-                z_angle_used = z_angle
-                break
-        except Exception:
-            continue
+        analyzed = analyzer.execute(z_correction=1)  # no k(theta)
+        if single_image:
+            _apply_cutoff_correction(analyzed[angle])
+        res = analyzed[angle].resolution["resolution"]
+        if np.isfinite(res) and res > 0:
+            xy_resolution = res
+            break
 
-    # Apply k(theta) correction (Koho et al. 2019, equation 5)
-    if np.isfinite(z_resolution) and z_factor > 1.0:
-        k_theta = 1.0 + (z_factor - 1.0) * np.abs(np.cos(np.deg2rad(z_angle_used)))
-        z_resolution = z_resolution * k_theta
+    # --- Z: with k(theta) correction ---
+    # Cascade from highest angle below 45° downward (best statistics with
+    # significant k(theta)), then fall back to angles above 45°.
+    z_below_45 = [a for a in reversed(angles) if a < 45]
+    z_above_45 = [a for a in angles if a >= 45]
+    z_cascade = z_below_45 + z_above_45
 
-    results["z"] = z_resolution
-    return results
+    z_resolution = float("nan")
+    for angle in z_cascade:
+        coll = FourierCorrelationDataCollection()
+        coll[angle] = fsc_data[angle]
+        analyzer = FourierCorrelationAnalysis(
+            coll,
+            spacing_xy,
+            resolution_threshold=resolution_threshold,
+            threshold_value=threshold_value,
+            curve_fit_type="smooth-spline",
+        )
+        analyzed = analyzer.execute(z_correction=z_factor)
+        if single_image:
+            _apply_cutoff_correction(analyzed[angle])
+        res = analyzed[angle].resolution["resolution"]
+        if np.isfinite(res) and res > 0:
+            z_resolution = res
+            break
+
+    return {"xy": xy_resolution, "z": z_resolution}
 
 
 def fsc_resolution(
@@ -973,6 +974,7 @@ def fsc_resolution(
     bin_delta: int = 1,
     angle_delta: int = 15,
     zero_padding: bool | None = None,
+    pad_mode: str = "constant",
     spacing: float | Sequence[float] | None = None,
     resample_isotropic: bool = False,
     resample_order: int = 1,
@@ -982,7 +984,6 @@ def fsc_resolution(
     resolution_threshold: str = "fixed",
     threshold_value: float = 0.143,
     backend: str = "hist",
-    z_xy_boundary: float = 30.0,
 ) -> dict[str, float]:
     """
     Calculate either single- or two-image FSC-based 3D image resolution.
@@ -1024,9 +1025,6 @@ def fsc_resolution(
                          correction was empirically calibrated for the 1/7 threshold
                          (Koho et al. 2019), so using other values may affect accuracy.
         backend: "hist" (vectorized, GPU-accelerated) or "mask" (deprecated)
-        z_xy_boundary: Polar angle boundary (degrees) for Z-candidate sectors in the
-                       hist backend. Sectors with center below this are tried for Z
-                       resolution in order from narrowest to widest. Default: 30.0
                        (matches mask backend Z wedge coverage of ~8% of Fourier space).
     """
     # Set default zero_padding based on backend
@@ -1062,6 +1060,7 @@ def fsc_resolution(
             resolution_threshold=resolution_threshold,
             spacing=spacing,
             zero_padding=zero_padding,
+            pad_mode=pad_mode,
         )
 
         angle_to_resolution = {
@@ -1094,6 +1093,7 @@ def fsc_resolution(
         exclude_axis_angle=exclude_axis_angle,
         use_max_nyquist=use_max_nyquist,
         zero_padding=zero_padding,
+        pad_mode=pad_mode,
         average=average,
     )
 
@@ -1105,7 +1105,6 @@ def fsc_resolution(
         original_spacing_z=original_spacing_z,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
-        z_xy_boundary=z_xy_boundary,
     )
 
 

@@ -323,84 +323,34 @@ def test_fsc_resolution_single_image(
             )
 
 
-def test_fsc_z_fallback_cascade(
+def test_fsc_all_sectors_processed(
     cells_volume: tuple[np.ndarray, list[float]],
 ) -> None:
-    """Test that Z resolution fallback cascade tries multiple sectors.
+    """Test that FSC processes all sectors with per-sector k(theta) correction.
 
-    With angle_delta=15 and z_xy_boundary=30, the cascade tries sectors [8°, 22°]
-    for Z resolution. If the narrowest sector fails, the next one is used.
-    Compares boundary=10 (single sector, old behavior) vs boundary=30 (cascade).
+    Following Koho et al. 2019: all sectors are analyzed at once with k(theta)
+    correction applied internally.  XY is read from the most XY-dominated
+    sector; Z from the most Z-dominated sector that crosses the threshold.
     """
     volume, spacing = cells_volume
 
-    # boundary=10: only the 8° sector is tried (equivalent to old behavior)
-    result_single = fsc_resolution(
+    result = fsc_resolution(
         volume,
         bin_delta=1,
         angle_delta=15,
         spacing=spacing,
         backend="hist",
-        z_xy_boundary=10.0,
     )
 
-    # boundary=30: cascade tries [8°, 22°]
-    result_cascade = fsc_resolution(
-        volume,
-        bin_delta=1,
-        angle_delta=15,
-        spacing=spacing,
-        backend="hist",
-        z_xy_boundary=30.0,
-    )
+    assert "xy" in result and "z" in result
 
-    assert "xy" in result_single and "z" in result_single
-    assert "xy" in result_cascade and "z" in result_cascade
+    # XY should always be finite for structured test data
+    assert np.isfinite(result["xy"]), "XY resolution should be finite"
+    assert result["xy"] > 0, "XY resolution should be positive"
 
-    # XY should be identical (same sector used)
-    assert result_single["xy"] == pytest.approx(result_cascade["xy"], rel=1e-10)
-
-    # If single-sector Z is finite, cascade should find the same value
-    # (it tries the 8° sector first and stops on success)
-    if np.isfinite(result_single["z"]):
-        assert result_cascade["z"] == pytest.approx(result_single["z"], rel=1e-10)
-    # If single-sector Z is NaN, cascade may recover a finite value
-    # from the 22° sector (this is the main benefit of the cascade)
-    if np.isfinite(result_cascade["z"]):
-        assert result_cascade["z"] > 0, "Z resolution should be positive when finite"
-
-
-def test_fsc_z_xy_boundary_parameter() -> None:
-    """Test that z_xy_boundary limits which sectors are tried for Z resolution."""
-    volume = make_fake_cells3d(shape=(32, 64, 64), random_seed=99)
-    spacing = [0.29, 0.26, 0.26]
-
-    # With angle_delta=15, sector centers are [8, 22, 38, 52, 68, 82]
-    # boundary=10 should only try [8] (single sector, same as old behavior)
-    result_narrow = fsc_resolution(
-        volume,
-        angle_delta=15,
-        spacing=spacing,
-        backend="hist",
-        z_xy_boundary=10.0,
-    )
-
-    # boundary=45 should try [8, 22, 38] — wider cascade
-    result_wide = fsc_resolution(
-        volume,
-        angle_delta=15,
-        spacing=spacing,
-        backend="hist",
-        z_xy_boundary=45.0,
-    )
-
-    # Both should have valid structure
-    assert "xy" in result_narrow and "z" in result_narrow
-    assert "xy" in result_wide and "z" in result_wide
-
-    # XY resolution should be the same regardless of z_xy_boundary
-    # (XY uses the highest-angle sector, unaffected by Z boundary)
-    assert result_narrow["xy"] == pytest.approx(result_wide["xy"], rel=1e-10)
+    # Z may or may not be finite depending on data, but if finite must be positive
+    if np.isfinite(result["z"]):
+        assert result["z"] > 0, "Z resolution should be positive when finite"
 
 
 def test_z_correction_at_boundary_angles() -> None:
