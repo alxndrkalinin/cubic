@@ -4,7 +4,7 @@ import warnings
 
 warnings.warn(
     "cubic.metrics.frc has been renamed to cubic.metrics.spectral. "
-    "The old path will be removed in 0.7.0.",
+    "The old path will be removed in 0.8.0.",
     DeprecationWarning,
     stacklevel=2,
 )
