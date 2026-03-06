@@ -399,3 +399,15 @@ def test_z_correction_at_boundary_angles() -> None:
             f"At angle={angle_deg}, expected multiplier={expected_mult}, "
             f"got {actual_mult}"
         )
+
+
+def test_backward_compat_shim() -> None:
+    """Verify backward-compatibility imports from cubic.metrics.frc still work."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        from cubic.metrics.frc import frc_resolution, fsc_resolution
+
+    assert callable(frc_resolution)
+    assert callable(fsc_resolution)
