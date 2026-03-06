@@ -7,14 +7,12 @@
 | `sfsc_paper_comparison.py` | Validate SFSC vs Koho et al. 2019 Figure 4b | Pollen ND2 (`40x_TAGoff_z_galvo.nd2`) | `python sfsc_paper_comparison.py` |
 | `benchmark_resolution_methods.py` | Compare FRC/FSC/DCR across crop sizes | STED tubulin + astrocyte | `python benchmark_resolution_methods.py` |
 
-## Debugging & Comparison
+## Comparison & Analysis
 
 | Script | Purpose | Data | Run |
 |--------|---------|------|-----|
-| `debug_fsc_dcr_resolution.py` | Debug FSC/DCR XY/Z sector assignments | Any 3D image | `python debug_fsc_dcr_resolution.py` |
 | `dcr_nanopyx_comparison.py` | Compare cubic DCR vs NanoPyx implementation | Astrocyte | `python dcr_nanopyx_comparison.py` |
-| `compare_frc_dcr_deconv.py` | Track FRC/DCR during RL deconvolution | User-supplied 2D image+PSF | `python compare_frc_dcr_deconv.py --image ... --psf ...` |
-| `generate_comparison_plots.py` | Generate summary plots from benchmark CSVs | `benchmark_plots/` results | `python generate_comparison_plots.py` |
+| `compare_frc_dcr_deconv.py` | Track FRC/DCR during RL deconvolution | User-supplied image+PSF | `python compare_frc_dcr_deconv.py --image ... --psf ...` |
 
 ## Plotting Utilities
 
