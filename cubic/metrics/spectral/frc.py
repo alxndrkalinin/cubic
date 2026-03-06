@@ -867,6 +867,7 @@ def _fsc_extract_resolution(
     original_spacing_z: float | None,
     resolution_threshold: str,
     threshold_value: float,
+    z_curve_fit_type: str = "smooth-spline",
 ) -> dict[str, float]:
     """Extract XY and Z resolution from sectioned FSC data.
 
@@ -954,7 +955,7 @@ def _fsc_extract_resolution(
             spacing_xy,
             resolution_threshold=resolution_threshold,
             threshold_value=threshold_value,
-            curve_fit_type="smooth-spline",
+            curve_fit_type=z_curve_fit_type,
         )
         analyzed = analyzer.execute(z_correction=z_factor)
         if single_image:
@@ -984,6 +985,7 @@ def fsc_resolution(
     resolution_threshold: str = "fixed",
     threshold_value: float = 0.143,
     backend: str = "hist",
+    z_curve_fit_type: str = "smooth-spline",
 ) -> dict[str, float]:
     """
     Calculate either single- or two-image FSC-based 3D image resolution.
@@ -1105,6 +1107,7 @@ def fsc_resolution(
         original_spacing_z=original_spacing_z,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
+        z_curve_fit_type=z_curve_fit_type,
     )
 
 

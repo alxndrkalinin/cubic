@@ -20,6 +20,16 @@ def test_pad_image_to_cube() -> None:
     assert padded.shape == (6, 6, 6)
 
 
+def test_pad_image_to_cube_default_constant() -> None:
+    """Verify default mode is 'constant' (zero-padding, not reflect)."""
+    img = np.ones((2, 4, 6), dtype=np.float32)
+    padded = pad_image_to_cube(img)
+    # Padded regions along the first axis (original size 2, padded to 6)
+    # should be zero (constant), not reflected ones
+    assert padded[0, 0, 0] == 0.0
+    assert padded[-1, 0, 0] == 0.0
+
+
 @pytest.mark.parametrize("use_gpu", [False, True])
 def test_rotate_image_cpu_vs_gpu(use_gpu: bool, gpu_available: bool) -> None:
     """CPU vs GPU results for ``rotate_image``."""
