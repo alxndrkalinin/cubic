@@ -1,13 +1,23 @@
-# Benchmark & Analysis Scripts
+# Examples
 
-## Resolution Benchmarks
+## Notebooks
+
+| Notebook | Description | Data |
+|----------|-------------|------|
+| [`resolution_estimation_2d.ipynb`](../notebooks/resolution_estimation_2d.ipynb) | 2D FRC + DCR on STED datasets (Tubulin, Vimentin, COS7) | STED TIF files |
+| [`resolution_estimation_3d.ipynb`](../notebooks/resolution_estimation_3d.ipynb) | 3D FSC + DCR on pollen confocal data (Koho et al. 2019) | Pollen ND2 |
+| [`deconvolution_iterations_3d.ipynb`](../notebooks/deconvolution_iterations_3d.ipynb) | Track RL deconvolution with PSNR, SSIM, FSC, and DCR | Astrocyte TIF + PSF |
+
+## Benchmark Scripts
+
+### Resolution Benchmarks
 
 | Script | Purpose | Data | Run |
 |--------|---------|------|-----|
 | `sfsc_paper_comparison.py` | Validate SFSC vs Koho et al. 2019 Figure 4b | Pollen ND2 (`40x_TAGoff_z_galvo.nd2`) | `python sfsc_paper_comparison.py` |
 | `benchmark_resolution_methods.py` | Compare FRC/FSC/DCR across crop sizes | STED tubulin + astrocyte | `python benchmark_resolution_methods.py` |
 
-## Comparison & Analysis
+### Comparison & Analysis
 
 | Script | Purpose | Data | Run |
 |--------|---------|------|-----|
