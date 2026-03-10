@@ -1,5 +1,6 @@
 """Implements utility functions that operate on 3D images."""
 
+import warnings
 from typing import Any
 from collections.abc import Callable, Sequence
 
@@ -113,7 +114,7 @@ def pad_image(
 def pad_image_to_cube(
     img: np.ndarray,
     cube_size: int | None = None,
-    mode: str = "reflect",
+    mode: str = "constant",
     axes: Sequence[int] | None = None,
 ) -> np.ndarray:
     """Pad all image axes up to cubic shape."""
@@ -411,82 +412,214 @@ def hamming_window(data: np.ndarray) -> np.ndarray:
     return _nd_window(data, xp.hamming, xp.power)
 
 
-def checkerboard_split(
-    img: np.ndarray, disable_3d_sum: bool = False
+def _tukey_window_1d(n: int, alpha: float, xp) -> np.ndarray:
+    """Create 1D Tukey window (device-agnostic, matches scipy exactly).
+
+    Parameters
+    ----------
+    n : int
+        Window length.
+    alpha : float
+        Taper fraction (0 = rectangular, 1 = Hann).
+    xp : module
+        Array module (numpy or cupy).
+
+    Returns
+    -------
+    np.ndarray
+        1D Tukey window of length *n*, dtype float32.
+    """
+    if alpha <= 0:
+        return xp.ones(n, dtype=np.float32)
+    if alpha >= 1:
+        if n <= 1:
+            return xp.ones(max(n, 0), dtype=np.float32)
+        idx = xp.arange(n, dtype=np.float64)
+        return (0.5 * (1 - xp.cos(2 * np.pi * idx / (n - 1)))).astype(np.float32)
+
+    width = int(np.floor(alpha * (n - 1) / 2.0))
+    n1 = xp.arange(0, width + 1, dtype=np.float64)
+    w1 = 0.5 * (1 + xp.cos(np.pi * (-1 + 2.0 * n1 / alpha / (n - 1))))
+    n_middle = (n - width - 1) - (width + 1)
+    w2 = xp.ones(max(n_middle, 0), dtype=np.float64)
+    n3 = xp.arange(n - width - 1, n, dtype=np.float64)
+    w3 = 0.5 * (1 + xp.cos(np.pi * (-2.0 / alpha + 1 + 2.0 * n3 / alpha / (n - 1))))
+    return xp.concatenate([w1, w2, w3]).astype(np.float32)
+
+
+def tukey_window(data: np.ndarray, alpha: float = 0.1) -> np.ndarray:
+    """Apply separable Tukey window for edge apodization.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        N-dimensional input array (numpy or cupy).
+    alpha : float
+        Taper fraction (0 = rectangular, 1 = Hann). Default 0.1.
+
+    Returns
+    -------
+    np.ndarray
+        Windowed copy of *data*.
+    """
+    xp = get_array_module(data)
+    result = data.copy()
+    for axis in range(result.ndim):
+        w = _tukey_window_1d(result.shape[axis], alpha, xp)
+        shape = [1] * result.ndim
+        shape[axis] = result.shape[axis]
+        w = w.reshape(shape)
+        result *= w
+    return result
+
+
+def _checkerboard_split_impl(
+    img: np.ndarray,
+    disable_3d_sum: bool,
+    preserve_range: bool,
+    reverse: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Split an image in two, by using a checkerboard pattern."""
-    # Make an index chess board structure
-    shape = img.shape
-    odd_index = [np.arange(1, shape[i], 2) for i in range(len(shape))]
-    even_index = [np.arange(0, shape[i], 2) for i in range(len(shape))]
+    """Split image using checkerboard pattern.
 
-    # Create the two pseudo images
-    if img.ndim == 2:
-        image1 = img[odd_index[0], :][:, odd_index[1]]
-        image2 = img[even_index[0], :][:, even_index[1]]
-    elif disable_3d_sum:
-        image1 = img[odd_index[0], :, :][:, odd_index[1], :][:, :, odd_index[2]]
-        image2 = img[even_index[0], :, :][:, even_index[1], :][:, :, even_index[2]]
+    Parameters
+    ----------
+    img : np.ndarray
+        Input 2D or 3D image array
+    disable_3d_sum : bool
+        If True, use full 3D checkerboard without Z-summing.
+    preserve_range : bool
+        If True, keep the original range of values and data type.
+    reverse : bool
+        If True, use reverse checkerboard pattern (other diagonal).
 
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Two split images with half the size in each spatial dimension.
+    """
+    # Determine safe dtype and warn if needed
+    needs_z_summing = img.ndim == 3 and not disable_3d_sum
+    is_integer = np.issubdtype(img.dtype, np.integer)
+
+    if preserve_range:
+        safe_dtype = img.dtype
+        if needs_z_summing and is_integer:
+            warnings.warn(
+                f"preserve_range=True with integer dtype {img.dtype} may cause "
+                "overflow when summing consecutive Z pairs. Consider using "
+                "preserve_range=False to convert to float32 for safe computation.",
+                UserWarning,
+                stacklevel=3,
+            )
     else:
-        image1 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, odd_index[1], :][
-                :, :, odd_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, odd_index[1], :][
-                :, :, odd_index[2]
-            ]
-        )
+        safe_dtype = np.float32 if is_integer else img.dtype
 
-        image2 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, even_index[1], :][
-                :, :, odd_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, even_index[1], :][
-                :, :, even_index[2]
-            ]
-        )
+    # Apply dtype conversion if needed
+    img_safe = img if img.dtype == safe_dtype else img.astype(safe_dtype)
+
+    # Define slicing patterns based on reverse flag
+    # Pattern matches miplib implementation (Koho et al. 2019)
+    # Both images sample from the same diagonal parity for proper FSC calculation
+    if reverse:
+        # Reverse pattern: (odd, even) vs (even, odd)
+        pattern1_y, pattern1_x = 1, 0
+        pattern2_y, pattern2_x = 0, 1
+    else:
+        # Regular pattern: (odd, odd) vs (even, even) - matches miplib
+        pattern1_y, pattern1_x = 1, 1
+        pattern2_y, pattern2_x = 0, 0
+
+    if img.ndim == 2:
+        # Truncate to even dimensions to ensure matching shapes
+        h_even = img_safe.shape[0] // 2 * 2
+        w_even = img_safe.shape[1] // 2 * 2
+        img_even = img_safe[:h_even, :w_even]
+        image1 = img_even[pattern1_y::2, pattern1_x::2]
+        image2 = img_even[pattern2_y::2, pattern2_x::2]
+    elif disable_3d_sum:
+        # Truncate all dimensions to even to ensure matching shapes
+        z_even = img_safe.shape[0] // 2 * 2
+        h_even = img_safe.shape[1] // 2 * 2
+        w_even = img_safe.shape[2] // 2 * 2
+        img_even = img_safe[:z_even, :h_even, :w_even]
+        image1 = img_even[1::2, pattern1_y::2, pattern1_x::2]
+        image2 = img_even[0::2, pattern2_y::2, pattern2_x::2]
+        if preserve_range:
+            image1 = image1.astype(img.dtype)
+            image2 = image2.astype(img.dtype)
+    else:
+        # Z-summing: sum consecutive Z pairs, then apply 2D checkerboard
+        # Truncate all dimensions to even to ensure matching shapes
+        z_even = img_safe.shape[0] // 2 * 2
+        h_even = img_safe.shape[1] // 2 * 2
+        w_even = img_safe.shape[2] // 2 * 2
+        img_even = img_safe[:z_even, :h_even, :w_even]
+        z_summed = img_even[0::2] + img_even[1::2]
+        image1 = z_summed[:, pattern1_y::2, pattern1_x::2]
+        image2 = z_summed[:, pattern2_y::2, pattern2_x::2]
+        if preserve_range:
+            image1 = image1.astype(img.dtype)
+            image2 = image2.astype(img.dtype)
 
     return image1, image2
+
+
+def checkerboard_split(
+    img: np.ndarray,
+    disable_3d_sum: bool = False,
+    preserve_range: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split an image in two using checkerboard pattern.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Input 2D or 3D image array
+    disable_3d_sum : bool, optional
+        If True, use full 3D checkerboard without Z-summing.
+        Default False uses Koho et al. 2019 strategy.
+    preserve_range : bool, optional
+        If True, keep the original range of values and data type.
+        If False (default), integer types are converted to float32 to avoid
+        overflow when summing consecutive Z pairs. Float types are preserved.
+        When True with integer types, overflow may occur if the sum exceeds
+        the dtype range. Default False.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Two split images with half the size in each spatial dimension.
+    """
+    return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=False)
 
 
 def reverse_checkerboard_split(
-    img: np.ndarray, disable_3d_sum: bool = False
+    img: np.ndarray,
+    disable_3d_sum: bool = False,
+    preserve_range: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Split an image in two, by using a checkerboard pattern."""
-    # Make an index chess board structure
-    shape = img.shape
-    odd_index = [np.arange(1, shape[i], 2) for i in range(len(shape))]
-    even_index = [np.arange(0, shape[i], 2) for i in range(len(shape))]
+    """Split an image using reverse checkerboard pattern (other diagonal).
 
-    # Create the two pseudo images
-    if img.ndim == 2:
-        image1 = img[odd_index[0], :][:, even_index[1]]
-        image2 = img[even_index[0], :][:, odd_index[1]]
-    elif disable_3d_sum:
-        image1 = img[odd_index[0], :, :][:, odd_index[1], :][:, :, even_index[2]]
-        image2 = img[even_index[0], :, :][:, even_index[1], :][:, :, odd_index[2]]
+    Parameters
+    ----------
+    img : np.ndarray
+        Input 2D or 3D image array
+    disable_3d_sum : bool, optional
+        If True, use full 3D checkerboard without Z-summing.
+        Default False uses Koho et al. 2019 strategy.
+    preserve_range : bool, optional
+        If True, keep the original range of values and data type.
+        If False (default), integer types are converted to float32 to avoid
+        overflow when summing consecutive Z pairs. Float types are preserved.
+        When True with integer types, overflow may occur if the sum exceeds
+        the dtype range. Default False.
 
-    else:
-        image1 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, odd_index[1], :][
-                :, :, even_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, even_index[1], :][
-                :, :, odd_index[2]
-            ]
-        )
-
-        image2 = (
-            img.astype(np.uint32)[even_index[0], :, :][:, even_index[1], :][
-                :, :, odd_index[2]
-            ]
-            + img.astype(np.uint32)[odd_index[0], :, :][:, odd_index[1], :][
-                :, :, even_index[2]
-            ]
-        )
-
-    return image1, image2
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Two split images with half the size in each spatial dimension.
+    """
+    return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=True)
 
 
 def label(img: npt.ArrayLike, **kwargs: Any) -> npt.ArrayLike:

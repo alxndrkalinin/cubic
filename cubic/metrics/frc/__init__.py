@@ -1,17 +1,13 @@
-"""Expose FRC functions."""
+"""Backwards-compatibility shim — use ``cubic.metrics.spectral`` instead."""
 
-from .frc import (
-    frc_resolution,
-    fsc_resolution,
-    five_crop_resolution,
-    grid_crop_resolution,
-    frc_resolution_difference,
+import warnings
+
+warnings.warn(
+    "cubic.metrics.frc has been renamed to cubic.metrics.spectral. "
+    "The old path will be removed in 0.8.0.",
+    DeprecationWarning,
+    stacklevel=2,
 )
 
-__all__ = [
-    "frc_resolution",
-    "fsc_resolution",
-    "five_crop_resolution",
-    "grid_crop_resolution",
-    "frc_resolution_difference",
-]
+from cubic.metrics.spectral import *  # noqa: F401, F403, E402
+from cubic.metrics.spectral import __all__  # noqa: F401, E402

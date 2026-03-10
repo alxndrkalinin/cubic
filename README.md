@@ -72,7 +72,14 @@ Pre-commit will then run style checks automatically. Please open an issue or
 pull request on GitHub.
 
 ## Usage
-See the example notebooks in `examples/notebooks/`.
+
+### Example Notebooks
+
+| Notebook | Description |
+|----------|-------------|
+| [Resolution Estimation (2D)](examples/notebooks/resolution_estimation_2d.ipynb) | FRC and DCR on STED microscopy data |
+| [Resolution Estimation (3D)](examples/notebooks/resolution_estimation_3d.ipynb) | FSC and DCR on 3D confocal pollen data |
+| [Deconvolution Iterations (3D)](examples/notebooks/deconvolution_iterations_3d.ipynb) | RL deconvolution stopping criteria via PSNR, SSIM, FSC, DCR |
 
 ## Citation
 If you use `cubic` in your research, please cite it:
