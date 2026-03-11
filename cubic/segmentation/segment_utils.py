@@ -20,8 +20,9 @@ def downscale_and_filter(
     downscale_anti_aliasing: bool = True,
     filter_size: int = 3,
     filter_shape: str = "square",
+    filter_mode: str = "nearest",
 ) -> npt.ArrayLike:
-    """Subsample and filter image prior to segmentiation.
+    """Subsample and filter image prior to segmentation.
 
     Parameters
     ----------
@@ -29,8 +30,21 @@ def downscale_and_filter(
         Image to be downsampled and filtered.
     downscale_factor : float, optional
         Factor by which to downscale the image, by default 0.5.
+    downscale_order : int, optional
+        Interpolation order for downscaling, by default 3.
+    downscale_anti_aliasing : bool, optional
+        Whether to apply anti-aliasing during downscaling, by default True.
     filter_size : int, optional
         Size of median filter kernel, by default 3.
+    filter_shape : str, optional
+        Shape of the filter kernel: ``"square"`` (cube in 3D) uses
+        ``scipy.ndimage.median_filter(size=filter_size)`` which supports
+        boundary modes; ``"circular"`` (ball in 3D) uses
+        ``skimage.filters.median`` with a shaped footprint.
+    filter_mode : str, optional
+        Boundary mode for the median filter, by default ``"nearest"``.
+        Only used when ``filter_shape="square"``. Common values:
+        ``"constant"`` (zero-padding), ``"nearest"``, ``"reflect"``.
 
     Returns
     -------
@@ -38,33 +52,34 @@ def downscale_and_filter(
         Filtered and downsampled image.
 
     """
-    # cuCIM does not yet support rank-based median filter
-    # https://github.com/rapidsai/cucim/blob/main/python/cucim/src/cucim/skimage/filters/_median.py#L124
+    from ..scipy import ndimage as _ndimage
+
     assert filter_shape in [
         "square",
         "circular",
     ], "Filter shape must be 'square' or 'circular'."
 
-    if image.ndim == 2:
-        skimage_footprint = (
-            morphology.square if filter_shape == "square" else morphology.disk
-        )
-    elif image.ndim == 3:
-        skimage_footprint = (
-            morphology.cube if filter_shape == "square" else morphology.ball
-        )
-    else:
-        raise ValueError("Image must be 2D or 3D.")
-
     if downscale_factor < 1.0:
-        image = transform.rescale(
+        from ..image_utils import rescale_xy
+
+        image = rescale_xy(
             image,
-            downscale_factor,
+            scale=downscale_factor,
             order=downscale_order,
             anti_aliasing=downscale_anti_aliasing,
         )
 
-    return filters.median(image, footprint=skimage_footprint(filter_size))
+    if filter_shape == "square":
+        return _ndimage.median_filter(image, size=filter_size, mode=filter_mode)
+
+    if image.ndim == 2:
+        footprint = morphology.disk(filter_size)
+    elif image.ndim == 3:
+        footprint = morphology.ball(filter_size)
+    else:
+        raise ValueError("Image must be 2D or 3D.")
+
+    return filters.median(image, footprint=footprint)
 
 
 def check_labeled_binary(image):
