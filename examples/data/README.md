@@ -32,3 +32,16 @@ Used in `examples/notebooks/resolution_estimation_3d.ipynb`.
 - **`40x_TAGoff_z_galvo.nd2`** — Pollen confocal (512x512x181, voxel 78x78x250 nm). Nikon A1 confocal, 40x/1.2 water, 488 nm excitation, GaAsP detector.
   [download from figshare](https://ndownloader.figshare.com/files/15203144)
   Source: Koho et al. (2019) *Nat. Commun.* 10:3103, [figshare dataset](https://doi.org/10.6084/m9.figshare.8159165.v1).
+
+#### 4. 3D cell monolayer segmentation
+
+Used in `examples/notebooks/segmentation_3d_monolayer.ipynb`. Auto-downloaded on first run using pooch.
+
+- **`3d_monolayer_xy1_ch0.tif`** — Membrane channel (60x256x256, uint16).
+- **`3d_monolayer_xy1_ch1.tif`** — Mitochondria channel (60x256x256, uint16).
+- **`3d_monolayer_xy1_ch2.tif`** — DNA channel (60x256x256, uint16).
+- **`3d_monolayer_xy1_ch2_NucleiLabels.tiff`** — CellProfiler nuclei reference labels.
+- **`3d_monolayer_xy1_ch0_CellsLabels.tiff`** — CellProfiler cell reference labels.
+
+Source: BBBC034v1 (Thirstrup et al. 2018), Broad Bioimage Benchmark Collection.
+[GitHub release assets](https://github.com/alxndrkalinin/cubic/releases/tag/v0.7.0a1).
