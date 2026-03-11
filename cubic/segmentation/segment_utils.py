@@ -253,26 +253,61 @@ def remove_thin_objects(label_image, min_z=2):
     return label_image
 
 
-def segment_watershed(image, markers=None, ball_size=15):
-    """Segment image using watershed algorithm."""
+def segment_watershed(
+    image: npt.ArrayLike,
+    markers: npt.ArrayLike | None = None,
+    ball_size: int = 15,
+    dilate_seeds: bool = False,
+) -> npt.ArrayLike:
+    """Segment image using watershed algorithm.
+
+    Parameters
+    ----------
+    image : npt.ArrayLike
+        Binary image to segment (distance-based) or intensity image
+        (marker-based).
+    markers : npt.ArrayLike or None, optional
+        Pre-computed markers for marker-based watershed. If None,
+        markers are generated from distance-transform peaks.
+    ball_size : int, optional
+        Radius of the ball footprint for ``peak_local_max``, by default 15.
+        Only used when ``markers`` is None.
+    dilate_seeds : bool, optional
+        If True, dilate seed points with ``ball(1)`` before labeling.
+        This merges nearby peaks and reduces over-segmentation.
+        Only used when ``markers`` is None.
+
+    Returns
+    -------
+    npt.ArrayLike
+        Label image on the same device as the input.
+
+    """
+    from ..cuda import to_same_device
+
     device = get_device(image)
 
     distance = distance_transform_edt(image)
-    coords = feature.peak_local_max(
-        distance, footprint=morphology.ball(ball_size), labels=image
-    )
+    footprint = morphology.ball(ball_size)
+    footprint = to_same_device(footprint, distance)
+    coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
 
     # https://github.com/rapidsai/cucim/issues/89
     if markers is None:
-        mask = np.zeros(distance.shape, dtype=bool)
-        mask[tuple(asnumpy(coords.T))] = True
+        mask = np.zeros(asnumpy(distance).shape, dtype=bool)
+        mask[tuple(asnumpy(coords).T)] = True
+        mask = to_device(mask, device)
+        if dilate_seeds:
+            mask = morphology.binary_dilation(
+                mask, to_same_device(morphology.ball(1), mask)
+            )
         markers = label(mask)
-        labels = watershed(-asnumpy(distance), markers, mask=asnumpy(image))
+        # watershed is not in cucim — run on CPU, return to original device
+        labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))
     else:
         labels = watershed(
             asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image)
         )
-    # return on the same device as input
     return to_device(labels, device)
 
 
