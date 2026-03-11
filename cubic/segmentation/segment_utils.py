@@ -283,19 +283,33 @@ def remove_thin_objects(label_image, min_z=2):
 def segment_watershed(
     image: npt.ArrayLike,
     markers: npt.ArrayLike | None = None,
+    mask: npt.ArrayLike | None = None,
     ball_size: int = 15,
     dilate_seeds: bool = False,
 ) -> npt.ArrayLike:
     """Segment image using watershed algorithm.
 
+    When ``markers`` is None, computes a distance-based watershed:
+    EDT of the binary image is used to find peaks, which become markers,
+    and the watershed floods the negated distance.
+
+    When ``markers`` is provided, runs a marker-based watershed. By default
+    the image is used as both the landscape and mask. If ``mask`` is also
+    provided, the watershed uses the negated EDT of the mask as the
+    landscape (shape-based partitioning) and restricts flooding to the mask.
+
     Parameters
     ----------
     image : npt.ArrayLike
         Binary image to segment (distance-based) or intensity image
-        (marker-based).
+        (marker-based when no mask is given).
     markers : npt.ArrayLike or None, optional
         Pre-computed markers for marker-based watershed. If None,
         markers are generated from distance-transform peaks.
+    mask : npt.ArrayLike or None, optional
+        Binary mask restricting the watershed. When provided with markers,
+        the watershed landscape is the negated EDT of the mask (shape-based
+        partitioning). Only used when ``markers`` is not None.
     ball_size : int, optional
         Radius of the ball footprint for ``peak_local_max``, by default 15.
         Only used when ``markers`` is None.
@@ -314,27 +328,35 @@ def segment_watershed(
 
     device = get_device(image)
 
-    distance = distance_transform_edt(image)
-    footprint = morphology.ball(ball_size)
-    footprint = to_same_device(footprint, distance)
-    coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
-
-    # https://github.com/rapidsai/cucim/issues/89
+    # Distance-based watershed (no markers provided)
     if markers is None:
-        mask = np.zeros(asnumpy(distance).shape, dtype=bool)
-        mask[tuple(asnumpy(coords).T)] = True
-        mask = to_device(mask, device)
+        distance = distance_transform_edt(image)
+        footprint = morphology.ball(ball_size)
+        footprint = to_same_device(footprint, distance)
+        coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
+
+        seed_mask = np.zeros(asnumpy(distance).shape, dtype=bool)
+        seed_mask[tuple(asnumpy(coords).T)] = True
+        seed_mask = to_device(seed_mask, device)
         if dilate_seeds:
-            mask = morphology.binary_dilation(
-                mask, to_same_device(morphology.ball(1), mask)
+            seed_mask = morphology.binary_dilation(
+                seed_mask, to_same_device(morphology.ball(1), seed_mask)
             )
-        markers = label(mask)
+        markers = label(seed_mask)
         # watershed is not in cucim — run on CPU, return to original device
         labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))
-    else:
-        labels = watershed(
-            asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image)
-        )
+        return to_device(labels, device)
+
+    # Marker-based watershed with explicit mask (shape-based partitioning)
+    if mask is not None:
+        distance = distance_transform_edt(asnumpy(mask))
+        ws_image = -distance
+        ws_image = ws_image - ws_image.min()
+        labels = watershed(ws_image, markers=asnumpy(markers), mask=asnumpy(mask))
+        return to_device(labels, device)
+
+    # Marker-based watershed without mask (image as landscape and mask)
+    labels = watershed(asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image))
     return to_device(labels, device)
 
 
