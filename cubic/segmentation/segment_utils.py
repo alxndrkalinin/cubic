@@ -18,6 +18,7 @@ def downscale_and_filter(
     downscale_factor: float = 0.5,
     downscale_order: int = 3,
     downscale_anti_aliasing: bool = True,
+    downscale_xy_only: bool = True,
     filter_size: int = 3,
     filter_shape: str = "square",
     filter_mode: str = "nearest",
@@ -34,6 +35,9 @@ def downscale_and_filter(
         Interpolation order for downscaling, by default 3.
     downscale_anti_aliasing : bool, optional
         Whether to apply anti-aliasing during downscaling, by default True.
+    downscale_xy_only : bool, optional
+        If True (default), only downscale XY dimensions, preserving Z for
+        3D images. If False, downscale all dimensions uniformly.
     filter_size : int, optional
         Size of median filter kernel, by default 3.
     filter_shape : str, optional
@@ -60,14 +64,22 @@ def downscale_and_filter(
     ], "Filter shape must be 'square' or 'circular'."
 
     if downscale_factor < 1.0:
-        from ..image_utils import rescale_xy
+        if downscale_xy_only:
+            from ..image_utils import rescale_xy
 
-        image = rescale_xy(
-            image,
-            scale=downscale_factor,
-            order=downscale_order,
-            anti_aliasing=downscale_anti_aliasing,
-        )
+            image = rescale_xy(
+                image,
+                scale=downscale_factor,
+                order=downscale_order,
+                anti_aliasing=downscale_anti_aliasing,
+            )
+        else:
+            image = transform.rescale(
+                image,
+                downscale_factor,
+                order=downscale_order,
+                anti_aliasing=downscale_anti_aliasing,
+            )
 
     if filter_shape == "square":
         return _ndimage.median_filter(image, size=filter_size, mode=filter_mode)
