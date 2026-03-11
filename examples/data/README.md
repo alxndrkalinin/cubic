@@ -43,5 +43,6 @@ Used in `examples/notebooks/segmentation_3d_monolayer.ipynb`. Auto-downloaded on
 - **`3d_monolayer_xy1_ch2_NucleiLabels.tiff`** — CellProfiler nuclei reference labels.
 - **`3d_monolayer_xy1_ch0_CellsLabels.tiff`** — CellProfiler cell reference labels.
 
-Source: BBBC034v1 (Thirstrup et al. 2018), Broad Bioimage Benchmark Collection.
+Source: hiPSC data from the Allen Institute for Cell Science, provided with the
+[CellProfiler 3D monolayer tutorial](https://github.com/CellProfiler/tutorials/tree/master/3d_monolayer).
 [GitHub release assets](https://github.com/alxndrkalinin/cubic/releases/tag/v0.7.0a1).
