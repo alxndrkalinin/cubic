@@ -47,7 +47,6 @@ plot = [
 ]
 examples = [
     "jupyter",
-    "pandas",
     "pooch",
 ]
 dev = [
