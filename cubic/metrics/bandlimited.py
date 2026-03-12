@@ -383,6 +383,328 @@ def spectral_weights(
     return w.astype(np.float32)
 
 
+def smooth_spectral_weights(
+    radii: np.ndarray,
+    power: np.ndarray,
+    noise_floor: float,
+    cutoff: float | None = None,
+    sg_window: int = 15,
+    sg_polyorder: int = 3,
+) -> np.ndarray:
+    """Smooth Wiener-style weights from SG-filtered log-power spectrum.
+
+    Savitzky-Golay-filters ``log(P)`` to remove per-bin variance, then
+    applies Wiener weighting: ``P_smooth² / (P_smooth² + N²)``.
+
+    Parameters
+    ----------
+    radii : np.ndarray
+        Radial-bin centres.
+    power : np.ndarray
+        Mean power per bin.
+    noise_floor : float
+        Noise-floor estimate from :func:`estimate_noise_floor`.
+    cutoff : float, optional
+        Hard cutoff frequency.
+    sg_window : int
+        Savitzky-Golay window length (must be odd; clamped to array size).
+    sg_polyorder : int
+        Savitzky-Golay polynomial order.
+
+    Returns
+    -------
+    np.ndarray
+        Weights in [0, 1].
+    """
+    from scipy.signal import savgol_filter
+
+    log_p = np.log(np.maximum(power, 1e-30))
+    # Clamp window to array length (must be odd, > polyorder)
+    wlen = min(sg_window, len(log_p))
+    if wlen % 2 == 0:
+        wlen -= 1
+    wlen = max(wlen, sg_polyorder + 2)
+    log_p_smooth = savgol_filter(log_p, wlen, sg_polyorder)
+    p_smooth = np.exp(log_p_smooth)
+
+    n2 = noise_floor**2
+    w = p_smooth**2 / (p_smooth**2 + n2)
+
+    if cutoff is not None:
+        w[radii > cutoff] = 0.0
+    return w.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 3b  Baseline-corrected spectral weights
+# ---------------------------------------------------------------------------
+
+
+def _running_quantile_1d(
+    arr: np.ndarray,
+    window: int = 11,
+    q: float = 0.1,
+) -> np.ndarray:
+    """Sliding-window quantile for a 1-D array.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array (typically ~100 elements).
+    window : int
+        Window size (must be odd and >= 3).
+    q : float
+        Quantile in [0, 1].
+
+    Returns
+    -------
+    np.ndarray
+        Same length as *arr*, with per-element local quantile.
+    """
+    if window % 2 == 0:
+        window += 1
+    window = max(window, 3)
+    n = len(arr)
+    half = window // 2
+    out = np.empty(n, dtype=arr.dtype)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = np.quantile(arr[lo:hi], q)
+    return out
+
+
+def estimate_noise_baseline(
+    power: np.ndarray,
+    sg_window: int = 15,
+    sg_polyorder: int = 3,
+    quantile_window: int = 11,
+    quantile: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frequency-dependent noise baseline from smoothed power spectrum.
+
+    Parameters
+    ----------
+    power : np.ndarray
+        Mean power per radial bin (from :func:`radial_power_spectrum`).
+    sg_window : int
+        Savitzky-Golay window for power smoothing.
+    sg_polyorder : int
+        Savitzky-Golay polynomial order.
+    quantile_window : int
+        Window size for running low-quantile (must be odd, >= 3).
+    quantile : float
+        Quantile for baseline estimation (e.g. 0.1 = 10th percentile).
+
+    Returns
+    -------
+    p_smooth : np.ndarray
+        SG-smoothed power spectrum.
+    noise_baseline : np.ndarray
+        Frequency-dependent noise floor N(k), same length as *power*.
+    """
+    from scipy.signal import savgol_filter
+
+    n = len(power)
+
+    # SG window: must be odd, > polyorder, <= array length
+    wlen = min(sg_window, n)
+    if wlen % 2 == 0:
+        wlen -= 1
+    wlen = max(wlen, sg_polyorder + 2)
+
+    log_p = np.log(np.maximum(power, 1e-30))
+    log_p_smooth = savgol_filter(log_p, wlen, sg_polyorder)
+
+    # Running low-quantile of smoothed log-power
+    log_n = _running_quantile_1d(log_p_smooth, window=quantile_window, q=quantile)
+
+    # Guardrail: baseline must not exceed smoothed spectrum
+    log_n = np.minimum(log_n, log_p_smooth)
+
+    # Monotone non-increasing constraint: baseline should not rise with k.
+    # Propagate maximum from high-k backward so earlier bins are >= later bins.
+    log_n = np.maximum.accumulate(log_n[::-1])[::-1]
+
+    return np.exp(log_p_smooth).astype(np.float32), np.exp(log_n).astype(np.float32)
+
+
+def baseline_snr2_weights(
+    radii: np.ndarray,
+    p_smooth: np.ndarray,
+    noise_baseline: np.ndarray,
+    nbins_low: int = 3,
+    cap_quantile: float = 0.99,
+    cutoff: float | None = None,
+) -> np.ndarray:
+    """SNR² weights with frequency-dependent noise baseline.
+
+    Parameters
+    ----------
+    radii : np.ndarray
+        Radial-bin centres.
+    p_smooth : np.ndarray
+        Smoothed power spectrum from :func:`estimate_noise_baseline`.
+    noise_baseline : np.ndarray
+        Frequency-dependent noise floor N(k) from :func:`estimate_noise_baseline`.
+    nbins_low : int
+        Number of lowest-frequency bins to exclude (DC/background).
+    cap_quantile : float
+        Soft cap: clamp weights above this quantile of nonzero weights.
+    cutoff : float, optional
+        Hard cutoff frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Unnormalized SNR² weights (zero where excluded).
+    """
+    if len(radii) <= nbins_low:
+        return np.zeros_like(radii, dtype=np.float32)
+
+    snr = p_smooth / np.maximum(noise_baseline, 1e-30)
+    # Cap SNR to prevent overflow in squaring (SNR > 1e4 is extreme)
+    snr = np.minimum(snr, 1e4)
+    w = np.maximum(snr - 1.0, 0.0) ** 2
+
+    # Exclude lowest bins (DC / background / autofluorescence)
+    w[:nbins_low] = 0.0
+
+    # Hard cutoff
+    if cutoff is not None:
+        w[radii > cutoff] = 0.0
+
+    # Soft cap to prevent single ultra-low bin from dominating
+    nonzero = w[w > 0]
+    if len(nonzero) > 0:
+        cap = float(np.quantile(nonzero, cap_quantile))
+        w = np.minimum(w, cap)
+
+    return w.astype(np.float32)
+
+
+def spectral_pcc_baseline(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    spacing: float | Sequence[float],
+    bin_delta: float = 1.0,
+    apodization: str = "tukey",
+    sg_window: int = 15,
+    sg_polyorder: int = 3,
+    quantile_window: int = 11,
+    quantile: float = 0.1,
+    nbins_low: int = 3,
+    cap_quantile: float = 0.99,
+    frozen_weights: np.ndarray | None = None,
+) -> float:
+    """Spectral PCC with frequency-dependent noise baseline.
+
+    Estimates a smooth noise baseline N(k) from the target's radial
+    power spectrum, computes SNR²-based weights against it, and
+    applies them as per-frequency weights in a Fourier-domain PCC.
+
+    Parameters
+    ----------
+    prediction, target : np.ndarray
+        Images to compare (same shape, 2-D or 3-D).
+    spacing : float or sequence of float
+        Physical pixel / voxel spacing.
+    bin_delta : float
+        Radial-bin width (index units).
+    apodization : str
+        Window function for edge apodisation.
+    sg_window, sg_polyorder : int
+        Savitzky-Golay parameters for power smoothing.
+    quantile_window : int
+        Window for running-quantile baseline estimation.
+    quantile : float
+        Quantile for baseline (e.g. 0.1).
+    nbins_low : int
+        Number of lowest bins to exclude (DC/background).
+    cap_quantile : float
+        Soft cap quantile for extreme weights.
+    frozen_weights : np.ndarray, optional
+        Pre-computed 1-D radial-bin weights (from t=0). If given,
+        skip weight estimation and use these directly. Must match
+        the binning (same *bin_delta* and *spacing*).
+
+    Returns
+    -------
+    float
+        Weighted Pearson *r* in [-1, 1].
+    """
+    check_same_device(prediction, target)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
+        )
+
+    spacing_seq = _normalize_spacing(spacing, prediction.ndim)
+    apo_fn = _APODIZATION_FNS.get(apodization)
+    if apo_fn is None:
+        raise ValueError(
+            f"Unknown apodization '{apodization}'. "
+            f"Choose from {list(_APODIZATION_FNS)}."
+        )
+
+    # Mean-subtract + apodise → FFT
+    pred = prediction.astype(np.float32) - np.mean(prediction)
+    targ = target.astype(np.float32) - np.mean(target)
+    pred = apo_fn(pred)
+    targ = apo_fn(targ)
+
+    F_pred = np.fft.fftn(pred)
+    F_targ = np.fft.fftn(targ)
+
+    # Compute or reuse per-bin weights
+    if frozen_weights is not None:
+        w_bins = frozen_weights
+    else:
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        p_smooth, noise_bl = estimate_noise_baseline(
+            power,
+            sg_window=sg_window,
+            sg_polyorder=sg_polyorder,
+            quantile_window=quantile_window,
+            quantile=quantile,
+        )
+        w_bins = baseline_snr2_weights(
+            radii,
+            p_smooth,
+            noise_bl,
+            nbins_low=nbins_low,
+            cap_quantile=cap_quantile,
+        )
+
+    # Map per-bin weights → per-voxel weight volume
+    edges_cpu, _ = radial_edges(
+        prediction.shape, bin_delta=bin_delta, spacing=spacing_seq
+    )
+    edges = to_same_device(edges_cpu, prediction)
+    bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
+
+    xp = get_array_module(prediction)
+    w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
+
+    W = np.zeros_like(bid, dtype=np.float32)
+    valid = bid >= 0
+    W[valid] = w_bins_dev[bid[valid]]
+
+    # Weighted cross-spectrum correlation
+    cross = np.real(F_pred.ravel() * np.conj(F_targ.ravel()))
+    num = float(asnumpy(np.sum(W * cross)))
+    denom_pred = float(asnumpy(np.sum(W * np.abs(F_pred.ravel()) ** 2)))
+    denom_targ = float(asnumpy(np.sum(W * np.abs(F_targ.ravel()) ** 2)))
+    denom = np.sqrt(denom_pred * denom_targ)
+
+    if denom < 1e-12:
+        return 0.0
+    return float(np.clip(num / denom, -1.0, 1.0))
+
+
 # ---------------------------------------------------------------------------
 # 4  Internal filtering helper
 # ---------------------------------------------------------------------------
@@ -635,6 +957,9 @@ def spectral_pcc(
     tail_fraction: float = 0.2,
     cutoff: float | None = None,
     apodization: str = "tukey",
+    smooth: bool = False,
+    sg_window: int = 15,
+    sg_polyorder: int = 3,
 ) -> float:
     r"""Spectrally-weighted Pearson correlation coefficient.
 
@@ -664,6 +989,13 @@ def spectral_pcc(
         Hard cutoff zeroing bins above this frequency.
     apodization : str
         Window function for edge apodisation.
+    smooth : bool
+        If True, use SG-smoothed Wiener weights instead of raw
+        subtract-normalize weights.
+    sg_window : int
+        Savitzky-Golay window length (used only when *smooth* is True).
+    sg_polyorder : int
+        Savitzky-Golay polynomial order (used only when *smooth* is True).
 
     Returns
     -------
@@ -698,7 +1030,17 @@ def spectral_pcc(
         target, spacing=spacing_seq, bin_delta=bin_delta
     )
     noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
-    w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
+    if smooth:
+        w_bins = smooth_spectral_weights(
+            radii,
+            power,
+            noise,
+            cutoff=cutoff,
+            sg_window=sg_window,
+            sg_polyorder=sg_polyorder,
+        )
+    else:
+        w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
 
     # Map per-bin weights → per-voxel weight volume
     edges_cpu, _ = radial_edges(
