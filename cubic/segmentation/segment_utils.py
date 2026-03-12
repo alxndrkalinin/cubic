@@ -20,8 +20,11 @@ def downscale_and_filter(
     downscale_anti_aliasing: bool = True,
     filter_size: int = 3,
     filter_shape: str = "square",
+    *,
+    downscale_xy_only: bool = True,
+    filter_mode: str = "nearest",
 ) -> npt.ArrayLike:
-    """Subsample and filter image prior to segmentiation.
+    """Subsample and filter image prior to segmentation.
 
     Parameters
     ----------
@@ -29,8 +32,24 @@ def downscale_and_filter(
         Image to be downsampled and filtered.
     downscale_factor : float, optional
         Factor by which to downscale the image, by default 0.5.
+    downscale_order : int, optional
+        Interpolation order for downscaling, by default 3.
+    downscale_anti_aliasing : bool, optional
+        Whether to apply anti-aliasing during downscaling, by default True.
+    downscale_xy_only : bool, optional
+        If True (default), only downscale XY dimensions, preserving Z for
+        3D images. If False, downscale all dimensions uniformly.
     filter_size : int, optional
         Size of median filter kernel, by default 3.
+    filter_shape : str, optional
+        Shape of the filter kernel: ``"square"`` (cube in 3D) uses
+        ``scipy.ndimage.median_filter(size=filter_size)`` which supports
+        boundary modes; ``"circular"`` (ball in 3D) uses
+        ``skimage.filters.median`` with a shaped footprint.
+    filter_mode : str, optional
+        Boundary mode for the median filter, by default ``"nearest"``.
+        Only used when ``filter_shape="square"``. Common values:
+        ``"constant"`` (zero-padding), ``"nearest"``, ``"reflect"``.
 
     Returns
     -------
@@ -38,33 +57,40 @@ def downscale_and_filter(
         Filtered and downsampled image.
 
     """
-    # cuCIM does not yet support rank-based median filter
-    # https://github.com/rapidsai/cucim/blob/main/python/cucim/src/cucim/skimage/filters/_median.py#L124
-    assert filter_shape in [
-        "square",
-        "circular",
-    ], "Filter shape must be 'square' or 'circular'."
+    from ..scipy import ndimage as _ndimage
+
+    if filter_shape not in ("square", "circular"):
+        raise ValueError("filter_shape must be 'square' or 'circular'.")
+
+    if downscale_factor < 1.0:
+        if downscale_xy_only:
+            from ..image_utils import rescale_xy
+
+            image = rescale_xy(
+                image,
+                scale=downscale_factor,
+                order=downscale_order,
+                anti_aliasing=downscale_anti_aliasing,
+            )
+        else:
+            image = transform.rescale(
+                image,
+                downscale_factor,
+                order=downscale_order,
+                anti_aliasing=downscale_anti_aliasing,
+            )
+
+    if filter_shape == "square":
+        return _ndimage.median_filter(image, size=filter_size, mode=filter_mode)
 
     if image.ndim == 2:
-        skimage_footprint = (
-            morphology.square if filter_shape == "square" else morphology.disk
-        )
+        footprint = morphology.disk(filter_size)
     elif image.ndim == 3:
-        skimage_footprint = (
-            morphology.cube if filter_shape == "square" else morphology.ball
-        )
+        footprint = morphology.ball(filter_size)
     else:
         raise ValueError("Image must be 2D or 3D.")
 
-    if downscale_factor < 1.0:
-        image = transform.rescale(
-            image,
-            downscale_factor,
-            order=downscale_order,
-            anti_aliasing=downscale_anti_aliasing,
-        )
-
-    return filters.median(image, footprint=skimage_footprint(filter_size))
+    return filters.median(image, footprint=footprint)
 
 
 def check_labeled_binary(image):
@@ -120,7 +146,7 @@ def cleanup_segmentation(
             )
             label_img[filled_mask] = label_id
 
-    return label(label_img).astype(np.uint8)
+    return label(label_img).astype(np.uint16)
 
 
 def find_objects(label_image, max_label=None):
@@ -253,26 +279,84 @@ def remove_thin_objects(label_image, min_z=2):
     return label_image
 
 
-def segment_watershed(image, markers=None, ball_size=15):
-    """Segment image using watershed algorithm."""
+def segment_watershed(
+    image: npt.ArrayLike,
+    markers: npt.ArrayLike | None = None,
+    ball_size: int = 15,
+    *,
+    mask: npt.ArrayLike | None = None,
+    dilate_seeds: bool = False,
+) -> npt.ArrayLike:
+    """Segment image using watershed algorithm.
+
+    When ``markers`` is None, computes a distance-based watershed:
+    EDT of the binary image is used to find peaks, which become markers,
+    and the watershed floods the negated distance.
+
+    When ``markers`` is provided, runs a marker-based watershed. By default
+    the image is used as both the landscape and mask. If ``mask`` is also
+    provided, the watershed uses the negated EDT of the mask as the
+    landscape (shape-based partitioning) and restricts flooding to the mask.
+
+    Parameters
+    ----------
+    image : npt.ArrayLike
+        Binary image to segment (distance-based) or intensity image
+        (marker-based when no mask is given).
+    markers : npt.ArrayLike or None, optional
+        Pre-computed markers for marker-based watershed. If None,
+        markers are generated from distance-transform peaks.
+    mask : npt.ArrayLike or None, optional
+        Binary mask restricting the watershed. When provided with markers,
+        the watershed landscape is the negated EDT of the mask (shape-based
+        partitioning). Only used when ``markers`` is not None.
+    ball_size : int, optional
+        Radius of the ball footprint for ``peak_local_max``, by default 15.
+        Only used when ``markers`` is None.
+    dilate_seeds : bool, optional
+        If True, dilate seed points with ``ball(1)`` before labeling.
+        This merges nearby peaks and reduces over-segmentation.
+        Only used when ``markers`` is None.
+
+    Returns
+    -------
+    npt.ArrayLike
+        Label image on the same device as the input.
+
+    """
+    from ..cuda import to_same_device
+
     device = get_device(image)
 
-    distance = distance_transform_edt(image)
-    coords = feature.peak_local_max(
-        distance, footprint=morphology.ball(ball_size), labels=image
-    )
-
-    # https://github.com/rapidsai/cucim/issues/89
+    # Distance-based watershed (no markers provided)
     if markers is None:
-        mask = np.zeros(distance.shape, dtype=bool)
-        mask[tuple(asnumpy(coords.T))] = True
-        markers = label(mask)
-        labels = watershed(-asnumpy(distance), markers, mask=asnumpy(image))
-    else:
-        labels = watershed(
-            asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image)
-        )
-    # return on the same device as input
+        distance = distance_transform_edt(image)
+        footprint = morphology.ball(ball_size)
+        footprint = to_same_device(footprint, distance)
+        coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
+
+        seed_mask = np.zeros(distance.shape, dtype=bool)
+        seed_mask[tuple(asnumpy(coords).T)] = True
+        seed_mask = to_device(seed_mask, device)
+        if dilate_seeds:
+            seed_mask = morphology.binary_dilation(
+                seed_mask, to_same_device(morphology.ball(1), seed_mask)
+            )
+        markers = label(seed_mask)
+        # watershed is not in cucim — run on CPU, return to original device
+        labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))
+        return to_device(labels, device)
+
+    # Marker-based watershed with explicit mask (shape-based partitioning)
+    if mask is not None:
+        distance = distance_transform_edt(asnumpy(mask))
+        ws_image = -distance
+        ws_image = ws_image - ws_image.min()
+        labels = watershed(ws_image, markers=asnumpy(markers), mask=asnumpy(mask))
+        return to_device(labels, device)
+
+    # Marker-based watershed without mask (image as landscape and mask)
+    labels = watershed(asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image))
     return to_device(labels, device)
 
 

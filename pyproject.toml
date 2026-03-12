@@ -45,6 +45,10 @@ mesh = [
 plot = [
     "matplotlib>=3.5",
 ]
+examples = [
+    "jupyter",
+    "pooch",
+]
 dev = [
     "ruff",
     "mypy",
@@ -56,6 +60,7 @@ all = [
     "cubic[cellpose]",
     "cubic[mesh]",
     "cubic[plot]",
+    "cubic[examples]",
     "cubic[dev]",
 ]
 

@@ -1,0 +1,43 @@
+name: Convert notebooks to scripts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/notebooks/*.ipynb"
+
+jobs:
+  convert:
+    name: nbconvert to scripts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: set up python
+        run: uv python install 3.11
+
+      - name: install dependencies
+        run: uv sync --extra examples
+
+      - name: convert notebooks to scripts
+        run: |
+          for nb in examples/notebooks/*.ipynb; do
+            uv run jupyter nbconvert --to script "$nb" --output-dir examples/scripts
+          done
+
+      - name: commit generated scripts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add examples/scripts/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: auto-generate scripts from notebooks"
+            git push
+          fi
