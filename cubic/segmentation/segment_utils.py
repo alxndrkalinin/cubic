@@ -146,7 +146,7 @@ def cleanup_segmentation(
             )
             label_img[filled_mask] = label_id
 
-    return label(label_img).astype(np.uint8)
+    return label(label_img).astype(np.uint16)
 
 
 def find_objects(label_image, max_label=None):
