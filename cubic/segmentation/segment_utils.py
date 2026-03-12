@@ -18,9 +18,10 @@ def downscale_and_filter(
     downscale_factor: float = 0.5,
     downscale_order: int = 3,
     downscale_anti_aliasing: bool = True,
-    downscale_xy_only: bool = True,
     filter_size: int = 3,
     filter_shape: str = "square",
+    *,
+    downscale_xy_only: bool = True,
     filter_mode: str = "nearest",
 ) -> npt.ArrayLike:
     """Subsample and filter image prior to segmentation.
@@ -58,10 +59,8 @@ def downscale_and_filter(
     """
     from ..scipy import ndimage as _ndimage
 
-    assert filter_shape in [
-        "square",
-        "circular",
-    ], "Filter shape must be 'square' or 'circular'."
+    if filter_shape not in ("square", "circular"):
+        raise ValueError("filter_shape must be 'square' or 'circular'.")
 
     if downscale_factor < 1.0:
         if downscale_xy_only:
@@ -283,8 +282,9 @@ def remove_thin_objects(label_image, min_z=2):
 def segment_watershed(
     image: npt.ArrayLike,
     markers: npt.ArrayLike | None = None,
-    mask: npt.ArrayLike | None = None,
     ball_size: int = 15,
+    *,
+    mask: npt.ArrayLike | None = None,
     dilate_seeds: bool = False,
 ) -> npt.ArrayLike:
     """Segment image using watershed algorithm.
@@ -335,7 +335,7 @@ def segment_watershed(
         footprint = to_same_device(footprint, distance)
         coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
 
-        seed_mask = np.zeros(asnumpy(distance).shape, dtype=bool)
+        seed_mask = np.zeros(distance.shape, dtype=bool)
         seed_mask[tuple(asnumpy(coords).T)] = True
         seed_mask = to_device(seed_mask, device)
         if dilate_seeds:

@@ -21,13 +21,13 @@ jobs:
       - name: set up python
         run: uv python install 3.11
 
-      - name: install jupyter
-        run: uv pip install jupyter
+      - name: install dependencies
+        run: uv sync --extra examples
 
       - name: convert notebooks to scripts
         run: |
           for nb in examples/notebooks/*.ipynb; do
-            jupyter nbconvert --to script "$nb" --output-dir examples/scripts
+            uv run jupyter nbconvert --to script "$nb" --output-dir examples/scripts
           done
 
       - name: commit generated scripts

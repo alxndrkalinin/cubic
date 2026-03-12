@@ -82,6 +82,3 @@ convention = "numpy"
 
 [tool.ruff.lint.isort]
 length-sort = true
-
-[tool.uv.sources]
-iohub = { git = "https://github.com/czbiohub-sf/iohub" }

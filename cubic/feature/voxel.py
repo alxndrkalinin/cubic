@@ -16,6 +16,9 @@ def regionprops(
     spacing: list[float] | None = None,
 ) -> list:
     """Extract region-based morphological features."""
+    # cucim requires spacing as tuple for kernel memoization
+    if spacing is not None:
+        spacing = tuple(spacing)
     return measure.regionprops(label_image, intensity_image, spacing=spacing)
 
 
