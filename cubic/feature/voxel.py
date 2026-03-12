@@ -30,6 +30,9 @@ def regionprops_table(
         properties = list(set(properties + ["label"]))
     else:
         properties = []
+    # cucim requires spacing as tuple for kernel memoization
+    if spacing is not None:
+        spacing = tuple(spacing)
     return measure.regionprops_table(
         label_image, intensity_image, properties=properties, spacing=spacing
     )

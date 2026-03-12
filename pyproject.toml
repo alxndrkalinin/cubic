@@ -45,6 +45,11 @@ mesh = [
 plot = [
     "matplotlib>=3.5",
 ]
+examples = [
+    "jupyter",
+    "pandas",
+    "pooch",
+]
 dev = [
     "ruff",
     "mypy",
@@ -56,6 +61,7 @@ all = [
     "cubic[cellpose]",
     "cubic[mesh]",
     "cubic[plot]",
+    "cubic[examples]",
     "cubic[dev]",
 ]
 
@@ -77,3 +83,6 @@ convention = "numpy"
 
 [tool.ruff.lint.isort]
 length-sort = true
+
+[tool.uv.sources]
+iohub = { git = "https://github.com/czbiohub-sf/iohub" }
