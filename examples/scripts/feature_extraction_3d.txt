@@ -1,0 +1,89 @@
+from time import perf_counter
+
+import numpy as np
+from skimage.data import cells3d
+
+from cubic.cuda import CUDAManager, asnumpy, to_device
+from cubic.skimage import filters, measure, morphology
+from cubic.image_utils import label
+
+USE_GPU = CUDAManager().num_gpus > 0
+DEVICE = "GPU" if USE_GPU else "CPU"
+print(f"Device: {DEVICE}")
+
+# Load cells3d: (60, 2, 256, 256) — channel 0 = membrane, channel 1 = nuclei
+data = cells3d()
+nuclei = to_device(data[:, 1].astype(np.float32), DEVICE)
+print(f"Volume shape: {nuclei.shape}")
+
+thresh = filters.threshold_otsu(nuclei)
+binary = morphology.remove_small_holes(nuclei > thresh, area_threshold=500)
+labels = label(binary)
+labels = morphology.remove_small_objects(labels, min_size=1000)
+labels = label(labels)  # relabel sequentially
+print(f"Found {int(labels.max())} nuclei")
+
+PROPS_3D = (
+    "label",
+    "area",
+    "area_bbox",
+    "area_convex",
+    "area_filled",
+    "axis_major_length",
+    "axis_minor_length",
+    "equivalent_diameter_area",
+    "euler_number",
+    "extent",
+    "feret_diameter_max",
+    "inertia_tensor",
+    "inertia_tensor_eigvals",
+    "intensity_max",
+    "intensity_mean",
+    "intensity_min",
+    "intensity_std",
+    "moments",
+    "moments_central",
+    "moments_weighted",
+    "moments_weighted_central",
+    "solidity",
+)
+
+t0 = perf_counter()
+props = measure.regionprops_table(
+    labels,
+    intensity_image=nuclei,
+    properties=PROPS_3D,
+)
+elapsed = perf_counter() - t0
+
+# regionprops_table returns a dict of arrays — move to CPU for display
+props_np = {k: asnumpy(v) for k, v in props.items()}
+n_objects = len(props_np["label"])
+n_features = len(props_np)
+print(f"{n_objects} objects, {n_features} features in {elapsed:.3f}s ({DEVICE})")
+
+# Show key morphological and intensity features
+key_cols = [
+    "label",
+    "area",
+    "area_convex",
+    "solidity",
+    "axis_major_length",
+    "axis_minor_length",
+    "equivalent_diameter_area",
+    "intensity_mean",
+    "intensity_std",
+    "intensity_min",
+    "intensity_max",
+]
+header = " ".join(f"{c:>16s}" for c in key_cols)
+print(header)
+print("-" * len(header))
+for i in range(n_objects):
+    row = " ".join(
+        f"{float(props_np[c][i]):>16.2f}"
+        if np.issubdtype(type(props_np[c][i]), np.floating)
+        else f"{int(props_np[c][i]):>16d}"
+        for c in key_cols
+    )
+    print(row)
