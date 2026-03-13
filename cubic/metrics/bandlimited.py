@@ -960,6 +960,7 @@ def spectral_pcc(
     smooth: bool = False,
     sg_window: int = 15,
     sg_polyorder: int = 3,
+    nbins_low: int = 0,
 ) -> float:
     r"""Spectrally-weighted Pearson correlation coefficient.
 
@@ -1041,6 +1042,13 @@ def spectral_pcc(
         )
     else:
         w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
+
+    # Low-k exclusion (DC / illumination / background)
+    nbins_low = min(nbins_low, len(w_bins))
+    if nbins_low > 0:
+        w_bins[:nbins_low] = 0.0
+    if float(w_bins.max().item()) == 0.0:
+        return 0.0
 
     # Map per-bin weights → per-voxel weight volume
     edges_cpu, _ = radial_edges(
