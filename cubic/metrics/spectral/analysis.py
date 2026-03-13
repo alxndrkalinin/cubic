@@ -190,11 +190,12 @@ class FourierCorrelationData(object):
     def __init__(self, data=None):
         """Initialise the data structure with optional ``data`` mapping."""
         correlation_keys = (
-            "correlation frequency points-x-bin curve-fit curve-fit-coefficients"
+            "correlation frequency points-x-bin curve-fit "
+            "curve-fit-coefficients correlation-std"
         )
         resolution_keys = (
             "threshold criterion resolution-point "
-            "resolution-threshold-coefficients resolution spacing"
+            "resolution-threshold-coefficients resolution spacing resolution-std"
         )
 
         self.resolution = FixedDictionary(resolution_keys.split())

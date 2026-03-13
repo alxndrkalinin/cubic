@@ -6,6 +6,7 @@ import pytest
 from cubic.cuda import ascupy, asnumpy
 from cubic.image_utils import (
     rotate_image,
+    binomial_split,
     pad_image_to_cube,
     checkerboard_split,
     reverse_checkerboard_split,
@@ -147,3 +148,109 @@ def test_checkerboard_split() -> None:
     expected_img2_rev = z_summed_rev[:, 0::2, 1::2]
     assert np.allclose(img1_rev_3d, expected_img1_rev)
     assert np.allclose(img2_rev_3d, expected_img2_rev)
+
+
+class TestBinomialSplit:
+    """Tests for ``binomial_split``."""
+
+    def test_conservation_counts_mode(self) -> None:
+        """img1 + img2 == integer counts (no readout correction)."""
+        rng = np.random.default_rng(42)
+        img = rng.poisson(100, size=(64, 64)).astype(np.float32)
+        img1, img2 = binomial_split(img, rng=0)
+        np.testing.assert_array_equal(img1 + img2, np.rint(img).astype(np.float32))
+
+    def test_expectation(self) -> None:
+        """Mean of img1 ≈ p * mean(img)."""
+        rng_img = np.random.default_rng(1)
+        img = rng_img.poisson(500, size=(128, 128)).astype(np.float32)
+        p = 0.5
+        img1, _ = binomial_split(img, p=p, rng=2)
+        assert abs(img1.mean() - p * img.mean()) / img.mean() < 0.02
+
+    def test_independence_poisson_thinning(self) -> None:
+        """Poisson thinning draws should be independent (uncorrelated residuals)."""
+        img = np.full((128, 128), 200.0, dtype=np.float32)
+        p = 0.5
+        img1, img2 = binomial_split(img, p=p, counts_mode="poisson_thinning", rng=4)
+        # In poisson_thinning mode, n1 and n2 are independent Poisson draws
+        corr = np.corrcoef(img1.ravel(), img2.ravel())[0, 1]
+        assert abs(corr) < 0.1
+
+    def test_variance_law(self) -> None:
+        """Var(img1) per pixel follows p*(1-p)*n scaling."""
+        n_val = 1000
+        p = 0.5
+        img = np.full((256, 256), n_val, dtype=np.float32)
+        img1, _ = binomial_split(img, p=p, rng=5)
+        expected_var = p * (1 - p) * n_val
+        actual_var = float(np.var(img1))
+        assert abs(actual_var - expected_var) / expected_var < 0.1
+
+    def test_shape_preservation(self) -> None:
+        """Output shape matches input shape."""
+        img = np.random.default_rng(6).poisson(50, size=(32, 64)).astype(np.float32)
+        img1, img2 = binomial_split(img, rng=7)
+        assert img1.shape == img.shape
+        assert img2.shape == img.shape
+
+    def test_deterministic_with_seed(self) -> None:
+        """Same seed produces same split."""
+        img = np.random.default_rng(8).poisson(100, size=(32, 32)).astype(np.float32)
+        img1a, img2a = binomial_split(img, rng=42)
+        img1b, img2b = binomial_split(img, rng=42)
+        np.testing.assert_array_equal(img1a, img1b)
+        np.testing.assert_array_equal(img2a, img2b)
+
+    def test_readout_noise_nonneg(self) -> None:
+        """With readout noise correction, outputs are non-negative."""
+        rng_img = np.random.default_rng(9)
+        img = rng_img.poisson(10, size=(64, 64)).astype(np.float32)
+        img1, img2 = binomial_split(img, readout_noise_rms=3.0, rng=10)
+        assert np.all(img1 >= 0)
+        assert np.all(img2 >= 0)
+
+    def test_poisson_thinning_nonneg(self) -> None:
+        """Poisson thinning mode: outputs non-negative."""
+        img = (
+            np.random.default_rng(11).uniform(0, 100, size=(32, 32)).astype(np.float32)
+        )
+        img1, img2 = binomial_split(img, counts_mode="poisson_thinning", rng=12)
+        assert np.all(img1 >= 0)
+        assert np.all(img2 >= 0)
+
+    def test_poisson_thinning_independence(self) -> None:
+        """Poisson thinning draws are independent (no exact conservation)."""
+        img = np.full((128, 128), 200.0, dtype=np.float32)
+        img1, img2 = binomial_split(img, counts_mode="poisson_thinning", rng=13)
+        # Not exactly conserved (unlike counts mode)
+        diff = img1 + img2 - img
+        assert np.std(diff) > 0  # there should be variation
+        # But means should be close
+        assert abs((img1 + img2).mean() - img.mean()) / img.mean() < 0.05
+
+    def test_float_input_warning(self) -> None:
+        """Float input with default gain/offset in counts mode triggers warning."""
+        img = (
+            np.random.default_rng(14)
+            .uniform(0.5, 10.5, size=(32, 32))
+            .astype(np.float32)
+        )
+        with pytest.warns(UserWarning, match="non-integer pixels"):
+            binomial_split(img, rng=15)
+
+    def test_invalid_p(self) -> None:
+        """P outside (0, 1) raises ValueError."""
+        img = np.ones((4, 4), dtype=np.float32)
+        with pytest.raises(ValueError, match="p must be in"):
+            binomial_split(img, p=0.0)
+        with pytest.raises(ValueError, match="p must be in"):
+            binomial_split(img, p=1.0)
+
+    def test_3d_input(self) -> None:
+        """3D input produces valid 3D output."""
+        img = np.random.default_rng(16).poisson(50, size=(8, 32, 32)).astype(np.float32)
+        img1, img2 = binomial_split(img, rng=17)
+        assert img1.shape == img.shape
+        assert img1.ndim == 3
+        np.testing.assert_array_equal(img1 + img2, np.rint(img).astype(np.float32))

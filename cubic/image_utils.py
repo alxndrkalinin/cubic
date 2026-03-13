@@ -1,7 +1,7 @@
 """Implements utility functions that operate on 3D images."""
 
 import warnings
-from typing import Any
+from typing import Any, Literal
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -620,6 +620,157 @@ def reverse_checkerboard_split(
         Two split images with half the size in each spatial dimension.
     """
     return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=True)
+
+
+def binomial_split(
+    image: np.ndarray,
+    p: float = 0.5,
+    *,
+    counts_mode: Literal["counts", "poisson_thinning"] = "counts",
+    gain: float = 1.0,
+    offset: float = 0.0,
+    readout_noise_rms: float = 0.0,
+    rng: np.random.Generator | int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split a single image into two noise-independent halves via binomial sampling.
+
+    Implements the single-image FRC method from Rieger et al. (Optics Express 2024).
+    Each pixel's photon count *n* is split into n1 ~ Binomial(n, p) and n2 = n - n1,
+    producing two images with preserved Poisson statistics and no spatial subsampling.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input 2D or 3D image (NumPy or CuPy).
+    p : float
+        Split probability. Default 0.5 (equal split).
+    counts_mode : {"counts", "poisson_thinning"}
+        ``"counts"`` — interpret pixels as photon counts (or convert via gain/offset).
+        ``"poisson_thinning"`` — treat pixel values as Poisson rates λ and draw
+        n1 ~ Poisson(p·λ), n2 ~ Poisson((1-p)·λ) independently. Does NOT conserve
+        exact pixel sums. Useful as a fallback for float / deconvolved images, but
+        note that it measures self-consistency, not physical resolution.
+    gain : float
+        Camera gain (electrons / ADU). Used only in counts mode. Default 1.0.
+    offset : float
+        Camera offset (ADU). Subtracted before gain conversion. Default 0.0.
+    readout_noise_rms : float
+        Read-noise standard deviation in **electrons**. When > 0 in counts mode,
+        applies the Rieger et al. Eq. 29 bias correction: σ² is added to the count
+        estimate before splitting, then σ²/2 is subtracted from each half. This
+        corrects the high-frequency FRC plateau caused by read noise. If gain/offset
+        or readout_noise_rms are wrong, this correction can make results worse.
+    rng : Generator, int, or None
+        NumPy random number generator, seed, or None for unseeded.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Two float32 images. In counts mode (without readout correction) their sum
+        equals the integer count image exactly.
+
+    Notes
+    -----
+    **Poisson thinning mode** does not split actual photon counts — it samples two
+    independent Poisson draws. This is not physically interpretable as resolution on
+    deconvolved or heavily processed images; it measures the effective reproducible
+    bandwidth of a noise model applied to the data.
+
+    References
+    ----------
+    Rieger, Droste, Gerritsma, ten Brink, Stallinga. "Single image Fourier ring
+    correlation." Optics Express 32(12):21767, 2024.
+    """
+    if not (0.0 < p < 1.0):
+        raise ValueError(f"p must be in (0, 1), got {p}")
+
+    xp = get_array_module(image)
+
+    # Resolve RNG
+    if isinstance(rng, int):
+        np_rng = np.random.default_rng(rng)
+    elif isinstance(rng, np.random.Generator):
+        np_rng = rng
+    else:
+        np_rng = np.random.default_rng()
+
+    if counts_mode == "counts":
+        # --- counts mode ---
+        # Warn if float input with default calibration (likely forgot gain/offset)
+        if np.issubdtype(image.dtype, np.floating):
+            frac_part = np.abs(image - np.rint(image))
+            frac_fraction = float(np.mean(frac_part > 0.01))
+            if frac_fraction > 0.1 and gain == 1.0 and offset == 0.0:
+                warnings.warn(
+                    f"counts_mode='counts' received float image with "
+                    f"{frac_fraction:.0%} non-integer pixels and default "
+                    f"gain/offset. Did you forget to set gain/offset?",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        # Convert ADU → electrons
+        electrons = (image.astype(np.float64) - offset) / gain
+
+        # Warn if large negative region before clipping (offset not removed)
+        neg_fraction = float(np.mean(electrons < -0.5))
+        if neg_fraction > 0.05:
+            warnings.warn(
+                f"{neg_fraction:.0%} of pixels are negative after offset "
+                f"subtraction — check that offset={offset} is correct.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        electrons = np.clip(electrons, 0, None)
+
+        # Readout noise bias correction (Rieger Eq. 29): add σ² before splitting
+        if readout_noise_rms > 0:
+            electrons = electrons + readout_noise_rms**2
+
+        # Round to integer counts
+        n = np.rint(electrons).astype(np.int64)
+
+        # Draw binomial split on CPU (transfer if needed)
+        n_cpu = n if isinstance(n, np.ndarray) else n.get()
+        n1_cpu = np_rng.binomial(n_cpu, p)
+        n2_cpu = n_cpu - n1_cpu
+
+        img1 = n1_cpu.astype(np.float32)
+        img2 = n2_cpu.astype(np.float32)
+
+        # Readout noise bias correction: subtract σ²/2 from each half
+        if readout_noise_rms > 0:
+            half_var = np.float32(readout_noise_rms**2 / 2.0)
+            img1 = np.clip(img1 - half_var, 0, None)
+            img2 = np.clip(img2 - half_var, 0, None)
+
+        # Transfer back to original device if needed
+        if xp.__name__ != "numpy":
+            img1 = xp.asarray(img1)
+            img2 = xp.asarray(img2)
+
+    elif counts_mode == "poisson_thinning":
+        # --- poisson thinning mode ---
+        rate = np.clip(image.astype(np.float64), 0, None)
+
+        rate_cpu = rate if isinstance(rate, np.ndarray) else rate.get()
+        n1_cpu = np_rng.poisson(p * rate_cpu).astype(np.float32)
+        n2_cpu = np_rng.poisson((1.0 - p) * rate_cpu).astype(np.float32)
+
+        img1 = n1_cpu
+        img2 = n2_cpu
+
+        if xp.__name__ != "numpy":
+            img1 = xp.asarray(img1)
+            img2 = xp.asarray(img2)
+
+    else:
+        raise ValueError(
+            f"counts_mode must be 'counts' or 'poisson_thinning', got {counts_mode!r}"
+        )
+
+    return img1, img2
 
 
 def label(img: npt.ArrayLike, **kwargs: Any) -> npt.ArrayLike:
