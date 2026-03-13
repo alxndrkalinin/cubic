@@ -43,6 +43,22 @@ from .spectral.radial import (
     radial_k_grid,
 )
 
+__all__ = [
+    "butterworth_lowpass",
+    "otf_cutoff",
+    "nyquist_cutoff",
+    "estimate_cutoff",
+    "radial_power_spectrum",
+    "estimate_noise_floor",
+    "spectral_weights",
+    "smooth_spectral_weights",
+    "frc_weights",
+    "spectral_pcc_frcw",
+    "band_limited_pcc",
+    "band_limited_ssim",
+    "spectral_pcc",
+]
+
 # ---------------------------------------------------------------------------
 # 1  Core building blocks
 # ---------------------------------------------------------------------------
@@ -419,13 +435,19 @@ def smooth_spectral_weights(
     from scipy.signal import savgol_filter
 
     log_p = np.log(np.maximum(power, 1e-30))
-    # Clamp window to array length (must be odd, > polyorder)
-    wlen = min(sg_window, len(log_p))
-    if wlen % 2 == 0:
-        wlen -= 1
-    wlen = max(wlen, sg_polyorder + 2)
-    log_p_smooth = savgol_filter(log_p, wlen, sg_polyorder)
-    p_smooth = np.exp(log_p_smooth)
+    n = len(log_p)
+    # Clamp window to array length (must be odd, > polyorder, <= n)
+    min_wlen = sg_polyorder + 2
+    if n < min_wlen:
+        # Array too short for SG filter — skip smoothing
+        p_smooth = power.copy()
+    else:
+        wlen = min(sg_window, n)
+        if wlen % 2 == 0:
+            wlen -= 1
+        wlen = max(wlen, min_wlen)
+        log_p_smooth = savgol_filter(log_p, wlen, sg_polyorder)
+        p_smooth = np.exp(log_p_smooth)
 
     n2 = noise_floor**2
     w = p_smooth**2 / (p_smooth**2 + n2)
@@ -474,7 +496,7 @@ def _running_quantile_1d(
     return out
 
 
-def estimate_noise_baseline(
+def _estimate_noise_baseline(
     power: np.ndarray,
     sg_window: int = 15,
     sg_polyorder: int = 3,
@@ -508,10 +530,15 @@ def estimate_noise_baseline(
     n = len(power)
 
     # SG window: must be odd, > polyorder, <= array length
+    min_wlen = sg_polyorder + 2
+    if n < min_wlen:
+        # Array too short for SG filter — return raw power as baseline
+        raw = np.maximum(power, 1e-30).astype(np.float32)
+        return raw, raw.copy()
     wlen = min(sg_window, n)
     if wlen % 2 == 0:
         wlen -= 1
-    wlen = max(wlen, sg_polyorder + 2)
+    wlen = max(wlen, min_wlen)
 
     log_p = np.log(np.maximum(power, 1e-30))
     log_p_smooth = savgol_filter(log_p, wlen, sg_polyorder)
@@ -529,7 +556,7 @@ def estimate_noise_baseline(
     return np.exp(log_p_smooth).astype(np.float32), np.exp(log_n).astype(np.float32)
 
 
-def baseline_snr2_weights(
+def _baseline_snr2_weights(
     radii: np.ndarray,
     p_smooth: np.ndarray,
     noise_baseline: np.ndarray,
@@ -544,9 +571,9 @@ def baseline_snr2_weights(
     radii : np.ndarray
         Radial-bin centres.
     p_smooth : np.ndarray
-        Smoothed power spectrum from :func:`estimate_noise_baseline`.
+        Smoothed power spectrum from :func:`_estimate_noise_baseline`.
     noise_baseline : np.ndarray
-        Frequency-dependent noise floor N(k) from :func:`estimate_noise_baseline`.
+        Frequency-dependent noise floor N(k) from :func:`_estimate_noise_baseline`.
     nbins_low : int
         Number of lowest-frequency bins to exclude (DC/background).
     cap_quantile : float
@@ -583,7 +610,7 @@ def baseline_snr2_weights(
     return w.astype(np.float32)
 
 
-def spectral_pcc_baseline(
+def _spectral_pcc_baseline(
     prediction: np.ndarray,
     target: np.ndarray,
     *,
@@ -664,14 +691,14 @@ def spectral_pcc_baseline(
         radii, power = radial_power_spectrum(
             target, spacing=spacing_seq, bin_delta=bin_delta
         )
-        p_smooth, noise_bl = estimate_noise_baseline(
+        p_smooth, noise_bl = _estimate_noise_baseline(
             power,
             sg_window=sg_window,
             sg_polyorder=sg_polyorder,
             quantile_window=quantile_window,
             quantile=quantile,
         )
-        w_bins = baseline_snr2_weights(
+        w_bins = _baseline_snr2_weights(
             radii,
             p_smooth,
             noise_bl,
@@ -687,6 +714,12 @@ def spectral_pcc_baseline(
     bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
 
     xp = get_array_module(prediction)
+    n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
+    if len(w_bins) < n_bins_needed:
+        raise ValueError(
+            f"frozen_weights has {len(w_bins)} bins but binning requires "
+            f"{n_bins_needed}; check that bin_delta and image shape match."
+        )
     w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
 
     W = np.zeros_like(bid, dtype=np.float32)
@@ -713,7 +746,7 @@ def spectral_pcc_baseline(
 def frc_weights(
     image: np.ndarray,
     *,
-    bin_delta: float = 1.0,
+    bin_delta: int = 1,
     threshold: float = 0.143,
     alpha: float = 2.0,
     nbins_low: int = 3,
@@ -730,10 +763,10 @@ def frc_weights(
     ----------
     image : np.ndarray
         2-D image (must be square).
-    bin_delta : float
+    bin_delta : int
         Radial-bin width in index units.
     threshold : float
-        FRC threshold (default 0.143 = 1-bit).
+        FRC threshold (default 0.143 = 1/7).
     alpha : float
         Weight exponent (default 2.0 — sharpens the transition).
     nbins_low : int
@@ -763,7 +796,7 @@ def frc_weights(
         image,
         image2=None,
         backend="hist",
-        bin_delta=int(bin_delta),
+        bin_delta=bin_delta,
         zero_padding=False,
         disable_hamming=False,
         average=True,
@@ -787,9 +820,12 @@ def frc_weights(
     freq_nyq_full = float(np.floor(image.shape[0] / 2.0))
     freq_full_norm = radii_full_idx / freq_nyq_full
 
-    # Factor-of-2: FRC was computed on checkerboard halves (shape//2),
-    # so its [0,1] axis covers only half the full Nyquist.
-    freq_full_in_half = np.clip(freq_full_norm * 2.0, 0.0, 1.0)
+    # FRC was computed on checkerboard halves (shape//2), so its [0,1]
+    # normalised axis covers only the half-image Nyquist.  Derive the
+    # frequency scaling factor from actual image dimensions.
+    freq_nyq_half = float(np.floor(image.shape[0] // 2 / 2.0))
+    freq_scale = freq_nyq_full / freq_nyq_half  # typically 2.0
+    freq_full_in_half = np.clip(freq_full_norm * freq_scale, 0.0, 1.0)
 
     # 3. Interpolate FRC onto full-resolution bins
     frc_full = np.interp(
@@ -819,7 +855,8 @@ def frc_weights(
     # 6. Low-k exclusion
     w[:nbins_low] = 0.0
 
-    assert (w >= 0).all() and (w <= 1.0 + 1e-7).all()
+    if not ((w >= 0).all() and (w <= 1.0 + 1e-7).all()):
+        raise ValueError(f"Weights out of range [0, 1]: min={w.min()}, max={w.max()}")
     return w.astype(np.float32)
 
 
@@ -828,7 +865,7 @@ def spectral_pcc_frcw(
     target: np.ndarray,
     *,
     spacing: float | Sequence[float] | None = None,
-    bin_delta: float = 1.0,
+    bin_delta: int = 1,
     apodization: str = "tukey",
     threshold: float = 0.143,
     alpha: float = 2.0,
@@ -845,7 +882,7 @@ def spectral_pcc_frcw(
     spacing : float or sequence of float or None
         Kept for API consistency with other spectral PCC variants.
         Not used for internal binning (index units throughout).
-    bin_delta : float
+    bin_delta : int
         Radial-bin width in index units.
     apodization : str
         Window function for edge apodisation (``"tukey"`` or ``"hamming"``).
@@ -914,6 +951,12 @@ def spectral_pcc_frcw(
     bid = radial_bin_id(prediction.shape, edges, spacing=None)
 
     xp = get_array_module(prediction)
+    n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
+    if len(w_bins) < n_bins_needed:
+        raise ValueError(
+            f"frozen_weights has {len(w_bins)} bins but binning requires "
+            f"{n_bins_needed}; check that bin_delta and image shape match."
+        )
     w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
 
     W = np.zeros_like(bid, dtype=np.float32)
@@ -1224,6 +1267,9 @@ def spectral_pcc(
         Savitzky-Golay window length (used only when *smooth* is True).
     sg_polyorder : int
         Savitzky-Golay polynomial order (used only when *smooth* is True).
+    nbins_low : int
+        Number of lowest-frequency bins to zero after weight computation
+        (DC / background / autofluorescence exclusion).
 
     Returns
     -------
@@ -1287,6 +1333,12 @@ def spectral_pcc(
     bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
 
     xp = get_array_module(prediction)
+    n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
+    if len(w_bins) < n_bins_needed:
+        raise ValueError(
+            f"Weight vector has {len(w_bins)} bins but binning requires "
+            f"{n_bins_needed}; check that bin_delta and image shape match."
+        )
     w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
 
     # Build weight volume: map bin weights through bin_id
