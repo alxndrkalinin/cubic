@@ -450,7 +450,8 @@ def calculate_frc(
         offset: Camera offset (ADU) for binomial counts mode.
         readout_noise_rms: Read-noise std in electrons for binomial counts mode.
         n_repeats: Number of independent binomial splits to average. Only used
-                   when split_type="binomial". Produces correlation-std and
+                   when split_type="binomial" and single-image mode (image2 is
+                   None). Ignored otherwise. Produces correlation-std and
                    resolution-std in the result. Default: 1.
         rng: Random number generator, seed, or None for binomial split.
     """
@@ -458,6 +459,14 @@ def calculate_frc(
     spacing = _normalize_spacing(spacing, image1.ndim)
 
     use_binomial = split_type == "binomial" and single_image
+
+    if n_repeats > 1 and not use_binomial:
+        warnings.warn(
+            f"n_repeats={n_repeats} ignored: only used with "
+            f"split_type='binomial' and single-image mode.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     if use_binomial and n_repeats == 1:
         logger.info(_BINOMIAL_SINGLE_REPEAT_MSG)
@@ -1274,7 +1283,8 @@ def fsc_resolution(
         offset: Camera offset (ADU) for binomial counts mode.
         readout_noise_rms: Read-noise std in electrons for binomial counts mode.
         n_repeats: Number of independent binomial splits to average. Only used
-                   when split_type="binomial". Default: 1.
+                   when split_type="binomial" and single-image mode (image2 is
+                   None). Ignored otherwise. Default: 1.
         rng: Random number generator, seed, or None for binomial split.
 
     Returns
@@ -1295,6 +1305,14 @@ def fsc_resolution(
 
     single_image = image2 is None
     use_binomial = split_type == "binomial" and single_image
+
+    if n_repeats > 1 and not use_binomial:
+        warnings.warn(
+            f"n_repeats={n_repeats} ignored: only used with "
+            f"split_type='binomial' and single-image mode.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # --- Isotropic resampling (optional) ---
     original_spacing_z = None
@@ -1345,7 +1363,11 @@ def fsc_resolution(
         xy_res = 0.5 * (
             angle_to_resolution.get(90, np.nan) + angle_to_resolution.get(270, np.nan)
         )
-        return {"xy": xy_res, "z": z_res}
+        result = {"xy": xy_res, "z": z_res}
+        if use_binomial:
+            result["xy_std"] = 0.0
+            result["z_std"] = 0.0
+        return result
 
     # --- Hist backend ---
     spacing_list = _normalize_spacing(spacing, image1.ndim)

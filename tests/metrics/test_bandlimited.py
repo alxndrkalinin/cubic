@@ -417,6 +417,38 @@ def test_spectral_pcc_shape_mismatch_raises() -> None:
         spectral_pcc(a, b, spacing=0.065)
 
 
+def test_spectral_pcc_smooth() -> None:
+    """Spectral PCC with SG-smoothed weights returns valid result."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=7)
+    r = spectral_pcc(pred, tgt, spacing=0.065, smooth=True)
+    assert -1.0 <= r <= 1.0
+
+
+def test_spectral_pcc_smooth_identical() -> None:
+    """Smooth-weighted spectral PCC of identical images is ~1."""
+    rng = np.random.default_rng(0)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    r = spectral_pcc(img, img, spacing=0.065, smooth=True)
+    assert r == pytest.approx(1.0, abs=1e-3)
+
+
+def test_spectral_pcc_nbins_low() -> None:
+    """nbins_low excludes DC bins without crashing."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=8)
+    r0 = spectral_pcc(pred, tgt, spacing=0.065, nbins_low=0)
+    r3 = spectral_pcc(pred, tgt, spacing=0.065, nbins_low=3)
+    # Both should be valid floats; excluding DC may change the value
+    assert -1.0 <= r0 <= 1.0
+    assert -1.0 <= r3 <= 1.0
+
+
+def test_spectral_pcc_smooth_with_nbins_low() -> None:
+    """Smooth + nbins_low combined work correctly."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=9)
+    r = spectral_pcc(pred, tgt, spacing=0.065, smooth=True, nbins_low=3)
+    assert -1.0 <= r <= 1.0
+
+
 # ===================================================================
 # GPU / CPU parity tests
 # ===================================================================

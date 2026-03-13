@@ -30,7 +30,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from cubic.cuda import asnumpy, to_same_device, get_array_module, check_same_device
+from cubic.cuda import asnumpy, to_same_device, check_same_device
 from cubic.image_utils import tukey_window, hamming_window
 
 from .spectral.dcr import dcr_resolution
@@ -432,7 +432,7 @@ def smooth_spectral_weights(
     np.ndarray
         Weights in [0, 1].
     """
-    from scipy.signal import savgol_filter
+    from cubic.scipy import signal as csignal
 
     log_p = np.log(np.maximum(power, 1e-30))
     n = len(log_p)
@@ -446,7 +446,7 @@ def smooth_spectral_weights(
         if wlen % 2 == 0:
             wlen -= 1
         wlen = max(wlen, min_wlen)
-        log_p_smooth = savgol_filter(log_p, wlen, sg_polyorder)
+        log_p_smooth = csignal.savgol_filter(log_p, wlen, sg_polyorder)
         p_smooth = np.exp(log_p_smooth)
 
     n2 = noise_floor**2
@@ -525,7 +525,7 @@ def _estimate_noise_baseline(
     noise_baseline : np.ndarray
         Frequency-dependent noise floor N(k), same length as *power*.
     """
-    from scipy.signal import savgol_filter
+    from cubic.scipy import signal as csignal
 
     n = len(power)
 
@@ -541,7 +541,7 @@ def _estimate_noise_baseline(
     wlen = max(wlen, min_wlen)
 
     log_p = np.log(np.maximum(power, 1e-30))
-    log_p_smooth = savgol_filter(log_p, wlen, sg_polyorder)
+    log_p_smooth = csignal.savgol_filter(log_p, wlen, sg_polyorder)
 
     # Running low-quantile of smoothed log-power
     log_n = _running_quantile_1d(log_p_smooth, window=quantile_window, q=quantile)
@@ -713,14 +713,13 @@ def _spectral_pcc_baseline(
     edges = to_same_device(edges_cpu, prediction)
     bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
 
-    xp = get_array_module(prediction)
     n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
     if len(w_bins) < n_bins_needed:
         raise ValueError(
             f"frozen_weights has {len(w_bins)} bins but binning requires "
             f"{n_bins_needed}; check that bin_delta and image shape match."
         )
-    w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
+    w_bins_dev = to_same_device(np.asarray(w_bins, dtype=np.float32), prediction)
 
     W = np.zeros_like(bid, dtype=np.float32)
     valid = bid >= 0
@@ -751,13 +750,14 @@ def frc_weights(
     alpha: float = 2.0,
     nbins_low: int = 3,
     smooth_window: int = 5,
+    split_type: str = "binomial",
+    n_repeats: int = 3,
+    rng: np.random.Generator | int | None = 42,
 ) -> np.ndarray:
     """Per-bin weights derived from single-image FRC reproducibility.
 
-    Splits the GT image via checkerboard, computes ring-wise FRC,
-    and converts the FRC curve to monotone-decreasing weights that
-    indicate per-frequency reliability.  Operates entirely in
-    index-frequency units.
+    Uses binomial splitting (same-shape, full frequency coverage) by
+    default, falling back to checkerboard if requested.
 
     Parameters
     ----------
@@ -766,13 +766,21 @@ def frc_weights(
     bin_delta : int
         Radial-bin width in index units.
     threshold : float
-        FRC threshold (default 0.143 = 1/7).
+        FRC threshold (default 0.143 = 1-bit).
     alpha : float
         Weight exponent (default 2.0 — sharpens the transition).
     nbins_low : int
         Number of lowest bins to zero (DC / background exclusion).
     smooth_window : int
         Median-filter window (clamped to odd, >= 3).
+    split_type : str
+        ``"binomial"`` (default, same-shape, Rieger et al. 2024) or
+        ``"checkerboard"`` (subsampled halves, Koho et al. 2019).
+    n_repeats : int
+        Number of independent binomial splits to average (default 3).
+        Ignored for checkerboard.
+    rng : Generator, int, or None
+        Random seed for binomial split reproducibility.
 
     Returns
     -------
@@ -781,7 +789,7 @@ def frc_weights(
         binning matching ``radial_edges(image.shape, bin_delta,
         spacing=None)``).
     """
-    from scipy.ndimage import median_filter
+    from cubic.scipy import ndimage as cndimage
 
     # --- lazy import to avoid circular deps ---
     from .spectral.frc import calculate_frc as _calculate_frc
@@ -791,16 +799,26 @@ def frc_weights(
     if image.shape[0] != image.shape[1]:
         raise ValueError(f"frc_weights requires square images, got {image.shape}.")
 
-    # 1. FRC curve via existing public API (no spacing → index units)
-    result = _calculate_frc(
-        image,
+    # 1. FRC curve via public API (no spacing → index units)
+    frc_kwargs = dict(
         image2=None,
         backend="hist",
         bin_delta=bin_delta,
         zero_padding=False,
         disable_hamming=False,
-        average=True,
+        split_type=split_type,
     )
+    if split_type == "binomial":
+        frc_kwargs.update(
+            counts_mode="poisson_thinning",
+            n_repeats=n_repeats,
+            rng=rng,
+            average=False,  # no checkerboard reverse averaging
+        )
+    else:
+        frc_kwargs["average"] = True  # checkerboard forward+reverse
+
+    result = _calculate_frc(image, **frc_kwargs)
     frc_curve = np.clip(
         np.asarray(result.correlation["correlation"], dtype=np.float64),
         -1.0,
@@ -820,16 +838,18 @@ def frc_weights(
     freq_nyq_full = float(np.floor(image.shape[0] / 2.0))
     freq_full_norm = radii_full_idx / freq_nyq_full
 
-    # FRC was computed on checkerboard halves (shape//2), so its [0,1]
-    # normalised axis covers only the half-image Nyquist.  Derive the
-    # frequency scaling factor from actual image dimensions.
-    freq_nyq_half = float(np.floor(image.shape[0] // 2 / 2.0))
-    freq_scale = freq_nyq_full / freq_nyq_half  # typically 2.0
-    freq_full_in_half = np.clip(freq_full_norm * freq_scale, 0.0, 1.0)
+    # 3. Map FRC frequency axis onto full-resolution bins
+    if split_type == "checkerboard":
+        # Checkerboard halves are shape//2 → FRC [0,1] covers half Nyquist
+        freq_nyq_half = float(np.floor(image.shape[0] // 2 / 2.0))
+        freq_scale = freq_nyq_full / freq_nyq_half
+        interp_x = np.clip(freq_full_norm * freq_scale, 0.0, 1.0)
+    else:
+        # Binomial split: same shape → FRC and full bins share the same axis
+        interp_x = freq_full_norm
 
-    # 3. Interpolate FRC onto full-resolution bins
     frc_full = np.interp(
-        freq_full_in_half,
+        interp_x,
         freq_norm,
         frc_curve,
         left=float(frc_curve[0]),
@@ -849,7 +869,7 @@ def frc_weights(
     # 5. Smooth + monotone non-increasing envelope
     sw = smooth_window | 1  # clamp to odd
     sw = max(3, min(sw, len(w) | 1))
-    w = median_filter(w, size=sw).astype(np.float64)
+    w = cndimage.median_filter(w, size=sw).astype(np.float64)
     w = np.maximum.accumulate(w[::-1])[::-1].copy()
 
     # 6. Low-k exclusion
@@ -871,6 +891,9 @@ def spectral_pcc_frcw(
     alpha: float = 2.0,
     nbins_low: int = 3,
     smooth_window: int = 5,
+    split_type: str = "binomial",
+    n_repeats: int = 3,
+    rng: np.random.Generator | int | None = 42,
     frozen_weights: np.ndarray | None = None,
 ) -> float:
     """Spectral PCC weighted by single-image FRC reproducibility.
@@ -894,6 +917,12 @@ def spectral_pcc_frcw(
         Number of lowest bins to exclude.
     smooth_window : int
         Median-filter window for weight smoothing.
+    split_type : str
+        ``"binomial"`` or ``"checkerboard"`` — passed to :func:`frc_weights`.
+    n_repeats : int
+        Number of binomial splits to average.
+    rng : Generator, int, or None
+        Random seed for binomial split.
     frozen_weights : np.ndarray, optional
         Pre-computed 1-D radial-bin weights. If given, skip FRC weight
         estimation.  Must match index-unit binning for the target shape.
@@ -920,6 +949,9 @@ def spectral_pcc_frcw(
             alpha=alpha,
             nbins_low=nbins_low,
             smooth_window=smooth_window,
+            split_type=split_type,
+            n_repeats=n_repeats,
+            rng=rng,
         )
 
     # 2. Zero-weight-mass guard
@@ -950,14 +982,13 @@ def spectral_pcc_frcw(
     edges = to_same_device(edges_cpu, prediction)
     bid = radial_bin_id(prediction.shape, edges, spacing=None)
 
-    xp = get_array_module(prediction)
     n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
     if len(w_bins) < n_bins_needed:
         raise ValueError(
             f"frozen_weights has {len(w_bins)} bins but binning requires "
             f"{n_bins_needed}; check that bin_delta and image shape match."
         )
-    w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
+    w_bins_dev = to_same_device(np.asarray(w_bins, dtype=np.float32), prediction)
 
     W = np.zeros_like(bid, dtype=np.float32)
     valid = bid >= 0
@@ -1332,14 +1363,13 @@ def spectral_pcc(
     edges = to_same_device(edges_cpu, prediction)
     bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
 
-    xp = get_array_module(prediction)
     n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
     if len(w_bins) < n_bins_needed:
         raise ValueError(
             f"Weight vector has {len(w_bins)} bins but binning requires "
             f"{n_bins_needed}; check that bin_delta and image shape match."
         )
-    w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
+    w_bins_dev = to_same_device(np.asarray(w_bins, dtype=np.float32), prediction)
 
     # Build weight volume: map bin weights through bin_id
     W = np.zeros_like(bid, dtype=np.float32)
