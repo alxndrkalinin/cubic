@@ -706,6 +706,233 @@ def spectral_pcc_baseline(
 
 
 # ---------------------------------------------------------------------------
+# 3b  FRC-weighted spectral PCC
+# ---------------------------------------------------------------------------
+
+
+def frc_weights(
+    image: np.ndarray,
+    *,
+    bin_delta: float = 1.0,
+    threshold: float = 0.143,
+    alpha: float = 2.0,
+    nbins_low: int = 3,
+    smooth_window: int = 5,
+) -> np.ndarray:
+    """Per-bin weights derived from single-image FRC reproducibility.
+
+    Splits the GT image via checkerboard, computes ring-wise FRC,
+    and converts the FRC curve to monotone-decreasing weights that
+    indicate per-frequency reliability.  Operates entirely in
+    index-frequency units.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2-D image (must be square).
+    bin_delta : float
+        Radial-bin width in index units.
+    threshold : float
+        FRC threshold (default 0.143 = 1-bit).
+    alpha : float
+        Weight exponent (default 2.0 — sharpens the transition).
+    nbins_low : int
+        Number of lowest bins to zero (DC / background exclusion).
+    smooth_window : int
+        Median-filter window (clamped to odd, >= 3).
+
+    Returns
+    -------
+    np.ndarray
+        1-D float32 weight array (one per radial bin, index-unit
+        binning matching ``radial_edges(image.shape, bin_delta,
+        spacing=None)``).
+    """
+    from scipy.ndimage import median_filter
+
+    # --- lazy import to avoid circular deps ---
+    from .spectral.frc import calculate_frc as _calculate_frc
+
+    if image.ndim != 2:
+        raise ValueError("frc_weights currently supports 2-D images only.")
+    if image.shape[0] != image.shape[1]:
+        raise ValueError(f"frc_weights requires square images, got {image.shape}.")
+
+    # 1. FRC curve via existing public API (no spacing → index units)
+    result = _calculate_frc(
+        image,
+        image2=None,
+        backend="hist",
+        bin_delta=int(bin_delta),
+        zero_padding=False,
+        disable_hamming=False,
+        average=True,
+    )
+    frc_curve = np.clip(
+        np.asarray(result.correlation["correlation"], dtype=np.float64),
+        -1.0,
+        1.0,
+    )
+    freq_norm = np.asarray(
+        result.correlation["frequency"],
+        dtype=np.float64,
+    )
+
+    # 2. Full-resolution radii in index units
+    _, radii_full_idx = radial_edges(
+        image.shape,
+        bin_delta=bin_delta,
+        spacing=None,
+    )
+    freq_nyq_full = float(np.floor(image.shape[0] / 2.0))
+    freq_full_norm = radii_full_idx / freq_nyq_full
+
+    # Factor-of-2: FRC was computed on checkerboard halves (shape//2),
+    # so its [0,1] axis covers only half the full Nyquist.
+    freq_full_in_half = np.clip(freq_full_norm * 2.0, 0.0, 1.0)
+
+    # 3. Interpolate FRC onto full-resolution bins
+    frc_full = np.interp(
+        freq_full_in_half,
+        freq_norm,
+        frc_curve,
+        left=float(frc_curve[0]),
+        right=float(frc_curve[-1]),
+    )
+
+    # 4. Convert to weights
+    w = (
+        np.clip(
+            (frc_full - threshold) / (1.0 - threshold),
+            0.0,
+            1.0,
+        )
+        ** alpha
+    )
+
+    # 5. Smooth + monotone non-increasing envelope
+    sw = smooth_window | 1  # clamp to odd
+    sw = max(3, min(sw, len(w) | 1))
+    w = median_filter(w, size=sw).astype(np.float64)
+    w = np.maximum.accumulate(w[::-1])[::-1].copy()
+
+    # 6. Low-k exclusion
+    w[:nbins_low] = 0.0
+
+    assert (w >= 0).all() and (w <= 1.0 + 1e-7).all()
+    return w.astype(np.float32)
+
+
+def spectral_pcc_frcw(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    spacing: float | Sequence[float] | None = None,
+    bin_delta: float = 1.0,
+    apodization: str = "tukey",
+    threshold: float = 0.143,
+    alpha: float = 2.0,
+    nbins_low: int = 3,
+    smooth_window: int = 5,
+    frozen_weights: np.ndarray | None = None,
+) -> float:
+    """Spectral PCC weighted by single-image FRC reproducibility.
+
+    Parameters
+    ----------
+    prediction, target : np.ndarray
+        Images to compare (same shape, 2-D).
+    spacing : float or sequence of float or None
+        Kept for API consistency with other spectral PCC variants.
+        Not used for internal binning (index units throughout).
+    bin_delta : float
+        Radial-bin width in index units.
+    apodization : str
+        Window function for edge apodisation (``"tukey"`` or ``"hamming"``).
+    threshold : float
+        FRC threshold for weight conversion.
+    alpha : float
+        Weight exponent.
+    nbins_low : int
+        Number of lowest bins to exclude.
+    smooth_window : int
+        Median-filter window for weight smoothing.
+    frozen_weights : np.ndarray, optional
+        Pre-computed 1-D radial-bin weights. If given, skip FRC weight
+        estimation.  Must match index-unit binning for the target shape.
+
+    Returns
+    -------
+    float
+        Weighted Pearson *r* in [-1, 1].
+    """
+    check_same_device(prediction, target)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
+        )
+
+    # 1. Compute or reuse per-bin weights
+    if frozen_weights is not None:
+        w_bins = frozen_weights
+    else:
+        w_bins = frc_weights(
+            target,
+            bin_delta=bin_delta,
+            threshold=threshold,
+            alpha=alpha,
+            nbins_low=nbins_low,
+            smooth_window=smooth_window,
+        )
+
+    # 2. Zero-weight-mass guard
+    if float(np.sum(w_bins)) < 1e-6:
+        return 0.0
+
+    # 3. Mean-subtract + apodise → FFT
+    apo_fn = _APODIZATION_FNS.get(apodization)
+    if apo_fn is None:
+        raise ValueError(
+            f"Unknown apodization '{apodization}'. "
+            f"Choose from {list(_APODIZATION_FNS)}."
+        )
+    pred = prediction.astype(np.float32) - np.mean(prediction)
+    targ = target.astype(np.float32) - np.mean(target)
+    pred = apo_fn(pred)
+    targ = apo_fn(targ)
+
+    F_pred = np.fft.fftn(pred)
+    F_targ = np.fft.fftn(targ)
+
+    # 4. Map per-bin weights → per-voxel weight volume (index units)
+    edges_cpu, _ = radial_edges(
+        prediction.shape,
+        bin_delta=bin_delta,
+        spacing=None,
+    )
+    edges = to_same_device(edges_cpu, prediction)
+    bid = radial_bin_id(prediction.shape, edges, spacing=None)
+
+    xp = get_array_module(prediction)
+    w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
+
+    W = np.zeros_like(bid, dtype=np.float32)
+    valid = bid >= 0
+    W[valid] = w_bins_dev[bid[valid]]
+
+    # 5. Weighted cross-spectrum correlation
+    cross = np.real(F_pred.ravel() * np.conj(F_targ.ravel()))
+    num = float(asnumpy(np.sum(W * cross)))
+    denom_pred = float(asnumpy(np.sum(W * np.abs(F_pred.ravel()) ** 2)))
+    denom_targ = float(asnumpy(np.sum(W * np.abs(F_targ.ravel()) ** 2)))
+    denom = np.sqrt(denom_pred * denom_targ)
+
+    if denom < 1e-12:
+        return 0.0
+    return float(np.clip(num / denom, -1.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
 # 4  Internal filtering helper
 # ---------------------------------------------------------------------------
 
