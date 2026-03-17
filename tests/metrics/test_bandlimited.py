@@ -15,6 +15,8 @@ from cubic.metrics.bandlimited import (
     band_limited_ssim,
     butterworth_lowpass,
     estimate_noise_floor,
+    bandpass_spectral_pcc,
+    percentile_band_taper,
     radial_power_spectrum,
 )
 
@@ -446,6 +448,177 @@ def test_spectral_pcc_smooth_with_nbins_low() -> None:
     """Smooth + nbins_low combined work correctly."""
     pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=9)
     r = spectral_pcc(pred, tgt, spacing=0.065, smooth=True, nbins_low=3)
+    assert -1.0 <= r <= 1.0
+
+
+# ===================================================================
+# percentile_band_taper tests
+# ===================================================================
+
+
+def test_percentile_band_taper_shape_and_dtype() -> None:
+    """Output has same length as input and is float32."""
+    w = np.ones(32, dtype=np.float32)
+    n = np.ones(32, dtype=np.float32) * 10
+    radii = np.linspace(0.5, 16, 32).astype(np.float32)
+    out, diag = percentile_band_taper(w, n, radii, k_nyquist=16.0)
+    assert out.shape == w.shape
+    assert out.dtype == np.float32
+
+
+def test_percentile_band_taper_zeros_outside_band() -> None:
+    """Bins far outside the band should be zero."""
+    rng = np.random.default_rng(0)
+    w = np.exp(-np.linspace(0, 5, 64)).astype(np.float32)
+    n = np.arange(1, 65, dtype=np.float32)
+    radii = np.linspace(0.5, 32, 64).astype(np.float32)
+    out, diag = percentile_band_taper(
+        w, n, radii, k_nyquist=32.0, p_low=0.2, p_high=0.8, taper_width=2
+    )
+    i_lo = int(diag["i_low"])
+    i_hi = int(diag["i_high"])
+    # Bins well below the low-side ramp must be zero
+    if i_lo > 4:
+        assert np.all(out[: i_lo - 2] == 0.0)
+    # Bins well above the high-side ramp must be zero
+    if i_hi + 4 < 64:
+        assert np.all(out[i_hi + 3 :] == 0.0)
+
+
+def test_percentile_band_taper_passthrough_in_band() -> None:
+    """Bins inside the band retain original weights (taper=1)."""
+    w = np.ones(32, dtype=np.float32) * 0.5
+    n = np.ones(32, dtype=np.float32)
+    radii = np.linspace(0.5, 16, 32).astype(np.float32)
+    out, diag = percentile_band_taper(
+        w, n, radii, k_nyquist=16.0, p_low=0.1, p_high=0.9
+    )
+    i_lo = int(diag["i_low"])
+    i_hi = int(diag["i_high"])
+    # Inside the flat region, weights should equal the originals
+    np.testing.assert_allclose(out[i_lo : i_hi + 1], 0.5, atol=1e-6)
+
+
+def test_percentile_band_taper_diagnostics_keys() -> None:
+    """Diagnostics dict has all expected keys."""
+    w = np.ones(16, dtype=np.float32)
+    n = np.ones(16, dtype=np.float32)
+    radii = np.linspace(0.5, 8, 16).astype(np.float32)
+    _, diag = percentile_band_taper(w, n, radii, k_nyquist=8.0)
+    expected_keys = {
+        "k_low",
+        "k_high",
+        "k_low_phys",
+        "k_high_phys",
+        "k50",
+        "k90",
+        "i_low",
+        "i_high",
+    }
+    assert set(diag.keys()) == expected_keys
+
+
+def test_percentile_band_taper_zero_mass_warns() -> None:
+    """All-zero weights produce a warning and NaN diagnostics."""
+    w = np.zeros(16, dtype=np.float32)
+    n = np.ones(16, dtype=np.float32)
+    radii = np.linspace(0.5, 8, 16).astype(np.float32)
+    with pytest.warns(UserWarning, match="Total weight mass"):
+        out, diag = percentile_band_taper(w, n, radii, k_nyquist=8.0)
+    assert np.all(out == 0.0)
+    assert np.isnan(diag["k_low"])
+
+
+def test_percentile_band_taper_full_band() -> None:
+    """p_low=0, p_high=1 → taper is all ones, weights unchanged."""
+    w = np.linspace(0.1, 1.0, 32).astype(np.float32)
+    n = np.ones(32, dtype=np.float32)
+    radii = np.linspace(0.5, 16, 32).astype(np.float32)
+    out, _ = percentile_band_taper(w, n, radii, k_nyquist=16.0, p_low=0.0, p_high=1.0)
+    np.testing.assert_allclose(out, w, atol=1e-6)
+
+
+# ===================================================================
+# bandpass_spectral_pcc tests
+# ===================================================================
+
+
+def test_bandpass_pcc_identical() -> None:
+    """PCC of identical images is ~1."""
+    rng = np.random.default_rng(0)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    r = bandpass_spectral_pcc(img, img, spacing=0.065)
+    assert r == pytest.approx(1.0, abs=1e-3)
+
+
+def test_bandpass_pcc_returns_float_by_default() -> None:
+    """Default return is a plain float."""
+    rng = np.random.default_rng(1)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    r = bandpass_spectral_pcc(img, img, spacing=0.065)
+    assert isinstance(r, float)
+
+
+def test_bandpass_pcc_return_diagnostics() -> None:
+    """return_diagnostics=True returns (float, dict)."""
+    rng = np.random.default_rng(2)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    result = bandpass_spectral_pcc(img, img, spacing=0.065, return_diagnostics=True)
+    assert isinstance(result, tuple)
+    pcc, diag = result
+    assert isinstance(pcc, float)
+    assert isinstance(diag, dict)
+    assert "k_low" in diag and "k_high" in diag
+
+
+def test_bandpass_pcc_range() -> None:
+    """PCC is in [-1, 1]."""
+    pred, tgt, _ = _make_synthetic_pair(seed=20)
+    r = bandpass_spectral_pcc(pred, tgt, spacing=0.065)
+    assert -1.0 <= r <= 1.0
+
+
+def test_bandpass_pcc_weight_methods() -> None:
+    """Each weight_method string produces a valid result."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=21)
+    for method in ("simple", "smooth_wiener", "baseline_snr2"):
+        r = bandpass_spectral_pcc(pred, tgt, spacing=0.065, weight_method=method)
+        assert -1.0 <= r <= 1.0, f"Failed for method={method}"
+
+
+def test_bandpass_pcc_unknown_method_raises() -> None:
+    """Unknown weight_method raises ValueError."""
+    a = np.zeros((64, 64), dtype=np.float32)
+    with pytest.raises(ValueError, match="Unknown weight_method"):
+        bandpass_spectral_pcc(a, a, spacing=0.065, weight_method="frc")
+
+
+def test_bandpass_pcc_shape_mismatch_raises() -> None:
+    """Mismatched shapes raise ValueError."""
+    a = np.zeros((64, 64), dtype=np.float32)
+    b = np.zeros((64, 32), dtype=np.float32)
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        bandpass_spectral_pcc(a, b, spacing=0.065)
+
+
+def test_bandpass_pcc_frozen_weights() -> None:
+    """Pre-computed weights produce a valid result."""
+    from cubic.metrics.spectral.radial import radial_edges
+
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=22)
+    # Build a weight vector matching the binning
+    _, radii = radial_edges(pred.shape, bin_delta=1.0, spacing=[0.065, 0.065])
+    w = np.ones(len(radii), dtype=np.float32)
+    r = bandpass_spectral_pcc(pred, tgt, spacing=0.065, frozen_weights=w)
+    assert -1.0 <= r <= 1.0
+
+
+def test_bandpass_pcc_3d() -> None:
+    """Works on 3D inputs."""
+    rng = np.random.default_rng(23)
+    img = rng.standard_normal((16, 32, 32)).astype(np.float32)
+    tgt = img + 0.2 * rng.standard_normal(img.shape).astype(np.float32)
+    r = bandpass_spectral_pcc(img, tgt, spacing=(0.3, 0.065, 0.065))
     assert -1.0 <= r <= 1.0
 
 

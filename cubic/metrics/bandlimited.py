@@ -26,6 +26,7 @@ Descloux, A., et al. (2019). Parameter-free image resolution estimation
 from __future__ import annotations
 
 import warnings
+from typing import Literal
 from collections.abc import Sequence
 
 import numpy as np
@@ -54,6 +55,8 @@ __all__ = [
     "smooth_spectral_weights",
     "frc_weights",
     "spectral_pcc_frcw",
+    "percentile_band_taper",
+    "bandpass_spectral_pcc",
     "band_limited_pcc",
     "band_limited_ssim",
     "spectral_pcc",
@@ -610,6 +613,143 @@ def _baseline_snr2_weights(
     return w.astype(np.float32)
 
 
+# ---------------------------------------------------------------------------
+# 3c  Percentile-band taper
+# ---------------------------------------------------------------------------
+
+
+def percentile_band_taper(
+    w_bins: np.ndarray,
+    n_bins: np.ndarray,
+    radii: np.ndarray,
+    k_nyquist: float,
+    p_low: float = 0.0,
+    p_high: float = 0.99,
+    taper_width: int = 3,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Apply percentile-based band selection with cosine taper to spectral weights.
+
+    Selects a frequency band by finding the radial bins where the
+    cumulative weight mass reaches *p_low* and *p_high*, then applies a
+    soft cosine taper outside the band to avoid Gibbs-like ringing.
+
+    The weight mass per bin is ``w_bins[i] * n_bins[i]``, reflecting
+    each ring's actual contribution to the weighted PCC sum (rings at
+    higher *k* contain more Fourier pixels).
+
+    Parameters
+    ----------
+    w_bins : np.ndarray
+        1-D per-bin weights (from any weight law).
+    n_bins : np.ndarray
+        1-D per-bin Fourier pixel counts (same length as *w_bins*).
+    radii : np.ndarray
+        1-D radial-bin centres (same length as *w_bins*).
+    k_nyquist : float
+        Nyquist frequency for normalising diagnostics.
+    p_low : float
+        Lower percentile of cumulative weight mass (default 0.0 = no
+        low-frequency exclusion).
+    p_high : float
+        Upper percentile of cumulative weight mass (default 0.99).
+    taper_width : int
+        Number of bins for cosine ramp on each side of the band
+        (clamped to available bins at boundaries).
+
+    Returns
+    -------
+    w_tapered : np.ndarray
+        Tapered weights (float32, same length as *w_bins*).
+    diagnostics : dict[str, float]
+        Band diagnostic info:
+
+        - ``k_low``, ``k_high``: band edges as fraction of Nyquist.
+        - ``k_low_phys``, ``k_high_phys``: band edges in physical
+          frequency units (same units as *radii*).
+        - ``k50``, ``k90``: 50th / 90th percentile of cumulative mass
+          as fraction of Nyquist.
+        - ``i_low``, ``i_high``: band-edge bin indices.
+    """
+    nbins = len(w_bins)
+    nan_diag: dict[str, float] = {
+        "k_low": float("nan"),
+        "k_high": float("nan"),
+        "k_low_phys": float("nan"),
+        "k_high_phys": float("nan"),
+        "k50": float("nan"),
+        "k90": float("nan"),
+        "i_low": float("nan"),
+        "i_high": float("nan"),
+    }
+
+    # Cumulative weight mass
+    m = np.asarray(w_bins, dtype=np.float64) * np.asarray(n_bins, dtype=np.float64)
+    total = float(np.sum(m))
+    if total < 1e-30:
+        warnings.warn(
+            "Total weight mass is ~0; returning zero weights.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return np.zeros(nbins, dtype=np.float32), nan_diag
+
+    cum = np.cumsum(m) / total
+
+    # Cut indices
+    i_low = int(np.searchsorted(cum, p_low))
+    i_high = int(np.searchsorted(cum, p_high))
+    i_low = max(0, min(i_low, nbins - 1))
+    i_high = max(0, min(i_high, nbins - 1))
+
+    if i_low >= i_high:
+        warnings.warn(
+            f"Empty band: i_low={i_low} >= i_high={i_high}; returning zero weights.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return np.zeros(nbins, dtype=np.float32), nan_diag
+
+    # Build cosine taper
+    taper = np.zeros(nbins, dtype=np.float64)
+    taper[i_low : i_high + 1] = 1.0
+
+    # Low-side ramp (clamp width to available bins below i_low)
+    lo_w = min(taper_width, i_low)
+    if lo_w > 0:
+        t = np.arange(1, lo_w + 1, dtype=np.float64)
+        taper[i_low - lo_w : i_low] = 0.5 * (1.0 - np.cos(np.pi * t / lo_w))
+
+    # High-side ramp (clamp width to available bins above i_high)
+    hi_w = min(taper_width, nbins - 1 - i_high)
+    if hi_w > 0:
+        t = np.arange(1, hi_w + 1, dtype=np.float64)
+        taper[i_high + 1 : i_high + 1 + hi_w] = 0.5 * (1.0 + np.cos(np.pi * t / hi_w))
+
+    w_tapered = (np.asarray(w_bins, dtype=np.float64) * taper).astype(np.float32)
+
+    # Diagnostics
+    radii_f = np.asarray(radii, dtype=np.float64)
+    k_nyq = max(k_nyquist, 1e-30)
+
+    def _cum_percentile_k(q: float) -> float:
+        idx = int(np.searchsorted(cum, q))
+        idx = max(0, min(idx, nbins - 1))
+        return float(radii_f[idx] / k_nyq)
+
+    diagnostics: dict[str, float] = {
+        "k_low": float(radii_f[i_low] / k_nyq),
+        "k_high": float(radii_f[i_high] / k_nyq),
+        "k_low_phys": float(radii_f[i_low]),
+        "k_high_phys": float(radii_f[i_high]),
+        "k50": _cum_percentile_k(0.50),
+        "k90": _cum_percentile_k(0.90),
+        "i_low": float(i_low),
+        "i_high": float(i_high),
+    }
+
+    return w_tapered, diagnostics
+
+
 def _spectral_pcc_baseline(
     prediction: np.ndarray,
     target: np.ndarray,
@@ -884,7 +1024,6 @@ def spectral_pcc_frcw(
     prediction: np.ndarray,
     target: np.ndarray,
     *,
-    spacing: float | Sequence[float] | None = None,
     bin_delta: int = 1,
     apodization: str = "tukey",
     threshold: float = 0.143,
@@ -898,13 +1037,14 @@ def spectral_pcc_frcw(
 ) -> float:
     """Spectral PCC weighted by single-image FRC reproducibility.
 
+    FRC weights are computed in index-frequency units (spacing is not
+    needed — the threshold crossing in normalised frequency is
+    independent of pixel size).
+
     Parameters
     ----------
     prediction, target : np.ndarray
         Images to compare (same shape, 2-D).
-    spacing : float or sequence of float or None
-        Kept for API consistency with other spectral PCC variants.
-        Not used for internal binning (index units throughout).
     bin_delta : int
         Radial-bin width in index units.
     apodization : str
@@ -1004,6 +1144,218 @@ def spectral_pcc_frcw(
     if denom < 1e-12:
         return 0.0
     return float(np.clip(num / denom, -1.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# 3e  Percentile-band spectral PCC
+# ---------------------------------------------------------------------------
+
+_WEIGHT_METHODS = frozenset({"simple", "smooth_wiener", "baseline_snr2"})
+
+
+def bandpass_spectral_pcc(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    spacing: float | Sequence[float],
+    bin_delta: float = 1.0,
+    apodization: str = "tukey",
+    p_low: float = 0.0,
+    p_high: float = 0.99,
+    taper_width: int = 3,
+    frozen_weights: np.ndarray | None = None,
+    weight_method: Literal[
+        "simple", "smooth_wiener", "baseline_snr2"
+    ] = "smooth_wiener",
+    return_diagnostics: bool = False,
+    **weight_kwargs,
+) -> float | tuple[float, dict[str, float]]:
+    r"""Spectral PCC within a percentile-defined frequency band.
+
+    Computes per-bin weights (or accepts pre-computed ones), selects a
+    frequency band via cumulative weight-mass percentiles, applies a
+    soft cosine taper at the band edges, and returns the weighted
+    Fourier-domain PCC.
+
+    The band is defined by *p_low* / *p_high* on the cumulative
+    distribution of ``w_i * n_i`` (weight times Fourier-pixel count
+    per ring), which measures each ring's actual contribution to the
+    PCC sum.
+
+    Parameters
+    ----------
+    prediction, target : np.ndarray
+        Images to compare (same shape, 2-D or 3-D).
+    spacing : float or sequence of float
+        Physical pixel / voxel spacing.
+    bin_delta : float
+        Radial-bin width (index units).
+    apodization : str
+        Window function for edge apodisation (``"tukey"`` or
+        ``"hamming"``).
+    p_low : float
+        Lower percentile of cumulative weight mass.  Default 0.0
+        (no low-frequency exclusion).
+    p_high : float
+        Upper percentile of cumulative weight mass.  Default 0.99.
+    taper_width : int
+        Number of bins for cosine ramp on each side of the band.
+    frozen_weights : np.ndarray, optional
+        Pre-computed 1-D per-bin weights.  If given, *weight_method*
+        and *weight_kwargs* are ignored.  Must match the binning
+        defined by *bin_delta* and *spacing* for the target shape.
+        FRC-derived weights (from :func:`frc_weights`) should be passed
+        here since they use index-unit binning.
+    weight_method : ``"simple"`` | ``"smooth_wiener"`` | ``"baseline_snr2"``
+        How to compute per-bin weights from the target power spectrum.
+        ``"simple"`` uses :func:`spectral_weights`;
+        ``"smooth_wiener"`` uses :func:`smooth_spectral_weights`;
+        ``"baseline_snr2"`` uses :func:`_estimate_noise_baseline` +
+        :func:`_baseline_snr2_weights`.
+    return_diagnostics : bool
+        If True, return ``(pcc, diagnostics)`` instead of just *pcc*.
+    **weight_kwargs
+        Extra keyword arguments forwarded to the selected weight
+        function (e.g. ``tail_fraction``, ``sg_window``, ``cutoff``).
+
+    Returns
+    -------
+    float or tuple[float, dict[str, float]]
+        Weighted Pearson *r* in [-1, 1].  When *return_diagnostics* is
+        True, also returns band diagnostics from
+        :func:`percentile_band_taper`.
+    """
+    check_same_device(prediction, target)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
+        )
+    if weight_method not in _WEIGHT_METHODS:
+        raise ValueError(
+            f"Unknown weight_method {weight_method!r}. "
+            f"Choose from {sorted(_WEIGHT_METHODS)}."
+        )
+
+    spacing_seq = _normalize_spacing(spacing, prediction.ndim)
+
+    apo_fn = _APODIZATION_FNS.get(apodization)
+    if apo_fn is None:
+        raise ValueError(
+            f"Unknown apodization '{apodization}'. "
+            f"Choose from {list(_APODIZATION_FNS)}."
+        )
+
+    # Mean-subtract + apodise → FFT
+    pred = prediction.astype(np.float32) - np.mean(prediction)
+    targ = target.astype(np.float32) - np.mean(target)
+    pred = apo_fn(pred)
+    targ = apo_fn(targ)
+
+    F_pred = np.fft.fftn(pred)
+    F_targ = np.fft.fftn(targ)
+
+    # --- Per-bin weights ---
+    if frozen_weights is not None:
+        w_bins = np.asarray(frozen_weights, dtype=np.float32)
+    elif weight_method == "simple":
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        kw = {k: v for k, v in weight_kwargs.items() if k in ("cutoff",)}
+        noise = estimate_noise_floor(
+            radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
+        )
+        w_bins = spectral_weights(radii, power, noise, **kw)
+    elif weight_method == "smooth_wiener":
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        kw = {
+            k: v
+            for k, v in weight_kwargs.items()
+            if k in ("cutoff", "sg_window", "sg_polyorder")
+        }
+        noise = estimate_noise_floor(
+            radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
+        )
+        w_bins = smooth_spectral_weights(radii, power, noise, **kw)
+    else:  # baseline_snr2
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        bl_kw = {
+            k: v
+            for k, v in weight_kwargs.items()
+            if k in ("sg_window", "sg_polyorder", "quantile_window", "quantile")
+        }
+        p_smooth, noise_bl = _estimate_noise_baseline(power, **bl_kw)
+        snr_kw = {
+            k: v for k, v in weight_kwargs.items() if k in ("cap_quantile", "cutoff")
+        }
+        w_bins = _baseline_snr2_weights(
+            radii, p_smooth, noise_bl, nbins_low=0, **snr_kw
+        )
+
+    # --- Radial binning ---
+    edges_cpu, radii_cpu = radial_edges(
+        prediction.shape, bin_delta=bin_delta, spacing=spacing_seq
+    )
+    edges = to_same_device(edges_cpu, prediction)
+    bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
+
+    # Validate weight vector length
+    valid = bid >= 0
+    n_bins_needed = int(asnumpy(bid[valid].max())) + 1 if np.any(valid) else 0
+    if len(w_bins) < n_bins_needed:
+        raise ValueError(
+            f"frozen_weights has {len(w_bins)} bins but binning requires "
+            f"{n_bins_needed}; check that bin_delta and image shape match."
+        )
+
+    # Bin counts and Nyquist for taper
+    n_per_bin = np.bincount(
+        asnumpy(bid[valid]).astype(np.intp), minlength=len(w_bins)
+    ).astype(np.float32)
+    k_nyquist = float(edges_cpu[-1])
+
+    # --- Percentile band taper ---
+    w_tapered, diagnostics = percentile_band_taper(
+        asnumpy(w_bins),
+        n_per_bin,
+        asnumpy(radii_cpu).astype(np.float32),
+        k_nyquist,
+        p_low=p_low,
+        p_high=p_high,
+        taper_width=taper_width,
+    )
+
+    # Zero-weight guard
+    if float(np.sum(w_tapered)) < 1e-6:
+        if return_diagnostics:
+            return 0.0, diagnostics
+        return 0.0
+
+    # Map tapered weights → per-voxel weight volume
+    w_dev = to_same_device(w_tapered, prediction)
+
+    W = np.zeros_like(bid, dtype=np.float32)
+    W[valid] = w_dev[bid[valid]]
+
+    # Weighted cross-spectrum correlation
+    cross = np.real(F_pred.ravel() * np.conj(F_targ.ravel()))
+    num = float(asnumpy(np.sum(W * cross)))
+    denom_pred = float(asnumpy(np.sum(W * np.abs(F_pred.ravel()) ** 2)))
+    denom_targ = float(asnumpy(np.sum(W * np.abs(F_targ.ravel()) ** 2)))
+    denom = np.sqrt(denom_pred * denom_targ)
+
+    if denom < 1e-12:
+        pcc = 0.0
+    else:
+        pcc = float(np.clip(num / denom, -1.0, 1.0))
+
+    if return_diagnostics:
+        return pcc, diagnostics
+    return pcc
 
 
 # ---------------------------------------------------------------------------
