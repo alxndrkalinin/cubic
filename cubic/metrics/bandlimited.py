@@ -1623,6 +1623,8 @@ def spectral_pcc(
     sg_window: int = 15,
     sg_polyorder: int = 3,
     nbins_low: int = 0,
+    taper_low: int = 0,
+    weighting: str = "simple",
 ) -> float:
     r"""Spectrally-weighted Pearson correlation coefficient.
 
@@ -1652,16 +1654,26 @@ def spectral_pcc(
         Hard cutoff zeroing bins above this frequency.
     apodization : str
         Window function for edge apodisation.
+    weighting : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"``
+        Per-bin weight law.  ``"simple"`` (default) uses subtract-normalize
+        weights; ``"smooth_wiener"`` uses SG-filtered Wiener weights;
+        ``"snr2"`` uses a frequency-dependent SNR² model.
     smooth : bool
-        If True, use SG-smoothed Wiener weights instead of raw
-        subtract-normalize weights.
+        Deprecated sugar: if *weighting* is not set, ``smooth=True`` maps to
+        ``weighting="smooth_wiener"``.  Ignored when *weighting* is passed.
     sg_window : int
-        Savitzky-Golay window length (used only when *smooth* is True).
+        Savitzky-Golay window length (used for ``"smooth_wiener"`` and
+        ``"snr2"``).
     sg_polyorder : int
-        Savitzky-Golay polynomial order (used only when *smooth* is True).
+        Savitzky-Golay polynomial order.
     nbins_low : int
         Number of lowest-frequency bins to zero after weight computation
-        (DC / background / autofluorescence exclusion).
+        (DC / background / autofluorescence exclusion).  Ignored when
+        *taper_low* > 0.
+    taper_low : int
+        Soft low-frequency exclusion: apply a half-cosine ramp from 0 to 1
+        over the first *taper_low* bins.  When > 0, takes precedence over
+        *nbins_low*.
 
     Returns
     -------
@@ -1691,12 +1703,26 @@ def spectral_pcc(
     F_pred = np.fft.fftn(pred)
     F_targ = np.fft.fftn(targ)
 
-    # Radial power spectrum of target → noise floor → per-bin weights
+    # Resolve effective weighting (smooth= is deprecated sugar)
+    _weighting = (
+        weighting
+        if weighting != "simple"
+        else ("smooth_wiener" if smooth else "simple")
+    )
+
+    # Radial power spectrum of target → per-bin weights
     radii, power = radial_power_spectrum(
         target, spacing=spacing_seq, bin_delta=bin_delta
     )
-    noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
-    if smooth:
+    if _weighting == "snr2":
+        p_smooth, noise_bl = _estimate_noise_baseline(
+            power, sg_window=sg_window, sg_polyorder=sg_polyorder
+        )
+        w_bins = _baseline_snr2_weights(radii, p_smooth, noise_bl, nbins_low=0)
+        if cutoff is not None:
+            w_bins[radii > cutoff] = 0.0
+    elif _weighting == "smooth_wiener":
+        noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
         w_bins = smooth_spectral_weights(
             radii,
             power,
@@ -1706,11 +1732,16 @@ def spectral_pcc(
             sg_polyorder=sg_polyorder,
         )
     else:
+        noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
         w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
 
     # Low-k exclusion (DC / illumination / background)
-    nbins_low = min(nbins_low, len(w_bins))
-    if nbins_low > 0:
+    if taper_low > 0:
+        _n = min(taper_low, len(w_bins))
+        _ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(_n) / _n))
+        w_bins[:_n] *= _ramp.astype(w_bins.dtype)
+    elif nbins_low > 0:
+        nbins_low = min(nbins_low, len(w_bins))
         w_bins[:nbins_low] = 0.0
     if float(w_bins.max().item()) == 0.0:
         return 0.0
