@@ -438,6 +438,11 @@ def smooth_spectral_weights(
     from cubic.scipy import signal as csignal
 
     log_p = np.log(np.maximum(power, 1e-30))
+    # DC bin (index 0) is always zero after mean subtraction, mapping to
+    # log(1e-30) ≈ -69.  Replace with neighbor before SG smoothing to
+    # prevent the extreme outlier from poisoning the first few fitted values.
+    if len(log_p) > 1:
+        log_p[0] = log_p[1]
     n = len(log_p)
     # Clamp window to array length (must be odd, > polyorder, <= n)
     min_wlen = sg_polyorder + 2
@@ -544,6 +549,10 @@ def _estimate_noise_baseline(
     wlen = max(wlen, min_wlen)
 
     log_p = np.log(np.maximum(power, 1e-30))
+    # DC bin (index 0) is always zero after mean subtraction → log(1e-30) ≈ -69.
+    # Replace with neighbor before SG to prevent boundary poisoning.
+    if len(log_p) > 1:
+        log_p[0] = log_p[1]
     log_p_smooth = csignal.savgol_filter(log_p, wlen, sg_polyorder)
 
     # Running low-quantile of smoothed log-power
