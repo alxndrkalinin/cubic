@@ -428,7 +428,7 @@ def _apply_lowpass(
         raise ValueError(
             f"Unknown apodization '{apodization}'. Choose from {list(_APODIZATION_FNS)}."
         )
-    img = apo_fn(img)
+    img = apo_fn(img)  # type: ignore[operator]
 
     F = np.fft.fftn(img)
     H = butterworth_lowpass(img.shape, cutoff, spacing=spacing, order=order)
@@ -687,8 +687,8 @@ def spectral_pcc(
     # Mean-subtract + apodise → FFT
     pred = prediction.astype(np.float32) - np.mean(prediction)
     targ = target.astype(np.float32) - np.mean(target)
-    pred = apo_fn(pred)
-    targ = apo_fn(targ)
+    pred = apo_fn(pred)  # type: ignore[operator]
+    targ = apo_fn(targ)  # type: ignore[operator]
 
     F_pred = np.fft.fftn(pred)
     F_targ = np.fft.fftn(targ)

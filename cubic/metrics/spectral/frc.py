@@ -92,8 +92,8 @@ def preprocess_images(
         )
     else:
         # Apply padding to second image
-        if len(set(image2.shape)) > 1 and zero_padding:
-            image2 = pad_image_to_cube(image2, mode=pad_mode)
+        if len(set(image2.shape)) > 1 and zero_padding:  # type: ignore[union-attr]
+            image2 = pad_image_to_cube(image2, mode=pad_mode)  # type: ignore[arg-type]
 
     # Apply Hamming windowing to both images independently
     if not disable_hamming:
@@ -540,7 +540,7 @@ def calculate_sectioned_fsc(
         image1.shape,
         bin_delta,
         angle_delta,
-        extract_angle_delta,
+        extract_angle_delta,  # type: ignore[arg-type]
         spacing=spacing,
     )
     fsc_task = DirectionalFSC(image1, image2, iterator)
@@ -548,7 +548,7 @@ def calculate_sectioned_fsc(
 
     analyzer = FourierCorrelationAnalysis(
         data,
-        spacing[0],
+        spacing[0],  # type: ignore[index]
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         snr_value=snr_value,
@@ -1042,7 +1042,7 @@ def fsc_resolution(
             raise ValueError("resample_isotropic=True requires spacing to be provided")
         spacing_list = _normalize_spacing(spacing, image1.ndim)
         image1, image2, spacing_list, z_factor, original_spacing_z = (
-            _resample_isotropic_for_fsc(image1, image2, spacing_list, resample_order)
+            _resample_isotropic_for_fsc(image1, image2, spacing_list, resample_order)  # type: ignore[arg-type]
         )
         spacing = spacing_list
 
@@ -1130,12 +1130,12 @@ def grid_crop_resolution(
     if isinstance(spacing, (int, float)):
         spacing = [spacing, spacing, spacing]
 
-    assert len(image.shape) == 3 and len(spacing) == 3
+    assert len(image.shape) == 3 and len(spacing) == 3  # type: ignore[arg-type]
     assert image.shape[0] < image.shape[1] and image.shape[0] < image.shape[2]
     assert image.shape[1] > crop_size and image.shape[2] > crop_size
 
-    spacing_xy = (spacing[1], spacing[2])
-    spacing_xz = (spacing[0], spacing[2])
+    spacing_xy = (spacing[1], spacing[2])  # type: ignore[index]
+    spacing_xz = (spacing[0], spacing[2])  # type: ignore[index]
 
     locations = get_xy_block_coords(image.shape, crop_size)
 
@@ -1209,12 +1209,12 @@ def five_crop_resolution(
     if isinstance(spacing, (int, float)):
         spacing = [spacing, spacing, spacing]
 
-    assert len(image.shape) == 3 and len(spacing) == 3
+    assert len(image.shape) == 3 and len(spacing) == 3  # type: ignore[arg-type]
     assert image.shape[0] < image.shape[1] and image.shape[0] < image.shape[2]
     assert image.shape[1] > crop_size and image.shape[2] > crop_size
 
-    spacing_xy = (spacing[1], spacing[2])
-    spacing_xz = (spacing[0], spacing[2])
+    spacing_xy = (spacing[1], spacing[2])  # type: ignore[index]
+    spacing_xz = (spacing[0], spacing[2])  # type: ignore[index]
 
     locations = [crop_tl, crop_bl, crop_tr, crop_br, crop_center]
     max_projection_resolutions = []

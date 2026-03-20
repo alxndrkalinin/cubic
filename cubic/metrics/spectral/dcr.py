@@ -622,7 +622,7 @@ def _dcr_curve_3d_sectioned(
     )
 
     # --- Step 1: Compute d₀ (unfiltered) to anchor sigma range ---
-    d0_results = _compute_decorrelation_curve_sectioned(image, **common_kwargs)
+    d0_results = _compute_decorrelation_curve_sectioned(image, **common_kwargs)  # type: ignore[arg-type]
 
     r0 = {}
     all_peaks: dict[str, list[tuple[float, float]]] = {"xy": [], "z": []}
@@ -673,7 +673,8 @@ def _dcr_curve_3d_sectioned(
     for sigma_hp in all_sigmas:
         filtered_image = _highpass_filter(image, sigma_hp)
         sector_results = _compute_decorrelation_curve_sectioned(
-            filtered_image, **common_kwargs
+            filtered_image,
+            **common_kwargs,  # type: ignore[arg-type]
         )
         for sector_name in ["xy", "z"]:
             radii, d_curve, _ = sector_results[sector_name]
@@ -704,7 +705,7 @@ def _dcr_curve_3d_sectioned(
 
             for sigma_hp in refined_sigmas:
                 filtered = _highpass_filter(image, sigma_hp)
-                sr = _compute_decorrelation_curve_sectioned(filtered, **common_kwargs)
+                sr = _compute_decorrelation_curve_sectioned(filtered, **common_kwargs)  # type: ignore[arg-type]
                 radii, d_curve, _ = sr[sector_name]
                 r_peak, a_peak = _find_peak_in_curve(
                     radii, d_curve, min_amplitude=min_amplitude
@@ -797,7 +798,7 @@ def dcr_curve_3d_sectioned(
     spacing_list = _normalize_spacing(spacing, 3)
     spacing_arr = np.array(spacing_list, dtype=np.float32) if spacing_list else None
 
-    return _dcr_curve_3d_sectioned(
+    return _dcr_curve_3d_sectioned(  # type: ignore[return-value]
         image,
         spacing=spacing_arr,
         num_radii=num_radii,
@@ -946,7 +947,7 @@ def dcr_resolution(
 
         if use_sectioned:
             # Full 3D analysis with angular sectoring
-            return _dcr_curve_3d_sectioned(
+            return _dcr_curve_3d_sectioned(  # type: ignore[return-value]
                 image,
                 spacing=np.array(spacing_list) if spacing_list else None,
                 num_radii=num_radii,
