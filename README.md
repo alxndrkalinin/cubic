@@ -5,12 +5,12 @@ multidimensional (2D/3D+) bioimages using CUDA.
 By leveraging GPU-enabled operations where possible, it offers substantial
 speed ups over purely CPU-based approaches.
 `cubic`'s device-agnostic API wraps scipy/scikit-image and cupy/cuCIM,
-allowing to add GPU acceleration to existing codebases by simply replacing import
-statement and and transferring input arrays to the target device.
+allowing users to add GPU acceleration to existing codebases by simply replacing import
+statements and transferring input arrays to the target device.
 It also provides custom GPU-accelerated implementations of additional
-features, including Forier Ring and Shell Correlation for image resolution,
+features, including Fourier Ring and Shell Correlation for image resolution,
 faster Richardson-Lucy deconvolution, average precision (AP) for segmentation
-quality assesement, and other.
+quality assessment, and other.
 
 ## Getting started
 
