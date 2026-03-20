@@ -225,7 +225,7 @@ def estimate_cutoff(
                 dcr_val = dcr_res
             if np.isfinite(dcr_val) and dcr_val > 0:
                 bounds.append(dcr_safety / dcr_val)
-        except Exception as exc:
+        except (ValueError, RuntimeError, TypeError) as exc:
             warnings.warn(f"DCR resolution estimation failed: {exc}", stacklevel=2)
 
     # --- FRC / FSC (data-driven) bound ---
@@ -250,7 +250,7 @@ def estimate_cutoff(
                 frc_res = float("nan")
             if np.isfinite(frc_res) and frc_res > 0:
                 bounds.append(frc_safety / frc_res)
-        except Exception as exc:
+        except (ValueError, RuntimeError, TypeError) as exc:
             warnings.warn(f"FRC/FSC resolution estimation failed: {exc}", stacklevel=2)
 
     # --- OTF (physics) bound ---
