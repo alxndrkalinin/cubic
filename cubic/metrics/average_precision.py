@@ -11,12 +11,15 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 https://github.com/MouseLand/cellpose/blob/509ffca33737058b0b4e2e96d506514e10620eb3/cellpose/metrics.py
 """
 
+import logging
 import warnings
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from ..cuda import ascupy, asnumpy, get_device
+
+logger = logging.getLogger(__name__)
 
 
 def _check_sequential_labels(mask: np.ndarray) -> bool:
@@ -77,7 +80,7 @@ def _label_overlap_cpu(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
         return _numba_label_overlap(x, y, overlap)
     except ImportError:
-        print("Numba not available, using pure NumPy.")
+        logger.info("Numba not available, using pure NumPy.")
         np.add.at(overlap, (x, y), 1)
         return overlap
 
@@ -129,7 +132,8 @@ def _matches_at_threshold(iou: np.ndarray, th: float) -> tuple[np.ndarray, np.nd
     https://github.com/stardist/stardist/blob/586f8ca76d063bf3443f7a9a66fe94658bc155b8/stardist/matching.py#L172
     """
     n_min = min(iou.shape[0], iou.shape[1])
-    assert n_min > 0, "No masks to match"
+    if n_min <= 0:
+        raise ValueError("No masks to match")
     costs = -(iou >= th).astype(float) - iou / (2 * n_min)
     true_ind, pred_ind = linear_sum_assignment(costs)
     match_ok = iou[true_ind, pred_ind] >= th
@@ -153,12 +157,10 @@ def compute_matches(
     , which was modified from: Copyright (c) 2018-2024, Uwe Schmidt, Martin Weigert
     https://github.com/stardist/stardist/blob/586f8ca76d063bf3443f7a9a66fe94658bc155b8/stardist/matching.py#L109
     """
-    assert _check_sequential_labels(mask_true), (
-        "mask_true should have sequential labels."
-    )
-    assert _check_sequential_labels(mask_pred), (
-        "mask_pred should have sequential labels."
-    )
+    if not _check_sequential_labels(mask_true):
+        raise ValueError("mask_true should have sequential labels.")
+    if not _check_sequential_labels(mask_pred):
+        raise ValueError("mask_pred should have sequential labels.")
     iou = _intersection_over_union(mask_true, mask_pred)[1:, 1:]
     iou = np.nan_to_num(asnumpy(iou))
     matches = {}
@@ -185,7 +187,8 @@ def average_precision(
     if matches_per_threshold is None:
         matches_per_threshold = compute_matches(masks_true, masks_pred, thresholds)  # type: ignore[assignment]
 
-    assert matches_per_threshold is not None, "No matches found."
+    if matches_per_threshold is None:
+        raise ValueError("No matches found.")
     tp = np.asarray([len(matches_per_threshold[th][0]) for th in thresholds])
     fp = asnumpy(masks_pred.max()) - tp
     fn = asnumpy(masks_true.max()) - tp
