@@ -430,7 +430,7 @@ def _compute_decorrelation_curve(
     absF = np.abs(F)
 
     # Use shared infrastructure for frequency grid with correct anisotropy handling
-    k_radius, k_max = radial_k_grid(image.shape, spacing=spacing)
+    k_radius, k_max = radial_k_grid(image.shape, spacing=spacing)  # type: ignore[arg-type]
 
     # Transfer k_radius to same device as image
     k_radius = to_same_device(k_radius, image)
@@ -497,7 +497,10 @@ def _compute_decorrelation_curve_sectioned(
     # Use max Nyquist so radial bins extend to XY frequencies.
     # Per-sector k_max handles the different normalization for Z vs XY.
     r_edges_raw, radii_raw = radial_edges(
-        shape, bin_delta=bin_delta, spacing=spacing, use_max_nyquist=True
+        shape,
+        bin_delta=bin_delta,
+        spacing=spacing,
+        use_max_nyquist=True,  # type: ignore[arg-type]
     )
     n_radial_raw = len(radii_raw)
     r_edges = to_same_device(r_edges_raw, image)
@@ -512,15 +515,15 @@ def _compute_decorrelation_curve_sectioned(
     # Per-sector k_max for resolution conversion
     # XY sector uses XY-Nyquist (max), Z sector uses Z-Nyquist (min)
     if spacing is not None:
-        k_max_z = _kmax_phys(shape, spacing)
-        k_max_xy = _kmax_phys_max(shape, spacing)
+        k_max_z = _kmax_phys(shape, spacing)  # type: ignore[arg-type]
+        k_max_xy = _kmax_phys_max(shape, spacing)  # type: ignore[arg-type]
     else:
         k_max_z = min(n // 2 for n in shape)
         k_max_xy = max(n // 2 for n in shape)
 
     # Get sectioned bin IDs
     radial_id, angle_id = sectioned_bin_id(
-        shape,
+        shape,  # type: ignore[arg-type]
         r_edges,
         angle_edges,
         spacing=list(spacing) if spacing is not None else None,

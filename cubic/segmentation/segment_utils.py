@@ -67,7 +67,7 @@ def downscale_and_filter(
             from ..image_utils import rescale_xy
 
             image = rescale_xy(
-                image,
+                image,  # type: ignore[arg-type]
                 scale=downscale_factor,
                 order=downscale_order,
                 anti_aliasing=downscale_anti_aliasing,
@@ -83,9 +83,9 @@ def downscale_and_filter(
     if filter_shape == "square":
         return _ndimage.median_filter(image, size=filter_size, mode=filter_mode)
 
-    if image.ndim == 2:
+    if image.ndim == 2:  # type: ignore[union-attr]
         footprint = morphology.disk(filter_size)
-    elif image.ndim == 3:
+    elif image.ndim == 3:  # type: ignore[union-attr]
         footprint = morphology.ball(filter_size)
     else:
         raise ValueError("Image must be 2D or 3D.")
@@ -144,9 +144,9 @@ def cleanup_segmentation(
             filled_mask = morphology.remove_small_holes(
                 mask, area_threshold=max_hole_size
             )
-            label_img[filled_mask] = label_id
+            label_img[filled_mask] = label_id  # type: ignore[index]
 
-    return label(label_img).astype(np.uint16)
+    return label(label_img).astype(np.uint16)  # type: ignore[union-attr]
 
 
 def find_objects(label_image, max_label=None):
@@ -204,10 +204,10 @@ def remove_large_objects(
 ) -> npt.ArrayLike:
     """Remove objects with volume above specified threshold."""
     check_labeled_binary(label_image)
-    label_volumes = np.bincount(label_image.ravel())
+    label_volumes = np.bincount(label_image.ravel())  # type: ignore[union-attr]
     too_large = label_volumes > max_size
-    too_large_mask = too_large[label_image]
-    label_image[too_large_mask] = 0
+    too_large_mask = too_large[label_image]  # type: ignore[index]
+    label_image[too_large_mask] = 0  # type: ignore[index]
     return label_image
 
 
@@ -223,13 +223,15 @@ def remove_small_objects(
 def clear_xy_borders(label_image: npt.ArrayLike, buffer_size: int = 0) -> npt.ArrayLike:
     """Remove masks that touch XY borders."""
     check_labeled_binary(label_image)
-    if label_image.ndim == 2:
+    if label_image.ndim == 2:  # type: ignore[union-attr]
         return clear_border(label_image, buffer_size=buffer_size)
     label_image = pad_image(
-        label_image, (buffer_size + 1, buffer_size + 1), mode="constant"
+        label_image,
+        (buffer_size + 1, buffer_size + 1),
+        mode="constant",  # type: ignore[arg-type]
     )
     label_image = clear_border(label_image, buffer_size=buffer_size)
-    return label(label_image[buffer_size + 1 : -(buffer_size + 1), :, :])
+    return label(label_image[buffer_size + 1 : -(buffer_size + 1), :, :])  # type: ignore[index, call-overload]
 
 
 def remove_touching_objects(
@@ -245,7 +247,7 @@ def remove_touching_objects(
             dilated_mask = morphology.binary_dilation(binary_mask, morphology.cube(3))
             mask_outline = dilated_mask & ~binary_mask
 
-            masks_copy = label_image.copy()
+            masks_copy = label_image.copy()  # type: ignore[union-attr]
             masks_copy[mask_outline] += border_value
 
             if masks_copy[masks_copy > border_value].sum() > 0:
@@ -255,7 +257,7 @@ def remove_touching_objects(
                 exclude_masks += [mask_idx] + list(overlap_masks)
 
     for exclude_mask in exclude_masks:
-        label_image[label_image == exclude_mask] = 0
+        label_image[label_image == exclude_mask] = 0  # type: ignore[index]
 
     return label_image
 
@@ -326,16 +328,16 @@ def segment_watershed(
     """
     from ..cuda import to_same_device
 
-    device = get_device(image)
+    device = get_device(image)  # type: ignore[arg-type]
 
     # Distance-based watershed (no markers provided)
     if markers is None:
         distance = distance_transform_edt(image)
         footprint = morphology.ball(ball_size)
-        footprint = to_same_device(footprint, distance)
+        footprint = to_same_device(footprint, distance)  # type: ignore[arg-type]
         coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
 
-        seed_mask = np.zeros(distance.shape, dtype=bool)
+        seed_mask = np.zeros(distance.shape, dtype=bool)  # type: ignore[union-attr, type-var]
         seed_mask[tuple(asnumpy(coords).T)] = True
         seed_mask = to_device(seed_mask, device)
         if dilate_seeds:
@@ -344,19 +346,19 @@ def segment_watershed(
             )
         markers = label(seed_mask)
         # watershed is not in cucim — run on CPU, return to original device
-        labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))
+        labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))  # type: ignore[arg-type]
         return to_device(labels, device)
 
     # Marker-based watershed with explicit mask (shape-based partitioning)
     if mask is not None:
-        distance = distance_transform_edt(asnumpy(mask))
-        ws_image = -distance
-        ws_image = ws_image - ws_image.min()
-        labels = watershed(ws_image, markers=asnumpy(markers), mask=asnumpy(mask))
+        distance = distance_transform_edt(asnumpy(mask))  # type: ignore[arg-type]
+        ws_image = -distance  # type: ignore[operator]
+        ws_image = ws_image - ws_image.min()  # type: ignore[union-attr]
+        labels = watershed(ws_image, markers=asnumpy(markers), mask=asnumpy(mask))  # type: ignore[arg-type]
         return to_device(labels, device)
 
     # Marker-based watershed without mask (image as landscape and mask)
-    labels = watershed(asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image))
+    labels = watershed(asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image))  # type: ignore[arg-type]
     return to_device(labels, device)
 
 

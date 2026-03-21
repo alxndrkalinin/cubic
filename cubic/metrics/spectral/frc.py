@@ -98,9 +98,9 @@ def preprocess_images(
     # Apply Hamming windowing to both images independently
     if not disable_hamming:
         image1 = hamming_window(image1)
-        image2 = hamming_window(image2)
+        image2 = hamming_window(image2)  # type: ignore[arg-type]
 
-    return image1, image2
+    return image1, image2  # type: ignore[return-value]
 
 
 class FRC(object):
@@ -348,7 +348,7 @@ def calculate_frc(
     if reverse:
         # Use original unprocessed image for reverse split
         image1, image2 = preprocess_images(
-            original_image1,
+            original_image1,  # type: ignore[arg-type]
             None,
             reverse_split=reverse,
             zero_padding=zero_padding,
@@ -623,7 +623,7 @@ def _calculate_fsc_sectioned_hist(
 
     # Get bin IDs
     radial_id, angle_id = sectioned_bin_id(
-        shape,
+        shape,  # type: ignore[arg-type]
         r_edges,
         angle_edges,
         spacing=spacing,
@@ -828,7 +828,7 @@ def _fsc_hist_compute(
     # Average with reverse split if enabled
     if do_average:
         image1_rev, image2_rev = preprocess_images(
-            original_image1,
+            original_image1,  # type: ignore[arg-type]
             None,
             zero_padding=zero_padding,
             pad_mode=pad_mode,
@@ -1168,7 +1168,7 @@ def grid_crop_resolution(
 
             pad_size = (xz_slice.shape[1] - xz_slice.shape[0]) // 2
             if (xz_slice.shape[1] - xz_slice.shape[0]) % 2 != 0:
-                pad_size = (pad_size + 1, pad_size)
+                pad_size = (pad_size + 1, pad_size)  # type: ignore[assignment]
 
             padded_xz_slice = pad_image(xz_slice, pad_size, 0, pad_mode)
 
@@ -1184,9 +1184,9 @@ def grid_crop_resolution(
         xz_resolutions.append(xz_slice_resolutions)
 
     return {
-        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),
-        "xy": aggregate_fn(xy_resolutions, axis=0),
-        "xz": aggregate_fn(xz_resolutions, axis=0),
+        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),  # type: ignore[arg-type]
+        "xy": aggregate_fn(xy_resolutions, axis=0),  # type: ignore[arg-type]
+        "xz": aggregate_fn(xz_resolutions, axis=0),  # type: ignore[arg-type]
     }
 
 
@@ -1260,9 +1260,9 @@ def five_crop_resolution(
         xz_resolutions.append(xz_slice_resolutions)
 
     return {
-        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),
-        "xy": aggregate_fn(xy_resolutions, axis=0),
-        "xz": aggregate_fn(xz_resolutions, axis=0),
+        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),  # type: ignore[arg-type]
+        "xy": aggregate_fn(xy_resolutions, axis=0),  # type: ignore[arg-type]
+        "xz": aggregate_fn(xz_resolutions, axis=0),  # type: ignore[arg-type]
     }
 
 

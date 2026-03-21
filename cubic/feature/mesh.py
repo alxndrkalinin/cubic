@@ -17,7 +17,7 @@ try:  # pragma: no cover - optional dependency
         discrete_gaussian_curvature_measure,
     )
 except ImportError:  # pragma: no cover - import failure path
-    trimesh = None
+    trimesh = None  # type: ignore[assignment]
     warnings.warn(
         "trimesh is not installed. Mesh features are unavailable.",
         stacklevel=2,
@@ -130,7 +130,7 @@ def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
 
     return {
         "Area": surface_area,
-        "Volume": volume,
+        "Volume": volume,  # type: ignore[dict-item]
         "Min Axis Length": axis_len[0],
         "Med Axis Length": axis_len[1],
         "Max Axis Length": axis_len[2],
@@ -144,7 +144,7 @@ def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
         "Bounding Sphere Volume": mesh.bounding_sphere.volume,
         "Convex Hull Volume": mesh.convex_hull.volume,
         "Convex Hull Area": mesh.convex_hull.area,
-        "Sphericity": ellipsoid_sphericity(volume, surface_area),
+        "Sphericity": ellipsoid_sphericity(volume, surface_area),  # type: ignore[arg-type]
         "Extent": mesh.volume / mesh.bounding_box.volume,
         "Solidity": mesh.volume / mesh.convex_hull.volume,
         "Avg Gaussian Curvature": discrete_gaussian_curvature_measure(
