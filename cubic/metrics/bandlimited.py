@@ -172,8 +172,10 @@ def estimate_cutoff(
     * **OTF bound** — ``otf_safety * otf_cutoff(NA, λ)`` (physics).
     * **Nyquist bound** — ``nyquist_safety * nyquist_cutoff(spacing)``.
 
-    Any bound whose required parameters are missing is silently skipped.
-    At least one bound must be computable.
+    Bounds whose required parameters are absent are silently skipped.
+    Data-driven bounds (DCR, FRC/FSC) that raise ``ValueError``,
+    ``RuntimeError``, or ``TypeError`` emit a warning and are excluded;
+    other exceptions propagate.  At least one bound must be computable.
 
     Parameters
     ----------

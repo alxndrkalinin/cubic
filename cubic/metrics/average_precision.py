@@ -80,7 +80,7 @@ def _label_overlap_cpu(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
         return _numba_label_overlap(x, y, overlap)
     except ImportError:
-        logger.info("Numba not available, using pure NumPy.")
+        logger.debug("Numba not available, using pure NumPy.")
         np.add.at(overlap, (x, y), 1)
         return overlap
 

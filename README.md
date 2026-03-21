@@ -10,7 +10,7 @@ statements and transferring input arrays to the target device.
 It also provides custom GPU-accelerated implementations of additional
 features, including Fourier Ring and Shell Correlation for image resolution,
 faster Richardson-Lucy deconvolution, average precision (AP) for segmentation
-quality assessment, and other.
+quality assessment, and other features.
 
 ## Getting started
 
