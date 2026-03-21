@@ -499,8 +499,8 @@ def _compute_decorrelation_curve_sectioned(
     r_edges_raw, radii_raw = radial_edges(
         shape,
         bin_delta=bin_delta,
-        spacing=spacing,
-        use_max_nyquist=True,  # type: ignore[arg-type]
+        spacing=spacing,  # type: ignore[arg-type]
+        use_max_nyquist=True,
     )
     n_radial_raw = len(radii_raw)
     r_edges = to_same_device(r_edges_raw, image)

@@ -21,6 +21,23 @@ from ..cuda import ascupy, asnumpy, get_device
 
 logger = logging.getLogger(__name__)
 
+# Hoist numba JIT outside function body so the decorated helper is compiled
+# once and cached across calls, not re-wrapped on every invocation.
+try:
+    from numba import jit as _numba_jit
+
+    @_numba_jit(nopython=True)
+    def _numba_label_overlap(
+        x: np.ndarray, y: np.ndarray, overlap: np.ndarray
+    ) -> np.ndarray:
+        for i in range(len(x)):
+            overlap[x[i], y[i]] += 1
+        return overlap
+
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
 
 def _check_sequential_labels(mask: np.ndarray) -> bool:
     labels = np.unique(mask)
@@ -67,22 +84,10 @@ def _label_overlap_cpu(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     y = y.ravel()
     overlap = np.zeros((1 + int(x.max()), 1 + int(y.max())), dtype=np.uint)
 
-    try:
-        from numba import jit
-
-        @jit(nopython=True)
-        def _numba_label_overlap(
-            x: np.ndarray, y: np.ndarray, overlap: np.ndarray
-        ) -> np.ndarray:
-            for i in range(len(x)):
-                overlap[x[i], y[i]] += 1
-            return overlap
-
+    if _HAS_NUMBA:
         return _numba_label_overlap(x, y, overlap)
-    except ImportError:
-        logger.debug("Numba not available, using pure NumPy.")
-        np.add.at(overlap, (x, y), 1)
-        return overlap
+    np.add.at(overlap, (x, y), 1)
+    return overlap
 
 
 def _label_overlap(x: np.ndarray, y: np.ndarray) -> np.ndarray:

@@ -226,9 +226,9 @@ def clear_xy_borders(label_image: npt.ArrayLike, buffer_size: int = 0) -> npt.Ar
     if label_image.ndim == 2:  # type: ignore[union-attr]
         return clear_border(label_image, buffer_size=buffer_size)
     label_image = pad_image(
-        label_image,
+        label_image,  # type: ignore[arg-type]
         (buffer_size + 1, buffer_size + 1),
-        mode="constant",  # type: ignore[arg-type]
+        mode="constant",
     )
     label_image = clear_border(label_image, buffer_size=buffer_size)
     return label(label_image[buffer_size + 1 : -(buffer_size + 1), :, :])  # type: ignore[index, call-overload]
@@ -358,7 +358,8 @@ def segment_watershed(
         return to_device(labels, device)
 
     # Marker-based watershed without mask (image as landscape and mask)
-    labels = watershed(asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image))  # type: ignore[arg-type]
+    img_cpu = asnumpy(image)  # type: ignore[arg-type]
+    labels = watershed(img_cpu, markers=asnumpy(markers), mask=img_cpu)  # type: ignore[arg-type]
     return to_device(labels, device)
 
 
