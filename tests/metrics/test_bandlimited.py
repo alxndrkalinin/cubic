@@ -451,6 +451,35 @@ def test_spectral_pcc_smooth_with_nbins_low() -> None:
     assert -1.0 <= r <= 1.0
 
 
+def test_spectral_pcc_weighting_snr2() -> None:
+    """weighting='snr2' produces a valid result."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=30)
+    r = spectral_pcc(pred, tgt, spacing=0.065, weighting="snr2")
+    assert -1.0 <= r <= 1.0
+
+
+def test_spectral_pcc_weighting_unknown_raises() -> None:
+    """Unknown weighting raises ValueError."""
+    a = np.zeros((64, 64), dtype=np.float32)
+    with pytest.raises(ValueError, match="Unknown weighting"):
+        spectral_pcc(a, a, spacing=0.065, weighting="frc")  # type: ignore[arg-type]
+
+
+def test_spectral_pcc_taper_low() -> None:
+    """taper_low produces a valid result."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=31)
+    r = spectral_pcc(pred, tgt, spacing=0.065, taper_low=3)
+    assert -1.0 <= r <= 1.0
+
+
+def test_spectral_pcc_smooth_backward_compat() -> None:
+    """smooth=True gives same result as weighting='smooth_wiener'."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=32)
+    r_smooth = spectral_pcc(pred, tgt, spacing=0.065, smooth=True)
+    r_weighting = spectral_pcc(pred, tgt, spacing=0.065, weighting="smooth_wiener")
+    assert r_smooth == pytest.approx(r_weighting, abs=1e-6)
+
+
 # ===================================================================
 # percentile_band_taper tests
 # ===================================================================
@@ -575,14 +604,16 @@ def test_bandpass_pcc_range() -> None:
     """PCC is in [-1, 1]."""
     pred, tgt, _ = _make_synthetic_pair(seed=20)
     r = bandpass_spectral_pcc(pred, tgt, spacing=0.065)
+    assert isinstance(r, float)
     assert -1.0 <= r <= 1.0
 
 
 def test_bandpass_pcc_weight_methods() -> None:
     """Each weight_method string produces a valid result."""
     pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=21)
-    for method in ("simple", "smooth_wiener", "baseline_snr2"):
+    for method in ("simple", "smooth_wiener", "snr2"):
         r = bandpass_spectral_pcc(pred, tgt, spacing=0.065, weight_method=method)
+        assert isinstance(r, float)
         assert -1.0 <= r <= 1.0, f"Failed for method={method}"
 
 
@@ -590,7 +621,7 @@ def test_bandpass_pcc_unknown_method_raises() -> None:
     """Unknown weight_method raises ValueError."""
     a = np.zeros((64, 64), dtype=np.float32)
     with pytest.raises(ValueError, match="Unknown weight_method"):
-        bandpass_spectral_pcc(a, a, spacing=0.065, weight_method="frc")
+        bandpass_spectral_pcc(a, a, spacing=0.065, weight_method="frc")  # type: ignore[arg-type]
 
 
 def test_bandpass_pcc_shape_mismatch_raises() -> None:
@@ -610,6 +641,7 @@ def test_bandpass_pcc_frozen_weights() -> None:
     _, radii = radial_edges(pred.shape, bin_delta=1.0, spacing=[0.065, 0.065])
     w = np.ones(len(radii), dtype=np.float32)
     r = bandpass_spectral_pcc(pred, tgt, spacing=0.065, frozen_weights=w)
+    assert isinstance(r, float)
     assert -1.0 <= r <= 1.0
 
 
@@ -619,6 +651,7 @@ def test_bandpass_pcc_3d() -> None:
     img = rng.standard_normal((16, 32, 32)).astype(np.float32)
     tgt = img + 0.2 * rng.standard_normal(img.shape).astype(np.float32)
     r = bandpass_spectral_pcc(img, tgt, spacing=(0.3, 0.065, 0.065))
+    assert isinstance(r, float)
     assert -1.0 <= r <= 1.0
 
 

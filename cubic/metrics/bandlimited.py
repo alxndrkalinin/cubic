@@ -1161,7 +1161,7 @@ def spectral_pcc_frcw(
 # 3e  Percentile-band spectral PCC
 # ---------------------------------------------------------------------------
 
-_WEIGHT_METHODS = frozenset({"simple", "smooth_wiener", "baseline_snr2"})
+_WEIGHT_METHODS = frozenset({"simple", "smooth_wiener", "snr2"})
 
 
 def bandpass_spectral_pcc(
@@ -1175,9 +1175,7 @@ def bandpass_spectral_pcc(
     p_high: float = 0.99,
     taper_width: int = 3,
     frozen_weights: np.ndarray | None = None,
-    weight_method: Literal[
-        "simple", "smooth_wiener", "baseline_snr2"
-    ] = "smooth_wiener",
+    weight_method: Literal["simple", "smooth_wiener", "snr2"] = "smooth_wiener",
     return_diagnostics: bool = False,
     **weight_kwargs,
 ) -> float | tuple[float, dict[str, float]]:
@@ -1217,11 +1215,11 @@ def bandpass_spectral_pcc(
         defined by *bin_delta* and *spacing* for the target shape.
         FRC-derived weights (from :func:`frc_weights`) should be passed
         here since they use index-unit binning.
-    weight_method : ``"simple"`` | ``"smooth_wiener"`` | ``"baseline_snr2"``
+    weight_method : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"``
         How to compute per-bin weights from the target power spectrum.
         ``"simple"`` uses :func:`spectral_weights`;
         ``"smooth_wiener"`` uses :func:`smooth_spectral_weights`;
-        ``"baseline_snr2"`` uses :func:`_estimate_noise_baseline` +
+        ``"snr2"`` uses :func:`_estimate_noise_baseline` +
         :func:`_baseline_snr2_weights`.
     return_diagnostics : bool
         If True, return ``(pcc, diagnostics)`` instead of just *pcc*.
@@ -1290,7 +1288,7 @@ def bandpass_spectral_pcc(
             radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
         )
         w_bins = smooth_spectral_weights(radii, power, noise, **kw)
-    else:  # baseline_snr2
+    else:  # snr2
         radii, power = radial_power_spectrum(
             target, spacing=spacing_seq, bin_delta=bin_delta
         )
@@ -1626,7 +1624,7 @@ def spectral_pcc(
     sg_polyorder: int = 3,
     nbins_low: int = 0,
     taper_low: int = 0,
-    weighting: str = "simple",
+    weighting: Literal["simple", "smooth_wiener", "snr2"] | None = None,
 ) -> float:
     r"""Spectrally-weighted Pearson correlation coefficient.
 
@@ -1656,13 +1654,15 @@ def spectral_pcc(
         Hard cutoff zeroing bins above this frequency.
     apodization : str
         Window function for edge apodisation.
-    weighting : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"``
-        Per-bin weight law.  ``"simple"`` (default) uses subtract-normalize
-        weights; ``"smooth_wiener"`` uses SG-filtered Wiener weights;
-        ``"snr2"`` uses a frequency-dependent SNR² model.
+    weighting : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"`` or None
+        Per-bin weight law.  ``None`` (default) auto-selects based on
+        *smooth*.  ``"simple"`` uses subtract-normalize weights;
+        ``"smooth_wiener"`` uses SG-filtered Wiener weights; ``"snr2"``
+        uses a frequency-dependent SNR² model.
     smooth : bool
-        Deprecated sugar: if *weighting* is not set, ``smooth=True`` maps to
-        ``weighting="smooth_wiener"``.  Ignored when *weighting* is passed.
+        Deprecated sugar: when *weighting* is ``None``, ``smooth=True``
+        selects ``"smooth_wiener"``.  Ignored when *weighting* is set
+        explicitly.
     sg_window : int
         Savitzky-Golay window length (used for ``"smooth_wiener"`` and
         ``"snr2"``).
@@ -1706,11 +1706,17 @@ def spectral_pcc(
     F_targ = np.fft.fftn(targ)
 
     # Resolve effective weighting (smooth= is deprecated sugar)
-    _weighting = (
-        weighting
-        if weighting != "simple"
-        else ("smooth_wiener" if smooth else "simple")
-    )
+    if weighting is not None:
+        _weighting = weighting
+    elif smooth:
+        _weighting = "smooth_wiener"
+    else:
+        _weighting = "simple"
+
+    if _weighting not in _WEIGHT_METHODS:
+        raise ValueError(
+            f"Unknown weighting {_weighting!r}. Choose from {sorted(_WEIGHT_METHODS)}."
+        )
 
     # Radial power spectrum of target → per-bin weights
     radii, power = radial_power_spectrum(
@@ -1740,7 +1746,7 @@ def spectral_pcc(
     # Low-k exclusion (DC / illumination / background)
     if taper_low > 0:
         _n = min(taper_low, len(w_bins))
-        _ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(_n) / _n))
+        _ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(1, _n + 1) / _n))
         w_bins[:_n] *= _ramp.astype(w_bins.dtype)
     elif nbins_low > 0:
         nbins_low = min(nbins_low, len(w_bins))
