@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import warnings
 from typing import Literal
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -191,8 +191,10 @@ def estimate_cutoff(
     * **OTF bound** — ``otf_safety * otf_cutoff(NA, λ)`` (physics).
     * **Nyquist bound** — ``nyquist_safety * nyquist_cutoff(spacing)``.
 
-    Any bound whose required parameters are missing is silently skipped.
-    At least one bound must be computable.
+    Bounds whose required parameters are absent are silently skipped.
+    Data-driven bounds (DCR, FRC/FSC) that raise ``ValueError``,
+    ``RuntimeError``, or ``TypeError`` emit a warning and are excluded;
+    other exceptions propagate.  At least one bound must be computable.
 
     Parameters
     ----------
@@ -244,7 +246,7 @@ def estimate_cutoff(
                 dcr_val = dcr_res
             if np.isfinite(dcr_val) and dcr_val > 0:
                 bounds.append(dcr_safety / dcr_val)
-        except Exception as exc:
+        except (ValueError, RuntimeError, TypeError) as exc:
             warnings.warn(f"DCR resolution estimation failed: {exc}", stacklevel=2)
 
     # --- FRC / FSC (data-driven) bound ---
@@ -269,7 +271,7 @@ def estimate_cutoff(
                 frc_res = float("nan")
             if np.isfinite(frc_res) and frc_res > 0:
                 bounds.append(frc_safety / frc_res)
-        except Exception as exc:
+        except (ValueError, RuntimeError, TypeError) as exc:
             warnings.warn(f"FRC/FSC resolution estimation failed: {exc}", stacklevel=2)
 
     # --- OTF (physics) bound ---
@@ -961,13 +963,13 @@ def frc_weights(
         frc_kwargs.update(
             counts_mode="poisson_thinning",
             n_repeats=n_repeats,
-            rng=rng,
+            rng=rng,  # type: ignore[arg-type]
             average=False,  # no checkerboard reverse averaging
         )
     else:
         frc_kwargs["average"] = True  # checkerboard forward+reverse
 
-    result = _calculate_frc(image, **frc_kwargs)
+    result = _calculate_frc(image, **frc_kwargs)  # type: ignore[arg-type]
     frc_curve = np.clip(
         np.asarray(result.correlation["correlation"], dtype=np.float64),
         -1.0,
@@ -1371,7 +1373,7 @@ def bandpass_spectral_pcc(
 # 4  Internal filtering helper
 # ---------------------------------------------------------------------------
 
-_APODIZATION_FNS = {
+_APODIZATION_FNS: dict[str, Callable[..., np.ndarray]] = {
     "tukey": tukey_window,
     "hamming": hamming_window,
 }
@@ -1412,7 +1414,7 @@ def _apply_lowpass(
         raise ValueError(
             f"Unknown apodization '{apodization}'. Choose from {list(_APODIZATION_FNS)}."
         )
-    img = apo_fn(img)
+    img = apo_fn(img)  # type: ignore[operator]
 
     F = np.fft.fftn(img)
     H = butterworth_lowpass(img.shape, cutoff, spacing=spacing, order=order)
@@ -1697,8 +1699,8 @@ def spectral_pcc(
     # Mean-subtract + apodise → FFT
     pred = prediction.astype(np.float32) - np.mean(prediction)
     targ = target.astype(np.float32) - np.mean(target)
-    pred = apo_fn(pred)
-    targ = apo_fn(targ)
+    pred = apo_fn(pred)  # type: ignore[operator]
+    targ = apo_fn(targ)  # type: ignore[operator]
 
     F_pred = np.fft.fftn(pred)
     F_targ = np.fft.fftn(targ)

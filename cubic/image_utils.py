@@ -762,8 +762,8 @@ def binomial_split(
         n1_cpu = np_rng.poisson(p * rate_cpu).astype(np.float32)
         n2_cpu = np_rng.poisson((1.0 - p) * rate_cpu).astype(np.float32)
 
-        img1 = n1_cpu
-        img2 = n2_cpu
+        img1 = n1_cpu  # type: ignore[assignment]
+        img2 = n2_cpu  # type: ignore[assignment]
 
         img1 = to_same_device(img1, image)
         img2 = to_same_device(img2, image)
@@ -776,7 +776,7 @@ def binomial_split(
     return img1, img2
 
 
-def label(img: npt.ArrayLike, **kwargs: Any) -> npt.ArrayLike:
+def label(img: npt.ArrayLike, **kwargs: Any) -> np.ndarray:
     """Label image using skimage.measure.label."""
     return measure.label(img, **kwargs)
 
@@ -805,7 +805,7 @@ def distance_transform_edt(
     indices: npt.ArrayLike | None = None,
     block_params: tuple[int, int, int] | None = None,
     float64_distances: bool = False,
-) -> npt.ArrayLike | tuple[npt.ArrayLike, npt.ArrayLike]:
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Compute the Euclidean distance transform of a binary image."""
     if isinstance(img, np.ndarray):
         if block_params is not None or float64_distances:
@@ -843,7 +843,7 @@ def clahe(
     kernel_size: np.ndarray | tuple[int, int, int] = (2, 3, 5),
     clip_limit: float = 0.01,
     nbins: int = 256,
-) -> npt.ArrayLike:
+) -> np.ndarray:
     """Apply CLAHE to the image."""
     assert len(img.shape) == len(kernel_size)
     kernel_size = np.asarray(img.shape) // kernel_size

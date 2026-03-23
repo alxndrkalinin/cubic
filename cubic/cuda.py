@@ -1,5 +1,7 @@
 """Contains a class for accessing CUDA-accelerated libraries."""
 
+from __future__ import annotations
+
 import os
 import warnings
 from types import ModuleType
@@ -12,7 +14,10 @@ import numpy as np
 class CUDAManager:
     """Manages CUDA resources."""
 
-    _instance = None
+    _instance: CUDAManager | None = None
+    cp: ModuleType | None
+    cucim: ModuleType | None
+    num_gpus: int
 
     def __new__(cls):
         """Ensure only one instance of CUDAManager is created."""
