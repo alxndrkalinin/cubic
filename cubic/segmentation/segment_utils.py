@@ -4,7 +4,6 @@ import warnings
 from collections.abc import Sequence
 
 import numpy as np
-import numpy.typing as npt
 from skimage.segmentation import watershed
 
 from ..cuda import asnumpy, to_device, get_device
@@ -14,7 +13,7 @@ from ._clear_border import clear_border
 
 
 def downscale_and_filter(
-    image: npt.ArrayLike,
+    image: np.ndarray,
     downscale_factor: float = 0.5,
     downscale_order: int = 3,
     downscale_anti_aliasing: bool = True,
@@ -23,12 +22,12 @@ def downscale_and_filter(
     *,
     downscale_xy_only: bool = True,
     filter_mode: str = "nearest",
-) -> npt.ArrayLike:
+) -> np.ndarray:
     """Subsample and filter image prior to segmentation.
 
     Parameters
     ----------
-    image : npt.ArrayLike
+    image : np.ndarray
         Image to be downsampled and filtered.
     downscale_factor : float, optional
         Factor by which to downscale the image, by default 0.5.
@@ -53,7 +52,7 @@ def downscale_and_filter(
 
     Returns
     -------
-    npt.ArrayLike
+    np.ndarray
         Filtered and downsampled image.
 
     """
@@ -117,12 +116,12 @@ def check_labeled_binary(image):
 
 
 def cleanup_segmentation(
-    label_img: npt.ArrayLike,
+    label_img: np.ndarray,
     min_obj_size: int | None = None,
     max_obj_size: int | None = None,
     border_buffer_size: int | None = None,
     max_hole_size: int | None = None,
-) -> npt.ArrayLike:
+) -> np.ndarray:
     """Clean up segmented image by removing small objects, clearing borders, and closing holes."""
     check_labeled_binary(label_img)
 
@@ -199,9 +198,7 @@ def find_objects(label_image, max_label=None):
     return object_slices
 
 
-def remove_large_objects(
-    label_image: npt.ArrayLike, max_size: int = 100000
-) -> npt.ArrayLike:
+def remove_large_objects(label_image: np.ndarray, max_size: int = 100000) -> np.ndarray:
     """Remove objects with volume above specified threshold."""
     check_labeled_binary(label_image)
     label_volumes = np.bincount(label_image.ravel())
@@ -211,30 +208,30 @@ def remove_large_objects(
     return label_image
 
 
-def remove_small_objects(
-    label_image: npt.ArrayLike, min_size: int = 500
-) -> npt.ArrayLike:
+def remove_small_objects(label_image: np.ndarray, min_size: int = 500) -> np.ndarray:
     """Remove objects with volume below specified threshold."""
     check_labeled_binary(label_image)
     label_image = morphology.remove_small_objects(label_image, min_size=min_size)
     return label_image
 
 
-def clear_xy_borders(label_image: npt.ArrayLike, buffer_size: int = 0) -> npt.ArrayLike:
+def clear_xy_borders(label_image: np.ndarray, buffer_size: int = 0) -> np.ndarray:
     """Remove masks that touch XY borders."""
     check_labeled_binary(label_image)
     if label_image.ndim == 2:
         return clear_border(label_image, buffer_size=buffer_size)
     label_image = pad_image(
-        label_image, (buffer_size + 1, buffer_size + 1), mode="constant"
+        label_image,
+        (buffer_size + 1, buffer_size + 1),
+        mode="constant",
     )
     label_image = clear_border(label_image, buffer_size=buffer_size)
     return label(label_image[buffer_size + 1 : -(buffer_size + 1), :, :])
 
 
 def remove_touching_objects(
-    label_image: npt.ArrayLike, border_value: int = 100
-) -> npt.ArrayLike:
+    label_image: np.ndarray, border_value: int = 100
+) -> np.ndarray:
     """Find labelled masks that overlap and remove from the image."""
     check_labeled_binary(label_image)
 
@@ -280,13 +277,13 @@ def remove_thin_objects(label_image, min_z=2):
 
 
 def segment_watershed(
-    image: npt.ArrayLike,
-    markers: npt.ArrayLike | None = None,
+    image: np.ndarray,
+    markers: np.ndarray | None = None,
     ball_size: int = 15,
     *,
-    mask: npt.ArrayLike | None = None,
+    mask: np.ndarray | None = None,
     dilate_seeds: bool = False,
-) -> npt.ArrayLike:
+) -> np.ndarray:
     """Segment image using watershed algorithm.
 
     When ``markers`` is None, computes a distance-based watershed:
@@ -300,13 +297,13 @@ def segment_watershed(
 
     Parameters
     ----------
-    image : npt.ArrayLike
+    image : np.ndarray
         Binary image to segment (distance-based) or intensity image
         (marker-based when no mask is given).
-    markers : npt.ArrayLike or None, optional
+    markers : np.ndarray or None, optional
         Pre-computed markers for marker-based watershed. If None,
         markers are generated from distance-transform peaks.
-    mask : npt.ArrayLike or None, optional
+    mask : np.ndarray or None, optional
         Binary mask restricting the watershed. When provided with markers,
         the watershed landscape is the negated EDT of the mask (shape-based
         partitioning). Only used when ``markers`` is not None.
@@ -320,7 +317,7 @@ def segment_watershed(
 
     Returns
     -------
-    npt.ArrayLike
+    np.ndarray
         Label image on the same device as the input.
 
     """
@@ -331,6 +328,7 @@ def segment_watershed(
     # Distance-based watershed (no markers provided)
     if markers is None:
         distance = distance_transform_edt(image)
+        assert isinstance(distance, np.ndarray)  # return_indices=False (default)
         footprint = morphology.ball(ball_size)
         footprint = to_same_device(footprint, distance)
         coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
@@ -350,13 +348,15 @@ def segment_watershed(
     # Marker-based watershed with explicit mask (shape-based partitioning)
     if mask is not None:
         distance = distance_transform_edt(asnumpy(mask))
+        assert isinstance(distance, np.ndarray)
         ws_image = -distance
         ws_image = ws_image - ws_image.min()
         labels = watershed(ws_image, markers=asnumpy(markers), mask=asnumpy(mask))
         return to_device(labels, device)
 
     # Marker-based watershed without mask (image as landscape and mask)
-    labels = watershed(asnumpy(image), markers=asnumpy(markers), mask=asnumpy(image))
+    img_cpu = asnumpy(image)
+    labels = watershed(img_cpu, markers=asnumpy(markers), mask=img_cpu)
     return to_device(labels, device)
 
 
@@ -404,7 +404,7 @@ def fill_label_holes(lbl_img, **binary_fill_holes_kwargs):
 
 
 def fill_holes_slicer(
-    image: npt.ArrayLike,
+    image: np.ndarray,
     area_threshold: int = 1000,
     num_iterations: int = 1,
     axes: Sequence[int] | None = None,

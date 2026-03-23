@@ -17,9 +17,8 @@ def regionprops(
 ) -> list:
     """Extract region-based morphological features."""
     # cucim requires spacing as tuple for kernel memoization
-    if spacing is not None:
-        spacing = tuple(spacing)
-    return measure.regionprops(label_image, intensity_image, spacing=spacing)
+    spacing_arg = tuple(spacing) if spacing is not None else None
+    return measure.regionprops(label_image, intensity_image, spacing=spacing_arg)
 
 
 def regionprops_table(
@@ -34,10 +33,9 @@ def regionprops_table(
     else:
         properties = []
     # cucim requires spacing as tuple for kernel memoization
-    if spacing is not None:
-        spacing = tuple(spacing)
+    spacing_arg = tuple(spacing) if spacing is not None else None
     return measure.regionprops_table(
-        label_image, intensity_image, properties=properties, spacing=spacing
+        label_image, intensity_image, properties=properties, spacing=spacing_arg
     )
 
 
