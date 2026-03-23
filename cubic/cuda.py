@@ -12,7 +12,10 @@ import numpy as np
 class CUDAManager:
     """Manages CUDA resources."""
 
-    _instance = None
+    _instance: CUDAManager | None = None
+    cp: ModuleType | None
+    cucim: ModuleType | None
+    num_gpus: int
 
     def __new__(cls):
         """Ensure only one instance of CUDAManager is created."""
@@ -31,11 +34,11 @@ class CUDAManager:
             self.cucim = cucim
             self.num_gpus = cp.cuda.runtime.getDeviceCount()
         except ImportError:
-            self.cp = self.cucim = None  # type: ignore[assignment]
+            self.cp = self.cucim = None
             self.num_gpus = 0
             warnings.warn("CuPy or CuCIM is not installed. Falling back to CPU.")
         except Exception:
-            self.cp = self.cucim = None  # type: ignore[assignment]
+            self.cp = self.cucim = None
             self.num_gpus = 0
             warnings.warn(
                 "Unable to detect CUDA-compatible GPU at the runtime. Check that driver is installed and GPU is visible. Falling back to CPU."

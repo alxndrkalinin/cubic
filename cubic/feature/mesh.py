@@ -117,8 +117,8 @@ def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
     """Extract surface features from a ``trimesh`` object."""
     axis_len = sorted(mesh.extents)
     intertia_pcs = mesh.principal_inertia_components
-    volume = mesh.volume
-    surface_area = mesh.area
+    volume = float(mesh.volume or 0.0)
+    surface_area = float(mesh.area)
 
     try:
         bounding_volume = mesh.bounding_cylinder.volume
@@ -130,7 +130,7 @@ def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
 
     return {
         "Area": surface_area,
-        "Volume": volume,  # type: ignore[dict-item]
+        "Volume": volume,
         "Min Axis Length": axis_len[0],
         "Med Axis Length": axis_len[1],
         "Max Axis Length": axis_len[2],
@@ -144,9 +144,9 @@ def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
         "Bounding Sphere Volume": mesh.bounding_sphere.volume,
         "Convex Hull Volume": mesh.convex_hull.volume,
         "Convex Hull Area": mesh.convex_hull.area,
-        "Sphericity": ellipsoid_sphericity(volume, surface_area),  # type: ignore[arg-type]
-        "Extent": mesh.volume / mesh.bounding_box.volume,
-        "Solidity": mesh.volume / mesh.convex_hull.volume,
+        "Sphericity": ellipsoid_sphericity(volume, surface_area),
+        "Extent": volume / mesh.bounding_box.volume,
+        "Solidity": volume / mesh.convex_hull.volume,
         "Avg Gaussian Curvature": discrete_gaussian_curvature_measure(
             mesh, mesh.vertices, 1
         ).mean(),
