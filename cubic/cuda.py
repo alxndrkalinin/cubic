@@ -1,5 +1,7 @@
 """Contains a class for accessing CUDA-accelerated libraries."""
 
+from __future__ import annotations
+
 import os
 import warnings
 from types import ModuleType
