@@ -145,7 +145,7 @@ def cleanup_segmentation(
             )
             label_img[filled_mask] = label_id
 
-    return label(label_img).astype(np.uint16)  # type: ignore[union-attr]
+    return label(label_img).astype(np.uint16)
 
 
 def find_objects(label_image, max_label=None):
@@ -226,7 +226,7 @@ def clear_xy_borders(label_image: np.ndarray, buffer_size: int = 0) -> np.ndarra
         mode="constant",
     )
     label_image = clear_border(label_image, buffer_size=buffer_size)
-    return label(label_image[buffer_size + 1 : -(buffer_size + 1), :, :])  # type: ignore[return-value]
+    return label(label_image[buffer_size + 1 : -(buffer_size + 1), :, :])
 
 
 def remove_touching_objects(
@@ -327,7 +327,8 @@ def segment_watershed(
 
     # Distance-based watershed (no markers provided)
     if markers is None:
-        distance: np.ndarray = distance_transform_edt(image)  # type: ignore[assignment]
+        distance = distance_transform_edt(image)
+        assert isinstance(distance, np.ndarray)  # return_indices=False (default)
         footprint = morphology.ball(ball_size)
         footprint = to_same_device(footprint, distance)
         coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
@@ -339,16 +340,16 @@ def segment_watershed(
             seed_mask = morphology.binary_dilation(
                 seed_mask, to_same_device(morphology.ball(1), seed_mask)
             )
-        markers = label(seed_mask)  # type: ignore[assignment]
-        assert markers is not None
+        markers = label(seed_mask)
         # watershed is not in cucim — run on CPU, return to original device
         labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))
         return to_device(labels, device)
 
     # Marker-based watershed with explicit mask (shape-based partitioning)
     if mask is not None:
-        distance_arr: np.ndarray = distance_transform_edt(asnumpy(mask))  # type: ignore[assignment]
-        ws_image = -distance_arr
+        distance = distance_transform_edt(asnumpy(mask))
+        assert isinstance(distance, np.ndarray)
+        ws_image = -distance
         ws_image = ws_image - ws_image.min()
         labels = watershed(ws_image, markers=asnumpy(markers), mask=asnumpy(mask))
         return to_device(labels, device)

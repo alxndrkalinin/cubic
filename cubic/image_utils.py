@@ -622,7 +622,7 @@ def reverse_checkerboard_split(
     return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=True)
 
 
-def label(img: npt.ArrayLike, **kwargs: Any) -> npt.ArrayLike:
+def label(img: npt.ArrayLike, **kwargs: Any) -> np.ndarray:
     """Label image using skimage.measure.label."""
     return measure.label(img, **kwargs)
 
@@ -651,7 +651,7 @@ def distance_transform_edt(
     indices: npt.ArrayLike | None = None,
     block_params: tuple[int, int, int] | None = None,
     float64_distances: bool = False,
-) -> npt.ArrayLike | tuple[npt.ArrayLike, npt.ArrayLike]:
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Compute the Euclidean distance transform of a binary image."""
     if isinstance(img, np.ndarray):
         if block_params is not None or float64_distances:
@@ -689,7 +689,7 @@ def clahe(
     kernel_size: np.ndarray | tuple[int, int, int] = (2, 3, 5),
     clip_limit: float = 0.01,
     nbins: int = 256,
-) -> npt.ArrayLike:
+) -> np.ndarray:
     """Apply CLAHE to the image."""
     assert len(img.shape) == len(kernel_size)
     kernel_size = np.asarray(img.shape) // kernel_size
