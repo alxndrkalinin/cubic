@@ -387,7 +387,8 @@ def _calculate_frc_single_pass(
 
     # Average with reverse checkerboard pattern (only for checkerboard single-image)
     if reverse:
-        assert original_image1 is not None
+        if original_image1 is None:
+            raise RuntimeError("original_image1 must be set when reverse=True")
         image1_rev, image2_rev = preprocess_images(
             original_image1,
             None,
@@ -1336,6 +1337,13 @@ def fsc_resolution(
             DeprecationWarning,
             stacklevel=2,
         )
+        if use_binomial and n_repeats > 1:
+            warnings.warn(
+                f"n_repeats={n_repeats} ignored: mask backend does not "
+                f"support multi-repeat binomial splitting.",
+                UserWarning,
+                stacklevel=2,
+            )
         fsc_result = calculate_sectioned_fsc(
             image1,
             image2,
