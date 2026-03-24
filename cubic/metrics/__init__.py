@@ -20,6 +20,7 @@ from .bandlimited import (
     butterworth_lowpass,
     bandpass_spectral_pcc,
     percentile_band_taper,
+    smooth_spectral_weights,
 )
 from .skimage_metrics import psnr, ssim
 from .average_precision import average_precision
@@ -46,4 +47,5 @@ __all__ = [
     "frc_weights",
     "percentile_band_taper",
     "bandpass_spectral_pcc",
+    "smooth_spectral_weights",
 ]

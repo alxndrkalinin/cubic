@@ -40,7 +40,7 @@ res = dcr_resolution(image_3d, spacing=[0.2, 0.065, 0.065])
 
 For single-image FRC/FSC, cubic supports two splitting strategies:
 
-| Property | Checkerboard (default) | Binomial (`split_type="binomial"`) |
+| Property | Checkerboard | Binomial |
 |----------|----------------------|-----------------------------------|
 | Output size | Stride-2 subsampled (half per dim) | Same as input |
 | Calibration correction | Yes (diagonal shift) | No |
