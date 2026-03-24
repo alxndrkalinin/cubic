@@ -761,133 +761,6 @@ def percentile_band_taper(
     return w_tapered, diagnostics
 
 
-def _spectral_pcc_baseline(
-    prediction: np.ndarray,
-    target: np.ndarray,
-    *,
-    spacing: float | Sequence[float],
-    bin_delta: float = 1.0,
-    apodization: str = "tukey",
-    sg_window: int = 15,
-    sg_polyorder: int = 3,
-    quantile_window: int = 11,
-    quantile: float = 0.1,
-    nbins_low: int = 3,
-    cap_quantile: float = 0.99,
-    frozen_weights: np.ndarray | None = None,
-) -> float:
-    """Spectral PCC with frequency-dependent noise baseline.
-
-    Estimates a smooth noise baseline N(k) from the target's radial
-    power spectrum, computes SNR²-based weights against it, and
-    applies them as per-frequency weights in a Fourier-domain PCC.
-
-    Parameters
-    ----------
-    prediction, target : np.ndarray
-        Images to compare (same shape, 2-D or 3-D).
-    spacing : float or sequence of float
-        Physical pixel / voxel spacing.
-    bin_delta : float
-        Radial-bin width (index units).
-    apodization : str
-        Window function for edge apodisation.
-    sg_window, sg_polyorder : int
-        Savitzky-Golay parameters for power smoothing.
-    quantile_window : int
-        Window for running-quantile baseline estimation.
-    quantile : float
-        Quantile for baseline (e.g. 0.1).
-    nbins_low : int
-        Number of lowest bins to exclude (DC/background).
-    cap_quantile : float
-        Soft cap quantile for extreme weights.
-    frozen_weights : np.ndarray, optional
-        Pre-computed 1-D radial-bin weights (from t=0). If given,
-        skip weight estimation and use these directly. Must match
-        the binning (same *bin_delta* and *spacing*).
-
-    Returns
-    -------
-    float
-        Weighted Pearson *r* in [-1, 1].
-    """
-    check_same_device(prediction, target)
-    if prediction.shape != target.shape:
-        raise ValueError(
-            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
-        )
-
-    spacing_seq = _normalize_spacing(spacing, prediction.ndim)
-    apo_fn = _APODIZATION_FNS.get(apodization)
-    if apo_fn is None:
-        raise ValueError(
-            f"Unknown apodization '{apodization}'. "
-            f"Choose from {list(_APODIZATION_FNS)}."
-        )
-
-    # Mean-subtract + apodise → FFT
-    pred = prediction.astype(np.float32) - np.mean(prediction)
-    targ = target.astype(np.float32) - np.mean(target)
-    pred = apo_fn(pred)
-    targ = apo_fn(targ)
-
-    F_pred = np.fft.fftn(pred)
-    F_targ = np.fft.fftn(targ)
-
-    # Compute or reuse per-bin weights
-    if frozen_weights is not None:
-        w_bins = frozen_weights
-    else:
-        radii, power = radial_power_spectrum(
-            target, spacing=spacing_seq, bin_delta=bin_delta
-        )
-        p_smooth, noise_bl = _estimate_noise_baseline(
-            power,
-            sg_window=sg_window,
-            sg_polyorder=sg_polyorder,
-            quantile_window=quantile_window,
-            quantile=quantile,
-        )
-        w_bins = _baseline_snr2_weights(
-            radii,
-            p_smooth,
-            noise_bl,
-            nbins_low=nbins_low,
-            cap_quantile=cap_quantile,
-        )
-
-    # Map per-bin weights → per-voxel weight volume
-    edges_cpu, _ = radial_edges(
-        prediction.shape, bin_delta=bin_delta, spacing=spacing_seq
-    )
-    edges = to_same_device(edges_cpu, prediction)
-    bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
-
-    n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
-    if len(w_bins) < n_bins_needed:
-        raise ValueError(
-            f"frozen_weights has {len(w_bins)} bins but binning requires "
-            f"{n_bins_needed}; check that bin_delta and image shape match."
-        )
-    w_bins_dev = to_same_device(np.asarray(w_bins, dtype=np.float32), prediction)
-
-    W = np.zeros_like(bid, dtype=np.float32)
-    valid = bid >= 0
-    W[valid] = w_bins_dev[bid[valid]]
-
-    # Weighted cross-spectrum correlation
-    cross = np.real(F_pred.ravel() * np.conj(F_targ.ravel()))
-    num = float(asnumpy(np.sum(W * cross)))
-    denom_pred = float(asnumpy(np.sum(W * np.abs(F_pred.ravel()) ** 2)))
-    denom_targ = float(asnumpy(np.sum(W * np.abs(F_targ.ravel()) ** 2)))
-    denom = np.sqrt(denom_pred * denom_targ)
-
-    if denom < 1e-12:
-        return 0.0
-    return float(np.clip(num / denom, -1.0, 1.0))
-
-
 # ---------------------------------------------------------------------------
 # 3b  FRC-weighted spectral PCC
 # ---------------------------------------------------------------------------
@@ -901,9 +774,9 @@ def frc_weights(
     alpha: float = 2.0,
     nbins_low: int = 3,
     smooth_window: int = 5,
-    split_type: str = "binomial",
+    split_type: Literal["checkerboard", "binomial"] = "binomial",
     n_repeats: int = 3,
-    rng: np.random.Generator | int | None = 42,
+    rng: np.random.Generator | int | None = None,
 ) -> np.ndarray:
     """Per-bin weights derived from single-image FRC reproducibility.
 
@@ -928,7 +801,8 @@ def frc_weights(
         ``"binomial"`` (default, same-shape, Rieger et al. 2024) or
         ``"checkerboard"`` (subsampled halves, Koho et al. 2019).
     n_repeats : int
-        Number of independent binomial splits to average (default 3).
+        Number of independent binomial splits to average (default 3
+        for stability; lower-level ``calculate_frc`` defaults to 1).
         Ignored for checkerboard.
     rng : Generator, int, or None
         Random seed for binomial split reproducibility.
@@ -1041,9 +915,9 @@ def spectral_pcc_frcw(
     alpha: float = 2.0,
     nbins_low: int = 3,
     smooth_window: int = 5,
-    split_type: str = "binomial",
+    split_type: Literal["checkerboard", "binomial"] = "binomial",
     n_repeats: int = 3,
-    rng: np.random.Generator | int | None = 42,
+    rng: np.random.Generator | int | None = None,
     frozen_weights: np.ndarray | None = None,
 ) -> float:
     """Spectral PCC weighted by single-image FRC reproducibility.
@@ -1071,7 +945,8 @@ def spectral_pcc_frcw(
     split_type : str
         ``"binomial"`` or ``"checkerboard"`` — passed to :func:`frc_weights`.
     n_repeats : int
-        Number of binomial splits to average.
+        Number of binomial splits to average (default 3 for stability;
+        lower-level ``calculate_frc`` defaults to 1).
     rng : Generator, int, or None
         Random seed for binomial split.
     frozen_weights : np.ndarray, optional
