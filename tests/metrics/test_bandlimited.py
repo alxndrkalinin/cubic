@@ -7,12 +7,14 @@ import pytest
 
 from cubic.metrics.bandlimited import (
     otf_cutoff,
+    frc_weights,
     spectral_pcc,
     nyquist_cutoff,
     estimate_cutoff,
     band_limited_pcc,
     spectral_weights,
     band_limited_ssim,
+    spectral_pcc_frcw,
     butterworth_lowpass,
     estimate_noise_floor,
     bandpass_spectral_pcc,
@@ -478,6 +480,66 @@ def test_spectral_pcc_smooth_backward_compat() -> None:
     r_smooth = spectral_pcc(pred, tgt, spacing=0.065, smooth=True)
     r_weighting = spectral_pcc(pred, tgt, spacing=0.065, weighting="smooth_wiener")
     assert r_smooth == pytest.approx(r_weighting, abs=1e-6)
+
+
+# ===================================================================
+# frc_weights / spectral_pcc_frcw tests
+# ===================================================================
+
+
+def test_frc_weights_range() -> None:
+    """Weights are in [0, 1] with correct length."""
+    rng = np.random.default_rng(40)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    w = frc_weights(img, rng=42)
+    assert w.dtype == np.float32
+    assert len(w) > 0
+    assert float(w.min()) >= 0.0
+    assert float(w.max()) <= 1.0 + 1e-7
+
+
+def test_frc_weights_monotone_envelope() -> None:
+    """Weights are monotone non-increasing after the nbins_low prefix."""
+    rng = np.random.default_rng(41)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    nbins_low = 3  # default
+    w = frc_weights(img, rng=42)
+    # After the zeroed prefix, weights should be non-increasing
+    w_active = w[nbins_low:]
+    if len(w_active) > 1:
+        assert np.all(np.diff(w_active) <= 1e-7)
+
+
+def test_frc_weights_square_image_required() -> None:
+    """Non-square image raises ValueError."""
+    img = np.zeros((64, 32), dtype=np.float32)
+    with pytest.raises(ValueError, match="square"):
+        frc_weights(img)
+
+
+def test_spectral_pcc_frcw_identical() -> None:
+    """PCC of identical images is ~1."""
+    rng = np.random.default_rng(42)
+    img = rng.standard_normal((64, 64)).astype(np.float32)
+    r = spectral_pcc_frcw(img, img, rng=42)
+    assert r == pytest.approx(1.0, abs=1e-2)
+
+
+def test_spectral_pcc_frcw_range() -> None:
+    """PCC is in [-1, 1]."""
+    rng = np.random.default_rng(43)
+    pred = rng.standard_normal((64, 64)).astype(np.float32)
+    tgt = pred + 0.5 * rng.standard_normal((64, 64)).astype(np.float32)
+    r = spectral_pcc_frcw(pred, tgt, rng=42)
+    assert -1.0 <= r <= 1.0
+
+
+def test_spectral_pcc_frcw_shape_mismatch_raises() -> None:
+    """Mismatched shapes raise ValueError."""
+    a = np.zeros((64, 64), dtype=np.float32)
+    b = np.zeros((64, 32), dtype=np.float32)
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        spectral_pcc_frcw(a, b)
 
 
 # ===================================================================
