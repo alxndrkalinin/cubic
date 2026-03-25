@@ -1036,7 +1036,7 @@ def spectral_pcc_frcw(
 # 3e  Percentile-band spectral PCC
 # ---------------------------------------------------------------------------
 
-_WEIGHT_METHODS = frozenset({"simple", "smooth_wiener", "snr2"})
+_WEIGHT_METHODS = frozenset({"simple", "smooth_wiener", "snr2", "snr2_baseline"})
 
 
 def bandpass_spectral_pcc(
@@ -1050,7 +1050,9 @@ def bandpass_spectral_pcc(
     p_high: float = 0.99,
     taper_width: int = 3,
     frozen_weights: np.ndarray | None = None,
-    weight_method: Literal["simple", "smooth_wiener", "snr2"] = "smooth_wiener",
+    weight_method: Literal[
+        "simple", "smooth_wiener", "snr2", "snr2_baseline"
+    ] = "smooth_wiener",
     return_diagnostics: bool = False,
     **weight_kwargs,
 ) -> float | tuple[float, dict[str, float]]:
@@ -1090,12 +1092,13 @@ def bandpass_spectral_pcc(
         defined by *bin_delta* and *spacing* for the target shape.
         FRC-derived weights (from :func:`frc_weights`) should be passed
         here since they use index-unit binning.
-    weight_method : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"``
+    weight_method : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"`` | ``"snr2_baseline"``
         How to compute per-bin weights from the target power spectrum.
         ``"simple"`` uses :func:`spectral_weights`;
         ``"smooth_wiener"`` uses :func:`smooth_spectral_weights`;
-        ``"snr2"`` uses :func:`_estimate_noise_baseline` +
-        :func:`_baseline_snr2_weights`.
+        ``"snr2"`` uses global-noise-floor SNR² (``max(0, SNR-1)²``);
+        ``"snr2_baseline"`` uses frequency-dependent noise baseline for
+        SNR² via :func:`_estimate_noise_baseline`.
     return_diagnostics : bool
         If True, return ``(pcc, diagnostics)`` instead of just *pcc*.
     **weight_kwargs
@@ -1163,7 +1166,20 @@ def bandpass_spectral_pcc(
             radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
         )
         w_bins = smooth_spectral_weights(radii, power, noise, **kw)
-    else:  # snr2
+    elif weight_method == "snr2":
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        noise = estimate_noise_floor(
+            radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
+        )
+        snr = power / max(noise, 1e-30)
+        snr = np.minimum(snr, 1e4)
+        w_bins = (np.maximum(snr - 1.0, 0.0) ** 2).astype(np.float32)
+        cutoff = weight_kwargs.get("cutoff")
+        if cutoff is not None:
+            w_bins[radii > cutoff] = 0.0
+    else:  # snr2_baseline
         radii, power = radial_power_spectrum(
             target, spacing=spacing_seq, bin_delta=bin_delta
         )
@@ -1499,7 +1515,8 @@ def spectral_pcc(
     sg_polyorder: int = 3,
     nbins_low: int = 0,
     taper_low: int = 0,
-    weighting: Literal["simple", "smooth_wiener", "snr2"] | None = None,
+    weighting: Literal["simple", "smooth_wiener", "snr2", "snr2_baseline"]
+    | None = None,
 ) -> float:
     r"""Spectrally-weighted Pearson correlation coefficient.
 
@@ -1529,11 +1546,12 @@ def spectral_pcc(
         Hard cutoff zeroing bins above this frequency.
     apodization : str
         Window function for edge apodisation.
-    weighting : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"`` or None
+    weighting : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"`` | ``"snr2_baseline"`` or None
         Per-bin weight law.  ``None`` (default) auto-selects based on
         *smooth*.  ``"simple"`` uses subtract-normalize weights;
         ``"smooth_wiener"`` uses SG-filtered Wiener weights; ``"snr2"``
-        uses a frequency-dependent SNR² model.
+        uses global-noise-floor SNR² (``max(0, SNR-1)²``); ``"snr2_baseline"``
+        uses a frequency-dependent noise baseline for SNR².
     smooth : bool
         Deprecated sugar: when *weighting* is ``None``, ``smooth=True``
         selects ``"smooth_wiener"``.  Ignored when *weighting* is set
@@ -1598,6 +1616,15 @@ def spectral_pcc(
         target, spacing=spacing_seq, bin_delta=bin_delta
     )
     if _weighting == "snr2":
+        # Global noise floor + SNR² weights (matches dynacell-validated approach)
+        noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
+        snr = power / max(noise, 1e-30)
+        snr = np.minimum(snr, 1e4)
+        w_bins = (np.maximum(snr - 1.0, 0.0) ** 2).astype(np.float32)
+        if cutoff is not None:
+            w_bins[radii > cutoff] = 0.0
+    elif _weighting == "snr2_baseline":
+        # Frequency-dependent noise baseline + SNR² weights
         p_smooth, noise_bl = _estimate_noise_baseline(
             power, sg_window=sg_window, sg_polyorder=sg_polyorder
         )

@@ -673,7 +673,7 @@ def test_bandpass_pcc_range() -> None:
 def test_bandpass_pcc_weight_methods() -> None:
     """Each weight_method string produces a valid result."""
     pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=21)
-    for method in ("simple", "smooth_wiener", "snr2"):
+    for method in ("simple", "smooth_wiener", "snr2", "snr2_baseline"):
         r = bandpass_spectral_pcc(pred, tgt, spacing=0.065, weight_method=method)
         assert isinstance(r, float)
         assert -1.0 <= r <= 1.0, f"Failed for method={method}"
