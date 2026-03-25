@@ -1,6 +1,8 @@
 """Implements 2D/3D Fourier Ring/Shell Correlation."""
 
+import logging
 import warnings
+from typing import Literal
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -13,6 +15,7 @@ from cubic.image_utils import (
     crop_tr,
     pad_image,
     crop_center,
+    binomial_split,
     hamming_window,
     pad_image_to_cube,
     rescale_isotropic,
@@ -40,6 +43,27 @@ from .analysis import (
     FourierCorrelationDataCollection,
 )
 from .iterators import FourierRingIterator, AxialExcludeSectionedFourierShellIterator
+
+logger = logging.getLogger(__name__)
+
+_BINOMIAL_SINGLE_REPEAT_MSG = (
+    "Binomial split with n_repeats=1; consider n_repeats>=3 for stability."
+)
+
+
+def _make_repeat_rngs(
+    rng: np.random.Generator | int | None, n_repeats: int
+) -> list[np.random.Generator]:
+    """Create deterministic independent RNG states for each repeat."""
+    if isinstance(rng, int):
+        ss = np.random.SeedSequence(rng)
+        return [np.random.default_rng(s) for s in ss.spawn(n_repeats)]
+    if isinstance(rng, np.random.Generator):
+        seeds = rng.integers(0, 2**32 - 1, size=n_repeats, dtype=np.uint32)
+        return [np.random.default_rng(int(s)) for s in seeds]
+    # None → fresh unseeded sequence
+    ss = np.random.SeedSequence()
+    return [np.random.default_rng(s) for s in ss.spawn(n_repeats)]
 
 
 def _empty_aggregate(*args: np.ndarray, **kwargs) -> np.ndarray:
@@ -77,6 +101,12 @@ def preprocess_images(
     reverse_split: bool = False,
     disable_hamming: bool = False,
     disable_3d_sum: bool = False,
+    split_type: Literal["checkerboard", "binomial"] = "checkerboard",
+    counts_mode: Literal["counts", "poisson_thinning"] = "counts",
+    gain: float = 1.0,
+    offset: float = 0.0,
+    readout_noise_rms: float = 0.0,
+    rng: np.random.Generator | int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Preprocess input images with all modifications (padding, windowing, splitting)."""
     single_image = image2 is None
@@ -86,10 +116,21 @@ def preprocess_images(
         image1 = pad_image_to_cube(image1, mode=pad_mode)
 
     if single_image:
-        # Split single image using checkerboard pattern
-        image1, image2 = frc_checkerboard_split(
-            image1, reverse=reverse_split, disable_3d_sum=disable_3d_sum
-        )
+        if split_type == "binomial":
+            image1, image2 = binomial_split(
+                image1,
+                p=0.5,
+                counts_mode=counts_mode,
+                gain=gain,
+                offset=offset,
+                readout_noise_rms=readout_noise_rms,
+                rng=rng,
+            )
+        else:
+            # Split single image using checkerboard pattern
+            image1, image2 = frc_checkerboard_split(
+                image1, reverse=reverse_split, disable_3d_sum=disable_3d_sum
+            )
     else:
         # Apply padding to second image
         if len(set(image2.shape)) > 1 and zero_padding:  # type: ignore[union-attr]
@@ -288,6 +329,87 @@ def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
     result.resolution["resolution"] /= cut_off_correction
 
 
+def _calculate_frc_single_pass(
+    image1: np.ndarray,
+    image2: np.ndarray | None,
+    *,
+    bin_delta: int,
+    spacing: list[float] | None,
+    zero_padding: bool,
+    pad_mode: str,
+    disable_hamming: bool,
+    average: bool,
+    backend: str,
+    split_type: Literal["checkerboard", "binomial"],
+    counts_mode: Literal["counts", "poisson_thinning"],
+    gain: float,
+    offset: float,
+    readout_noise_rms: float,
+    rng: np.random.Generator | int | None,
+) -> FourierCorrelationDataCollection:
+    """Run a single FRC pass (split + FFT + radial binning).
+
+    For checkerboard splits this includes the forward+reverse averaging.
+    For binomial splits this is a single random split.
+    """
+    single_image = image2 is None
+    use_checkerboard = split_type == "checkerboard"
+    reverse = average and single_image and use_checkerboard
+    original_image1 = image1.copy() if reverse else None
+
+    image1_proc, image2_proc = preprocess_images(
+        image1,
+        image2,
+        zero_padding=zero_padding,
+        pad_mode=pad_mode,
+        disable_hamming=disable_hamming,
+        split_type=split_type,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        rng=rng,
+    )
+
+    # Adjust spacing to match preprocessed image shape (padding may have changed dims)
+    spacing_adj = spacing
+    if spacing_adj is not None and len(spacing_adj) != image1_proc.ndim:
+        if len(spacing_adj) < image1_proc.ndim:
+            spacing_adj = list(spacing_adj) + [spacing_adj[0]] * (
+                image1_proc.ndim - len(spacing_adj)
+            )
+        else:
+            spacing_adj = list(spacing_adj[: image1_proc.ndim])
+
+    frc_data = _calculate_frc_core(
+        image1_proc, image2_proc, bin_delta, backend=backend, spacing=spacing_adj
+    )
+
+    # Average with reverse checkerboard pattern (only for checkerboard single-image)
+    if reverse:
+        if original_image1 is None:
+            raise RuntimeError("original_image1 must be set when reverse=True")
+        image1_rev, image2_rev = preprocess_images(
+            original_image1,
+            None,
+            reverse_split=True,
+            zero_padding=zero_padding,
+            pad_mode=pad_mode,
+            disable_hamming=disable_hamming,
+        )
+
+        frc_data_rev = _calculate_frc_core(
+            image1_rev, image2_rev, bin_delta, backend=backend, spacing=spacing_adj
+        )
+
+        frc_data[0].correlation["correlation"] = (
+            0.5 * frc_data[0].correlation["correlation"]
+            + 0.5 * frc_data_rev[0].correlation["correlation"]
+        )
+
+    return frc_data
+
+
 def calculate_frc(
     image1: np.ndarray,
     image2: np.ndarray | None = None,
@@ -306,6 +428,13 @@ def calculate_frc(
     zero_padding: bool = True,
     pad_mode: str = "constant",
     backend: str = "mask",
+    split_type: Literal["checkerboard", "binomial"] = "checkerboard",
+    counts_mode: Literal["counts", "poisson_thinning"] = "counts",
+    gain: float = 1.0,
+    offset: float = 0.0,
+    readout_noise_rms: float = 0.0,
+    n_repeats: int = 1,
+    rng: np.random.Generator | int | None = None,
 ) -> FourierCorrelationData:
     """
     Calculate a regular FRC with single or two image inputs.
@@ -314,57 +443,129 @@ def calculate_frc(
         bin_delta: Bin width (step size between bins). Controls binning resolution
                    for both backends. Default: 1.
         backend: "mask" (existing iterators) or "hist" (radial histogram)
+        split_type: "checkerboard" (default, Koho et al. 2019) or "binomial"
+                    (Rieger et al. 2024). Binomial splitting preserves image size
+                    and needs no calibration correction.
+        counts_mode: For binomial split: "counts" (raw photon counts) or
+                     "poisson_thinning" (float/deconvolved fallback).
+        gain: Camera gain (electrons/ADU) for binomial counts mode.
+        offset: Camera offset (ADU) for binomial counts mode.
+        readout_noise_rms: Read-noise std in electrons for binomial counts mode.
+        n_repeats: Number of independent binomial splits to average. Only used
+                   when split_type="binomial" and single-image mode (image2 is
+                   None). Ignored otherwise. Produces correlation-std and
+                   resolution-std in the result. Default: 1.
+        rng: Random number generator, seed, or None for binomial split.
     """
     single_image = image2 is None
-    reverse = average and single_image
-    original_image1 = image1.copy() if reverse else None
-
     spacing = _normalize_spacing(spacing, image1.ndim)
 
-    image1, image2 = preprocess_images(
+    use_binomial = split_type == "binomial" and single_image
+
+    if n_repeats > 1 and not use_binomial:
+        warnings.warn(
+            f"n_repeats={n_repeats} ignored: only used with "
+            f"split_type='binomial' and single-image mode.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if use_binomial and n_repeats == 1:
+        logger.info(_BINOMIAL_SINGLE_REPEAT_MSG)
+
+    if use_binomial and n_repeats > 1:
+        # --- Multi-repeat binomial averaging ---
+        rngs = _make_repeat_rngs(rng, n_repeats)
+        all_curves: list[np.ndarray] = []
+        all_resolutions: list[float] = []
+
+        for rep_rng in rngs:
+            frc_data = _calculate_frc_single_pass(
+                image1,
+                None,
+                bin_delta=bin_delta,
+                spacing=spacing,
+                zero_padding=zero_padding,
+                pad_mode=pad_mode,
+                disable_hamming=disable_hamming,
+                average=average,
+                backend=backend,
+                split_type="binomial",
+                counts_mode=counts_mode,
+                gain=gain,
+                offset=offset,
+                readout_noise_rms=readout_noise_rms,
+                rng=rep_rng,
+            )
+
+            # Analyze this repeat
+            analyzer = FourierCorrelationAnalysis(
+                frc_data,
+                spacing[0] if spacing is not None else 1.0,
+                resolution_threshold=resolution_threshold,
+                threshold_value=threshold_value,
+                snr_value=snr_value,
+                curve_fit_type=curve_fit_type,
+                curve_fit_degree=curve_fit_degree,
+                smoothing_factor=smoothing_factor,
+            )
+            rep_result = analyzer.execute(z_correction=z_correction)[0]
+            # No cutoff correction for binomial
+            all_curves.append(rep_result.correlation["correlation"])
+            all_resolutions.append(rep_result.resolution["resolution"])
+
+        # Note: resolution-std is computed from per-repeat resolutions, while the
+        # final resolution comes from analyzing the mean curve. These are different
+        # statistical procedures — std reflects inter-split variability, not
+        # uncertainty in the mean-curve resolution estimate.
+        curves_stack = np.array(all_curves)
+        mean_curve = np.nanmean(curves_stack, axis=0)
+        std_curve = np.nanstd(curves_stack, axis=0)
+        res_std = float(np.nanstd(all_resolutions))
+
+        # Build final result from averaged curve
+        # Re-use frequency/points from last repeat (identical across repeats)
+        final_data = FourierCorrelationDataCollection()
+        final_ds = FourierCorrelationData()
+        final_ds.correlation["correlation"] = mean_curve
+        final_ds.correlation["frequency"] = frc_data[0].correlation["frequency"]
+        final_ds.correlation["points-x-bin"] = frc_data[0].correlation["points-x-bin"]
+        final_ds.correlation["correlation-std"] = std_curve
+        final_data[0] = final_ds
+
+        analyzer = FourierCorrelationAnalysis(
+            final_data,
+            spacing[0] if spacing is not None else 1.0,
+            resolution_threshold=resolution_threshold,
+            threshold_value=threshold_value,
+            snr_value=snr_value,
+            curve_fit_type=curve_fit_type,
+            curve_fit_degree=curve_fit_degree,
+            smoothing_factor=smoothing_factor,
+        )
+        result = analyzer.execute(z_correction=z_correction)[0]
+        result.correlation["correlation-std"] = std_curve
+        result.resolution["resolution-std"] = res_std
+        return result
+
+    # --- Single pass (checkerboard or single binomial) ---
+    frc_data = _calculate_frc_single_pass(
         image1,
         image2,
+        bin_delta=bin_delta,
+        spacing=spacing,
         zero_padding=zero_padding,
         pad_mode=pad_mode,
         disable_hamming=disable_hamming,
+        average=average,
+        backend=backend,
+        split_type=split_type,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        rng=rng,
     )
-
-    # Adjust spacing to match preprocessed image shape (padding may have changed dimensions)
-    # For padded dimensions, use the spacing from the first dimension
-    if spacing is not None and len(spacing) != image1.ndim:
-        if len(spacing) < image1.ndim:
-            # Extend spacing if needed (use first spacing value for new dimensions)
-            spacing = list(spacing) + [spacing[0]] * (image1.ndim - len(spacing))
-        else:
-            # Truncate if too long (shouldn't happen, but be safe)
-            spacing = list(spacing[: image1.ndim])
-
-    # Pass spacing to core calculation (for histogram backend)
-    frc_data = _calculate_frc_core(
-        image1, image2, bin_delta, backend=backend, spacing=spacing
-    )
-
-    # Average with reverse pattern (only for single image mode)
-    if reverse:
-        # Use original unprocessed image for reverse split
-        image1, image2 = preprocess_images(
-            original_image1,  # type: ignore[arg-type]
-            None,
-            reverse_split=reverse,
-            zero_padding=zero_padding,
-            pad_mode=pad_mode,
-            disable_hamming=disable_hamming,
-        )
-
-        frc_data_rev = _calculate_frc_core(
-            image1, image2, bin_delta, backend=backend, spacing=spacing
-        )
-
-        # Average the two results
-        frc_data[0].correlation["correlation"] = (
-            0.5 * frc_data[0].correlation["correlation"]
-            + 0.5 * frc_data_rev[0].correlation["correlation"]
-        )
 
     # Analyze results
     analyzer = FourierCorrelationAnalysis(
@@ -379,8 +580,8 @@ def calculate_frc(
     )
     result = analyzer.execute(z_correction=z_correction)[0]
 
-    # Apply cut-off correction (only for single image case)
-    if single_image:
+    # Apply cut-off correction (only for checkerboard single-image case)
+    if single_image and split_type == "checkerboard":
         _apply_cutoff_correction(result)
 
     return result
@@ -397,6 +598,13 @@ def frc_resolution(
     curve_fit_type: str = "smooth-spline",
     smoothing_factor: float = 0.05,
     backend: str = "mask",
+    split_type: Literal["checkerboard", "binomial"] = "checkerboard",
+    counts_mode: Literal["counts", "poisson_thinning"] = "counts",
+    gain: float = 1.0,
+    offset: float = 0.0,
+    readout_noise_rms: float = 0.0,
+    n_repeats: int = 1,
+    rng: np.random.Generator | int | None = None,
 ) -> float:
     """Calculate either single- or two-image FRC-based 2D image resolution."""
     frc_result = calculate_frc(
@@ -409,6 +617,13 @@ def frc_resolution(
         zero_padding=zero_padding,
         pad_mode=pad_mode,
         backend=backend,
+        split_type=split_type,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        n_repeats=n_repeats,
+        rng=rng,
     )
 
     return frc_result.resolution["resolution"]
@@ -521,6 +736,12 @@ def calculate_sectioned_fsc(
     spacing: float | Sequence[float] | None = None,
     zero_padding: bool = True,
     pad_mode: str = "constant",
+    split_type: Literal["checkerboard", "binomial"] = "checkerboard",
+    counts_mode: Literal["counts", "poisson_thinning"] = "counts",
+    gain: float = 1.0,
+    offset: float = 0.0,
+    readout_noise_rms: float = 0.0,
+    rng: np.random.Generator | int | None = None,
 ) -> FourierCorrelationDataCollection:
     """Calculate sectioned FSC for one or two images."""
     single_image = image2 is None
@@ -534,6 +755,12 @@ def calculate_sectioned_fsc(
         pad_mode=pad_mode,
         disable_hamming=disable_hamming,
         disable_3d_sum=disable_3d_sum,
+        split_type=split_type,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        rng=rng,
     )
 
     iterator = AxialExcludeSectionedFourierShellIterator(
@@ -558,8 +785,8 @@ def calculate_sectioned_fsc(
     )
     result = analyzer.execute(z_correction=z_correction)
 
-    # Apply cut-off correction (only for single image case)
-    if single_image:
+    # Apply cut-off correction (only for checkerboard single-image case)
+    if single_image and split_type == "checkerboard":
         for angle, dataset in result:
             _apply_cutoff_correction(dataset)
 
@@ -787,11 +1014,17 @@ def _fsc_hist_compute(
     zero_padding: bool,
     pad_mode: str = "constant",
     average: bool,
+    split_type: Literal["checkerboard", "binomial"] = "checkerboard",
+    counts_mode: Literal["counts", "poisson_thinning"] = "counts",
+    gain: float = 1.0,
+    offset: float = 0.0,
+    readout_noise_rms: float = 0.0,
+    rng: np.random.Generator | int | None = None,
 ) -> dict[int, FourierCorrelationData]:
     """Compute sectioned FSC data using the hist backend.
 
-    Handles single-image detection, forward checkerboard split, and optional
-    reverse-split averaging.
+    Handles single-image detection, forward checkerboard/binomial split, and
+    optional reverse-split averaging (checkerboard only).
 
     Returns
     -------
@@ -799,7 +1032,8 @@ def _fsc_hist_compute(
         Per-sector FSC data keyed by polar angle (degrees).
     """
     single_image = image2 is None
-    do_average = average and single_image
+    use_checkerboard = split_type == "checkerboard"
+    do_average = average and single_image and use_checkerboard
 
     # Save original for reverse split if averaging
     original_image1 = image1.copy() if do_average else None
@@ -812,6 +1046,12 @@ def _fsc_hist_compute(
         pad_mode=pad_mode,
         disable_hamming=False,
         disable_3d_sum=False,
+        split_type=split_type,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        rng=rng,
     )
 
     # Calculate sectioned FSC (forward split)
@@ -825,7 +1065,7 @@ def _fsc_hist_compute(
         use_max_nyquist=use_max_nyquist,
     )
 
-    # Average with reverse split if enabled
+    # Average with reverse split if enabled (checkerboard only)
     if do_average:
         image1_rev, image2_rev = preprocess_images(
             original_image1,  # type: ignore[arg-type]
@@ -868,6 +1108,7 @@ def _fsc_extract_resolution(
     resolution_threshold: str,
     threshold_value: float,
     z_curve_fit_type: str = "smooth-spline",
+    apply_cutoff: bool = True,
 ) -> dict[str, float]:
     """Extract XY and Z resolution from sectioned FSC data.
 
@@ -903,6 +1144,9 @@ def _fsc_extract_resolution(
         Threshold criterion for resolution calculation.
     threshold_value : float
         Fixed threshold value.
+    apply_cutoff : bool
+        Whether to apply the checkerboard cutoff correction for single-image
+        mode. Set to False for binomial splits. Default True.
 
     Returns
     -------
@@ -932,7 +1176,7 @@ def _fsc_extract_resolution(
             curve_fit_type="smooth-spline",
         )
         analyzed = analyzer.execute(z_correction=1)  # no k(theta)
-        if single_image:
+        if single_image and apply_cutoff:
             _apply_cutoff_correction(analyzed[angle])
         res = analyzed[angle].resolution["resolution"]
         if np.isfinite(res) and res > 0:
@@ -958,7 +1202,7 @@ def _fsc_extract_resolution(
             curve_fit_type=z_curve_fit_type,
         )
         analyzed = analyzer.execute(z_correction=z_factor)
-        if single_image:
+        if single_image and apply_cutoff:
             _apply_cutoff_correction(analyzed[angle])
         res = analyzed[angle].resolution["resolution"]
         if np.isfinite(res) and res > 0:
@@ -986,6 +1230,13 @@ def fsc_resolution(
     threshold_value: float = 0.143,
     backend: str = "hist",
     z_curve_fit_type: str = "smooth-spline",
+    split_type: Literal["checkerboard", "binomial"] = "checkerboard",
+    counts_mode: Literal["counts", "poisson_thinning"] = "counts",
+    gain: float = 1.0,
+    offset: float = 0.0,
+    readout_noise_rms: float = 0.0,
+    n_repeats: int = 1,
+    rng: np.random.Generator | int | None = None,
 ) -> dict[str, float]:
     """
     Calculate either single- or two-image FSC-based 3D image resolution.
@@ -1028,10 +1279,42 @@ def fsc_resolution(
                          (Koho et al. 2019), so using other values may affect accuracy.
         backend: "hist" (vectorized, GPU-accelerated) or "mask" (deprecated)
                        (matches mask backend Z wedge coverage of ~8% of Fourier space).
+        split_type: "checkerboard" (default) or "binomial" (Rieger et al. 2024).
+        counts_mode: For binomial split: "counts" or "poisson_thinning".
+        gain: Camera gain (electrons/ADU) for binomial counts mode.
+        offset: Camera offset (ADU) for binomial counts mode.
+        readout_noise_rms: Read-noise std in electrons for binomial counts mode.
+        n_repeats: Number of independent binomial splits to average. Only used
+                   when split_type="binomial" and single-image mode (image2 is
+                   None). Ignored otherwise. Default: 1.
+        rng: Random number generator, seed, or None for binomial split.
+
+    Returns
+    -------
+    dict[str, float]
+        Resolution values with keys:
+
+        - ``"xy"``: XY resolution in physical units (or index units).
+        - ``"z"``: Z resolution in physical units (or index units).
+        - ``"xy_std"``: Std of XY resolution across repeats (binomial only,
+          0.0 when n_repeats=1).
+        - ``"z_std"``: Std of Z resolution across repeats (binomial only,
+          0.0 when n_repeats=1).
     """
     # Set default zero_padding based on backend
     if zero_padding is None:
         zero_padding = backend == "mask"
+
+    single_image = image2 is None
+    use_binomial = split_type == "binomial" and single_image
+
+    if n_repeats > 1 and not use_binomial:
+        warnings.warn(
+            f"n_repeats={n_repeats} ignored: only used with "
+            f"split_type='binomial' and single-image mode.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # --- Isotropic resampling (optional) ---
     original_spacing_z = None
@@ -1054,6 +1337,13 @@ def fsc_resolution(
             DeprecationWarning,
             stacklevel=2,
         )
+        if use_binomial and n_repeats > 1:
+            warnings.warn(
+                f"n_repeats={n_repeats} ignored: mask backend does not "
+                f"support multi-repeat binomial splitting.",
+                UserWarning,
+                stacklevel=2,
+            )
         fsc_result = calculate_sectioned_fsc(
             image1,
             image2,
@@ -1063,6 +1353,12 @@ def fsc_resolution(
             spacing=spacing,
             zero_padding=zero_padding,
             pad_mode=pad_mode,
+            split_type=split_type,
+            counts_mode=counts_mode,
+            gain=gain,
+            offset=offset,
+            readout_noise_rms=readout_noise_rms,
+            rng=rng,
         )
 
         angle_to_resolution = {
@@ -1076,15 +1372,69 @@ def fsc_resolution(
         xy_res = 0.5 * (
             angle_to_resolution.get(90, np.nan) + angle_to_resolution.get(270, np.nan)
         )
-        return {"xy": xy_res, "z": z_res}
+        result = {"xy": xy_res, "z": z_res}
+        if use_binomial:
+            result["xy_std"] = 0.0
+            result["z_std"] = 0.0
+        return result
 
     # --- Hist backend ---
     spacing_list = _normalize_spacing(spacing, image1.ndim)
-    single_image = image2 is None
 
     # Calculate z_factor from spacing if not already set by isotropic resampling
     if not resample_isotropic and spacing_list is not None:
         z_factor = spacing_list[0] / spacing_list[1]
+
+    if use_binomial and n_repeats > 1:
+        # --- Multi-repeat binomial FSC ---
+        rngs = _make_repeat_rngs(rng, n_repeats)
+        all_results: list[dict[str, float]] = []
+
+        for rep_rng in rngs:
+            fsc_data = _fsc_hist_compute(
+                image1,
+                None,
+                bin_delta=bin_delta,
+                angle_delta=angle_delta,
+                spacing_list=spacing_list,
+                exclude_axis_angle=exclude_axis_angle,
+                use_max_nyquist=use_max_nyquist,
+                zero_padding=zero_padding,
+                pad_mode=pad_mode,
+                average=average,
+                split_type="binomial",
+                counts_mode=counts_mode,
+                gain=gain,
+                offset=offset,
+                readout_noise_rms=readout_noise_rms,
+                rng=rep_rng,
+            )
+
+            rep_res = _fsc_extract_resolution(
+                fsc_data,
+                spacing_list=spacing_list,
+                single_image=True,
+                z_factor=z_factor,
+                original_spacing_z=original_spacing_z,
+                resolution_threshold=resolution_threshold,
+                threshold_value=threshold_value,
+                z_curve_fit_type=z_curve_fit_type,
+                apply_cutoff=False,
+            )
+            all_results.append(rep_res)
+
+        xy_vals = [r["xy"] for r in all_results]
+        z_vals = [r["z"] for r in all_results]
+        return {
+            "xy": float(np.nanmean(xy_vals)),
+            "z": float(np.nanmean(z_vals)),
+            "xy_std": float(np.nanstd(xy_vals)),
+            "z_std": float(np.nanstd(z_vals)),
+        }
+
+    # --- Single pass ---
+    if use_binomial and n_repeats == 1:
+        logger.info(_BINOMIAL_SINGLE_REPEAT_MSG)
 
     fsc_data = _fsc_hist_compute(
         image1,
@@ -1097,9 +1447,15 @@ def fsc_resolution(
         zero_padding=zero_padding,
         pad_mode=pad_mode,
         average=average,
+        split_type=split_type,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        rng=rng,
     )
 
-    return _fsc_extract_resolution(
+    result = _fsc_extract_resolution(
         fsc_data,
         spacing_list=spacing_list,
         single_image=single_image,
@@ -1108,7 +1464,12 @@ def fsc_resolution(
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         z_curve_fit_type=z_curve_fit_type,
+        apply_cutoff=split_type == "checkerboard",
     )
+    if use_binomial:
+        result["xy_std"] = 0.0
+        result["z_std"] = 0.0
+    return result
 
 
 def grid_crop_resolution(

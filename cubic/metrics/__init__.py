@@ -11,11 +11,16 @@ from .spectral import (
     frc_resolution_difference,
 )
 from .bandlimited import (
+    frc_weights,
     spectral_pcc,
     estimate_cutoff,
     band_limited_pcc,
     band_limited_ssim,
+    spectral_pcc_frcw,
     butterworth_lowpass,
+    bandpass_spectral_pcc,
+    percentile_band_taper,
+    smooth_spectral_weights,
 )
 from .skimage_metrics import psnr, ssim
 from .average_precision import average_precision
@@ -38,4 +43,9 @@ __all__ = [
     "butterworth_lowpass",
     "estimate_cutoff",
     "spectral_pcc",
+    "spectral_pcc_frcw",
+    "frc_weights",
+    "percentile_band_taper",
+    "bandpass_spectral_pcc",
+    "smooth_spectral_weights",
 ]

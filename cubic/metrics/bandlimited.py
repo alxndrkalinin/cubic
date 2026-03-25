@@ -26,11 +26,12 @@ Descloux, A., et al. (2019). Parameter-free image resolution estimation
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from typing import Literal
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
-from cubic.cuda import asnumpy, to_same_device, get_array_module, check_same_device
+from cubic.cuda import asnumpy, to_same_device, check_same_device
 from cubic.image_utils import tukey_window, hamming_window
 
 from .spectral.dcr import dcr_resolution
@@ -42,6 +43,24 @@ from .spectral.radial import (
     radial_bin_id,
     radial_k_grid,
 )
+
+__all__ = [
+    "butterworth_lowpass",
+    "otf_cutoff",
+    "nyquist_cutoff",
+    "estimate_cutoff",
+    "radial_power_spectrum",
+    "estimate_noise_floor",
+    "spectral_weights",
+    "smooth_spectral_weights",
+    "frc_weights",
+    "spectral_pcc_frcw",
+    "percentile_band_taper",
+    "bandpass_spectral_pcc",
+    "band_limited_pcc",
+    "band_limited_ssim",
+    "spectral_pcc",
+]
 
 # ---------------------------------------------------------------------------
 # 1  Core building blocks
@@ -385,11 +404,865 @@ def spectral_weights(
     return w.astype(np.float32)
 
 
+def smooth_spectral_weights(
+    radii: np.ndarray,
+    power: np.ndarray,
+    noise_floor: float,
+    cutoff: float | None = None,
+    sg_window: int = 15,
+    sg_polyorder: int = 3,
+) -> np.ndarray:
+    """Smooth Wiener-style weights from SG-filtered log-power spectrum.
+
+    Savitzky-Golay-filters ``log(P)`` to remove per-bin variance, then
+    applies Wiener weighting: ``P_smooth² / (P_smooth² + N²)``.
+
+    Parameters
+    ----------
+    radii : np.ndarray
+        Radial-bin centres.
+    power : np.ndarray
+        Mean power per bin.
+    noise_floor : float
+        Noise-floor estimate from :func:`estimate_noise_floor`.
+    cutoff : float, optional
+        Hard cutoff frequency.
+    sg_window : int
+        Savitzky-Golay window length (must be odd; clamped to array size).
+    sg_polyorder : int
+        Savitzky-Golay polynomial order.
+
+    Returns
+    -------
+    np.ndarray
+        Weights in [0, 1].
+    """
+    from cubic.scipy import signal as csignal
+
+    log_p = np.log(np.maximum(power, 1e-30))
+    # DC bin (index 0) is always zero after mean subtraction, mapping to
+    # log(1e-30) ≈ -69.  Replace with neighbor before SG smoothing to
+    # prevent the extreme outlier from poisoning the first few fitted values.
+    if len(log_p) > 1:
+        log_p[0] = log_p[1]
+    n = len(log_p)
+    # Clamp window to array length (must be odd, > polyorder, <= n)
+    min_wlen = sg_polyorder + 2
+    if n < min_wlen:
+        # Array too short for SG filter — skip smoothing
+        p_smooth = power.copy()
+    else:
+        wlen = min(sg_window, n)
+        if wlen % 2 == 0:
+            wlen -= 1
+        wlen = max(wlen, min_wlen)
+        log_p_smooth = csignal.savgol_filter(log_p, wlen, sg_polyorder)
+        p_smooth = np.exp(log_p_smooth)
+
+    n2 = noise_floor**2
+    w = p_smooth**2 / (p_smooth**2 + n2)
+
+    if cutoff is not None:
+        w[radii > cutoff] = 0.0
+    return w.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 3b  Baseline-corrected spectral weights
+# ---------------------------------------------------------------------------
+
+
+def _running_quantile_1d(
+    arr: np.ndarray,
+    window: int = 11,
+    q: float = 0.1,
+) -> np.ndarray:
+    """Sliding-window quantile for a 1-D array.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array (typically ~100 elements).
+    window : int
+        Window size (must be odd and >= 3).
+    q : float
+        Quantile in [0, 1].
+
+    Returns
+    -------
+    np.ndarray
+        Same length as *arr*, with per-element local quantile.
+    """
+    if window % 2 == 0:
+        window += 1
+    window = max(window, 3)
+    n = len(arr)
+    half = window // 2
+    out = np.empty(n, dtype=arr.dtype)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = np.quantile(arr[lo:hi], q)
+    return out
+
+
+def _estimate_noise_baseline(
+    power: np.ndarray,
+    sg_window: int = 15,
+    sg_polyorder: int = 3,
+    quantile_window: int = 11,
+    quantile: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frequency-dependent noise baseline from smoothed power spectrum.
+
+    Parameters
+    ----------
+    power : np.ndarray
+        Mean power per radial bin (from :func:`radial_power_spectrum`).
+    sg_window : int
+        Savitzky-Golay window for power smoothing.
+    sg_polyorder : int
+        Savitzky-Golay polynomial order.
+    quantile_window : int
+        Window size for running low-quantile (must be odd, >= 3).
+    quantile : float
+        Quantile for baseline estimation (e.g. 0.1 = 10th percentile).
+
+    Returns
+    -------
+    p_smooth : np.ndarray
+        SG-smoothed power spectrum.
+    noise_baseline : np.ndarray
+        Frequency-dependent noise floor N(k), same length as *power*.
+    """
+    from cubic.scipy import signal as csignal
+
+    n = len(power)
+
+    # SG window: must be odd, > polyorder, <= array length
+    min_wlen = sg_polyorder + 2
+    if n < min_wlen:
+        # Array too short for SG filter — return raw power as baseline
+        raw = np.maximum(power, 1e-30).astype(np.float32)
+        return raw, raw.copy()
+    wlen = min(sg_window, n)
+    if wlen % 2 == 0:
+        wlen -= 1
+    wlen = max(wlen, min_wlen)
+
+    log_p = np.log(np.maximum(power, 1e-30))
+    # DC bin (index 0) is always zero after mean subtraction → log(1e-30) ≈ -69.
+    # Replace with neighbor before SG to prevent boundary poisoning.
+    if len(log_p) > 1:
+        log_p[0] = log_p[1]
+    log_p_smooth = csignal.savgol_filter(log_p, wlen, sg_polyorder)
+
+    # Running low-quantile of smoothed log-power
+    log_n = _running_quantile_1d(log_p_smooth, window=quantile_window, q=quantile)
+
+    # Guardrail: baseline must not exceed smoothed spectrum
+    log_n = np.minimum(log_n, log_p_smooth)
+
+    # Monotone non-increasing constraint: baseline should not rise with k.
+    # Propagate maximum from high-k backward so earlier bins are >= later bins.
+    log_n = np.maximum.accumulate(log_n[::-1])[::-1]
+
+    return np.exp(log_p_smooth).astype(np.float32), np.exp(log_n).astype(np.float32)
+
+
+def _baseline_snr2_weights(
+    radii: np.ndarray,
+    p_smooth: np.ndarray,
+    noise_baseline: np.ndarray,
+    nbins_low: int = 3,
+    cap_quantile: float = 0.99,
+    cutoff: float | None = None,
+) -> np.ndarray:
+    """SNR² weights with frequency-dependent noise baseline.
+
+    Parameters
+    ----------
+    radii : np.ndarray
+        Radial-bin centres.
+    p_smooth : np.ndarray
+        Smoothed power spectrum from :func:`_estimate_noise_baseline`.
+    noise_baseline : np.ndarray
+        Frequency-dependent noise floor N(k) from :func:`_estimate_noise_baseline`.
+    nbins_low : int
+        Number of lowest-frequency bins to exclude (DC/background).
+    cap_quantile : float
+        Soft cap: clamp weights above this quantile of nonzero weights.
+    cutoff : float, optional
+        Hard cutoff frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Unnormalized SNR² weights (zero where excluded).
+    """
+    if len(radii) <= nbins_low:
+        return np.zeros_like(radii, dtype=np.float32)
+
+    snr = p_smooth / np.maximum(noise_baseline, 1e-30)
+    # Cap SNR to prevent overflow in squaring (SNR > 1e4 is extreme)
+    snr = np.minimum(snr, 1e4)
+    w = np.maximum(snr - 1.0, 0.0) ** 2
+
+    # Exclude lowest bins (DC / background / autofluorescence)
+    w[:nbins_low] = 0.0
+
+    # Hard cutoff
+    if cutoff is not None:
+        w[radii > cutoff] = 0.0
+
+    # Soft cap to prevent single ultra-low bin from dominating
+    nonzero = w[w > 0]
+    if len(nonzero) > 0:
+        cap = float(np.quantile(nonzero, cap_quantile))
+        w = np.minimum(w, cap)
+
+    return w.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 3c  Percentile-band taper
+# ---------------------------------------------------------------------------
+
+
+def percentile_band_taper(
+    w_bins: np.ndarray,
+    n_bins: np.ndarray,
+    radii: np.ndarray,
+    k_nyquist: float,
+    p_low: float = 0.0,
+    p_high: float = 0.99,
+    taper_width: int = 3,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Apply percentile-based band selection with cosine taper to spectral weights.
+
+    Selects a frequency band by finding the radial bins where the
+    cumulative weight mass reaches *p_low* and *p_high*, then applies a
+    soft cosine taper outside the band to avoid Gibbs-like ringing.
+
+    The weight mass per bin is ``w_bins[i] * n_bins[i]``, reflecting
+    each ring's actual contribution to the weighted PCC sum (rings at
+    higher *k* contain more Fourier pixels).
+
+    Parameters
+    ----------
+    w_bins : np.ndarray
+        1-D per-bin weights (from any weight law).
+    n_bins : np.ndarray
+        1-D per-bin Fourier pixel counts (same length as *w_bins*).
+    radii : np.ndarray
+        1-D radial-bin centres (same length as *w_bins*).
+    k_nyquist : float
+        Nyquist frequency for normalising diagnostics.
+    p_low : float
+        Lower percentile of cumulative weight mass (default 0.0 = no
+        low-frequency exclusion).
+    p_high : float
+        Upper percentile of cumulative weight mass (default 0.99).
+    taper_width : int
+        Number of bins for cosine ramp on each side of the band
+        (clamped to available bins at boundaries).
+
+    Returns
+    -------
+    w_tapered : np.ndarray
+        Tapered weights (float32, same length as *w_bins*).
+    diagnostics : dict[str, float]
+        Band diagnostic info:
+
+        - ``k_low``, ``k_high``: band edges as fraction of Nyquist.
+        - ``k_low_phys``, ``k_high_phys``: band edges in physical
+          frequency units (same units as *radii*).
+        - ``k50``, ``k90``: 50th / 90th percentile of cumulative mass
+          as fraction of Nyquist.
+        - ``i_low``, ``i_high``: band-edge bin indices.
+    """
+    nbins = len(w_bins)
+    nan_diag: dict[str, float] = {
+        "k_low": float("nan"),
+        "k_high": float("nan"),
+        "k_low_phys": float("nan"),
+        "k_high_phys": float("nan"),
+        "k50": float("nan"),
+        "k90": float("nan"),
+        "i_low": float("nan"),
+        "i_high": float("nan"),
+    }
+
+    # Cumulative weight mass
+    m = np.asarray(w_bins, dtype=np.float64) * np.asarray(n_bins, dtype=np.float64)
+    total = float(np.sum(m))
+    if total < 1e-30:
+        warnings.warn(
+            "Total weight mass is ~0; returning zero weights.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return np.zeros(nbins, dtype=np.float32), nan_diag
+
+    cum = np.cumsum(m) / total
+
+    # Cut indices
+    i_low = int(np.searchsorted(cum, p_low))
+    i_high = int(np.searchsorted(cum, p_high))
+    i_low = max(0, min(i_low, nbins - 1))
+    i_high = max(0, min(i_high, nbins - 1))
+
+    if i_low >= i_high:
+        warnings.warn(
+            f"Empty band: i_low={i_low} >= i_high={i_high}; returning zero weights.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return np.zeros(nbins, dtype=np.float32), nan_diag
+
+    # Build cosine taper
+    taper = np.zeros(nbins, dtype=np.float64)
+    taper[i_low : i_high + 1] = 1.0
+
+    # Low-side ramp (clamp width to available bins below i_low)
+    lo_w = min(taper_width, i_low)
+    if lo_w > 0:
+        t = np.arange(1, lo_w + 1, dtype=np.float64)
+        taper[i_low - lo_w : i_low] = 0.5 * (1.0 - np.cos(np.pi * t / lo_w))
+
+    # High-side ramp (clamp width to available bins above i_high)
+    hi_w = min(taper_width, nbins - 1 - i_high)
+    if hi_w > 0:
+        t = np.arange(1, hi_w + 1, dtype=np.float64)
+        taper[i_high + 1 : i_high + 1 + hi_w] = 0.5 * (1.0 + np.cos(np.pi * t / hi_w))
+
+    w_tapered = (np.asarray(w_bins, dtype=np.float64) * taper).astype(np.float32)
+
+    # Diagnostics
+    radii_f = np.asarray(radii, dtype=np.float64)
+    k_nyq = max(k_nyquist, 1e-30)
+
+    def _cum_percentile_k(q: float) -> float:
+        idx = int(np.searchsorted(cum, q))
+        idx = max(0, min(idx, nbins - 1))
+        return float(radii_f[idx] / k_nyq)
+
+    diagnostics: dict[str, float] = {
+        "k_low": float(radii_f[i_low] / k_nyq),
+        "k_high": float(radii_f[i_high] / k_nyq),
+        "k_low_phys": float(radii_f[i_low]),
+        "k_high_phys": float(radii_f[i_high]),
+        "k50": _cum_percentile_k(0.50),
+        "k90": _cum_percentile_k(0.90),
+        "i_low": float(i_low),
+        "i_high": float(i_high),
+    }
+
+    return w_tapered, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# 3b  FRC-weighted spectral PCC
+# ---------------------------------------------------------------------------
+
+
+def frc_weights(
+    image: np.ndarray,
+    *,
+    bin_delta: int = 1,
+    threshold: float = 0.143,
+    alpha: float = 2.0,
+    nbins_low: int = 3,
+    smooth_window: int = 5,
+    split_type: Literal["checkerboard", "binomial"] = "binomial",
+    n_repeats: int = 3,
+    rng: np.random.Generator | int | None = None,
+) -> np.ndarray:
+    """Per-bin weights derived from single-image FRC reproducibility.
+
+    Uses binomial splitting (same-shape, full frequency coverage) by
+    default, falling back to checkerboard if requested.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2-D image (must be square).
+    bin_delta : int
+        Radial-bin width in index units.
+    threshold : float
+        FRC threshold (default 0.143 = 1-bit).
+    alpha : float
+        Weight exponent (default 2.0 — sharpens the transition).
+    nbins_low : int
+        Number of lowest bins to zero (DC / background exclusion).
+    smooth_window : int
+        Median-filter window (clamped to odd, >= 3).
+    split_type : str
+        ``"binomial"`` (default, same-shape, Rieger et al. 2024) or
+        ``"checkerboard"`` (subsampled halves, Koho et al. 2019).
+    n_repeats : int
+        Number of independent binomial splits to average (default 3
+        for stability; lower-level ``calculate_frc`` defaults to 1).
+        Ignored for checkerboard.
+    rng : Generator, int, or None
+        Random seed for binomial split reproducibility.
+
+    Returns
+    -------
+    np.ndarray
+        1-D float32 weight array (one per radial bin, index-unit
+        binning matching ``radial_edges(image.shape, bin_delta,
+        spacing=None)``).
+    """
+    from cubic.scipy import ndimage as cndimage
+
+    # --- lazy import to avoid circular deps ---
+    from .spectral.frc import calculate_frc as _calculate_frc
+
+    if image.ndim != 2:
+        raise ValueError("frc_weights currently supports 2-D images only.")
+    if image.shape[0] != image.shape[1]:
+        raise ValueError(f"frc_weights requires square images, got {image.shape}.")
+
+    # 1. FRC curve via public API (no spacing → index units)
+    frc_kwargs = dict(
+        image2=None,
+        backend="hist",
+        bin_delta=bin_delta,
+        zero_padding=False,
+        disable_hamming=False,
+        split_type=split_type,
+    )
+    if split_type == "binomial":
+        frc_kwargs.update(
+            counts_mode="poisson_thinning",
+            n_repeats=n_repeats,
+            rng=rng,  # type: ignore[arg-type]
+            average=False,  # no checkerboard reverse averaging
+        )
+    else:
+        frc_kwargs["average"] = True  # checkerboard forward+reverse
+
+    result = _calculate_frc(image, **frc_kwargs)  # type: ignore[arg-type]
+    frc_curve = np.clip(
+        np.asarray(result.correlation["correlation"], dtype=np.float64),
+        -1.0,
+        1.0,
+    )
+    freq_norm = np.asarray(
+        result.correlation["frequency"],
+        dtype=np.float64,
+    )
+
+    # 2. Full-resolution radii in index units
+    _, radii_full_idx = radial_edges(
+        image.shape,
+        bin_delta=bin_delta,
+        spacing=None,
+    )
+    freq_nyq_full = float(np.floor(image.shape[0] / 2.0))
+    freq_full_norm = radii_full_idx / freq_nyq_full
+
+    # 3. Map FRC frequency axis onto full-resolution bins
+    if split_type == "checkerboard":
+        # Checkerboard halves are shape//2 → FRC [0,1] covers half Nyquist
+        freq_nyq_half = float(np.floor(image.shape[0] // 2 / 2.0))
+        freq_scale = freq_nyq_full / freq_nyq_half
+        interp_x = np.clip(freq_full_norm * freq_scale, 0.0, 1.0)
+    else:
+        # Binomial split: same shape → FRC and full bins share the same axis
+        interp_x = freq_full_norm
+
+    frc_full = np.interp(
+        interp_x,
+        freq_norm,
+        frc_curve,
+        left=float(frc_curve[0]),
+        right=float(frc_curve[-1]),
+    )
+
+    # 4. Convert to weights
+    w = (
+        np.clip(
+            (frc_full - threshold) / (1.0 - threshold),
+            0.0,
+            1.0,
+        )
+        ** alpha
+    )
+
+    # 5. Smooth + monotone non-increasing envelope
+    sw = smooth_window | 1  # clamp to odd
+    sw = max(3, min(sw, len(w) | 1))
+    w = cndimage.median_filter(w, size=sw).astype(np.float64)
+    w = np.maximum.accumulate(w[::-1])[::-1].copy()
+
+    # 6. Low-k exclusion
+    w[:nbins_low] = 0.0
+
+    if not ((w >= 0).all() and (w <= 1.0 + 1e-7).all()):
+        raise ValueError(f"Weights out of range [0, 1]: min={w.min()}, max={w.max()}")
+    return w.astype(np.float32)
+
+
+def spectral_pcc_frcw(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    bin_delta: int = 1,
+    apodization: str = "tukey",
+    threshold: float = 0.143,
+    alpha: float = 2.0,
+    nbins_low: int = 3,
+    smooth_window: int = 5,
+    split_type: Literal["checkerboard", "binomial"] = "binomial",
+    n_repeats: int = 3,
+    rng: np.random.Generator | int | None = None,
+    frozen_weights: np.ndarray | None = None,
+) -> float:
+    """Spectral PCC weighted by single-image FRC reproducibility.
+
+    FRC weights are computed in index-frequency units (spacing is not
+    needed — the threshold crossing in normalised frequency is
+    independent of pixel size).
+
+    Parameters
+    ----------
+    prediction, target : np.ndarray
+        Images to compare (same shape, 2-D).
+    bin_delta : int
+        Radial-bin width in index units.
+    apodization : str
+        Window function for edge apodisation (``"tukey"`` or ``"hamming"``).
+    threshold : float
+        FRC threshold for weight conversion.
+    alpha : float
+        Weight exponent.
+    nbins_low : int
+        Number of lowest bins to exclude.
+    smooth_window : int
+        Median-filter window for weight smoothing.
+    split_type : str
+        ``"binomial"`` or ``"checkerboard"`` — passed to :func:`frc_weights`.
+    n_repeats : int
+        Number of binomial splits to average (default 3 for stability;
+        lower-level ``calculate_frc`` defaults to 1).
+    rng : Generator, int, or None
+        Random seed for binomial split.
+    frozen_weights : np.ndarray, optional
+        Pre-computed 1-D radial-bin weights. If given, skip FRC weight
+        estimation.  Must match index-unit binning for the target shape.
+
+    Returns
+    -------
+    float
+        Weighted Pearson *r* in [-1, 1].
+    """
+    check_same_device(prediction, target)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
+        )
+
+    # 1. Compute or reuse per-bin weights
+    if frozen_weights is not None:
+        w_bins = frozen_weights
+    else:
+        w_bins = frc_weights(
+            target,
+            bin_delta=bin_delta,
+            threshold=threshold,
+            alpha=alpha,
+            nbins_low=nbins_low,
+            smooth_window=smooth_window,
+            split_type=split_type,
+            n_repeats=n_repeats,
+            rng=rng,
+        )
+
+    # 2. Zero-weight-mass guard
+    if float(np.sum(w_bins)) < 1e-6:
+        return 0.0
+
+    # 3. Mean-subtract + apodise → FFT
+    apo_fn = _APODIZATION_FNS.get(apodization)
+    if apo_fn is None:
+        raise ValueError(
+            f"Unknown apodization '{apodization}'. "
+            f"Choose from {list(_APODIZATION_FNS)}."
+        )
+    pred = prediction.astype(np.float32) - np.mean(prediction)
+    targ = target.astype(np.float32) - np.mean(target)
+    pred = apo_fn(pred)
+    targ = apo_fn(targ)
+
+    F_pred = np.fft.fftn(pred)
+    F_targ = np.fft.fftn(targ)
+
+    # 4. Map per-bin weights → per-voxel weight volume (index units)
+    edges_cpu, _ = radial_edges(
+        prediction.shape,
+        bin_delta=bin_delta,
+        spacing=None,
+    )
+    edges = to_same_device(edges_cpu, prediction)
+    bid = radial_bin_id(prediction.shape, edges, spacing=None)
+
+    n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
+    if len(w_bins) < n_bins_needed:
+        raise ValueError(
+            f"frozen_weights has {len(w_bins)} bins but binning requires "
+            f"{n_bins_needed}; check that bin_delta and image shape match."
+        )
+    w_bins_dev = to_same_device(np.asarray(w_bins, dtype=np.float32), prediction)
+
+    W = np.zeros_like(bid, dtype=np.float32)
+    valid = bid >= 0
+    W[valid] = w_bins_dev[bid[valid]]
+
+    # 5. Weighted cross-spectrum correlation
+    cross = np.real(F_pred.ravel() * np.conj(F_targ.ravel()))
+    num = float(asnumpy(np.sum(W * cross)))
+    denom_pred = float(asnumpy(np.sum(W * np.abs(F_pred.ravel()) ** 2)))
+    denom_targ = float(asnumpy(np.sum(W * np.abs(F_targ.ravel()) ** 2)))
+    denom = np.sqrt(denom_pred * denom_targ)
+
+    if denom < 1e-12:
+        return 0.0
+    return float(np.clip(num / denom, -1.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# 3e  Percentile-band spectral PCC
+# ---------------------------------------------------------------------------
+
+_WEIGHT_METHODS = frozenset({"simple", "smooth_wiener", "snr2", "snr2_baseline"})
+
+
+def bandpass_spectral_pcc(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    spacing: float | Sequence[float],
+    bin_delta: float = 1.0,
+    apodization: str = "tukey",
+    p_low: float = 0.0,
+    p_high: float = 0.99,
+    taper_width: int = 3,
+    frozen_weights: np.ndarray | None = None,
+    weight_method: Literal[
+        "simple", "smooth_wiener", "snr2", "snr2_baseline"
+    ] = "smooth_wiener",
+    return_diagnostics: bool = False,
+    **weight_kwargs,
+) -> float | tuple[float, dict[str, float]]:
+    r"""Spectral PCC within a percentile-defined frequency band.
+
+    Computes per-bin weights (or accepts pre-computed ones), selects a
+    frequency band via cumulative weight-mass percentiles, applies a
+    soft cosine taper at the band edges, and returns the weighted
+    Fourier-domain PCC.
+
+    The band is defined by *p_low* / *p_high* on the cumulative
+    distribution of ``w_i * n_i`` (weight times Fourier-pixel count
+    per ring), which measures each ring's actual contribution to the
+    PCC sum.
+
+    Parameters
+    ----------
+    prediction, target : np.ndarray
+        Images to compare (same shape, 2-D or 3-D).
+    spacing : float or sequence of float
+        Physical pixel / voxel spacing.
+    bin_delta : float
+        Radial-bin width (index units).
+    apodization : str
+        Window function for edge apodisation (``"tukey"`` or
+        ``"hamming"``).
+    p_low : float
+        Lower percentile of cumulative weight mass.  Default 0.0
+        (no low-frequency exclusion).
+    p_high : float
+        Upper percentile of cumulative weight mass.  Default 0.99.
+    taper_width : int
+        Number of bins for cosine ramp on each side of the band.
+    frozen_weights : np.ndarray, optional
+        Pre-computed 1-D per-bin weights.  If given, *weight_method*
+        and *weight_kwargs* are ignored.  Must match the binning
+        defined by *bin_delta* and *spacing* for the target shape.
+        FRC-derived weights (from :func:`frc_weights`) should be passed
+        here since they use index-unit binning.
+    weight_method : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"`` | ``"snr2_baseline"``
+        How to compute per-bin weights from the target power spectrum.
+        ``"simple"`` uses :func:`spectral_weights`;
+        ``"smooth_wiener"`` uses :func:`smooth_spectral_weights`;
+        ``"snr2"`` uses global-noise-floor SNR² (``max(0, SNR-1)²``);
+        ``"snr2_baseline"`` uses frequency-dependent noise baseline for
+        SNR² via :func:`_estimate_noise_baseline`.
+    return_diagnostics : bool
+        If True, return ``(pcc, diagnostics)`` instead of just *pcc*.
+    **weight_kwargs
+        Extra keyword arguments forwarded to the selected weight
+        function (e.g. ``tail_fraction``, ``sg_window``, ``cutoff``).
+
+    Returns
+    -------
+    float or tuple[float, dict[str, float]]
+        Weighted Pearson *r* in [-1, 1].  When *return_diagnostics* is
+        True, also returns band diagnostics from
+        :func:`percentile_band_taper`.
+    """
+    check_same_device(prediction, target)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
+        )
+    if weight_method not in _WEIGHT_METHODS:
+        raise ValueError(
+            f"Unknown weight_method {weight_method!r}. "
+            f"Choose from {sorted(_WEIGHT_METHODS)}."
+        )
+
+    spacing_seq = _normalize_spacing(spacing, prediction.ndim)
+
+    apo_fn = _APODIZATION_FNS.get(apodization)
+    if apo_fn is None:
+        raise ValueError(
+            f"Unknown apodization '{apodization}'. "
+            f"Choose from {list(_APODIZATION_FNS)}."
+        )
+
+    # Mean-subtract + apodise → FFT
+    pred = prediction.astype(np.float32) - np.mean(prediction)
+    targ = target.astype(np.float32) - np.mean(target)
+    pred = apo_fn(pred)
+    targ = apo_fn(targ)
+
+    F_pred = np.fft.fftn(pred)
+    F_targ = np.fft.fftn(targ)
+
+    # --- Per-bin weights ---
+    if frozen_weights is not None:
+        w_bins = np.asarray(frozen_weights, dtype=np.float32)
+    elif weight_method == "simple":
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        kw = {k: v for k, v in weight_kwargs.items() if k in ("cutoff",)}
+        noise = estimate_noise_floor(
+            radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
+        )
+        w_bins = spectral_weights(radii, power, noise, **kw)
+    elif weight_method == "smooth_wiener":
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        kw = {
+            k: v
+            for k, v in weight_kwargs.items()
+            if k in ("cutoff", "sg_window", "sg_polyorder")
+        }
+        noise = estimate_noise_floor(
+            radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
+        )
+        w_bins = smooth_spectral_weights(radii, power, noise, **kw)
+    elif weight_method == "snr2":
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        noise = estimate_noise_floor(
+            radii, power, tail_fraction=weight_kwargs.get("tail_fraction", 0.2)
+        )
+        snr = power / max(noise, 1e-30)
+        snr = np.minimum(snr, 1e4)
+        w_bins = (np.maximum(snr - 1.0, 0.0) ** 2).astype(np.float32)
+        cutoff = weight_kwargs.get("cutoff")
+        if cutoff is not None:
+            w_bins[radii > cutoff] = 0.0
+    else:  # snr2_baseline
+        radii, power = radial_power_spectrum(
+            target, spacing=spacing_seq, bin_delta=bin_delta
+        )
+        bl_kw = {
+            k: v
+            for k, v in weight_kwargs.items()
+            if k in ("sg_window", "sg_polyorder", "quantile_window", "quantile")
+        }
+        p_smooth, noise_bl = _estimate_noise_baseline(power, **bl_kw)
+        snr_kw = {
+            k: v for k, v in weight_kwargs.items() if k in ("cap_quantile", "cutoff")
+        }
+        w_bins = _baseline_snr2_weights(
+            radii, p_smooth, noise_bl, nbins_low=0, **snr_kw
+        )
+
+    # --- Radial binning ---
+    edges_cpu, radii_cpu = radial_edges(
+        prediction.shape, bin_delta=bin_delta, spacing=spacing_seq
+    )
+    edges = to_same_device(edges_cpu, prediction)
+    bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
+
+    # Validate weight vector length
+    valid = bid >= 0
+    n_bins_needed = int(asnumpy(bid[valid].max())) + 1 if np.any(valid) else 0
+    if len(w_bins) < n_bins_needed:
+        raise ValueError(
+            f"frozen_weights has {len(w_bins)} bins but binning requires "
+            f"{n_bins_needed}; check that bin_delta and image shape match."
+        )
+
+    # Bin counts and Nyquist for taper
+    n_per_bin = np.bincount(
+        asnumpy(bid[valid]).astype(np.intp), minlength=len(w_bins)
+    ).astype(np.float32)
+    k_nyquist = float(edges_cpu[-1])
+
+    # --- Percentile band taper ---
+    w_tapered, diagnostics = percentile_band_taper(
+        asnumpy(w_bins),
+        n_per_bin,
+        asnumpy(radii_cpu).astype(np.float32),
+        k_nyquist,
+        p_low=p_low,
+        p_high=p_high,
+        taper_width=taper_width,
+    )
+
+    # Zero-weight guard
+    if float(np.sum(w_tapered)) < 1e-6:
+        if return_diagnostics:
+            return 0.0, diagnostics
+        return 0.0
+
+    # Map tapered weights → per-voxel weight volume
+    w_dev = to_same_device(w_tapered, prediction)
+
+    W = np.zeros_like(bid, dtype=np.float32)
+    W[valid] = w_dev[bid[valid]]
+
+    # Weighted cross-spectrum correlation
+    cross = np.real(F_pred.ravel() * np.conj(F_targ.ravel()))
+    num = float(asnumpy(np.sum(W * cross)))
+    denom_pred = float(asnumpy(np.sum(W * np.abs(F_pred.ravel()) ** 2)))
+    denom_targ = float(asnumpy(np.sum(W * np.abs(F_targ.ravel()) ** 2)))
+    denom = np.sqrt(denom_pred * denom_targ)
+
+    if denom < 1e-12:
+        pcc = 0.0
+    else:
+        pcc = float(np.clip(num / denom, -1.0, 1.0))
+
+    if return_diagnostics:
+        return pcc, diagnostics
+    return pcc
+
+
 # ---------------------------------------------------------------------------
 # 4  Internal filtering helper
 # ---------------------------------------------------------------------------
 
-_APODIZATION_FNS = {
+_APODIZATION_FNS: dict[str, Callable[..., np.ndarray]] = {
     "tukey": tukey_window,
     "hamming": hamming_window,
 }
@@ -637,6 +1510,13 @@ def spectral_pcc(
     tail_fraction: float = 0.2,
     cutoff: float | None = None,
     apodization: str = "tukey",
+    smooth: bool = False,
+    sg_window: int = 15,
+    sg_polyorder: int = 3,
+    nbins_low: int = 0,
+    taper_low: int = 0,
+    weighting: Literal["simple", "smooth_wiener", "snr2", "snr2_baseline"]
+    | None = None,
 ) -> float:
     r"""Spectrally-weighted Pearson correlation coefficient.
 
@@ -666,6 +1546,29 @@ def spectral_pcc(
         Hard cutoff zeroing bins above this frequency.
     apodization : str
         Window function for edge apodisation.
+    weighting : ``"simple"`` | ``"smooth_wiener"`` | ``"snr2"`` | ``"snr2_baseline"`` or None
+        Per-bin weight law.  ``None`` (default) auto-selects based on
+        *smooth*.  ``"simple"`` uses subtract-normalize weights;
+        ``"smooth_wiener"`` uses SG-filtered Wiener weights; ``"snr2"``
+        uses global-noise-floor SNR² (``max(0, SNR-1)²``); ``"snr2_baseline"``
+        uses a frequency-dependent noise baseline for SNR².
+    smooth : bool
+        Deprecated sugar: when *weighting* is ``None``, ``smooth=True``
+        selects ``"smooth_wiener"``.  Ignored when *weighting* is set
+        explicitly.
+    sg_window : int
+        Savitzky-Golay window length (used for ``"smooth_wiener"`` and
+        ``"snr2"``).
+    sg_polyorder : int
+        Savitzky-Golay polynomial order.
+    nbins_low : int
+        Number of lowest-frequency bins to zero after weight computation
+        (DC / background / autofluorescence exclusion).  Ignored when
+        *taper_low* > 0.
+    taper_low : int
+        Soft low-frequency exclusion: apply a half-cosine ramp from 0 to 1
+        over the first *taper_low* bins.  When > 0, takes precedence over
+        *nbins_low*.
 
     Returns
     -------
@@ -695,12 +1598,63 @@ def spectral_pcc(
     F_pred = np.fft.fftn(pred)
     F_targ = np.fft.fftn(targ)
 
-    # Radial power spectrum of target → noise floor → per-bin weights
+    # Resolve effective weighting (smooth= is deprecated sugar)
+    if weighting is not None:
+        _weighting = weighting
+    elif smooth:
+        _weighting = "smooth_wiener"
+    else:
+        _weighting = "simple"
+
+    if _weighting not in _WEIGHT_METHODS:
+        raise ValueError(
+            f"Unknown weighting {_weighting!r}. Choose from {sorted(_WEIGHT_METHODS)}."
+        )
+
+    # Radial power spectrum of target → per-bin weights
     radii, power = radial_power_spectrum(
         target, spacing=spacing_seq, bin_delta=bin_delta
     )
-    noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
-    w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
+    if _weighting == "snr2":
+        # Global noise floor + SNR² weights (matches dynacell-validated approach)
+        noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
+        snr = power / max(noise, 1e-30)
+        snr = np.minimum(snr, 1e4)
+        w_bins = (np.maximum(snr - 1.0, 0.0) ** 2).astype(np.float32)
+        if cutoff is not None:
+            w_bins[radii > cutoff] = 0.0
+    elif _weighting == "snr2_baseline":
+        # Frequency-dependent noise baseline + SNR² weights
+        p_smooth, noise_bl = _estimate_noise_baseline(
+            power, sg_window=sg_window, sg_polyorder=sg_polyorder
+        )
+        w_bins = _baseline_snr2_weights(radii, p_smooth, noise_bl, nbins_low=0)
+        if cutoff is not None:
+            w_bins[radii > cutoff] = 0.0
+    elif _weighting == "smooth_wiener":
+        noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
+        w_bins = smooth_spectral_weights(
+            radii,
+            power,
+            noise,
+            cutoff=cutoff,
+            sg_window=sg_window,
+            sg_polyorder=sg_polyorder,
+        )
+    else:
+        noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
+        w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
+
+    # Low-k exclusion (DC / illumination / background)
+    if taper_low > 0:
+        _n = min(taper_low, len(w_bins))
+        _ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(1, _n + 1) / _n))
+        w_bins[:_n] *= _ramp.astype(w_bins.dtype)
+    elif nbins_low > 0:
+        nbins_low = min(nbins_low, len(w_bins))
+        w_bins[:nbins_low] = 0.0
+    if float(w_bins.max().item()) == 0.0:
+        return 0.0
 
     # Map per-bin weights → per-voxel weight volume
     edges_cpu, _ = radial_edges(
@@ -711,8 +1665,13 @@ def spectral_pcc(
     edges = to_same_device(edges_cpu, prediction)
     bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
 
-    xp = get_array_module(prediction)
-    w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
+    n_bins_needed = int(asnumpy(bid[bid >= 0].max())) + 1 if np.any(bid >= 0) else 0
+    if len(w_bins) < n_bins_needed:
+        raise ValueError(
+            f"Weight vector has {len(w_bins)} bins but binning requires "
+            f"{n_bins_needed}; check that bin_delta and image shape match."
+        )
+    w_bins_dev = to_same_device(np.asarray(w_bins, dtype=np.float32), prediction)
 
     # Build weight volume: map bin weights through bin_id
     W = np.zeros_like(bid, dtype=np.float32)
