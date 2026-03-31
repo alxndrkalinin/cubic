@@ -47,7 +47,7 @@ For single-image FRC/FSC, cubic supports two splitting strategies:
 | Reverse-split averaging | Yes | N/A (use `n_repeats` instead) |
 | Input requirement | Any image | Photon counts or Poisson rates |
 | Sampling requirement | Adequate oversampling | Any |
-| Uncertainty quantification | N/A | Repeat M times → curve std |
+| Uncertainty quantification | Fwd/rev averaging | Repeat M times → curve std |
 
 **When to use which:**
 - **Binomial + counts mode**: Raw camera data with known gain/offset/readout noise. Recommended for data where the checkerboard subsampling may bias high-frequency statistics.

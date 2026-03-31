@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import numpy.typing as npt
 
-from .cuda import asnumpy, get_array_module
+from .cuda import asnumpy, to_same_device, get_array_module
 from .skimage import measure, exposure, transform
 
 
@@ -651,7 +651,8 @@ def binomial_split(
         exact pixel sums. Useful as a fallback for float / deconvolved images, but
         note that it measures self-consistency, not physical resolution.
     gain : float
-        Camera gain (electrons / ADU). Used only in counts mode. Default 1.0.
+        Camera gain (ADU per electron). Used only in counts mode. Default 1.0.
+        Conversion: ``electrons = (image - offset) / gain``.
     offset : float
         Camera offset (ADU). Subtracted before gain conversion. Default 0.0.
     readout_noise_rms : float
@@ -683,8 +684,12 @@ def binomial_split(
     """
     if not (0.0 < p < 1.0):
         raise ValueError(f"p must be in (0, 1), got {p}")
-
-    xp = get_array_module(image)
+    if image.ndim not in (2, 3):
+        raise ValueError(f"Expected 2D or 3D image, got {image.ndim}D")
+    if gain <= 0:
+        raise ValueError(f"gain must be > 0, got {gain}")
+    if readout_noise_rms < 0:
+        raise ValueError(f"readout_noise_rms must be >= 0, got {readout_noise_rms}")
 
     # Resolve RNG
     if isinstance(rng, int):
@@ -732,7 +737,7 @@ def binomial_split(
         n = np.rint(electrons).astype(np.int64)
 
         # Draw binomial split on CPU (transfer if needed)
-        n_cpu = n if isinstance(n, np.ndarray) else n.get()
+        n_cpu = asnumpy(n)
         n1_cpu = np_rng.binomial(n_cpu, p)
         n2_cpu = n_cpu - n1_cpu
 
@@ -746,24 +751,22 @@ def binomial_split(
             img2 = np.clip(img2 - half_var, 0, None)
 
         # Transfer back to original device if needed
-        if xp.__name__ != "numpy":
-            img1 = xp.asarray(img1)
-            img2 = xp.asarray(img2)
+        img1 = to_same_device(img1, image)
+        img2 = to_same_device(img2, image)
 
     elif counts_mode == "poisson_thinning":
         # --- poisson thinning mode ---
         rate = np.clip(image.astype(np.float64), 0, None)
 
-        rate_cpu = rate if isinstance(rate, np.ndarray) else rate.get()
+        rate_cpu = asnumpy(rate)
         n1_cpu = np_rng.poisson(p * rate_cpu).astype(np.float32)
         n2_cpu = np_rng.poisson((1.0 - p) * rate_cpu).astype(np.float32)
 
         img1 = n1_cpu
         img2 = n2_cpu
 
-        if xp.__name__ != "numpy":
-            img1 = xp.asarray(img1)
-            img2 = xp.asarray(img2)
+        img1 = to_same_device(img1, image)
+        img2 = to_same_device(img2, image)
 
     else:
         raise ValueError(

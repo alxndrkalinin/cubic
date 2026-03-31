@@ -46,6 +46,10 @@ from .iterators import FourierRingIterator, AxialExcludeSectionedFourierShellIte
 
 logger = logging.getLogger(__name__)
 
+_BINOMIAL_SINGLE_REPEAT_MSG = (
+    "Binomial split with n_repeats=1; consider n_repeats>=3 for stability."
+)
+
 
 def _make_repeat_rngs(
     rng: np.random.Generator | int | None, n_repeats: int
@@ -456,9 +460,7 @@ def calculate_frc(
     use_binomial = split_type == "binomial" and single_image
 
     if use_binomial and n_repeats == 1:
-        logger.info(
-            "Binomial split with n_repeats=1; consider n_repeats>=3 for stability."
-        )
+        logger.info(_BINOMIAL_SINGLE_REPEAT_MSG)
 
     if use_binomial and n_repeats > 1:
         # --- Multi-repeat binomial averaging ---
@@ -501,10 +503,13 @@ def calculate_frc(
             all_curves.append(rep_result.correlation["correlation"])
             all_resolutions.append(rep_result.resolution["resolution"])
 
-        # Average curves and compute std
+        # Note: resolution-std is computed from per-repeat resolutions, while the
+        # final resolution comes from analyzing the mean curve. These are different
+        # statistical procedures — std reflects inter-split variability, not
+        # uncertainty in the mean-curve resolution estimate.
         curves_stack = np.array(all_curves)
-        mean_curve = np.mean(curves_stack, axis=0)
-        std_curve = np.std(curves_stack, axis=0)
+        mean_curve = np.nanmean(curves_stack, axis=0)
+        std_curve = np.nanstd(curves_stack, axis=0)
         res_std = float(np.nanstd(all_resolutions))
 
         # Build final result from averaged curve
@@ -1271,6 +1276,18 @@ def fsc_resolution(
         n_repeats: Number of independent binomial splits to average. Only used
                    when split_type="binomial". Default: 1.
         rng: Random number generator, seed, or None for binomial split.
+
+    Returns
+    -------
+    dict[str, float]
+        Resolution values with keys:
+
+        - ``"xy"``: XY resolution in physical units (or index units).
+        - ``"z"``: Z resolution in physical units (or index units).
+        - ``"xy_std"``: Std of XY resolution across repeats (binomial only,
+          0.0 when n_repeats=1).
+        - ``"z_std"``: Std of Z resolution across repeats (binomial only,
+          0.0 when n_repeats=1).
     """
     # Set default zero_padding based on backend
     if zero_padding is None:
@@ -1386,9 +1403,7 @@ def fsc_resolution(
 
     # --- Single pass ---
     if use_binomial and n_repeats == 1:
-        logger.info(
-            "Binomial FSC with n_repeats=1; consider n_repeats>=3 for stability."
-        )
+        logger.info(_BINOMIAL_SINGLE_REPEAT_MSG)
 
     fsc_data = _fsc_hist_compute(
         image1,
@@ -1409,7 +1424,7 @@ def fsc_resolution(
         rng=rng,
     )
 
-    return _fsc_extract_resolution(
+    result = _fsc_extract_resolution(
         fsc_data,
         spacing_list=spacing_list,
         single_image=single_image,
@@ -1420,6 +1435,10 @@ def fsc_resolution(
         z_curve_fit_type=z_curve_fit_type,
         apply_cutoff=split_type == "checkerboard",
     )
+    if use_binomial:
+        result["xy_std"] = 0.0
+        result["z_std"] = 0.0
+    return result
 
 
 def grid_crop_resolution(
