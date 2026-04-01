@@ -54,7 +54,12 @@ _BINOMIAL_SINGLE_REPEAT_MSG = (
 def _make_repeat_rngs(
     rng: np.random.Generator | int | None, n_repeats: int
 ) -> list[np.random.Generator]:
-    """Create deterministic independent RNG states for each repeat."""
+    """Create deterministic independent RNG states for each repeat.
+
+    Note: passing a ``np.random.Generator`` advances its state by drawing
+    *n_repeats* seed integers.  Use an integer seed for fully reproducible
+    results across multiple calls.
+    """
     if isinstance(rng, int):
         ss = np.random.SeedSequence(rng)
         return [np.random.default_rng(s) for s in ss.spawn(n_repeats)]
@@ -133,17 +138,20 @@ def preprocess_images(
             )
     else:
         # Apply padding to second image
-        assert image2 is not None  # guaranteed: single_image is False
+        if image2 is None:
+            raise RuntimeError("image2 must not be None when single_image is False")
         if len(set(image2.shape)) > 1 and zero_padding:
             image2 = pad_image_to_cube(image2, mode=pad_mode)
 
     # Apply Hamming windowing to both images independently
     if not disable_hamming:
         image1 = hamming_window(image1)
-        assert image2 is not None  # always set: either split above or provided
+        if image2 is None:
+            raise RuntimeError("image2 must be set after splitting")
         image2 = hamming_window(image2)
 
-    assert image2 is not None
+    if image2 is None:
+        raise RuntimeError("image2 must be set after preprocessing")
     return image1, image2
 
 
@@ -469,6 +477,14 @@ def calculate_frc(
         warnings.warn(
             f"n_repeats={n_repeats} ignored: only used with "
             f"split_type='binomial' and single-image mode.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if counts_mode != "counts" and not use_binomial:
+        warnings.warn(
+            f"counts_mode={counts_mode!r} ignored: only applies to "
+            f"split_type='binomial' in single-image mode.",
             UserWarning,
             stacklevel=2,
         )
@@ -1317,6 +1333,14 @@ def fsc_resolution(
         warnings.warn(
             f"n_repeats={n_repeats} ignored: only used with "
             f"split_type='binomial' and single-image mode.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if counts_mode != "counts" and not use_binomial:
+        warnings.warn(
+            f"counts_mode={counts_mode!r} ignored: only applies to "
+            f"split_type='binomial' in single-image mode.",
             UserWarning,
             stacklevel=2,
         )

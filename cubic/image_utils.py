@@ -10,6 +10,12 @@ import numpy.typing as npt
 from .cuda import asnumpy, to_same_device, get_array_module
 from .skimage import measure, exposure, transform
 
+# Thresholds for binomial_split calibration warnings
+_FLOAT_NON_INTEGER_FRAC_THRESHOLD = 0.01  # pixel tolerance for integer check
+_FLOAT_NON_INTEGER_WARN_FRACTION = 0.1  # warn if >10% of pixels are non-integer
+_NEGATIVE_ELECTRON_WARN_FRACTION = 0.05  # warn if >5% of pixels go negative
+_CLIPPED_READOUT_WARN_FRACTION = 0.1  # warn if >10% of pixels clipped to 0
+
 
 # image operations assume ZYX channel order
 def image_stats(
@@ -704,8 +710,14 @@ def binomial_split(
         # Warn if float input with default calibration (likely forgot gain/offset)
         if np.issubdtype(image.dtype, np.floating):
             frac_part = np.abs(image - np.rint(image))
-            frac_fraction = float(np.mean(frac_part > 0.01))
-            if frac_fraction > 0.1 and gain == 1.0 and offset == 0.0:
+            frac_fraction = float(
+                np.mean(frac_part > _FLOAT_NON_INTEGER_FRAC_THRESHOLD)
+            )
+            if (
+                frac_fraction > _FLOAT_NON_INTEGER_WARN_FRACTION
+                and gain == 1.0
+                and offset == 0.0
+            ):
                 warnings.warn(
                     f"counts_mode='counts' received float image with "
                     f"{frac_fraction:.0%} non-integer pixels and default "
@@ -719,7 +731,7 @@ def binomial_split(
 
         # Warn if large negative region before clipping (offset not removed)
         neg_fraction = float(np.mean(electrons < -0.5))
-        if neg_fraction > 0.05:
+        if neg_fraction > _NEGATIVE_ELECTRON_WARN_FRACTION:
             warnings.warn(
                 f"{neg_fraction:.0%} of pixels are negative after offset "
                 f"subtraction — check that offset={offset} is correct.",
@@ -749,6 +761,15 @@ def binomial_split(
             half_var = np.float32(readout_noise_rms**2 / 2.0)
             img1 = np.clip(img1 - half_var, 0, None)
             img2 = np.clip(img2 - half_var, 0, None)
+            clipped_fraction = float(np.mean((n1_cpu - half_var) < 0))
+            if clipped_fraction > _CLIPPED_READOUT_WARN_FRACTION:
+                warnings.warn(
+                    f"Readout noise correction clipped {clipped_fraction:.0%} of "
+                    f"pixels to zero — readout_noise_rms={readout_noise_rms} may "
+                    f"be too large for these photon counts.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         # Transfer back to original device if needed
         img1 = to_same_device(img1, image)
