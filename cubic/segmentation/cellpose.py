@@ -2,7 +2,7 @@
 
 import warnings
 
-import numpy.typing as npt
+import numpy as np
 
 try:
     from cellpose import models
@@ -21,13 +21,13 @@ from .segment_utils import (
 
 
 def cellpose_eval(
-    image: npt.ArrayLike,
+    image: np.ndarray,
     model_type: str = "cyto",
     omni: bool = False,
     channels: list[int] | None = None,
     diameter: int | None = None,
     do_3D: bool = True,
-) -> npt.ArrayLike:
+) -> np.ndarray:
     """Run pre-trained Cellpose model and return masks."""
     model = models.Cellpose(gpu=True, model_type=model_type, omni=omni)
     masks, _, _, _ = model.eval(
@@ -49,7 +49,7 @@ def cellpose_segment(
     do_3D: bool = True,
     border_value: int = 100,
     min_size: int = 500,
-) -> npt.ArrayLike:
+) -> np.ndarray:
     """Preprocess image, run Cellpose and postprocessing."""
     if not _CELLPOSE_AVAILABLE:
         raise ImportError(

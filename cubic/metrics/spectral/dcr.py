@@ -308,7 +308,7 @@ def dcr_curve(
         radii, d_curve, k_max = _compute_decorrelation_curve(
             filtered_image,
             num_radii,
-            spacing=spacing_arr if spacing is not None else None,
+            spacing=spacing_list,
             smoothing=smoothing,
             quantize=quantize,
         )
@@ -345,7 +345,7 @@ def dcr_curve(
             radii_ref, d_ref, _ = _compute_decorrelation_curve(
                 filtered,
                 num_radii,
-                spacing=spacing_arr if spacing is not None else None,
+                spacing=spacing_list,
                 smoothing=smoothing,
                 r_min=r_min2,
                 r_max=r_max2,
@@ -383,7 +383,7 @@ def dcr_curve(
 def _compute_decorrelation_curve(
     image: np.ndarray,
     num_radii: int = 100,
-    spacing: np.ndarray | None = None,
+    spacing: Sequence[float] | None = None,
     smoothing: int | None = None,
     r_min: float = 0.0,
     r_max: float = 1.0,
@@ -474,7 +474,7 @@ def _compute_decorrelation_curve_sectioned(
     num_radii: int = 100,
     angle_delta: int = 45,
     bin_delta: int = 1,
-    spacing: np.ndarray | None = None,
+    spacing: Sequence[float] | None = None,
     exclude_axis_angle: float = 0.0,
     smoothing: int | None = None,
     quantize: bool = False,
@@ -497,7 +497,10 @@ def _compute_decorrelation_curve_sectioned(
     # Use max Nyquist so radial bins extend to XY frequencies.
     # Per-sector k_max handles the different normalization for Z vs XY.
     r_edges_raw, radii_raw = radial_edges(
-        shape, bin_delta=bin_delta, spacing=spacing, use_max_nyquist=True
+        shape,
+        bin_delta=bin_delta,
+        spacing=spacing,
+        use_max_nyquist=True,
     )
     n_radial_raw = len(radii_raw)
     r_edges = to_same_device(r_edges_raw, image)
@@ -520,7 +523,7 @@ def _compute_decorrelation_curve_sectioned(
 
     # Get sectioned bin IDs
     radial_id, angle_id = sectioned_bin_id(
-        shape,
+        shape,  # type: ignore[arg-type]
         r_edges,
         angle_edges,
         spacing=list(spacing) if spacing is not None else None,
@@ -581,7 +584,7 @@ def _compute_decorrelation_curve_sectioned(
 def _dcr_curve_3d_sectioned(
     image: np.ndarray,
     *,
-    spacing: np.ndarray | None = None,
+    spacing: Sequence[float] | None = None,
     num_radii: int = 100,
     num_highpass: int = 10,
     angle_delta: int = 45,
@@ -609,20 +612,18 @@ def _dcr_curve_3d_sectioned(
 
     image = _preprocess_dcr_image(image, windowing=windowing)
 
-    spacing_arr = np.array(spacing, dtype=np.float32) if spacing is not None else None
-
     common_kwargs = dict(
         num_radii=num_radii,
         angle_delta=angle_delta,
         bin_delta=bin_delta,
-        spacing=spacing_arr,
+        spacing=spacing,
         exclude_axis_angle=exclude_axis_angle,
         smoothing=smoothing,
         quantize=quantize,
     )
 
     # --- Step 1: Compute d₀ (unfiltered) to anchor sigma range ---
-    d0_results = _compute_decorrelation_curve_sectioned(image, **common_kwargs)
+    d0_results = _compute_decorrelation_curve_sectioned(image, **common_kwargs)  # type: ignore[arg-type]
 
     r0 = {}
     all_peaks: dict[str, list[tuple[float, float]]] = {"xy": [], "z": []}
@@ -673,7 +674,8 @@ def _dcr_curve_3d_sectioned(
     for sigma_hp in all_sigmas:
         filtered_image = _highpass_filter(image, sigma_hp)
         sector_results = _compute_decorrelation_curve_sectioned(
-            filtered_image, **common_kwargs
+            filtered_image,
+            **common_kwargs,  # type: ignore[arg-type]
         )
         for sector_name in ["xy", "z"]:
             radii, d_curve, _ = sector_results[sector_name]
@@ -704,7 +706,7 @@ def _dcr_curve_3d_sectioned(
 
             for sigma_hp in refined_sigmas:
                 filtered = _highpass_filter(image, sigma_hp)
-                sr = _compute_decorrelation_curve_sectioned(filtered, **common_kwargs)
+                sr = _compute_decorrelation_curve_sectioned(filtered, **common_kwargs)  # type: ignore[arg-type]
                 radii, d_curve, _ = sr[sector_name]
                 r_peak, a_peak = _find_peak_in_curve(
                     radii, d_curve, min_amplitude=min_amplitude
@@ -795,11 +797,10 @@ def dcr_curve_3d_sectioned(
         - ``"k_max"`` : float — physical k_max for the sector
     """
     spacing_list = _normalize_spacing(spacing, 3)
-    spacing_arr = np.array(spacing_list, dtype=np.float32) if spacing_list else None
 
-    return _dcr_curve_3d_sectioned(
+    return _dcr_curve_3d_sectioned(  # type: ignore[return-value]
         image,
-        spacing=spacing_arr,
+        spacing=spacing_list,
         num_radii=num_radii,
         num_highpass=num_highpass,
         angle_delta=angle_delta,
@@ -946,9 +947,9 @@ def dcr_resolution(
 
         if use_sectioned:
             # Full 3D analysis with angular sectoring
-            return _dcr_curve_3d_sectioned(
+            return _dcr_curve_3d_sectioned(  # type: ignore[return-value]
                 image,
-                spacing=np.array(spacing_list) if spacing_list else None,
+                spacing=spacing_list,
                 num_radii=num_radii,
                 num_highpass=num_highpass,
                 angle_delta=45,
