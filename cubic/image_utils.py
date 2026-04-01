@@ -762,11 +762,8 @@ def binomial_split(
         n1_cpu = np_rng.poisson(p * rate_cpu).astype(np.float32)
         n2_cpu = np_rng.poisson((1.0 - p) * rate_cpu).astype(np.float32)
 
-        img1 = n1_cpu
-        img2 = n2_cpu
-
-        img1 = to_same_device(img1, image)
-        img2 = to_same_device(img2, image)
+        img1 = to_same_device(n1_cpu, image)
+        img2 = to_same_device(n2_cpu, image)
 
     else:
         raise ValueError(

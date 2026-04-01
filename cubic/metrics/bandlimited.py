@@ -26,7 +26,7 @@ Descloux, A., et al. (2019). Parameter-free image resolution estimation
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -387,7 +387,7 @@ def spectral_weights(
 # 4  Internal filtering helper
 # ---------------------------------------------------------------------------
 
-_APODIZATION_FNS = {
+_APODIZATION_FNS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "tukey": tukey_window,
     "hamming": hamming_window,
 }

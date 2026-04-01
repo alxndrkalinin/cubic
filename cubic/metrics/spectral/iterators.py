@@ -482,7 +482,7 @@ class AxialExcludeSectionedFourierShellIterator(HollowSectionedFourierShellItera
         shape: Iterable[int],
         d_bin: int,
         d_angle: int,
-        d_extract_angle: int = 5,
+        d_extract_angle: int | float = 5,
         spacing: Sequence[float] | None = None,
     ) -> None:
         HollowSectionedFourierShellIterator.__init__(

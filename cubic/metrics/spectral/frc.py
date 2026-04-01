@@ -2,7 +2,7 @@
 
 import logging
 import warnings
-from typing import Literal
+from typing import Any, Literal
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -66,8 +66,8 @@ def _make_repeat_rngs(
     return [np.random.default_rng(s) for s in ss.spawn(n_repeats)]
 
 
-def _empty_aggregate(*args: np.ndarray, **kwargs) -> np.ndarray:
-    """Return unchanged array."""
+def _empty_aggregate(*args: Any, **kwargs: Any) -> Any:
+    """Return unchanged first argument."""
     return args[0]
 
 
@@ -133,14 +133,17 @@ def preprocess_images(
             )
     else:
         # Apply padding to second image
+        assert image2 is not None  # guaranteed: single_image is False
         if len(set(image2.shape)) > 1 and zero_padding:
             image2 = pad_image_to_cube(image2, mode=pad_mode)
 
     # Apply Hamming windowing to both images independently
     if not disable_hamming:
         image1 = hamming_window(image1)
+        assert image2 is not None  # always set: either split above or provided
         image2 = hamming_window(image2)
 
+    assert image2 is not None
     return image1, image2
 
 
@@ -387,6 +390,7 @@ def _calculate_frc_single_pass(
 
     # Average with reverse checkerboard pattern (only for checkerboard single-image)
     if reverse:
+        assert original_image1 is not None  # set above when reverse=True
         image1_rev, image2_rev = preprocess_images(
             original_image1,
             None,
@@ -761,6 +765,7 @@ def calculate_sectioned_fsc(
         rng=rng,
     )
 
+    eff_spacing = spacing if spacing is not None else [1.0] * image1.ndim
     iterator = AxialExcludeSectionedFourierShellIterator(
         image1.shape,
         bin_delta,
@@ -773,7 +778,7 @@ def calculate_sectioned_fsc(
 
     analyzer = FourierCorrelationAnalysis(
         data,
-        spacing[0],
+        eff_spacing[0],
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         snr_value=snr_value,
@@ -847,8 +852,9 @@ def _calculate_fsc_sectioned_hist(
     )
 
     # Get bin IDs
+    shape3d = (shape[0], shape[1], shape[2])
     radial_id, angle_id = sectioned_bin_id(
-        shape,
+        shape3d,
         r_edges,
         angle_edges,
         spacing=spacing,
@@ -1065,6 +1071,7 @@ def _fsc_hist_compute(
 
     # Average with reverse split if enabled (checkerboard only)
     if do_average:
+        assert original_image1 is not None  # set above when do_average=True
         image1_rev, image2_rev = preprocess_images(
             original_image1,
             None,
@@ -1322,6 +1329,9 @@ def fsc_resolution(
         if spacing is None:
             raise ValueError("resample_isotropic=True requires spacing to be provided")
         spacing_list = _normalize_spacing(spacing, image1.ndim)
+        assert (
+            spacing_list is not None
+        )  # guaranteed: spacing is not None (checked above)
         image1, image2, spacing_list, z_factor, original_spacing_z = (
             _resample_isotropic_for_fsc(image1, image2, spacing_list, resample_order)
         )
@@ -1474,6 +1484,7 @@ def grid_crop_resolution(
     aggregate: Callable | None = np.median,
 ) -> dict[str, np.ndarray]:
     """Calculate FRC-based 3D image resolution by tiling and taking 2D slices along XY and XZ."""
+    aggregate_fn: Callable
     if not return_resolution or aggregate is None:
         aggregate_fn = _empty_aggregate
     else:
@@ -1481,13 +1492,16 @@ def grid_crop_resolution(
 
     if isinstance(spacing, (int, float)):
         spacing = [spacing, spacing, spacing]
+    if spacing is None:
+        raise ValueError("spacing is required for grid_crop_resolution")
+    spacing_list: list[float] = list(spacing)
 
-    assert len(image.shape) == 3 and len(spacing) == 3
+    assert len(image.shape) == 3 and len(spacing_list) == 3
     assert image.shape[0] < image.shape[1] and image.shape[0] < image.shape[2]
     assert image.shape[1] > crop_size and image.shape[2] > crop_size
 
-    spacing_xy = (spacing[1], spacing[2])
-    spacing_xz = (spacing[0], spacing[2])
+    spacing_xy = (spacing_list[1], spacing_list[2])
+    spacing_xz = (spacing_list[0], spacing_list[2])
 
     locations = get_xy_block_coords(image.shape, crop_size)
 
@@ -1518,11 +1532,12 @@ def grid_crop_resolution(
 
             xz_slice = loc_image[:, xz_slices[slice_idx], :]
 
-            pad_size = (xz_slice.shape[1] - xz_slice.shape[0]) // 2
+            half = (xz_slice.shape[1] - xz_slice.shape[0]) // 2
             if (xz_slice.shape[1] - xz_slice.shape[0]) % 2 != 0:
-                pad_size = (pad_size + 1, pad_size)
-
-            padded_xz_slice = pad_image(xz_slice, pad_size, 0, pad_mode)
+                pad_arg: int | tuple[int, int] = (half + 1, half)
+            else:
+                pad_arg = half
+            padded_xz_slice = pad_image(xz_slice, pad_arg, 0, pad_mode)
 
             xz_slice_resolutions.append(
                 fsc_resolution(
@@ -1553,6 +1568,7 @@ def five_crop_resolution(
     aggregate: Callable = np.median,
 ) -> dict[str, np.ndarray]:
     """Calculate FRC-based 3D image resolution by taking 2D slices along XY and XZ at 4 corners and the center."""
+    aggregate_fn: Callable
     if not return_resolution or aggregate is None:
         aggregate_fn = _empty_aggregate
     else:
@@ -1560,13 +1576,16 @@ def five_crop_resolution(
 
     if isinstance(spacing, (int, float)):
         spacing = [spacing, spacing, spacing]
+    if spacing is None:
+        raise ValueError("spacing is required for five_crop_resolution")
+    spacing_list: list[float] = list(spacing)
 
-    assert len(image.shape) == 3 and len(spacing) == 3
+    assert len(image.shape) == 3 and len(spacing_list) == 3
     assert image.shape[0] < image.shape[1] and image.shape[0] < image.shape[2]
     assert image.shape[1] > crop_size and image.shape[2] > crop_size
 
-    spacing_xy = (spacing[1], spacing[2])
-    spacing_xz = (spacing[0], spacing[2])
+    spacing_xy = (spacing_list[1], spacing_list[2])
+    spacing_xz = (spacing_list[0], spacing_list[2])
 
     locations = [crop_tl, crop_bl, crop_tr, crop_br, crop_center]
     max_projection_resolutions = []
