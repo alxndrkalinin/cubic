@@ -761,7 +761,7 @@ def binomial_split(
             half_var = np.float32(readout_noise_rms**2 / 2.0)
             img1 = np.clip(img1 - half_var, 0, None)
             img2 = np.clip(img2 - half_var, 0, None)
-            clipped_fraction = float(np.mean((n1_cpu - half_var) < 0))
+            clipped_fraction = float(np.mean(n1_cpu.astype(np.float32) < half_var))
             if clipped_fraction > _CLIPPED_READOUT_WARN_FRACTION:
                 warnings.warn(
                     f"Readout noise correction clipped {clipped_fraction:.0%} of "
