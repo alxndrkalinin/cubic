@@ -513,7 +513,6 @@ def calculate_frc(
                 smoothing_factor=smoothing_factor,
             )
             rep_result = analyzer.execute(z_correction=z_correction)[0]
-            # No cutoff correction for binomial
             all_curves.append(rep_result.correlation["correlation"])
             all_resolutions.append(rep_result.resolution["resolution"])
 
@@ -1330,9 +1329,8 @@ def fsc_resolution(
         if spacing is None:
             raise ValueError("resample_isotropic=True requires spacing to be provided")
         spacing_list = _normalize_spacing(spacing, image1.ndim)
-        assert (
-            spacing_list is not None
-        )  # guaranteed: spacing is not None (checked above)
+        if spacing_list is None:
+            raise RuntimeError("_normalize_spacing returned None with non-None spacing")
         image1, image2, spacing_list, z_factor, original_spacing_z = (
             _resample_isotropic_for_fsc(image1, image2, spacing_list, resample_order)
         )
@@ -1504,9 +1502,16 @@ def grid_crop_resolution(
         raise ValueError("spacing is required for grid_crop_resolution")
     spacing_list: list[float] = list(spacing)
 
-    assert len(image.shape) == 3 and len(spacing_list) == 3
-    assert image.shape[0] < image.shape[1] and image.shape[0] < image.shape[2]
-    assert image.shape[1] > crop_size and image.shape[2] > crop_size
+    if len(image.shape) != 3 or len(spacing_list) != 3:
+        raise ValueError(
+            f"Expected 3D image and 3-element spacing, got shape {image.shape}"
+        )
+    if image.shape[0] >= image.shape[1] or image.shape[0] >= image.shape[2]:
+        raise ValueError(f"Z dimension must be smallest, got shape {image.shape}")
+    if image.shape[1] <= crop_size or image.shape[2] <= crop_size:
+        raise ValueError(
+            f"XY dimensions must exceed crop_size={crop_size}, got shape {image.shape}"
+        )
 
     spacing_xy = (spacing_list[1], spacing_list[2])
     spacing_xz = (spacing_list[0], spacing_list[2])
@@ -1588,9 +1593,16 @@ def five_crop_resolution(
         raise ValueError("spacing is required for five_crop_resolution")
     spacing_list: list[float] = list(spacing)
 
-    assert len(image.shape) == 3 and len(spacing_list) == 3
-    assert image.shape[0] < image.shape[1] and image.shape[0] < image.shape[2]
-    assert image.shape[1] > crop_size and image.shape[2] > crop_size
+    if len(image.shape) != 3 or len(spacing_list) != 3:
+        raise ValueError(
+            f"Expected 3D image and 3-element spacing, got shape {image.shape}"
+        )
+    if image.shape[0] >= image.shape[1] or image.shape[0] >= image.shape[2]:
+        raise ValueError(f"Z dimension must be smallest, got shape {image.shape}")
+    if image.shape[1] <= crop_size or image.shape[2] <= crop_size:
+        raise ValueError(
+            f"XY dimensions must exceed crop_size={crop_size}, got shape {image.shape}"
+        )
 
     spacing_xy = (spacing_list[1], spacing_list[2])
     spacing_xz = (spacing_list[0], spacing_list[2])
