@@ -9,7 +9,7 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.spectral import calculate_frc, fsc_resolution
+from cubic.metrics.spectral import calculate_frc, frc_resolution, fsc_resolution
 from cubic.metrics.spectral.frc import _calibration_factor
 from cubic.metrics.spectral.analysis import (
     FourierCorrelationData,
@@ -604,6 +604,51 @@ def test_fsc_binomial_basic() -> None:
     # At least XY should produce a valid resolution
     assert result["xy"] > 0
     assert np.isfinite(result["xy"])
+
+
+def test_frc_binomial_camera_calibration() -> None:
+    """Camera calibration params (gain, offset, readout_noise_rms) flow through frc_resolution."""
+    rng = np.random.default_rng(77)
+    shape = (128, 128)
+    gain = 2.0
+    offset = 100.0
+    readout_sigma = 3.0
+
+    # Simulate raw camera data: electrons → ADU with gain/offset
+    rate = (
+        150.0
+        * np.exp(
+            -(
+                (np.arange(shape[0])[:, None] - 64) ** 2
+                + (np.arange(shape[1])[None, :] - 64) ** 2
+            )
+            / (2 * 12.0**2)
+        )
+        + 10.0
+    )
+    electrons = rng.poisson(rate)
+    electrons += rng.normal(0, readout_sigma, size=shape).astype(int)
+    img_adu = (electrons * gain + offset).astype(np.float32)
+
+    result = frc_resolution(
+        img_adu,
+        split_type="binomial",
+        counts_mode="counts",
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_sigma,
+        backend="hist",
+        rng=42,
+    )
+    assert result > 0
+    assert np.isfinite(result)
+
+
+def test_counts_mode_warns_without_binomial() -> None:
+    """counts_mode='poisson_thinning' warns when split_type='checkerboard'."""
+    img = _make_poisson_image_2d(seed=5)
+    with pytest.warns(UserWarning, match="counts_mode"):
+        calculate_frc(img, split_type="checkerboard", counts_mode="poisson_thinning")
 
 
 def test_checkerboard_default_unchanged(
