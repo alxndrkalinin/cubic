@@ -1,3 +1,3 @@
 # CLAUDE.md
 
-Read @AGENTS.md file and follow instructions closely.
+Read the @AGENTS.md file and follow its instructions closely.
