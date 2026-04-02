@@ -137,6 +137,17 @@ cpu_array = cp.asnumpy(gpu_array)  # Don't do this - breaks abstraction
 
 **Rationale**: Using `np.` directly allows code to work seamlessly with both NumPy and CuPy arrays through duck typing. This maximizes portability and allows users to port NumPy code in/out with minimal modifications. The `xp` interface should only be used when absolutely necessary for device placement or when NumPy functions don't support CuPy arrays (rare). For device operations, always use `cubic.cuda` functions to maintain the abstraction layer and ensure consistent behavior.
 
+## Commit Workflow
+
+Before running `git commit`, follow these steps every time:
+
+1. **List** all pending changes (`git diff --stat`).
+2. **Group** them by concept — e.g., "device-abstraction cleanup", "input validation", "docstring fixes", "new tests". Each group becomes one commit.
+3. **Plan** the N commits (N ≥ 1) before executing any.
+4. **Stage and commit** each group separately with a focused message.
+
+Never group by workflow step ("plan fixes", "review fixes"). Always group by what the change *is*.
+
 ## Programmatic Checks
 
 Before committing, ensure the following commands succeed from the repository root:

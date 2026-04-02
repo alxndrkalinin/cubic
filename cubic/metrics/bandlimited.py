@@ -26,7 +26,7 @@ Descloux, A., et al. (2019). Parameter-free image resolution estimation
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -389,7 +389,7 @@ def spectral_weights(
 # 4  Internal filtering helper
 # ---------------------------------------------------------------------------
 
-_APODIZATION_FNS = {
+_APODIZATION_FNS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "tukey": tukey_window,
     "hamming": hamming_window,
 }
@@ -637,6 +637,8 @@ def spectral_pcc(
     tail_fraction: float = 0.2,
     cutoff: float | None = None,
     apodization: str = "tukey",
+    nbins_low: int = 0,
+    taper_low: int = 0,
 ) -> float:
     r"""Spectrally-weighted Pearson correlation coefficient.
 
@@ -666,6 +668,13 @@ def spectral_pcc(
         Hard cutoff zeroing bins above this frequency.
     apodization : str
         Window function for edge apodisation.
+    nbins_low : int
+        Number of lowest-frequency bins to zero (DC / background exclusion).
+        Default 0 (include all bins).  Ignored when *taper_low* > 0.
+    taper_low : int
+        Soft low-frequency exclusion: apply a half-cosine ramp from 0 → 1
+        over the first *taper_low* bins.  Takes precedence over *nbins_low*.
+        Default 0 (no taper).
 
     Returns
     -------
@@ -677,6 +686,10 @@ def spectral_pcc(
         raise ValueError(
             f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
         )
+    if nbins_low < 0:
+        raise ValueError(f"nbins_low must be >= 0, got {nbins_low}")
+    if taper_low < 0:
+        raise ValueError(f"taper_low must be >= 0, got {taper_low}")
 
     spacing_seq = _normalize_spacing(spacing, prediction.ndim)
 
@@ -701,6 +714,24 @@ def spectral_pcc(
     )
     noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
     w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
+
+    # Low-frequency exclusion (DC / background / autofluorescence)
+    if taper_low > 0:
+        _n = min(taper_low, len(w_bins))
+        if _n == 1:
+            _ramp = np.array([0.0], dtype=w_bins.dtype)
+        else:
+            _ramp = 0.5 * (
+                1.0 - np.cos(np.pi * np.arange(_n, dtype=np.float32) / (_n - 1))
+            )
+        w_bins[:_n] *= _ramp.astype(w_bins.dtype)
+    elif nbins_low > 0:
+        _nb = min(nbins_low, len(w_bins))
+        w_bins[:_nb] = 0.0
+
+    # Guard: if all weights are zero after exclusion, return 0.0
+    if float(w_bins.max()) == 0.0:
+        return 0.0
 
     # Map per-bin weights → per-voxel weight volume
     edges_cpu, _ = radial_edges(

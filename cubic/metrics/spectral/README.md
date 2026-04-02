@@ -36,6 +36,47 @@ res = dcr_resolution(image_3d, spacing=[0.2, 0.065, 0.065])
 | Super-resolution (STED, PALM) | FSC | DCR may underestimate due to power weighting |
 | Deconvolution stopping criterion | FSC | Smooth convergence tracking (Koho et al. 2019, Fig. 3) |
 
+### Image Splitting Methods
+
+For single-image FRC/FSC, cubic supports two splitting strategies:
+
+| Property | Checkerboard (default) | Binomial (`split_type="binomial"`) |
+|----------|----------------------|-----------------------------------|
+| Output size | Stride-2 subsampled (half per dim) | Same as input |
+| Calibration correction | Yes (diagonal shift) | No |
+| Reverse-split averaging | Yes | N/A (use `n_repeats` instead) |
+| Input requirement | Any image | Photon counts or Poisson rates |
+| Sampling requirement | Adequate oversampling | Any |
+| Uncertainty quantification | Fwd/rev averaging | Repeat M times → curve std |
+
+**When to use which:**
+- **Binomial + counts mode**: Raw camera data with known gain/offset/readout noise. Recommended for data where the checkerboard subsampling may bias high-frequency statistics.
+- **Checkerboard** (default): No calibration available, or compatibility with existing workflows (Koho et al. 2019).
+- **Poisson thinning**: Fallback heuristic for float/deconvolved images — measures self-consistency of a noise model, not physical resolution.
+
+```python
+# Binomial split (raw camera data)
+res = frc_resolution(image_2d, spacing=0.065, split_type="binomial",
+                     gain=2.0, offset=100.0)
+
+# Binomial split with uncertainty (multiple repeats)
+result = calculate_frc(image_2d, spacing=0.065, split_type="binomial",
+                       n_repeats=5, rng=42)
+# result.correlation["correlation-std"]  # per-ring std
+# result.resolution["resolution-std"]    # resolution uncertainty
+
+# 3D FSC with binomial split
+res = fsc_resolution(image_3d, spacing=[0.2, 0.065, 0.065],
+                     split_type="binomial", gain=2.0, offset=100.0)
+```
+
+Note: For deconvolved images, `counts_mode="poisson_thinning"` treats pixel values as
+Poisson rates. The resulting 1FRC measures the effective reproducible bandwidth of the
+processing pipeline, not ground-truth resolution.
+
+**Reference:** Rieger, Droste, Gerritsma, ten Brink, Stallinga. "Single image Fourier
+ring correlation." *Optics Express* 32(12):21767, 2024.
+
 ## Key Parameters
 
 ### FSC

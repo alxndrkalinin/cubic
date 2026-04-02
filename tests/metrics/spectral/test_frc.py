@@ -9,7 +9,7 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.spectral import calculate_frc, fsc_resolution
+from cubic.metrics.spectral import calculate_frc, frc_resolution, fsc_resolution
 from cubic.metrics.spectral.frc import _calibration_factor
 from cubic.metrics.spectral.analysis import (
     FourierCorrelationData,
@@ -411,3 +411,271 @@ def test_backward_compat_shim() -> None:
 
     assert callable(frc_resolution)
     assert callable(fsc_resolution)
+
+
+# ---------- Binomial split FRC/FSC tests ----------
+
+
+def _make_poisson_image_2d(
+    shape: tuple[int, int] = (128, 128),
+    signal_peak: float = 200.0,
+    blob_sigma: float = 10.0,
+    seed: int = 0,
+) -> np.ndarray:
+    """Create a 2D Poisson image with Gaussian blobs for FRC tests."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(
+        np.arange(shape[0]), np.arange(shape[1]), indexing="ij", copy=False
+    )
+    cy, cx = shape[0] // 2, shape[1] // 2
+    rate = signal_peak * np.exp(
+        -((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * blob_sigma**2)
+    )
+    rate += 5.0  # background
+    return rng.poisson(rate).astype(np.float32)
+
+
+def test_frc_binomial_basic() -> None:
+    """Binomial split produces valid FRC with positive resolution."""
+    img = _make_poisson_image_2d(seed=42)
+    result = calculate_frc(
+        img,
+        split_type="binomial",
+        backend="hist",
+        rng=0,
+    )
+    assert result.resolution["resolution"] > 0
+    assert np.isfinite(result.resolution["resolution"])
+    # Should NOT have calibration correction applied
+    # (We don't test the exact value, just that it's valid)
+
+
+def test_frc_binomial_no_calibration() -> None:
+    """Binomial split skips cutoff correction (differs from checkerboard)."""
+    img = _make_poisson_image_2d(seed=1)
+    result_binom = calculate_frc(img, split_type="binomial", backend="hist", rng=10)
+    result_checker = calculate_frc(img, split_type="checkerboard", backend="hist")
+    # Both should produce positive resolution
+    assert result_binom.resolution["resolution"] > 0
+    assert result_checker.resolution["resolution"] > 0
+    # They will differ because checkerboard applies calibration and halves dims
+    assert (
+        result_binom.resolution["resolution"] != result_checker.resolution["resolution"]
+    )
+
+
+def test_frc_binomial_n_repeats() -> None:
+    """n_repeats>1 produces correlation-std and resolution-std."""
+    img = _make_poisson_image_2d(seed=2, signal_peak=500)
+    result = calculate_frc(
+        img,
+        split_type="binomial",
+        backend="hist",
+        n_repeats=5,
+        rng=42,
+    )
+    assert result.correlation["correlation-std"] is not None
+    assert len(result.correlation["correlation-std"]) == len(
+        result.correlation["correlation"]
+    )
+    assert result.resolution["resolution-std"] is not None
+    assert result.resolution["resolution-std"] >= 0
+    assert result.resolution["resolution"] > 0
+
+
+def test_frc_binomial_1frc_vs_2frc() -> None:
+    """1FRC(binomial) ≈ 2FRC(two independent Poisson draws) within tolerance.
+
+    This is a statistical test: we generate two independent Poisson images
+    from the same rate map, compute 2-image FRC, then compare with 1FRC
+    from a single Poisson draw using binomial split.
+    """
+    rng = np.random.default_rng(100)
+    shape = (128, 128)
+    yy, xx = np.meshgrid(
+        np.arange(shape[0]), np.arange(shape[1]), indexing="ij", copy=False
+    )
+    cy, cx = shape[0] // 2, shape[1] // 2
+    rate = 300.0 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 15.0**2)) + 10.0
+
+    # Two independent draws for gold standard 2FRC
+    img_a = rng.poisson(rate).astype(np.float32)
+    img_b = rng.poisson(rate).astype(np.float32)
+
+    res_2frc = calculate_frc(img_a, img_b, backend="hist").resolution["resolution"]
+
+    # Single image 1FRC with binomial split (averaged over repeats)
+    img_single = rng.poisson(rate).astype(np.float32)
+    res_1frc = calculate_frc(
+        img_single,
+        split_type="binomial",
+        backend="hist",
+        n_repeats=10,
+        rng=42,
+    ).resolution["resolution"]
+
+    # They should be in the same ballpark (within 40% relative tolerance)
+    # This is a statistical test, not exact
+    assert abs(res_1frc - res_2frc) / res_2frc < 0.4, (
+        f"1FRC={res_1frc:.4f} vs 2FRC={res_2frc:.4f}"
+    )
+
+
+def test_frc_binomial_readout_noise_plateau() -> None:
+    """Readout noise correction reduces high-frequency FRC plateau bias.
+
+    Flat field + Poisson + Gaussian read noise → without correction the 1FRC
+    has a bias plateau at high-k. With correct readout_noise_rms the plateau
+    should be closer to 0.
+    """
+    rng = np.random.default_rng(200)
+    shape = (128, 128)
+    # Flat field with moderate signal
+    signal = 100.0
+    readout_sigma = 5.0
+    img = rng.poisson(signal, size=shape).astype(np.float64)
+    img += rng.normal(0, readout_sigma, size=shape)
+    img = np.clip(img, 0, None).astype(np.float32)
+
+    # FRC without readout correction
+    result_no_corr = calculate_frc(
+        img,
+        split_type="binomial",
+        backend="hist",
+        n_repeats=5,
+        rng=10,
+    )
+    curve_no_corr = result_no_corr.correlation["correlation"]
+
+    # FRC with readout correction
+    result_with_corr = calculate_frc(
+        img,
+        split_type="binomial",
+        backend="hist",
+        readout_noise_rms=readout_sigma,
+        n_repeats=5,
+        rng=10,
+    )
+    curve_with_corr = result_with_corr.correlation["correlation"]
+
+    # High-frequency tail (last 25% of bins): corrected should be lower
+    n = len(curve_no_corr)
+    tail_no = np.mean(np.abs(curve_no_corr[3 * n // 4 :]))
+    tail_with = np.mean(np.abs(curve_with_corr[3 * n // 4 :]))
+    assert tail_with <= tail_no, (
+        f"Corrected high-freq plateau {tail_with:.3f} should be <= "
+        f"uncorrected {tail_no:.3f}"
+    )
+
+
+def test_fsc_binomial_basic() -> None:
+    """FSC with binomial split returns valid XY/Z resolution."""
+    rng = np.random.default_rng(42)
+    shape = (64, 64, 64)
+    zz, yy, xx = np.meshgrid(
+        np.arange(shape[0]),
+        np.arange(shape[1]),
+        np.arange(shape[2]),
+        indexing="ij",
+        copy=False,
+    )
+    rate = 300.0 * np.exp(
+        -(
+            (zz - 32) ** 2 / (2 * 8.0**2)
+            + (yy - 32) ** 2 / (2 * 8.0**2)
+            + (xx - 32) ** 2 / (2 * 8.0**2)
+        )
+    )
+    rate += 20.0
+    vol = rng.poisson(rate).astype(np.float32)
+
+    # Use physical spacing different from 1.0 to avoid the index-unit ambiguity
+    result = fsc_resolution(
+        vol,
+        spacing=[0.5, 0.5, 0.5],
+        split_type="binomial",
+        counts_mode="counts",
+        backend="hist",
+        angle_delta=45,
+        rng=0,
+    )
+    assert "xy" in result
+    assert "z" in result
+    # At least XY should produce a valid resolution
+    assert result["xy"] > 0
+    assert np.isfinite(result["xy"])
+
+
+def test_frc_binomial_camera_calibration() -> None:
+    """Camera calibration params (gain, offset, readout_noise_rms) flow through frc_resolution."""
+    rng = np.random.default_rng(77)
+    shape = (128, 128)
+    gain = 2.0
+    offset = 100.0
+    readout_sigma = 3.0
+
+    # Simulate raw camera data: electrons → ADU with gain/offset
+    rate = (
+        150.0
+        * np.exp(
+            -(
+                (np.arange(shape[0])[:, None] - 64) ** 2
+                + (np.arange(shape[1])[None, :] - 64) ** 2
+            )
+            / (2 * 12.0**2)
+        )
+        + 10.0
+    )
+    electrons = rng.poisson(rate)
+    electrons += rng.normal(0, readout_sigma, size=shape).astype(int)
+    img_adu = (electrons * gain + offset).astype(np.float32)
+
+    result = frc_resolution(
+        img_adu,
+        split_type="binomial",
+        counts_mode="counts",
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_sigma,
+        backend="hist",
+        rng=42,
+    )
+    assert result > 0
+    assert np.isfinite(result)
+
+
+def test_counts_mode_warns_without_binomial() -> None:
+    """counts_mode='poisson_thinning' warns when split_type='checkerboard'."""
+    img = _make_poisson_image_2d(seed=5)
+    with pytest.warns(UserWarning, match="counts_mode"):
+        calculate_frc(img, split_type="checkerboard", counts_mode="poisson_thinning")
+
+
+def test_checkerboard_default_unchanged(
+    cells_volume: tuple[np.ndarray, list[float]],
+) -> None:
+    """Default checkerboard behavior is unchanged by the new parameters."""
+    volume, spacing = cells_volume
+    slice_2d = _middle_slice(volume)
+    xy_spacing = spacing[1:]
+
+    # Default call (no new params)
+    result_default = calculate_frc(
+        slice_2d, bin_delta=1, spacing=xy_spacing, backend="hist"
+    )
+    # Explicit checkerboard call
+    result_checker = calculate_frc(
+        slice_2d,
+        bin_delta=1,
+        spacing=xy_spacing,
+        backend="hist",
+        split_type="checkerboard",
+    )
+    np.testing.assert_allclose(
+        result_default.correlation["correlation"],
+        result_checker.correlation["correlation"],
+        rtol=1e-10,
+    )
+    assert result_default.resolution["resolution"] == pytest.approx(
+        result_checker.resolution["resolution"], rel=1e-10
+    )
