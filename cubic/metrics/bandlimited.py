@@ -718,7 +718,12 @@ def spectral_pcc(
     # Low-frequency exclusion (DC / background / autofluorescence)
     if taper_low > 0:
         _n = min(taper_low, len(w_bins))
-        _ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(1, _n + 1) / _n))
+        if _n == 1:
+            _ramp = np.array([0.0], dtype=w_bins.dtype)
+        else:
+            _ramp = 0.5 * (
+                1.0 - np.cos(np.pi * np.arange(_n, dtype=np.float32) / (_n - 1))
+            )
         w_bins[:_n] *= _ramp.astype(w_bins.dtype)
     elif nbins_low > 0:
         _nb = min(nbins_low, len(w_bins))
