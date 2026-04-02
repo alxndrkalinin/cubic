@@ -564,6 +564,14 @@ def calculate_frc(
         result = analyzer.execute(z_correction=z_correction)[0]
         result.correlation["correlation-std"] = std_curve
         result.resolution["resolution-std"] = res_std
+
+        # Fallback: if the mean-curve resolution is NaN (e.g. averaged curve
+        # never crosses the threshold), use the mean of per-repeat resolutions.
+        if np.isnan(result.resolution["resolution"]):
+            valid = [r for r in all_resolutions if not np.isnan(r)]
+            if valid:
+                result.resolution["resolution"] = float(np.mean(valid))
+
         return result
 
     # --- Single pass (checkerboard or single binomial) ---
