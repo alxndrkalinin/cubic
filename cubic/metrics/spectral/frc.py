@@ -229,6 +229,7 @@ def _calculate_frc_core(
     *,
     backend: str = "mask",
     spacing: Sequence[float] | None = None,
+    signed: bool = False,
 ) -> FourierCorrelationDataCollection:
     """
     Core FRC calculation logic.
@@ -262,16 +263,19 @@ def _calculate_frc_core(
         Sy2, Ny = reduce_power(fft_image2, bin_id)
         Sxy_re, _ = reduce_cross(fft_image1, fft_image2, bin_id, numerator="real")
 
-        # Compute FRC: abs(Sxy) / sqrt(Sx2 * Sy2) in log domain for stability
+        # Compute FRC in log domain: exp(log|Sxy| - 0.5*(log(Sx2) + log(Sy2)))
+        # Log domain avoids float32 overflow in Sx2 * Sy2.
+        # When signed=True (binomial counts split), preserve the sign of Sxy so
+        # anticorrelated noise at high frequencies is not flipped positive by abs().
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             eps = np.finfo(np.float32).tiny
             Sx2_safe = np.clip(Sx2, eps, None)
             Sy2_safe = np.clip(Sy2, eps, None)
-            Sxy_re_safe = np.clip(np.abs(Sxy_re), eps, None)
+            Sxy_abs = np.clip(np.abs(Sxy_re), eps, None)
 
-            frc = np.exp(
-                np.log(Sxy_re_safe) - 0.5 * (np.log(Sx2_safe) + np.log(Sy2_safe))
-            )
+            frc = np.exp(np.log(Sxy_abs) - 0.5 * (np.log(Sx2_safe) + np.log(Sy2_safe)))
+            if signed:
+                frc = np.where(Sxy_re < 0, -frc, frc)
             frc[frc == np.inf] = 0.0
             frc = np.nan_to_num(frc)
 
@@ -357,6 +361,7 @@ def _calculate_frc_single_pass(
     offset: float,
     readout_noise_rms: float,
     rng: np.random.Generator | int | None,
+    signed: bool = False,
 ) -> FourierCorrelationDataCollection:
     """Run a single FRC pass (split + FFT + radial binning).
 
@@ -393,7 +398,12 @@ def _calculate_frc_single_pass(
             spacing_adj = list(spacing_adj[: image1_proc.ndim])
 
     frc_data = _calculate_frc_core(
-        image1_proc, image2_proc, bin_delta, backend=backend, spacing=spacing_adj
+        image1_proc,
+        image2_proc,
+        bin_delta,
+        backend=backend,
+        spacing=spacing_adj,
+        signed=signed,
     )
 
     # Average with reverse checkerboard pattern (only for checkerboard single-image)
@@ -410,7 +420,11 @@ def _calculate_frc_single_pass(
         )
 
         frc_data_rev = _calculate_frc_core(
-            image1_rev, image2_rev, bin_delta, backend=backend, spacing=spacing_adj
+            image1_rev,
+            image2_rev,
+            bin_delta,
+            backend=backend,
+            spacing=spacing_adj,
         )
 
         frc_data[0].correlation["correlation"] = (
@@ -472,6 +486,9 @@ def calculate_frc(
     spacing = _normalize_spacing(spacing, image1.ndim)
 
     use_binomial = split_type == "binomial" and single_image
+    # Binomial counts split produces anticorrelated noise (n1 + n2 = n).
+    # Use signed FRC so the negative noise correlation is not flipped positive by abs().
+    use_signed = use_binomial and counts_mode == "counts"
 
     if n_repeats > 1 and not use_binomial:
         warnings.warn(
@@ -515,6 +532,7 @@ def calculate_frc(
                 offset=offset,
                 readout_noise_rms=readout_noise_rms,
                 rng=rep_rng,
+                signed=use_signed,
             )
 
             # Analyze this repeat
@@ -591,6 +609,7 @@ def calculate_frc(
         offset=offset,
         readout_noise_rms=readout_noise_rms,
         rng=rng,
+        signed=use_signed,
     )
 
     # Analyze results
