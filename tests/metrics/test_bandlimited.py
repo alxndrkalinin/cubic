@@ -417,6 +417,36 @@ def test_spectral_pcc_shape_mismatch_raises() -> None:
         spectral_pcc(a, b, spacing=0.065)
 
 
+def test_spectral_pcc_nbins_low() -> None:
+    """nbins_low excludes low-frequency bins without crashing."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=8)
+    r0 = spectral_pcc(pred, tgt, spacing=0.065, nbins_low=0)
+    r3 = spectral_pcc(pred, tgt, spacing=0.065, nbins_low=3)
+    assert -1.0 <= r0 <= 1.0
+    assert -1.0 <= r3 <= 1.0
+
+
+def test_spectral_pcc_taper_low() -> None:
+    """taper_low applies soft cosine ramp to low-frequency bins."""
+    pred, tgt, _ = _make_synthetic_pair(noise_sigma=0.5, seed=31)
+    r = spectral_pcc(pred, tgt, spacing=0.065, taper_low=3)
+    assert -1.0 <= r <= 1.0
+
+
+def test_spectral_pcc_negative_nbins_low() -> None:
+    """Negative nbins_low raises ValueError."""
+    a = np.zeros((64, 64), dtype=np.float32)
+    with pytest.raises(ValueError, match="nbins_low"):
+        spectral_pcc(a, a, spacing=0.065, nbins_low=-1)
+
+
+def test_spectral_pcc_negative_taper_low() -> None:
+    """Negative taper_low raises ValueError."""
+    a = np.zeros((64, 64), dtype=np.float32)
+    with pytest.raises(ValueError, match="taper_low"):
+        spectral_pcc(a, a, spacing=0.065, taper_low=-1)
+
+
 # ===================================================================
 # GPU / CPU parity tests
 # ===================================================================
