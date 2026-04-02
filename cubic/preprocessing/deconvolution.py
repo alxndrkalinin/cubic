@@ -298,8 +298,6 @@ def deconv_iter_num_finder(
         raise ValueError(f"Unknown implementation: {implementation}")
 
     for i, result in enumerate(results):
-        iter_image = result["iter_image"]
-        assert isinstance(iter_image, np.ndarray)
-        results[i]["iter_image"] = asnumpy(iter_image)
+        results[i]["iter_image"] = asnumpy(result["iter_image"])
 
     return (thresh_iter, results)
