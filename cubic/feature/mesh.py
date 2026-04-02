@@ -117,7 +117,11 @@ def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
     """Extract surface features from a ``trimesh`` object."""
     axis_len = sorted(mesh.extents)
     intertia_pcs = mesh.principal_inertia_components
-    volume = float(mesh.volume or 0.0)
+    volume = (
+        float(mesh.volume)
+        if mesh.volume is not None and np.isfinite(mesh.volume)
+        else 0.0
+    )
     surface_area = float(mesh.area)
 
     try:

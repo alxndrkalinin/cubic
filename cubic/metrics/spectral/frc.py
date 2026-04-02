@@ -459,7 +459,7 @@ def calculate_frc(
                     and needs no calibration correction.
         counts_mode: For binomial split: "counts" (raw photon counts) or
                      "poisson_thinning" (float/deconvolved fallback).
-        gain: Camera gain (electrons/ADU) for binomial counts mode.
+        gain: Camera gain (ADU/electron) for binomial counts mode.
         offset: Camera offset (ADU) for binomial counts mode.
         readout_noise_rms: Read-noise std in electrons for binomial counts mode.
         n_repeats: Number of independent binomial splits to average. Only used
@@ -1302,7 +1302,7 @@ def fsc_resolution(
                        (matches mask backend Z wedge coverage of ~8% of Fourier space).
         split_type: "checkerboard" (default) or "binomial" (Rieger et al. 2024).
         counts_mode: For binomial split: "counts" or "poisson_thinning".
-        gain: Camera gain (electrons/ADU) for binomial counts mode.
+        gain: Camera gain (ADU/electron) for binomial counts mode.
         offset: Camera offset (ADU) for binomial counts mode.
         readout_noise_rms: Read-noise std in electrons for binomial counts mode.
         n_repeats: Number of independent binomial splits to average. Only used
