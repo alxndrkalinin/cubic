@@ -562,7 +562,7 @@ def test_frc_binomial_readout_noise_plateau() -> None:
     n = len(curve_no_corr)
     tail_no = np.mean(np.abs(curve_no_corr[3 * n // 4 :]))
     tail_with = np.mean(np.abs(curve_with_corr[3 * n // 4 :]))
-    assert tail_with <= tail_no + 0.05, (
+    assert tail_with <= tail_no, (
         f"Corrected high-freq plateau {tail_with:.3f} should be <= "
         f"uncorrected {tail_no:.3f}"
     )
