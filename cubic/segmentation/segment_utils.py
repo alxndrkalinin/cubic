@@ -328,12 +328,11 @@ def segment_watershed(
     # Distance-based watershed (no markers provided)
     if markers is None:
         distance = distance_transform_edt(image)
-        assert isinstance(distance, np.ndarray)  # return_indices=False (default)
         footprint = morphology.ball(ball_size)
-        footprint = to_same_device(footprint, distance)
+        footprint = to_same_device(footprint, distance)  # type: ignore[arg-type]
         coords = feature.peak_local_max(distance, footprint=footprint, labels=image)
 
-        seed_mask = np.zeros(distance.shape, dtype=bool)
+        seed_mask = np.zeros(distance.shape, dtype=bool)  # type: ignore[union-attr]
         seed_mask[tuple(asnumpy(coords).T)] = True
         seed_mask = to_device(seed_mask, device)
         if dilate_seeds:
@@ -342,7 +341,7 @@ def segment_watershed(
             )
         markers = label(seed_mask)
         # watershed is not in cucim — run on CPU, return to original device
-        labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))
+        labels = watershed(-asnumpy(distance), asnumpy(markers), mask=asnumpy(image))  # type: ignore[arg-type]
         return to_device(labels, device)
 
     # Marker-based watershed with explicit mask (shape-based partitioning)
