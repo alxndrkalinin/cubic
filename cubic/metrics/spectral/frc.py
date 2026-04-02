@@ -786,7 +786,7 @@ def calculate_sectioned_fsc(
         image1.shape,
         bin_delta,
         angle_delta,
-        extract_angle_delta,
+        extract_angle_delta,  # type: ignore[arg-type]
         spacing=spacing,
     )
     fsc_task = DirectionalFSC(image1, image2, iterator)
@@ -1089,7 +1089,7 @@ def _fsc_hist_compute(
     if do_average:
         assert original_image1 is not None  # set above when do_average=True
         image1_rev, image2_rev = preprocess_images(
-            original_image1,
+            original_image1,  # type: ignore[arg-type]
             None,
             zero_padding=zero_padding,
             pad_mode=pad_mode,
@@ -1356,7 +1356,7 @@ def fsc_resolution(
         if spacing_list is None:
             raise RuntimeError("_normalize_spacing returned None with non-None spacing")
         image1, image2, spacing_list, z_factor, original_spacing_z = (
-            _resample_isotropic_for_fsc(image1, image2, spacing_list, resample_order)
+            _resample_isotropic_for_fsc(image1, image2, spacing_list, resample_order)  # type: ignore[arg-type]
         )
         spacing = spacing_list
 
@@ -1588,9 +1588,9 @@ def grid_crop_resolution(
         xz_resolutions.append(xz_slice_resolutions)
 
     return {
-        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),
-        "xy": aggregate_fn(xy_resolutions, axis=0),
-        "xz": aggregate_fn(xz_resolutions, axis=0),
+        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),  # type: ignore[arg-type]
+        "xy": aggregate_fn(xy_resolutions, axis=0),  # type: ignore[arg-type]
+        "xz": aggregate_fn(xz_resolutions, axis=0),  # type: ignore[arg-type]
     }
 
 
@@ -1675,9 +1675,9 @@ def five_crop_resolution(
         xz_resolutions.append(xz_slice_resolutions)
 
     return {
-        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),
-        "xy": aggregate_fn(xy_resolutions, axis=0),
-        "xz": aggregate_fn(xz_resolutions, axis=0),
+        "max_projection": aggregate_fn(max_projection_resolutions, axis=0),  # type: ignore[arg-type]
+        "xy": aggregate_fn(xy_resolutions, axis=0),  # type: ignore[arg-type]
+        "xz": aggregate_fn(xz_resolutions, axis=0),  # type: ignore[arg-type]
     }
 
 
