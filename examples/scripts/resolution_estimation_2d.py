@@ -2,14 +2,14 @@
 # coding: utf-8
 
 # ## 2D Resolution Estimation: FRC vs DCR
-# 
+#
 # This notebook demonstrates 2D image resolution estimation using two complementary methods:
-# 
+#
 # - **FRC** (Fourier Ring Correlation) — correlation-based, uses checkerboard splitting of a single image
 # - **DCR** (Decorrelation Analysis) — single-image, parameter-free
-# 
+#
 # We compare results on three real super-resolution microscopy datasets from the original FRC and DCR papers.
-# 
+#
 # **References:**
 # - Koho et al. (2019) "Fourier ring correlation simplifies image restoration in fluorescence microscopy", *Nature Communications* 10:3103.
 # - Descloux et al. (2019) "Parameter-free image resolution estimation based on decorrelation analysis", *Nature Methods* 16:918-924.
@@ -99,7 +99,7 @@ def measure_and_plot(image, spacing, title):
 
 
 # ### Dataset 1 — Tubulin STED (Koho et al. 2019, Figure 3)
-# 
+#
 # Fixed cell with microtubule cytoskeleton stained with Star635, imaged on an
 # Abberior Instruments Expert Line STED system: 633 nm excitation, 100x/1.4
 # (UPLSAPO100XO) objective. Part of a pixel-size gradient series (29–113 nm);
@@ -141,7 +141,7 @@ tubulin_frc_res, tubulin_dcr_res = measure_and_plot(
 
 
 # ### Dataset 2 — Vimentin STED (Koho et al. 2019)
-# 
+#
 # Fixed cell with intermediate filaments (vimentin) cytoskeleton stained with
 # Star635, imaged on an Abberior Instruments Expert Line STED system: 633 nm
 # excitation, 100x/1.4 (UPLSAPO100XO) objective. Part of the same pixel-size
@@ -184,7 +184,7 @@ vimentin_frc_res, vimentin_dcr_res = measure_and_plot(
 
 
 # ### Dataset 3 — COS7 STED (Descloux et al. 2019, Figure 2c)
-# 
+#
 # STED image of alpha-tubulin in COS7 cells labeled with Abberior STAR 635P.
 # Acquired on a Leica TCS SP8 STED 3X with HC PL APO CS2 100x/1.40 OIL objective:
 # 634 nm excitation (11.2 µW), 775 nm STED depletion (201.5 mW), HyD detector
@@ -223,4 +223,3 @@ sted_frc_res, sted_dcr_res = measure_and_plot(
     sted_spacing,
     "COS7 STED (Descloux et al. 2019, 15 nm pixel)",
 )
-

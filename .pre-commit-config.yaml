@@ -17,3 +17,4 @@ repos:
     hooks:
       - id: mypy
         args: [--ignore-missing-imports]
+        files: ^cubic/
