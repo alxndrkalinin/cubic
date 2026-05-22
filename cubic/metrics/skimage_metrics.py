@@ -6,19 +6,32 @@ from collections.abc import Callable
 
 import numpy as np
 
-from ..cuda import asnumpy, _is_torch_tensor, check_same_device
+from ..cuda import CUDAManager, asnumpy, _is_torch_tensor, check_same_device
 from ..skimage import metrics, morphology
 
 
 def _canonicalize_torch(*arrays: Any) -> tuple[Any, ...]:
-    """Materialize torch.Tensor inputs as host NumPy arrays.
+    """Convert torch.Tensor inputs to the appropriate array type.
 
     Non-torch inputs (NumPy/CuPy) are passed through unchanged so GPU
-    acceleration via CuPy/cuCIM is preserved. Torch CUDA tensors are
-    moved to host because the downstream skimage primitives do not
-    accept torch tensors directly.
+    acceleration via CuPy/cuCIM is preserved.
+
+    For torch tensors:
+    - CUDA tensor + CuPy available → ``cupy.asarray`` zero-copy via
+      ``__cuda_array_interface__``. Computation stays on GPU.
+    - CPU tensor or no CuPy → ``asnumpy`` (host NumPy).
     """
-    return tuple(asnumpy(a) if _is_torch_tensor(a) else a for a in arrays)
+    cp = CUDAManager().get_cp()
+    result = []
+    for a in arrays:
+        if _is_torch_tensor(a):
+            if cp is not None and a.device.type == "cuda":  # type: ignore[attr-defined]
+                result.append(cp.asarray(a))
+            else:
+                result.append(asnumpy(a))
+        else:
+            result.append(a)
+    return tuple(result)
 
 
 def _min_max_to_unit(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:

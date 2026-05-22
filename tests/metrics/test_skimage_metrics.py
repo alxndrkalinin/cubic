@@ -202,6 +202,26 @@ def test_ssim_spatial_dims_rejects_mask() -> None:
         ssim(a, a, spatial_dims=2, mask=m)
 
 
+def test_torch_cuda_tensor_routes_to_cupy_not_numpy(gpu_available) -> None:
+    """Torch CUDA tensor is converted to cupy (not numpy) by _canonicalize_torch.
+
+    Previously the decorator used ``asnumpy`` unconditionally, causing a
+    pointless GPU→CPU transfer for metrics that are cupy/cucim-capable.
+    With CuPy available, a CUDA tensor should stay on GPU as a cupy view.
+    """
+    torch = pytest.importorskip("torch")
+    if not gpu_available or not torch.cuda.is_available():
+        pytest.skip("GPU not available")
+    import cupy as cp
+
+    from cubic.metrics.skimage_metrics import _canonicalize_torch
+
+    t = torch.ones(4, 4, dtype=torch.float32).cuda()
+    (out,) = _canonicalize_torch(t)
+    assert isinstance(out, cp.ndarray), f"expected cupy.ndarray, got {type(out)}"
+    assert out.data.ptr == t.data_ptr(), "expected zero-copy view (same GPU pointer)"
+
+
 def test_ssim_accepts_cpu_torch_tensor() -> None:
     """A CPU torch.Tensor is auto-canonicalized to NumPy by the decorator."""
     torch = pytest.importorskip("torch")
