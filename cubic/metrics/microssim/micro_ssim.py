@@ -12,8 +12,8 @@ from typing import Any, cast
 
 import numpy as np
 
-from .ri_factor import get_ri_factor
-from .ssim_elements import SSIMElements, compute_ssim_elements
+from .ri_factor import get_global_ri_factor
+from .ssim_elements import compute_ssim_elements
 from .image_processing import (
     normalize_min_max,
     compute_norm_parameters,
@@ -144,40 +144,12 @@ class MicroSSIM:
             gt_norm = gt_norm[None]
             pred_norm = pred_norm[None]
 
-        # Upstream-faithful per-slice elements: each slice gets its own
-        # data_range; C1, C2 come from the LAST slice (ri_factor.py:123-131).
-        # gaussian_weights=False, win_size=7 is the fit-time path (matches
-        # upstream's get_global_ri_factor call at ri_factor.py:89).
-        ux_l, uy_l, vxy_l, vx_l, vy_l = [], [], [], [], []
-        c1_last: float = 0.0
-        c2_last: float = 0.0
-        for i in range(gt_norm.shape[0]):
-            dr = float(gt_norm[i].max() - gt_norm[i].min())
-            e_i = compute_ssim_elements(
-                gt_norm[i],
-                pred_norm[i],
-                data_range=dr,
-                gaussian_weights=False,
-                win_size=7,
-                crop=True,
-            )
-            ux_l.append(e_i.ux.ravel())
-            uy_l.append(e_i.uy.ravel())
-            vxy_l.append(e_i.vxy.ravel())
-            vx_l.append(e_i.vx.ravel())
-            vy_l.append(e_i.vy.ravel())
-            c1_last, c2_last = e_i.C1, e_i.C2
-
-        pooled = SSIMElements(
-            ux=np.concatenate(ux_l),
-            uy=np.concatenate(uy_l),
-            vxy=np.concatenate(vxy_l),
-            vx=np.concatenate(vx_l),
-            vy=np.concatenate(vy_l),
-            C1=c1_last,
-            C2=c2_last,
-        )
-        self._ri_factor = get_ri_factor(pooled)
+        # Upstream-faithful per-slice elements + pooled RI fit: each slice
+        # gets its own data_range; C1, C2 come from the LAST slice
+        # (ri_factor.py:123-131). gaussian_weights=False, win_size=7,
+        # crop=True is the fit-time path — these are the defaults of
+        # get_global_ri_factor (matches upstream ri_factor.py:89).
+        self._ri_factor = get_global_ri_factor(gt_norm, pred_norm)
         self._initialized = True
         return self
 

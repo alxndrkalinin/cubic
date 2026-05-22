@@ -27,6 +27,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import cubic.scipy as _sp
+import cubic.skimage as _sk
+
 from ...cuda import check_same_device
 
 
@@ -222,8 +225,6 @@ def compute_ssim_elements(
     # proxies so CPU vs GPU dispatch is automatic.
     ndim = image1.ndim
     if gaussian_weights:
-        import cubic.skimage as _sk
-
         sigma_axes = (0.0,) * (ndim - 2) + (float(sigma), float(sigma))
 
         def _filter(arr: np.ndarray) -> np.ndarray:
@@ -231,8 +232,6 @@ def compute_ssim_elements(
                 arr, sigma=sigma_axes, truncate=truncate, mode="reflect"
             )
     else:
-        import cubic.scipy as _sp
-
         size_axes = (1,) * (ndim - 2) + (int(win_size), int(win_size))
 
         def _filter(arr: np.ndarray) -> np.ndarray:

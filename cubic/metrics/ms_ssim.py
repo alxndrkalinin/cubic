@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import numpy as np
 
+import cubic.skimage as _sk
+
 from ..cuda import check_same_device
 
 DEFAULT_BETAS: tuple[float, ...] = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)
@@ -114,8 +116,6 @@ def _torchmetrics_ssim_update(
     pad_widths = [(0, 0)] * (image1.ndim - 2) + [(pad, pad), (pad, pad)]
     i1p = np.pad(image1, pad_widths, mode="reflect")
     i2p = np.pad(image2, pad_widths, mode="reflect")
-
-    import cubic.skimage as _sk
 
     sigma_axes = (0.0,) * (i1p.ndim - 2) + (float(sigma), float(sigma))
 
