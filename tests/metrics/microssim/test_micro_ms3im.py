@@ -150,3 +150,25 @@ def test_convenience_list_input_returns_list():
     out = micro_multiscale_structural_similarity(gt_list, pred_list)
     assert isinstance(out, list)
     assert len(out) == 3
+
+
+# --- GPU dispatch ----------------------------------------------------------
+
+
+def test_xp_dispatch():
+    """End-to-end fit+score on CuPy input matches the NumPy result.
+
+    Exercises MicroMS3IM's full pipeline (compute_norm_parameters,
+    normalize_min_max, compute_ssim_elements, get_global_ri_factor,
+    ms_ssim) through cubic's device-agnostic dispatch on a CuPy array.
+    Auto-skips on CPU-only hosts via ``pytest.importorskip``.
+    """
+    cp = pytest.importorskip("cupy")
+    gt, pred = _seeded_data()
+    score_np = MicroMS3IM().fit(gt, pred).score(gt[0], pred[0])
+
+    gt_cp, pred_cp = cp.asarray(gt), cp.asarray(pred)
+    m3_cp = MicroMS3IM().fit(gt_cp, pred_cp)
+    score_cp = m3_cp.score(gt_cp[0], pred_cp[0])
+
+    assert abs(float(score_np) - float(score_cp)) < 1e-4
