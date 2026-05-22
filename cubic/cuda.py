@@ -55,8 +55,29 @@ class CUDAManager:
         return self.num_gpus
 
 
+def _is_torch_tensor(array: Any) -> bool:
+    """Return True if ``array`` is a torch.Tensor.
+
+    Uses a lazy import: returns False when torch is not installed so the
+    cubic runtime never hard-depends on torch.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+    return isinstance(array, torch.Tensor)
+
+
 def get_device(array: np.ndarray) -> str:
-    """Return current image device."""
+    """Return current image device.
+
+    Recognizes:
+    - NumPy arrays → "CPU".
+    - CuPy arrays (with ``device`` attribute) → "GPU".
+    - torch.Tensor → "GPU" iff ``tensor.device.type == "cuda"``, else "CPU".
+    """
+    if _is_torch_tensor(array):
+        return "GPU" if array.device.type == "cuda" else "CPU"  # type: ignore[attr-defined]
     cp = CUDAManager().get_cp()
     if cp is not None and hasattr(array, "device") and array.device != "cpu":
         return "GPU"
@@ -104,7 +125,16 @@ def get_array_module(array: np.ndarray) -> ModuleType:
 
 
 def asnumpy(array: np.ndarray) -> np.ndarray:
-    """Move (or keep) array to CPU."""
+    """Move (or keep) array to CPU.
+
+    Recognizes:
+    - NumPy arrays → returned as-is.
+    - CuPy arrays → moved via ``cupy.asnumpy``.
+    - torch.Tensor → moved via ``.detach().cpu().numpy()`` (zero-copy
+      when already on CPU).
+    """
+    if _is_torch_tensor(array):
+        return array.detach().cpu().numpy()  # type: ignore[attr-defined]
     cp = CUDAManager().get_cp()
     if isinstance(array, np.ndarray):
         return np.asarray(array)
@@ -118,7 +148,16 @@ def asnumpy(array: np.ndarray) -> np.ndarray:
 
 
 def ascupy(array: np.ndarray) -> object:
-    """Move (or keep) array to GPU."""
+    """Move (or keep) array to GPU.
+
+    For torch CUDA tensors and other CUDA Array Interface (CAI) producers,
+    ``cupy.asarray`` returns a zero-copy view that shares storage with the
+    source. Callers should treat the returned array as read-only: cubic
+    metrics never mutate their inputs (verified by
+    ``tests/test_cuda.py::test_metrics_do_not_mutate_input``); third-party
+    code that wants to write into the GPU buffer should explicitly copy
+    with ``cp.array(x, copy=True)`` first.
+    """
     cp = CUDAManager().get_cp()
     if cp is not None:
         return cp.asarray(array)
