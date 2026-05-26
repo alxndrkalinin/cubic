@@ -187,6 +187,27 @@ def test_ri_factor_without_norm_params_raises():
         MicroMS3IM(ri_factor=0.9)
 
 
+def test_alpha_caps_propagate_through_inheritance():
+    """Alpha caps inherit through ``MicroMS3IM`` and reach fit-time.
+
+    No ``MicroMS3IM.__init__`` override exists, so this test pins the
+    contract that ``alpha_min`` / ``alpha_max`` work uniformly across
+    the class hierarchy (constructor validation + fit forwarding).
+    """
+    # Eager validation propagates through inheritance.
+    with pytest.raises(ValueError, match="alpha_max"):
+        MicroMS3IM(alpha_max=0.5)
+    with pytest.raises(ValueError, match="alpha_min"):
+        MicroMS3IM(alpha_min=1.5)
+
+    # Heavy down-scaled fit fails cleanly when alpha_max is below the optimum.
+    rng = np.random.default_rng(12)
+    gt = rng.random((3, _H, _W)).astype(np.float64)
+    pred = gt * 1e-4
+    with pytest.raises(RuntimeError, match="failed to bracket on the right"):
+        MicroMS3IM(alpha_max=1e3).fit(gt, pred)
+
+
 # --- GPU dispatch ----------------------------------------------------------
 
 

@@ -461,3 +461,48 @@ def test_global_ri_factor_rejects_bad_alpha_min_before_per_slice_pass() -> None:
     for bad in (0.0, 1.0, -0.5, 2.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="alpha_min"):
             get_global_ri_factor(gt, pred, alpha_min=bad)
+
+
+# -- Bracket boundary: cap probed once before raising ----------------------
+
+
+def test_alpha_max_cap_probed_when_loop_overshoots() -> None:
+    """``alpha_max`` itself is probed once when the powers-of-2 schedule overshoots.
+
+    Setup: ``pred = gt * 0.833`` puts ``alpha*`` near ``1.2``; with
+    ``alpha_max = 1.5``, the doubling loop's first probe ``alpha = 2.0``
+    already overshoots ``alpha_max`` and the loop exits without entering
+    its body. Pre-fix, this raised ``RuntimeError`` despite a root
+    existing in ``(1, 1.5]``. Post-fix, the cap probe at ``1.5`` covers
+    the gap and the bracket succeeds.
+    """
+    rng = np.random.default_rng(30)
+    gt = rng.random((48, 48)).astype(np.float64)
+    pred = gt * 0.833  # alpha* ~ 1.2 (between 1.0 and the first would-be probe at 2.0)
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements, alpha_max=1.5)
+    assert np.isfinite(alpha)
+    assert 1.0 <= alpha <= 1.5, f"expected root in [1.0, 1.5]; got {alpha}"
+
+
+def test_alpha_min_cap_probed_when_loop_undershoots() -> None:
+    """Mirror: ``alpha_min`` itself is probed once when halving undershoots.
+
+    ``pred = gt * 1.2`` puts ``alpha*`` near ``0.833``; with
+    ``alpha_min = 0.6``, the halving loop's first probe ``alpha = 0.5``
+    already undershoots ``alpha_min``. Pre-fix this raised; post-fix the
+    cap probe at ``0.6`` covers the gap.
+    """
+    rng = np.random.default_rng(31)
+    gt = rng.random((48, 48)).astype(np.float64)
+    pred = gt * 1.2  # alpha* ~ 0.833 (between 0.5 and 1.0)
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements, alpha_min=0.6)
+    assert np.isfinite(alpha)
+    assert 0.6 <= alpha <= 1.0, f"expected root in [0.6, 1.0]; got {alpha}"

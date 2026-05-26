@@ -210,6 +210,14 @@ def _bracket_root(
                 return lo, alpha, f_lo, f_alpha
             lo, f_lo = alpha, f_alpha
             alpha *= 2.0
+        # Powers-of-2 schedule could miss a root in (lo, alpha_max] when
+        # alpha_max isn't itself a power of 2 (e.g., default 1e6 →
+        # last probe is 2**19 = 524288). Probe alpha_max itself before
+        # giving up so the full requested interval is actually covered.
+        if lo < alpha_max:
+            f_cap = _compute_dS_mean(alpha_max, elements)
+            if f_cap <= 0.0:
+                return lo, alpha_max, f_lo, f_cap
         raise RuntimeError(
             "RI factor failed to bracket on the right; input may violate "
             f"fit assumptions or alpha_max={alpha_max} is too small. "
@@ -224,6 +232,13 @@ def _bracket_root(
             return alpha, hi, f_alpha, f_hi
         hi, f_hi = alpha, f_alpha
         alpha *= 0.5
+    # Mirror of the right-side fix: probe alpha_min itself before giving
+    # up so a root in [alpha_min, hi) isn't missed by the powers-of-2
+    # schedule.
+    if hi > alpha_min:
+        f_floor = _compute_dS_mean(alpha_min, elements)
+        if f_floor >= 0.0:
+            return alpha_min, hi, f_floor, f_hi
     raise RuntimeError(
         "RI factor failed to bracket on the left; input may violate "
         f"fit assumptions or alpha_min={alpha_min} is too large. "
@@ -265,11 +280,11 @@ def get_ri_factor(
         calibration sets, heavily mis-normalized predictions).
 
         Note: bracket probes are powers of 2 starting at 2 (rightward) or
-        0.5 (leftward). The extreme probed values are therefore the
-        nearest powers of 2 not exceeding ``alpha_max`` / not falling
-        below ``alpha_min`` (e.g., ``2**19 = 524288`` for
-        ``alpha_max = 1e6`` and ``2**-20 ~= 9.5e-7`` for
-        ``alpha_min = 1e-6``).
+        0.5 (leftward); if the schedule overshoots ``alpha_max`` /
+        undershoots ``alpha_min`` without finding a sign change, the cap
+        itself is probed once before raising so a root in
+        ``(last_probe, alpha_max]`` (or ``[alpha_min, last_probe)``) is
+        not missed.
 
     Returns
     -------
