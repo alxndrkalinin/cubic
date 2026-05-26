@@ -238,6 +238,27 @@ def test_alpha_max_degenerate_raises_at_construction():
         MicroSSIM(alpha_max=float("inf"))
 
 
+def test_alpha_min_constructor_propagates_to_fit():
+    """High ``alpha_min`` on the constructor surfaces as a fit-time RuntimeError.
+
+    Heavy up-scaled input (alpha* well below 1e-3); the bumped default
+    ``alpha_min=1e-6`` would handle this, but an explicit high floor must
+    fail loudly instead of silently clipping.
+    """
+    rng = np.random.default_rng(21)
+    gt = rng.random((3, 64, 64)).astype(np.float64)
+    pred = gt * 1e5
+    with pytest.raises(RuntimeError, match="failed to bracket on the left"):
+        MicroSSIM(alpha_min=1e-3).fit(gt, pred)
+
+
+def test_alpha_min_degenerate_raises_at_construction():
+    """``alpha_min`` outside ``(0, 1)`` is rejected eagerly in ``__init__``."""
+    for bad in (0.0, 1.0, -1.0, 1.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="alpha_min"):
+            MicroSSIM(alpha_min=bad)
+
+
 # --- pinned ri_factor (external calibration) -------------------------------
 
 

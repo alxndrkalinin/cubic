@@ -12,7 +12,12 @@ from typing import Any, cast
 
 import numpy as np
 
-from .ri_factor import ALPHA_MAX_DEFAULT, get_global_ri_factor
+from .ri_factor import (
+    ALPHA_MAX_DEFAULT,
+    ALPHA_MIN_DEFAULT,
+    get_global_ri_factor,
+    _validate_alpha_bounds,
+)
 from .ssim_elements import compute_ssim_elements
 from .image_processing import (
     normalize_min_max,
@@ -45,6 +50,9 @@ class MicroSSIM:
         Use this to pin ``alpha`` from an external calibration (e.g.
         load a per-(model, organelle) RI factor fit once and reuse it
         across all evaluation calls).
+    alpha_min : float, default=:data:`ALPHA_MIN_DEFAULT` (``1e-6``)
+        Lower bracket cap forwarded to :func:`get_global_ri_factor` during
+        ``fit()``. Has no effect when ``ri_factor`` is supplied directly.
     alpha_max : float, default=:data:`ALPHA_MAX_DEFAULT` (``1e6``)
         Upper bracket cap forwarded to :func:`get_global_ri_factor` during
         ``fit()``. Has no effect when ``ri_factor`` is supplied directly.
@@ -53,7 +61,8 @@ class MicroSSIM:
     ------
     ValueError
         If ``ri_factor`` is provided but any of the normalization
-        parameters is missing (matches upstream ``micro_ssim.py:270-279``).
+        parameters is missing (matches upstream ``micro_ssim.py:270-279``),
+        or if ``alpha_min`` / ``alpha_max`` are out of range.
     """
 
     def __init__(
@@ -64,15 +73,16 @@ class MicroSSIM:
         max_val: float | None = None,
         ri_factor: float | None = None,
         *,
+        alpha_min: float = ALPHA_MIN_DEFAULT,
         alpha_max: float = ALPHA_MAX_DEFAULT,
     ) -> None:
-        if not (np.isfinite(alpha_max) and alpha_max > 1.0):
-            raise ValueError(f"alpha_max must be a finite float > 1; got {alpha_max}")
+        _validate_alpha_bounds(alpha_min, alpha_max)
         self._bg_percentile = bg_percentile
         self._offset_pred = offset_pred
         self._offset_gt = offset_gt
         self._max_val = max_val
         self._ri_factor = ri_factor
+        self._alpha_min = alpha_min
         self._alpha_max = alpha_max
         self._initialized = ri_factor is not None
         if self._initialized and any(
@@ -161,7 +171,10 @@ class MicroSSIM:
         # crop=True is the fit-time path — these are the defaults of
         # get_global_ri_factor (matches upstream ri_factor.py:89).
         self._ri_factor = get_global_ri_factor(
-            gt_norm, pred_norm, alpha_max=self._alpha_max
+            gt_norm,
+            pred_norm,
+            alpha_min=self._alpha_min,
+            alpha_max=self._alpha_max,
         )
         self._initialized = True
         return self
@@ -242,10 +255,11 @@ class MicroSSIM:
         Notes
         -----
         The key set intentionally mirrors upstream ``MicroSSIM``. The
-        cubic-only ``alpha_max`` knob is **not** round-tripped here — a
-        ``MicroSSIM(**ms.get_parameters())`` re-instantiation reverts
-        ``alpha_max`` to :data:`ALPHA_MAX_DEFAULT`. Save it separately if
-        a non-default cap is part of your configuration.
+        cubic-only ``alpha_min`` / ``alpha_max`` knobs are **not**
+        round-tripped here — a ``MicroSSIM(**ms.get_parameters())``
+        re-instantiation reverts them to :data:`ALPHA_MIN_DEFAULT` /
+        :data:`ALPHA_MAX_DEFAULT`. Save them separately if non-default
+        caps are part of your configuration.
         """
         return {
             "bg_percentile": self._bg_percentile,
