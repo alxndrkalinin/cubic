@@ -74,9 +74,10 @@ def test_constant_gt_noisy_pred_no_silent_nan() -> None:
 
     With gt constant, ``ux*uy != 0`` but ``vx == vxy == 0`` (or nearly so);
     ``vy`` is small but positive. Empirically the derivative still changes
-    sign inside ``[1e-3, 1e3]`` for this configuration, so we accept either
-    a finite positive ``alpha*`` (with the ascent invariant satisfied) or a
-    clean ``RuntimeError`` from bracket failure — never a silent NaN / inf.
+    sign inside the default bracket window for this configuration, so we
+    accept either a finite positive ``alpha*`` (with the ascent invariant
+    satisfied) or a clean ``RuntimeError`` from bracket failure — never a
+    silent NaN / inf.
     """
     rng = np.random.default_rng(2)
     gt = np.full((16, 16), 5.0, dtype=np.float64)
@@ -96,11 +97,12 @@ def test_constant_gt_noisy_pred_no_silent_nan() -> None:
 
 
 def test_extreme_scaling_bracket_failure() -> None:
-    """Heavy uniform scaling pushes the optimum below the bracket floor.
+    """Tight ``alpha_min`` raises cleanly when the optimum falls below it.
 
-    ``pred = 1e5 * gt`` puts the optimum at alpha ~ 1e-5, well below the
-    bracket cap ``_ALPHA_MIN = 1e-3``. Verifies the bisection raises a clean
-    ``RuntimeError`` instead of converging to a nonsensical value or NaN.
+    ``pred = 1e5 * gt`` puts the optimum at alpha ~ 1e-5. With an explicit
+    ``alpha_min = 1e-3`` (the pre-PR default), the bracket cannot reach
+    the optimum and raises a clean ``RuntimeError`` instead of converging
+    to a nonsensical value or NaN.
     """
     rng = np.random.default_rng(10)
     gt = rng.random((32, 32)).astype(np.float64)
@@ -110,7 +112,7 @@ def test_extreme_scaling_bracket_failure() -> None:
         gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
     )
     with pytest.raises(RuntimeError, match="RI factor failed to bracket"):
-        get_ri_factor(elements)
+        get_ri_factor(elements, alpha_min=1e-3)
 
 
 def test_all_zero_pred_no_silent_nan() -> None:
@@ -194,7 +196,7 @@ def test_bisection_terminates_quickly() -> None:
     # accidentally already satisfies |f(1)| ~ 0.
     if abs(f1) < 1e-14:
         pytest.skip("f(1) already at machine zero; iter count not meaningful")
-    lo, hi, f_lo, f_hi = _bracket_root(flat, f1)
+    lo, hi, f_lo, f_hi = _bracket_root(flat, f1, alpha_min=1e-3, alpha_max=1e3)
 
     iters = 0
     mid = 0.5 * (lo + hi)
@@ -301,3 +303,206 @@ def test_global_ri_factor_rejects_ndim_4() -> None:
     pred = np.zeros((2, 3, 32, 32))
     with pytest.raises(ValueError, match="ndim"):
         get_global_ri_factor(gt, pred)
+
+
+# -- alpha_max kwarg --------------------------------------------------------
+
+
+def test_alpha_max_below_one_raises() -> None:
+    """``alpha_max <= 1`` is degenerate (bracket starts at 1) — must raise."""
+    rng = np.random.default_rng(11)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt.copy()
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    with pytest.raises(ValueError, match="alpha_max"):
+        get_ri_factor(elements, alpha_max=1.0)
+    with pytest.raises(ValueError, match="alpha_max"):
+        get_ri_factor(elements, alpha_max=0.5)
+
+
+def test_alpha_max_default_lifts_right_bracket() -> None:
+    """Heavy down-scaling (alpha* ~ 1e4) now succeeds at the default cap.
+
+    With the old ``alpha_max = 1e3`` default this would have raised
+    ``RuntimeError("RI factor failed to bracket on the right ...")``;
+    the bumped default (``1e6``) keeps the fit working on this case.
+    """
+    rng = np.random.default_rng(12)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt * 1e-4  # optimum sits near alpha ~ 1e4
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements)  # default alpha_max=1e6
+    assert np.isfinite(alpha)
+    assert alpha > 1e3  # would have hit the old 1e3 cap
+
+
+def test_alpha_max_below_optimum_raises() -> None:
+    """Explicit low cap forces a clean bracket failure (no silent clip).
+
+    Same heavy down-scaling input as the previous test; passing
+    ``alpha_max=1e3`` reproduces the failure mode of the old default.
+    """
+    rng = np.random.default_rng(12)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt * 1e-4
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    with pytest.raises(RuntimeError, match="failed to bracket on the right"):
+        get_ri_factor(elements, alpha_max=1e3)
+
+
+def test_global_ri_factor_forwards_alpha_max() -> None:
+    """``get_global_ri_factor`` forwards ``alpha_max`` to ``get_ri_factor``.
+
+    Same heavy down-scaled stack used for the unit test; explicit low cap
+    must propagate and raise.
+    """
+    rng = np.random.default_rng(12)
+    gt = rng.random((3, 32, 32)).astype(np.float64)
+    pred = gt * 1e-4
+    with pytest.raises(RuntimeError, match="failed to bracket on the right"):
+        get_global_ri_factor(gt, pred, alpha_max=1e3)
+    # Default cap recovers a finite positive alpha.
+    alpha = get_global_ri_factor(gt, pred)
+    assert np.isfinite(alpha) and alpha > 1e3
+
+
+def test_global_ri_factor_rejects_bad_alpha_max_before_per_slice_pass() -> None:
+    """``get_global_ri_factor`` validates ``alpha_max`` before the element loop.
+
+    A bad ``alpha_max`` should surface immediately, not after N expensive
+    ``compute_ssim_elements`` calls. Use a stack large enough that a
+    deferred check would be observable in wallclock; here we just confirm
+    the error type / message matches the eager-validation contract.
+    """
+    gt = np.zeros((3, 32, 32))
+    pred = np.zeros((3, 32, 32))
+    for bad in (0.5, 1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="alpha_max"):
+            get_global_ri_factor(gt, pred, alpha_max=bad)
+
+
+# -- alpha_min kwarg (mirror of alpha_max) ---------------------------------
+
+
+def test_alpha_min_outside_unit_interval_raises() -> None:
+    """``alpha_min`` outside ``(0, 1)`` is rejected up-front."""
+    rng = np.random.default_rng(20)
+    gt = rng.random((32, 32)).astype(np.float64)
+    elements = compute_ssim_elements(
+        gt,
+        gt,
+        data_range=float(gt.max() - gt.min()),
+        gaussian_weights=False,
+        win_size=7,
+        crop=True,
+    )
+    for bad in (0.0, 1.0, -1.0, 1.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="alpha_min"):
+            get_ri_factor(elements, alpha_min=bad)
+
+
+def test_alpha_min_default_lifts_left_bracket() -> None:
+    """Heavy up-scaling (alpha* ~ 1e-5) now succeeds at the default floor.
+
+    With the old ``_ALPHA_MIN = 1e-3`` this would have raised
+    ``RuntimeError("RI factor failed to bracket on the left ...")``;
+    the bumped default (``1e-6``) keeps the fit working on this case.
+    """
+    rng = np.random.default_rng(21)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt * 1e5  # optimum sits near alpha ~ 1e-5
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements)  # default alpha_min=1e-6
+    assert np.isfinite(alpha)
+    assert alpha < 1e-3  # would have hit the old 1e-3 floor
+
+
+def test_alpha_min_above_optimum_raises() -> None:
+    """Explicit high floor forces a clean bracket failure (no silent clip)."""
+    rng = np.random.default_rng(21)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt * 1e5
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    with pytest.raises(RuntimeError, match="failed to bracket on the left"):
+        get_ri_factor(elements, alpha_min=1e-3)
+
+
+def test_global_ri_factor_forwards_alpha_min() -> None:
+    """``get_global_ri_factor`` forwards ``alpha_min`` to ``get_ri_factor``."""
+    rng = np.random.default_rng(21)
+    gt = rng.random((3, 32, 32)).astype(np.float64)
+    pred = gt * 1e5
+    with pytest.raises(RuntimeError, match="failed to bracket on the left"):
+        get_global_ri_factor(gt, pred, alpha_min=1e-3)
+    # Default floor recovers a finite positive alpha.
+    alpha = get_global_ri_factor(gt, pred)
+    assert np.isfinite(alpha) and alpha < 1e-3
+
+
+def test_global_ri_factor_rejects_bad_alpha_min_before_per_slice_pass() -> None:
+    """``get_global_ri_factor`` validates ``alpha_min`` before the element loop."""
+    gt = np.zeros((3, 32, 32))
+    pred = np.zeros((3, 32, 32))
+    for bad in (0.0, 1.0, -0.5, 2.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="alpha_min"):
+            get_global_ri_factor(gt, pred, alpha_min=bad)
+
+
+# -- Bracket boundary: cap probed once before raising ----------------------
+
+
+def test_alpha_max_cap_probed_when_loop_overshoots() -> None:
+    """``alpha_max`` itself is probed once when the powers-of-2 schedule overshoots.
+
+    Setup: ``pred = gt * 0.833`` puts ``alpha*`` near ``1.2``; with
+    ``alpha_max = 1.5``, the doubling loop's first probe ``alpha = 2.0``
+    already overshoots ``alpha_max`` and the loop exits without entering
+    its body. Pre-fix, this raised ``RuntimeError`` despite a root
+    existing in ``(1, 1.5]``. Post-fix, the cap probe at ``1.5`` covers
+    the gap and the bracket succeeds.
+    """
+    rng = np.random.default_rng(30)
+    gt = rng.random((48, 48)).astype(np.float64)
+    pred = gt * 0.833  # alpha* ~ 1.2 (between 1.0 and the first would-be probe at 2.0)
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements, alpha_max=1.5)
+    assert np.isfinite(alpha)
+    assert 1.0 <= alpha <= 1.5, f"expected root in [1.0, 1.5]; got {alpha}"
+
+
+def test_alpha_min_cap_probed_when_loop_undershoots() -> None:
+    """Mirror: ``alpha_min`` itself is probed once when halving undershoots.
+
+    ``pred = gt * 1.2`` puts ``alpha*`` near ``0.833``; with
+    ``alpha_min = 0.6``, the halving loop's first probe ``alpha = 0.5``
+    already undershoots ``alpha_min``. Pre-fix this raised; post-fix the
+    cap probe at ``0.6`` covers the gap.
+    """
+    rng = np.random.default_rng(31)
+    gt = rng.random((48, 48)).astype(np.float64)
+    pred = gt * 1.2  # alpha* ~ 0.833 (between 0.5 and 1.0)
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements, alpha_min=0.6)
+    assert np.isfinite(alpha)
+    assert 0.6 <= alpha <= 1.0, f"expected root in [0.6, 1.0]; got {alpha}"

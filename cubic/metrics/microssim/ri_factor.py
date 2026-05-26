@@ -25,8 +25,10 @@ Analytical derivative (per-pixel):
 
 ``f(alpha)`` is the mean of ``dS_n/dalpha`` over all flattened element pixels.
 MicroSSIM normalization places the optimum near ``alpha = 1``; we bracket by
-doubling outwards from ``alpha = 1`` (cap ``1e-3 <= alpha <= 1e3``) and refine
-with bisection terminated on both ``|f(mid)| < 1e-10`` AND ``|hi - lo| < 1e-8``.
+doubling outwards from ``alpha = 1`` (default range ``1e-6 <= alpha <= 1e6``;
+both bounds are configurable via the ``alpha_min`` / ``alpha_max`` kwargs) and
+refine with bisection terminated on both ``|f(mid)| < 1e-10`` AND
+``|hi - lo| < 1e-8``.
 """
 
 from __future__ import annotations
@@ -40,13 +42,26 @@ from .ssim_elements import SSIMElements, compute_ssim_elements
 # conjunctive termination guards both flat-region stalls (pure |f| tol)
 # and tiny-slope spinning (pure x tol).
 _ALPHA_INIT = 1.0
-_ALPHA_MAX = 1e3
-_ALPHA_MIN = 1e-3
+ALPHA_MIN_DEFAULT = 1e-6
+ALPHA_MAX_DEFAULT = 1e6
 _F_TOL = 1e-10
 _X_TOL = 1e-8
 _INIT_F_TOL = 1e-14
 _ASCENT_SLACK = 1e-12
 _MAX_BISECT_ITERS = 200
+
+
+def _validate_alpha_bounds(alpha_min: float, alpha_max: float) -> None:
+    """Validate that ``(alpha_min, alpha_max)`` brackets ``alpha = 1`` strictly.
+
+    The bracket starts at ``alpha = 1`` and expands by halving leftward /
+    doubling rightward, so any ``alpha_min`` not in ``(0, 1)`` or any
+    ``alpha_max`` not in ``(1, +inf)`` produces a degenerate window.
+    """
+    if not (np.isfinite(alpha_min) and 0.0 < alpha_min < 1.0):
+        raise ValueError(f"alpha_min must be a finite float in (0, 1); got {alpha_min}")
+    if not (np.isfinite(alpha_max) and alpha_max > 1.0):
+        raise ValueError(f"alpha_max must be a finite float > 1; got {alpha_max}")
 
 
 def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:
@@ -152,7 +167,7 @@ def _flatten_elements(elements: SSIMElements) -> SSIMElements:
 
 
 def _bracket_root(
-    elements: SSIMElements, f1: float
+    elements: SSIMElements, f1: float, alpha_min: float, alpha_max: float
 ) -> tuple[float, float, float, float]:
     """Find ``(lo, hi)`` with opposite-sign ``f`` values by expanding from 1.
 
@@ -167,6 +182,12 @@ def _bracket_root(
         Flattened SSIM elements (variances / covariance).
     f1 : float
         Value of ``f(1)``; sign decides direction.
+    alpha_min : float
+        Lower bracket cap. Halving expansion stops once ``alpha`` falls
+        below this value without a sign change.
+    alpha_max : float
+        Upper bracket cap. Doubling expansion stops once ``alpha`` exceeds
+        this value without a sign change.
 
     Returns
     -------
@@ -177,38 +198,60 @@ def _bracket_root(
     Raises
     ------
     RuntimeError
-        If no sign change is found within ``[_ALPHA_MIN, _ALPHA_MAX]``.
+        If no sign change is found within ``[alpha_min, alpha_max]``.
     """
     if f1 > 0.0:
         # f(1) > 0: root is to the right of 1 — expand by doubling.
         lo, f_lo = _ALPHA_INIT, f1
         alpha = _ALPHA_INIT * 2.0
-        while alpha <= _ALPHA_MAX:
+        while alpha <= alpha_max:
             f_alpha = _compute_dS_mean(alpha, elements)
             if f_alpha == 0.0 or (f_alpha < 0.0):
                 return lo, alpha, f_lo, f_alpha
             lo, f_lo = alpha, f_alpha
             alpha *= 2.0
+        # Powers-of-2 schedule could miss a root in (lo, alpha_max] when
+        # alpha_max isn't itself a power of 2 (e.g., default 1e6 →
+        # last probe is 2**19 = 524288). Probe alpha_max itself before
+        # giving up so the full requested interval is actually covered.
+        if lo < alpha_max:
+            f_cap = _compute_dS_mean(alpha_max, elements)
+            if f_cap <= 0.0:
+                return lo, alpha_max, f_lo, f_cap
         raise RuntimeError(
             "RI factor failed to bracket on the right; input may violate "
-            f"fit assumptions. ux shape={elements.ux.shape}"
+            f"fit assumptions or alpha_max={alpha_max} is too small. "
+            f"ux shape={elements.ux.shape}"
         )
     # f(1) < 0: root is to the left of 1 — expand by halving.
     hi, f_hi = _ALPHA_INIT, f1
     alpha = _ALPHA_INIT * 0.5
-    while alpha >= _ALPHA_MIN:
+    while alpha >= alpha_min:
         f_alpha = _compute_dS_mean(alpha, elements)
         if f_alpha == 0.0 or (f_alpha > 0.0):
             return alpha, hi, f_alpha, f_hi
         hi, f_hi = alpha, f_alpha
         alpha *= 0.5
+    # Mirror of the right-side fix: probe alpha_min itself before giving
+    # up so a root in [alpha_min, hi) isn't missed by the powers-of-2
+    # schedule.
+    if hi > alpha_min:
+        f_floor = _compute_dS_mean(alpha_min, elements)
+        if f_floor >= 0.0:
+            return alpha_min, hi, f_floor, f_hi
     raise RuntimeError(
         "RI factor failed to bracket on the left; input may violate "
-        f"fit assumptions. ux shape={elements.ux.shape}"
+        f"fit assumptions or alpha_min={alpha_min} is too large. "
+        f"ux shape={elements.ux.shape}"
     )
 
 
-def get_ri_factor(elements: SSIMElements) -> float:
+def get_ri_factor(
+    elements: SSIMElements,
+    *,
+    alpha_min: float = ALPHA_MIN_DEFAULT,
+    alpha_max: float = ALPHA_MAX_DEFAULT,
+) -> float:
     """Compute the range-invariant factor by bisection on ``dS/dalpha = 0``.
 
     The MicroSSIM range-invariant factor ``alpha`` is the scalar multiplier
@@ -225,6 +268,23 @@ def get_ri_factor(elements: SSIMElements) -> float:
         taken over all pixels. ``C1`` and ``C2`` are taken from the
         ``elements`` object (callers using :func:`get_global_ri_factor` get
         the last-slice values, matching upstream).
+    alpha_min : float, default=:data:`ALPHA_MIN_DEFAULT` (``1e-6``)
+        Lower bracket cap for the halving expansion. Used when ``pred`` is
+        scaled larger than ``gt`` so the optimum sits below ``1``. The
+        default safely covers most reasonable fits; lower it for heavily
+        up-scaled predictions (``pred ~ 1e6 * gt``).
+    alpha_max : float, default=:data:`ALPHA_MAX_DEFAULT` (``1e6``)
+        Upper bracket cap for the doubling expansion. The default safely
+        covers most reasonable MicroSSIM fits where the optimum sits near
+        ``alpha = 1``; raise it for pathological inputs (very small
+        calibration sets, heavily mis-normalized predictions).
+
+        Note: bracket probes are powers of 2 starting at 2 (rightward) or
+        0.5 (leftward); if the schedule overshoots ``alpha_max`` /
+        undershoots ``alpha_min`` without finding a sign change, the cap
+        itself is probed once before raising so a root in
+        ``(last_probe, alpha_max]`` (or ``[alpha_min, last_probe)``) is
+        not missed.
 
     Returns
     -------
@@ -235,8 +295,13 @@ def get_ri_factor(elements: SSIMElements) -> float:
     ------
     RuntimeError
         If the bracketing phase fails to find a sign change within
-        ``[1e-3, 1e3]`` — typical for pathological inputs (constant ground
-        truth with non-constant prediction, or all-zero prediction).
+        ``[alpha_min, alpha_max]`` — typical for pathological inputs
+        (constant ground truth with non-constant prediction, or all-zero
+        prediction).
+    ValueError
+        If ``alpha_min`` is outside ``(0, 1)`` or ``alpha_max`` is outside
+        ``(1, +inf)``. The bracket starts at ``alpha = 1`` and expands
+        outward, so any cap on the wrong side of 1 is degenerate.
 
     Notes
     -----
@@ -245,13 +310,14 @@ def get_ri_factor(elements: SSIMElements) -> float:
     invariant ``mean(S(alpha*)) >= mean(S(1)) - 1e-12`` is asserted (with
     slack to allow ``alpha = 1`` itself being the optimum).
     """
+    _validate_alpha_bounds(alpha_min, alpha_max)
     flat = _flatten_elements(elements)
 
     f1 = _compute_dS_mean(_ALPHA_INIT, flat)
     if abs(f1) < _INIT_F_TOL:
         return float(_ALPHA_INIT)
 
-    lo, hi, f_lo, f_hi = _bracket_root(flat, f1)
+    lo, hi, f_lo, f_hi = _bracket_root(flat, f1, alpha_min, alpha_max)
 
     # Bisection refinement. The conjunction of |f| and x tolerances guards
     # both stalling in flat regions and spinning on near-zero slope.
@@ -281,7 +347,12 @@ def get_ri_factor(elements: SSIMElements) -> float:
 
 
 def get_global_ri_factor(
-    gt: np.ndarray, pred: np.ndarray, **ssim_kwargs: object
+    gt: np.ndarray,
+    pred: np.ndarray,
+    *,
+    alpha_min: float = ALPHA_MIN_DEFAULT,
+    alpha_max: float = ALPHA_MAX_DEFAULT,
+    **ssim_kwargs: object,
 ) -> float:
     """Compute the range-invariant factor on a stack of images.
 
@@ -300,6 +371,10 @@ def get_global_ri_factor(
         here; pool such inputs at the ``MicroSSIM.fit`` layer.
     pred : numpy.ndarray
         Prediction stack; same shape as ``gt``.
+    alpha_min : float, default=:data:`ALPHA_MIN_DEFAULT` (``1e-6``)
+        Lower bracket cap forwarded to :func:`get_ri_factor`.
+    alpha_max : float, default=:data:`ALPHA_MAX_DEFAULT` (``1e6``)
+        Upper bracket cap forwarded to :func:`get_ri_factor`.
     **ssim_kwargs : object
         Additional keyword arguments forwarded to
         :func:`compute_ssim_elements`. Defaults match the upstream RI-factor
@@ -315,9 +390,13 @@ def get_global_ri_factor(
     Raises
     ------
     ValueError
-        If ``gt`` and ``pred`` differ in shape, or either has ``ndim`` not
-        in ``{2, 3}``.
+        If ``alpha_min`` / ``alpha_max`` are out of range (see
+        :func:`get_ri_factor`), ``gt`` and ``pred`` differ in shape, or
+        either has ``ndim`` not in ``{2, 3}``.
     """
+    # Validate bracket bounds up-front so a bad value fails before the
+    # potentially-expensive per-slice compute_ssim_elements loop.
+    _validate_alpha_bounds(alpha_min, alpha_max)
     if gt.shape != pred.shape:
         raise ValueError(
             f"Ground-truth and prediction arrays must have the same shape "
@@ -375,4 +454,4 @@ def get_global_ri_factor(
         C1=C1_last,
         C2=C2_last,
     )
-    return get_ri_factor(pooled)
+    return get_ri_factor(pooled, alpha_min=alpha_min, alpha_max=alpha_max)
