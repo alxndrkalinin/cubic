@@ -372,3 +372,18 @@ def test_global_ri_factor_forwards_alpha_max() -> None:
     # Default cap recovers a finite positive alpha.
     alpha = get_global_ri_factor(gt, pred)
     assert np.isfinite(alpha) and alpha > 1e3
+
+
+def test_global_ri_factor_rejects_bad_alpha_max_before_per_slice_pass() -> None:
+    """``get_global_ri_factor`` validates ``alpha_max`` before the element loop.
+
+    A bad ``alpha_max`` should surface immediately, not after N expensive
+    ``compute_ssim_elements`` calls. Use a stack large enough that a
+    deferred check would be observable in wallclock; here we just confirm
+    the error type / message matches the eager-validation contract.
+    """
+    gt = np.zeros((3, 32, 32))
+    pred = np.zeros((3, 32, 32))
+    for bad in (0.5, 1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="alpha_max"):
+            get_global_ri_factor(gt, pred, alpha_max=bad)

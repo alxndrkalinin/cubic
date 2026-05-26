@@ -63,6 +63,7 @@ class MicroSSIM:
         offset_pred: float | None = None,
         max_val: float | None = None,
         ri_factor: float | None = None,
+        *,
         alpha_max: float = ALPHA_MAX_DEFAULT,
     ) -> None:
         if not (np.isfinite(alpha_max) and alpha_max > 1.0):
@@ -237,6 +238,14 @@ class MicroSSIM:
             Keys ``bg_percentile``, ``offset_pred``, ``offset_gt``,
             ``max_val``, ``ri_factor`` matching upstream
             ``micro_ssim.py:296-302`` exactly.
+
+        Notes
+        -----
+        The key set intentionally mirrors upstream ``MicroSSIM``. The
+        cubic-only ``alpha_max`` knob is **not** round-tripped here — a
+        ``MicroSSIM(**ms.get_parameters())`` re-instantiation reverts
+        ``alpha_max`` to :data:`ALPHA_MAX_DEFAULT`. Save it separately if
+        a non-default cap is part of your configuration.
         """
         return {
             "bg_percentile": self._bg_percentile,

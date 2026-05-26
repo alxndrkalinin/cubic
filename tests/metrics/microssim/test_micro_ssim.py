@@ -261,7 +261,9 @@ def test_score_with_pinned_ri_factor_skips_fit():
     assert pinned._initialized
     score_fitted = fitted.score(gt[0], pred[0])
     score_pinned = pinned.score(gt[0], pred[0])
-    assert abs(score_fitted - score_pinned) < 1e-12
+    # Identical code paths with identical params + inputs must be bit-exact;
+    # a non-zero diff signals an unintended non-determinism in the score path.
+    assert score_fitted == score_pinned
 
 
 # --- Convenience function --------------------------------------------------

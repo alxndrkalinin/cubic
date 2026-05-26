@@ -214,7 +214,7 @@ def _bracket_root(
 
 
 def get_ri_factor(
-    elements: SSIMElements, alpha_max: float = ALPHA_MAX_DEFAULT
+    elements: SSIMElements, *, alpha_max: float = ALPHA_MAX_DEFAULT
 ) -> float:
     """Compute the range-invariant factor by bisection on ``dS/dalpha = 0``.
 
@@ -237,6 +237,10 @@ def get_ri_factor(
         covers most reasonable MicroSSIM fits where the optimum sits near
         ``alpha = 1``; raise it for pathological inputs (very small
         calibration sets, heavily mis-normalized predictions).
+
+        Note: bracket probes are powers of 2 starting at 2. The largest
+        probed value is therefore the largest power of 2 not exceeding
+        ``alpha_max`` (e.g., ``2**19 = 524288`` for ``alpha_max = 1e6``).
 
     Returns
     -------
@@ -300,6 +304,7 @@ def get_ri_factor(
 def get_global_ri_factor(
     gt: np.ndarray,
     pred: np.ndarray,
+    *,
     alpha_max: float = ALPHA_MAX_DEFAULT,
     **ssim_kwargs: object,
 ) -> float:
@@ -337,9 +342,14 @@ def get_global_ri_factor(
     Raises
     ------
     ValueError
-        If ``gt`` and ``pred`` differ in shape, or either has ``ndim`` not
-        in ``{2, 3}``.
+        If ``alpha_max <= 1`` (see :func:`get_ri_factor`), ``gt`` and
+        ``pred`` differ in shape, or either has ``ndim`` not in
+        ``{2, 3}``.
     """
+    # Validate alpha_max up-front so a bad value fails before the
+    # potentially-expensive per-slice compute_ssim_elements loop.
+    if not (np.isfinite(alpha_max) and alpha_max > 1.0):
+        raise ValueError(f"alpha_max must be a finite float > 1; got {alpha_max}")
     if gt.shape != pred.shape:
         raise ValueError(
             f"Ground-truth and prediction arrays must have the same shape "
