@@ -222,6 +222,22 @@ def test_alpha_max_constructor_propagates_to_fit():
         MicroSSIM(alpha_max=1e3).fit(gt, pred)
 
 
+def test_alpha_max_degenerate_raises_at_construction():
+    """``alpha_max <= 1`` is rejected eagerly in ``__init__``, not at fit-time.
+
+    Catches obvious-bug values (0, 0.5, NaN, ±inf) at the call site instead
+    of after an expensive per-slice element pass.
+    """
+    with pytest.raises(ValueError, match="alpha_max"):
+        MicroSSIM(alpha_max=0.5)
+    with pytest.raises(ValueError, match="alpha_max"):
+        MicroSSIM(alpha_max=1.0)
+    with pytest.raises(ValueError, match="alpha_max"):
+        MicroSSIM(alpha_max=float("nan"))
+    with pytest.raises(ValueError, match="alpha_max"):
+        MicroSSIM(alpha_max=float("inf"))
+
+
 # --- pinned ri_factor (external calibration) -------------------------------
 
 

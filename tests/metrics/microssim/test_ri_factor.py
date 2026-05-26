@@ -74,9 +74,10 @@ def test_constant_gt_noisy_pred_no_silent_nan() -> None:
 
     With gt constant, ``ux*uy != 0`` but ``vx == vxy == 0`` (or nearly so);
     ``vy`` is small but positive. Empirically the derivative still changes
-    sign inside ``[1e-3, 1e3]`` for this configuration, so we accept either
-    a finite positive ``alpha*`` (with the ascent invariant satisfied) or a
-    clean ``RuntimeError`` from bracket failure — never a silent NaN / inf.
+    sign inside the default bracket window for this configuration, so we
+    accept either a finite positive ``alpha*`` (with the ascent invariant
+    satisfied) or a clean ``RuntimeError`` from bracket failure — never a
+    silent NaN / inf.
     """
     rng = np.random.default_rng(2)
     gt = np.full((16, 16), 5.0, dtype=np.float64)

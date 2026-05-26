@@ -65,6 +65,8 @@ class MicroSSIM:
         ri_factor: float | None = None,
         alpha_max: float = ALPHA_MAX_DEFAULT,
     ) -> None:
+        if not (np.isfinite(alpha_max) and alpha_max > 1.0):
+            raise ValueError(f"alpha_max must be a finite float > 1; got {alpha_max}")
         self._bg_percentile = bg_percentile
         self._offset_pred = offset_pred
         self._offset_gt = offset_gt

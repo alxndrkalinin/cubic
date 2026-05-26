@@ -5,7 +5,7 @@ Device-agnostic (NumPy / CuPy) implementation. Public API is exposed via
 from this subpackage.
 """
 
-from .ri_factor import get_ri_factor, get_global_ri_factor
+from .ri_factor import ALPHA_MAX_DEFAULT, get_ri_factor, get_global_ri_factor
 from .micro_ssim import MicroSSIM, micro_structural_similarity
 from .micro_ms3im import MicroMS3IM, micro_multiscale_structural_similarity
 from .ssim_elements import SSIMElements, compute_ssim_elements
@@ -16,6 +16,7 @@ from .image_processing import (
 )
 
 __all__ = [
+    "ALPHA_MAX_DEFAULT",
     "MicroMS3IM",
     "MicroSSIM",
     "SSIMElements",
