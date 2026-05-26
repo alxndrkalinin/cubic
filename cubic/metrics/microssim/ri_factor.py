@@ -25,8 +25,9 @@ Analytical derivative (per-pixel):
 
 ``f(alpha)`` is the mean of ``dS_n/dalpha`` over all flattened element pixels.
 MicroSSIM normalization places the optimum near ``alpha = 1``; we bracket by
-doubling outwards from ``alpha = 1`` (cap ``1e-3 <= alpha <= 1e3``) and refine
-with bisection terminated on both ``|f(mid)| < 1e-10`` AND ``|hi - lo| < 1e-8``.
+doubling outwards from ``alpha = 1`` (default cap ``1e-3 <= alpha <= 1e6``;
+the upper bound is configurable via the ``alpha_max`` kwarg) and refine with
+bisection terminated on both ``|f(mid)| < 1e-10`` AND ``|hi - lo| < 1e-8``.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from .ssim_elements import SSIMElements, compute_ssim_elements
 # conjunctive termination guards both flat-region stalls (pure |f| tol)
 # and tiny-slope spinning (pure x tol).
 _ALPHA_INIT = 1.0
-_ALPHA_MAX = 1e3
+ALPHA_MAX_DEFAULT = 1e6
 _ALPHA_MIN = 1e-3
 _F_TOL = 1e-10
 _X_TOL = 1e-8
@@ -152,7 +153,7 @@ def _flatten_elements(elements: SSIMElements) -> SSIMElements:
 
 
 def _bracket_root(
-    elements: SSIMElements, f1: float
+    elements: SSIMElements, f1: float, alpha_max: float
 ) -> tuple[float, float, float, float]:
     """Find ``(lo, hi)`` with opposite-sign ``f`` values by expanding from 1.
 
@@ -167,6 +168,9 @@ def _bracket_root(
         Flattened SSIM elements (variances / covariance).
     f1 : float
         Value of ``f(1)``; sign decides direction.
+    alpha_max : float
+        Upper bracket cap. Doubling expansion stops once ``alpha`` exceeds
+        this value without a sign change.
 
     Returns
     -------
@@ -177,13 +181,13 @@ def _bracket_root(
     Raises
     ------
     RuntimeError
-        If no sign change is found within ``[_ALPHA_MIN, _ALPHA_MAX]``.
+        If no sign change is found within ``[_ALPHA_MIN, alpha_max]``.
     """
     if f1 > 0.0:
         # f(1) > 0: root is to the right of 1 — expand by doubling.
         lo, f_lo = _ALPHA_INIT, f1
         alpha = _ALPHA_INIT * 2.0
-        while alpha <= _ALPHA_MAX:
+        while alpha <= alpha_max:
             f_alpha = _compute_dS_mean(alpha, elements)
             if f_alpha == 0.0 or (f_alpha < 0.0):
                 return lo, alpha, f_lo, f_alpha
@@ -191,7 +195,8 @@ def _bracket_root(
             alpha *= 2.0
         raise RuntimeError(
             "RI factor failed to bracket on the right; input may violate "
-            f"fit assumptions. ux shape={elements.ux.shape}"
+            f"fit assumptions or alpha_max={alpha_max} is too small. "
+            f"ux shape={elements.ux.shape}"
         )
     # f(1) < 0: root is to the left of 1 — expand by halving.
     hi, f_hi = _ALPHA_INIT, f1
@@ -208,7 +213,9 @@ def _bracket_root(
     )
 
 
-def get_ri_factor(elements: SSIMElements) -> float:
+def get_ri_factor(
+    elements: SSIMElements, alpha_max: float = ALPHA_MAX_DEFAULT
+) -> float:
     """Compute the range-invariant factor by bisection on ``dS/dalpha = 0``.
 
     The MicroSSIM range-invariant factor ``alpha`` is the scalar multiplier
@@ -225,6 +232,11 @@ def get_ri_factor(elements: SSIMElements) -> float:
         taken over all pixels. ``C1`` and ``C2`` are taken from the
         ``elements`` object (callers using :func:`get_global_ri_factor` get
         the last-slice values, matching upstream).
+    alpha_max : float, default=:data:`ALPHA_MAX_DEFAULT` (``1e6``)
+        Upper bracket cap for the doubling expansion. The default safely
+        covers most reasonable MicroSSIM fits where the optimum sits near
+        ``alpha = 1``; raise it for pathological inputs (very small
+        calibration sets, heavily mis-normalized predictions).
 
     Returns
     -------
@@ -235,8 +247,11 @@ def get_ri_factor(elements: SSIMElements) -> float:
     ------
     RuntimeError
         If the bracketing phase fails to find a sign change within
-        ``[1e-3, 1e3]`` — typical for pathological inputs (constant ground
-        truth with non-constant prediction, or all-zero prediction).
+        ``[1e-3, alpha_max]`` — typical for pathological inputs (constant
+        ground truth with non-constant prediction, or all-zero prediction).
+    ValueError
+        If ``alpha_max <= 1`` (the bracket starts at ``alpha = 1`` and
+        expands rightward, so any cap at or below 1 is degenerate).
 
     Notes
     -----
@@ -245,13 +260,15 @@ def get_ri_factor(elements: SSIMElements) -> float:
     invariant ``mean(S(alpha*)) >= mean(S(1)) - 1e-12`` is asserted (with
     slack to allow ``alpha = 1`` itself being the optimum).
     """
+    if not (np.isfinite(alpha_max) and alpha_max > 1.0):
+        raise ValueError(f"alpha_max must be a finite float > 1; got {alpha_max}")
     flat = _flatten_elements(elements)
 
     f1 = _compute_dS_mean(_ALPHA_INIT, flat)
     if abs(f1) < _INIT_F_TOL:
         return float(_ALPHA_INIT)
 
-    lo, hi, f_lo, f_hi = _bracket_root(flat, f1)
+    lo, hi, f_lo, f_hi = _bracket_root(flat, f1, alpha_max)
 
     # Bisection refinement. The conjunction of |f| and x tolerances guards
     # both stalling in flat regions and spinning on near-zero slope.
@@ -281,7 +298,10 @@ def get_ri_factor(elements: SSIMElements) -> float:
 
 
 def get_global_ri_factor(
-    gt: np.ndarray, pred: np.ndarray, **ssim_kwargs: object
+    gt: np.ndarray,
+    pred: np.ndarray,
+    alpha_max: float = ALPHA_MAX_DEFAULT,
+    **ssim_kwargs: object,
 ) -> float:
     """Compute the range-invariant factor on a stack of images.
 
@@ -300,6 +320,8 @@ def get_global_ri_factor(
         here; pool such inputs at the ``MicroSSIM.fit`` layer.
     pred : numpy.ndarray
         Prediction stack; same shape as ``gt``.
+    alpha_max : float, default=:data:`ALPHA_MAX_DEFAULT` (``1e6``)
+        Upper bracket cap forwarded to :func:`get_ri_factor`.
     **ssim_kwargs : object
         Additional keyword arguments forwarded to
         :func:`compute_ssim_elements`. Defaults match the upstream RI-factor
@@ -375,4 +397,4 @@ def get_global_ri_factor(
         C1=C1_last,
         C2=C2_last,
     )
-    return get_ri_factor(pooled)
+    return get_ri_factor(pooled, alpha_max=alpha_max)

@@ -152,6 +152,39 @@ def test_convenience_list_input_returns_list():
     assert len(out) == 3
 
 
+# --- pinned ri_factor (external calibration) -------------------------------
+
+
+def test_score_with_pinned_ri_factor_skips_fit():
+    """``MicroMS3IM(ri_factor=...)`` enables scoring without ``fit()``.
+
+    Inherits the constructor contract from ``MicroSSIM``; this test pins
+    the use case for callers that want to load a per-(model, organelle)
+    RI factor calibrated once and reuse it across all evaluation calls.
+    """
+    gt, pred = _seeded_data()
+    fitted = MicroMS3IM().fit(gt, pred)
+    params = fitted.get_parameters()
+
+    pinned = MicroMS3IM(
+        offset_gt=params["offset_gt"],
+        offset_pred=params["offset_pred"],
+        max_val=params["max_val"],
+        ri_factor=params["ri_factor"],
+    )
+    # No fit() call — score works immediately.
+    assert pinned._initialized
+    score_fitted = fitted.score(gt[0], pred[0])
+    score_pinned = pinned.score(gt[0], pred[0])
+    assert abs(score_fitted - score_pinned) < 1e-12
+
+
+def test_ri_factor_without_norm_params_raises():
+    """``ri_factor=`` alone on ``MicroMS3IM`` is rejected (inherited check)."""
+    with pytest.raises(ValueError, match="offset_pred, offset_gt and max_val"):
+        MicroMS3IM(ri_factor=0.9)
+
+
 # --- GPU dispatch ----------------------------------------------------------
 
 

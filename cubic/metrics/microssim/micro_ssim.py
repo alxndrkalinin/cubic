@@ -12,7 +12,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from .ri_factor import get_global_ri_factor
+from .ri_factor import ALPHA_MAX_DEFAULT, get_global_ri_factor
 from .ssim_elements import compute_ssim_elements
 from .image_processing import (
     normalize_min_max,
@@ -42,6 +42,12 @@ class MicroSSIM:
         Pre-computed RI factor. If supplied, all of ``offset_gt``,
         ``offset_pred``, and ``max_val`` must also be supplied; in that
         case ``score()`` can be called without first calling ``fit()``.
+        Use this to pin ``alpha`` from an external calibration (e.g.
+        load a per-(model, organelle) RI factor fit once and reuse it
+        across all evaluation calls).
+    alpha_max : float, default=:data:`ALPHA_MAX_DEFAULT` (``1e6``)
+        Upper bracket cap forwarded to :func:`get_global_ri_factor` during
+        ``fit()``. Has no effect when ``ri_factor`` is supplied directly.
 
     Raises
     ------
@@ -57,12 +63,14 @@ class MicroSSIM:
         offset_pred: float | None = None,
         max_val: float | None = None,
         ri_factor: float | None = None,
+        alpha_max: float = ALPHA_MAX_DEFAULT,
     ) -> None:
         self._bg_percentile = bg_percentile
         self._offset_pred = offset_pred
         self._offset_gt = offset_gt
         self._max_val = max_val
         self._ri_factor = ri_factor
+        self._alpha_max = alpha_max
         self._initialized = ri_factor is not None
         if self._initialized and any(
             p is None for p in (offset_gt, offset_pred, max_val)
@@ -149,7 +157,9 @@ class MicroSSIM:
         # (ri_factor.py:123-131). gaussian_weights=False, win_size=7,
         # crop=True is the fit-time path — these are the defaults of
         # get_global_ri_factor (matches upstream ri_factor.py:89).
-        self._ri_factor = get_global_ri_factor(gt_norm, pred_norm)
+        self._ri_factor = get_global_ri_factor(
+            gt_norm, pred_norm, alpha_max=self._alpha_max
+        )
         self._initialized = True
         return self
 

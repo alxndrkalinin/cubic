@@ -194,7 +194,7 @@ def test_bisection_terminates_quickly() -> None:
     # accidentally already satisfies |f(1)| ~ 0.
     if abs(f1) < 1e-14:
         pytest.skip("f(1) already at machine zero; iter count not meaningful")
-    lo, hi, f_lo, f_hi = _bracket_root(flat, f1)
+    lo, hi, f_lo, f_hi = _bracket_root(flat, f1, alpha_max=1e3)
 
     iters = 0
     mid = 0.5 * (lo + hi)
@@ -301,3 +301,73 @@ def test_global_ri_factor_rejects_ndim_4() -> None:
     pred = np.zeros((2, 3, 32, 32))
     with pytest.raises(ValueError, match="ndim"):
         get_global_ri_factor(gt, pred)
+
+
+# -- alpha_max kwarg --------------------------------------------------------
+
+
+def test_alpha_max_below_one_raises() -> None:
+    """``alpha_max <= 1`` is degenerate (bracket starts at 1) — must raise."""
+    rng = np.random.default_rng(11)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt.copy()
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    with pytest.raises(ValueError, match="alpha_max"):
+        get_ri_factor(elements, alpha_max=1.0)
+    with pytest.raises(ValueError, match="alpha_max"):
+        get_ri_factor(elements, alpha_max=0.5)
+
+
+def test_alpha_max_default_lifts_right_bracket() -> None:
+    """Heavy down-scaling (alpha* ~ 1e4) now succeeds at the default cap.
+
+    With the old ``alpha_max = 1e3`` default this would have raised
+    ``RuntimeError("RI factor failed to bracket on the right ...")``;
+    the bumped default (``1e6``) keeps the fit working on this case.
+    """
+    rng = np.random.default_rng(12)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt * 1e-4  # optimum sits near alpha ~ 1e4
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements)  # default alpha_max=1e6
+    assert np.isfinite(alpha)
+    assert alpha > 1e3  # would have hit the old 1e3 cap
+
+
+def test_alpha_max_below_optimum_raises() -> None:
+    """Explicit low cap forces a clean bracket failure (no silent clip).
+
+    Same heavy down-scaling input as the previous test; passing
+    ``alpha_max=1e3`` reproduces the failure mode of the old default.
+    """
+    rng = np.random.default_rng(12)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt * 1e-4
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    with pytest.raises(RuntimeError, match="failed to bracket on the right"):
+        get_ri_factor(elements, alpha_max=1e3)
+
+
+def test_global_ri_factor_forwards_alpha_max() -> None:
+    """``get_global_ri_factor`` forwards ``alpha_max`` to ``get_ri_factor``.
+
+    Same heavy down-scaled stack used for the unit test; explicit low cap
+    must propagate and raise.
+    """
+    rng = np.random.default_rng(12)
+    gt = rng.random((3, 32, 32)).astype(np.float64)
+    pred = gt * 1e-4
+    with pytest.raises(RuntimeError, match="failed to bracket on the right"):
+        get_global_ri_factor(gt, pred, alpha_max=1e3)
+    # Default cap recovers a finite positive alpha.
+    alpha = get_global_ri_factor(gt, pred)
+    assert np.isfinite(alpha) and alpha > 1e3

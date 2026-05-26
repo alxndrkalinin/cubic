@@ -205,6 +205,49 @@ def test_score_kwargs_forwarded_to_elements():
     assert default_score != bigger_K1_score
 
 
+# --- alpha_max kwarg -------------------------------------------------------
+
+
+def test_alpha_max_constructor_propagates_to_fit():
+    """Low ``alpha_max`` on the constructor surfaces as a fit-time RuntimeError.
+
+    Heavy down-scaled input (alpha* well past 1e3); the bumped default
+    ``alpha_max=1e6`` would handle this, but an explicit low cap must
+    fail loudly instead of silently clipping.
+    """
+    rng = np.random.default_rng(12)
+    gt = rng.random((3, 64, 64)).astype(np.float64)
+    pred = gt * 1e-4
+    with pytest.raises(RuntimeError, match="failed to bracket on the right"):
+        MicroSSIM(alpha_max=1e3).fit(gt, pred)
+
+
+# --- pinned ri_factor (external calibration) -------------------------------
+
+
+def test_score_with_pinned_ri_factor_skips_fit():
+    """Constructor-supplied params + ri_factor enable scoring without fit().
+
+    Use case: load a per-(model, organelle) RI factor calibrated once
+    upstream and reuse it across all evaluation calls without re-fitting.
+    """
+    gt, pred = _seeded_data()
+    fitted = MicroSSIM().fit(gt, pred)
+    params = fitted.get_parameters()
+
+    pinned = MicroSSIM(
+        offset_gt=params["offset_gt"],
+        offset_pred=params["offset_pred"],
+        max_val=params["max_val"],
+        ri_factor=params["ri_factor"],
+    )
+    # No fit() call — score works immediately.
+    assert pinned._initialized
+    score_fitted = fitted.score(gt[0], pred[0])
+    score_pinned = pinned.score(gt[0], pred[0])
+    assert abs(score_fitted - score_pinned) < 1e-12
+
+
 # --- Convenience function --------------------------------------------------
 
 
