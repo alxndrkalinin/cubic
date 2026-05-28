@@ -21,7 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from skimage import io, color
 
-from cubic.cuda import CUDAManager, ascupy
+from cubic.cuda import CUDAManager, ascupy, asnumpy
 from cubic.metrics.spectral.dcr import dcr_curve
 from cubic.metrics.spectral.frc import calculate_frc
 
@@ -125,7 +125,7 @@ print(f"Image shape: {tubulin.shape}")
 print(f"Pixel size: {tubulin_spacing * 1000:.1f} nm")
 
 fig, ax = plt.subplots(figsize=(6, 6))
-ax.imshow(np.asarray(tubulin), cmap="gray")
+ax.imshow(asnumpy(tubulin), cmap="gray")
 ax.set_title("Tubulin STED")
 plt.show()
 
@@ -167,7 +167,7 @@ print(f"Image shape: {vimentin.shape}")
 print(f"Pixel size: {vimentin_spacing * 1000:.1f} nm")
 
 fig, ax = plt.subplots(figsize=(4, 4))
-ax.imshow(np.asarray(vimentin), cmap="inferno")
+ax.imshow(asnumpy(vimentin), cmap="inferno")
 ax.set_title("Vimentin STED (Koho et al. 2019)")
 plt.tight_layout()
 plt.show()
@@ -209,7 +209,7 @@ print(f"Image shape: {sted.shape}")
 print(f"Pixel size: {sted_spacing * 1000:.1f} nm")
 
 fig, ax = plt.subplots(figsize=(4, 4))
-ax.imshow(np.asarray(sted), cmap="inferno")
+ax.imshow(asnumpy(sted), cmap="inferno")
 ax.set_title("COS7 STED")
 plt.tight_layout()
 plt.show()
