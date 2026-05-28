@@ -10,7 +10,7 @@ from skimage import data
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
 from cubic.metrics.spectral import calculate_frc, frc_resolution, fsc_resolution
-from cubic.metrics.spectral.frc import _calibration_factor
+from cubic.metrics.spectral.frc import preprocess_images, _calibration_factor
 from cubic.metrics.spectral.analysis import (
     FourierCorrelationData,
     FourierCorrelationAnalysis,
@@ -678,4 +678,68 @@ def test_checkerboard_default_unchanged(
     )
     assert result_default.resolution["resolution"] == pytest.approx(
         result_checker.resolution["resolution"], rel=1e-10
+    )
+
+
+def _low_freq_power(image: np.ndarray, max_k: float = 10.0) -> float:
+    """Sum |FFT|^2 over the low-frequency annulus 0.5 < k < max_k."""
+    f = np.fft.fftn(image - image.mean())
+    h, w = f.shape
+    yy, xx = np.meshgrid(np.fft.fftfreq(h) * h, np.fft.fftfreq(w) * w, indexing="ij")
+    r = np.sqrt(yy**2 + xx**2)
+    mask = (r > 0.5) & (r < max_k)
+    return float(np.sum(np.abs(f[mask]) ** 2))
+
+
+def test_preprocess_images_centers_before_windowing_high_dc_offset() -> None:
+    """High-DC-offset input must not bleed into low-frequency bins via the taper.
+
+    Regression guard: if mean-subtraction is moved back to after Hamming
+    windowing, the DC offset μ multiplied by the non-zero-mean taper
+    creates a μ·(w(x) − mean(w)) low-frequency artifact that survives the
+    later image − image.mean() DC removal. This test pins the ordering by
+    comparing the low-frequency FFT power against a centered-input baseline.
+    """
+    rng = np.random.default_rng(0)
+    h, w = 256, 256
+    structure = rng.gamma(2.0, 850.0, (h, w)).astype(np.float32)
+    offset_image = (structure + 2500.0).astype(np.float32)
+    centered_image = structure.astype(np.float32)
+
+    p_offset, _ = preprocess_images(offset_image.copy(), zero_padding=False)
+    p_centered, _ = preprocess_images(centered_image.copy(), zero_padding=False)
+
+    # The two preprocessing outputs must have indistinguishable low-frequency
+    # power, since they differ only by a global constant — i.e. centering
+    # must happen before the taper is applied.
+    ratio = _low_freq_power(p_offset) / _low_freq_power(p_centered)
+    assert 0.5 < ratio < 2.0, (
+        f"DC-offset input has {ratio:.1f}x the low-freq power of centered "
+        f"input — preprocess_images must mean-center before Hamming windowing"
+    )
+
+
+def test_preprocess_images_centers_before_padding_non_cubic_input() -> None:
+    """Non-cubic zero-padded input must not leak the DC offset through the pad ring.
+
+    Regression guard for the second ordering invariant: mean-subtraction
+    happens before pad_image_to_cube so the zero ring stays at zero
+    instead of carrying -diluted_mean into the Hamming taper edges.
+    """
+    rng = np.random.default_rng(0)
+    structure = rng.gamma(2.0, 850.0, (200, 256)).astype(np.float32)
+    offset_image = (structure + 2500.0).astype(np.float32)
+
+    # Pad to (256, 256) cube via zero_padding=True.
+    p_offset, _ = preprocess_images(offset_image.copy(), zero_padding=True)
+    # A square (256, 256) image of the centered structure is the cleanest
+    # reachable reference (no pad ring at all).
+    structure_square = rng.gamma(2.0, 850.0, (256, 256)).astype(np.float32)
+    p_ref, _ = preprocess_images(structure_square.copy(), zero_padding=False)
+
+    ratio = _low_freq_power(p_offset) / _low_freq_power(p_ref)
+    assert 0.5 < ratio < 2.0, (
+        f"Padded DC-offset input has {ratio:.1f}x the low-freq power of "
+        f"centered reference — preprocess_images must mean-center before "
+        f"pad_image_to_cube"
     )
