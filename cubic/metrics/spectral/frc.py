@@ -143,12 +143,15 @@ def preprocess_images(
         if len(set(image2.shape)) > 1 and zero_padding:
             image2 = pad_image_to_cube(image2, mode=pad_mode)
 
-    # Apply Hamming windowing to both images independently
+    # Apply Hamming windowing to both images independently. Mean-subtract
+    # before windowing so a large DC offset isn't multiplied by the
+    # non-zero-mean taper (which would otherwise create a low-frequency
+    # artifact ~ mean * (w(x) - mean(w)) that survives later DC removal).
     if not disable_hamming:
-        image1 = hamming_window(image1)
         if image2 is None:
             raise RuntimeError("image2 must be set after splitting")
-        image2 = hamming_window(image2)
+        image1 = hamming_window(image1 - image1.mean())
+        image2 = hamming_window(image2 - image2.mean())
 
     if image2 is None:
         raise RuntimeError("image2 must be set after preprocessing")
