@@ -115,6 +115,19 @@ def preprocess_images(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Preprocess input images with all modifications (padding, windowing, splitting)."""
     single_image = image2 is None
+    # Mean-subtract before padding so a large DC offset isn't multiplied by
+    # the non-zero-mean Hamming taper (which would otherwise create a
+    # low-frequency artifact ~ mean * (w(x) - mean(w)) that survives later
+    # DC removal) and so the zero-padded ring stays at zero rather than at
+    # -diluted_mean. Binomial counts splitting requires raw photon counts
+    # (binomial_split clips negatives and rounds to integers), so its halves
+    # are centered after splitting instead.
+    pre_subtract = not disable_hamming and not (
+        single_image and split_type == "binomial"
+    )
+
+    if pre_subtract:
+        image1 = image1 - image1.mean()
 
     # Apply padding to first image
     if len(set(image1.shape)) > 1 and zero_padding:
@@ -140,18 +153,23 @@ def preprocess_images(
         # Apply padding to second image
         if image2 is None:
             raise RuntimeError("image2 must not be None when single_image is False")
+        if pre_subtract:
+            image2 = image2 - image2.mean()
         if len(set(image2.shape)) > 1 and zero_padding:
             image2 = pad_image_to_cube(image2, mode=pad_mode)
 
-    # Apply Hamming windowing to both images independently. Mean-subtract
-    # before windowing so a large DC offset isn't multiplied by the
-    # non-zero-mean taper (which would otherwise create a low-frequency
-    # artifact ~ mean * (w(x) - mean(w)) that survives later DC removal).
+    # Apply Hamming windowing to both images independently. Binomial halves
+    # were not centered above (the split needed raw counts), so center them
+    # here.
     if not disable_hamming:
         if image2 is None:
             raise RuntimeError("image2 must be set after splitting")
-        image1 = hamming_window(image1 - image1.mean())
-        image2 = hamming_window(image2 - image2.mean())
+        if single_image and split_type == "binomial":
+            image1 = hamming_window(image1 - image1.mean())
+            image2 = hamming_window(image2 - image2.mean())
+        else:
+            image1 = hamming_window(image1)
+            image2 = hamming_window(image2)
 
     if image2 is None:
         raise RuntimeError("image2 must be set after preprocessing")
