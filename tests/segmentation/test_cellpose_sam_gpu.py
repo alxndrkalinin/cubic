@@ -35,6 +35,22 @@ def _disks(h: int = 224, w: int = 224, centers=None, r: int = 15) -> np.ndarray:
     return img + np.random.default_rng(0).normal(0, 3, img.shape).astype(np.float32)
 
 
+def _volume_3d(lz: int = 20, h: int = 80, w: int = 80) -> np.ndarray:
+    """Small 3D grayscale volume with a few spherical blobs."""
+    vol = np.zeros((lz, h, w), np.float32)
+    zz, yy, xx = np.mgrid[0:lz, 0:h, 0:w]
+    for cz, cy, cx in [(10, 28, 28), (10, 55, 55), (7, 30, 58)]:
+        vol[(zz - cz) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2 <= 12**2] = 200.0
+    return vol + np.random.default_rng(2).normal(0, 3, vol.shape).astype(np.float32)
+
+
+def _zstack(nz: int = 6) -> np.ndarray:
+    """Z-stack of 2D disk images (same objects per plane) for stitching."""
+    return np.stack(
+        [_disks(centers=[(60, 60), (60, 150), (150, 100)], r=16) for _ in range(nz)]
+    )
+
+
 def test_segmentation_imports_without_optional_deps() -> None:
     """``import cubic.segmentation`` must succeed even without cellpose/cupy/torch."""
     import importlib
@@ -148,6 +164,60 @@ def test_list_input_returns_per_image_lists(gpu_available: bool) -> None:
             np.asarray(ms).astype(np.int32), np.asarray(mg).astype(np.int32), [0.5]
         )
         assert ap[0] >= 0.95, f"AP@0.5={ap[0]:.3f}"
+
+
+def test_parity_3d_vs_stock(gpu_available: bool) -> None:
+    """3D (do_3D=True) resident masks match stock eval (AP >= 0.95 @ IoU 0.5)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cpsam_resident
+    from cubic.metrics.average_precision import average_precision
+
+    vol = _volume_3d()
+    model = CellposeModel(gpu=True, pretrained_model="cpsam")
+    m_stock, _, _ = model.eval(vol, z_axis=0, diameter=None, do_3D=True)
+    m_gpu, _, _ = segment_cpsam_resident(
+        model, vol, z_axis=0, do_3D=True, download=True
+    )
+
+    m_stock = np.asarray(m_stock).astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    assert m_stock.shape == m_gpu.shape == vol.shape
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"AP@0.5={ap[0]:.3f} (stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
+
+
+def test_parity_stitch_vs_stock(gpu_available: bool) -> None:
+    """Stitched 3D masks (stitch_threshold>0) match stock eval (AP >= 0.95)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cpsam_resident
+    from cubic.metrics.average_precision import average_precision
+
+    stack = _zstack()
+    model = CellposeModel(gpu=True, pretrained_model="cpsam")
+    m_stock, _, _ = model.eval(
+        stack, z_axis=0, diameter=None, do_3D=False, stitch_threshold=0.5
+    )
+    m_gpu, _, _ = segment_cpsam_resident(
+        model, stack, z_axis=0, do_3D=False, stitch_threshold=0.5, download=True
+    )
+
+    m_stock = np.asarray(m_stock).astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    assert m_stock.shape == m_gpu.shape == stack.shape
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"AP@0.5={ap[0]:.3f} (stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
 
 
 def test_residency_single_download(gpu_available: bool) -> None:
