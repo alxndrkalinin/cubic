@@ -13,11 +13,12 @@ are imported and reused as-is.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
 
-from ..cuda import CUDAManager, ascupy, to_torch
+from ..cuda import CUDAManager, ascupy, asnumpy, to_torch
 from .cellpose_sam_gpu import resize_gpu
 
 try:  # cellpose is optional; fail only at call time
@@ -348,8 +349,35 @@ def _flow_error(maski: Any, dP_net: Any, device: Any) -> tuple[Any, Any]:
 def _remove_bad_flow_masks(
     masks: Any, flows: Any, threshold: float, device: Any
 ) -> Any:
-    """Discard masks whose flows disagree with the network (mirror cellpose)."""
+    """Discard masks whose flows disagree with the network (mirror cellpose).
+
+    For very large masks where the on-device flow recomputation would not fit
+    in free VRAM, fall back to cellpose's CPU flow-QC (mirrors the
+    ``masks.size > 1e8`` guard in ``dynamics.remove_bad_flow_masks``). This
+    is the one place a derived array may leave the GPU, and only to avoid an
+    out-of-memory error on a huge image.
+    """
     cp = _cp()
+    import torch
+
+    if masks.size > 10000 * 10000 and device is not None and device.type == "cuda":
+        torch.cuda.empty_cache()
+        free_mem, _total = torch.cuda.mem_get_info(device.index)
+        if masks.size * 32 > free_mem:
+            warnings.warn(
+                "image is very large; computing flow-QC on CPU to avoid GPU OOM "
+                "(set flow_threshold=0 to skip this step)."
+            )
+            from cellpose.dynamics import remove_bad_flow_masks as _cpu_remove
+
+            out = _cpu_remove(
+                asnumpy(masks),
+                asnumpy(flows),
+                threshold=threshold,
+                device=torch.device("cpu"),
+            )
+            return ascupy(out)
+
     merrors, _ = _flow_error(masks, flows, device)
     badi = 1 + cp.nonzero(merrors > threshold)[0]
     masks = cp.where(cp.isin(masks, badi), 0, masks)
