@@ -135,8 +135,9 @@ def _get_masks(
         pt[i] = torch.clamp(pt[i], max=shape0[i] + rpad - 1)
     shape = tuple(np.array(shape0) + 2 * rpad)
 
+    # sparse_coo_tensor requires int64 indices; pt arrives as int32 (.int())
     coo = torch.sparse_coo_tensor(
-        pt, torch.ones(pt.shape[1], device=device, dtype=torch.int), shape
+        pt.long(), torch.ones(pt.shape[1], device=device, dtype=torch.int), shape
     )
     h1 = coo.to_dense()
     del coo
@@ -405,9 +406,10 @@ def _fill_holes_and_size_filter(masks: Any, min_size: int = 15) -> Any:
     slices = cnd.find_objects(masks)
     for i, slc in enumerate(slices):
         if slc is not None:
-            msk = masks[slc] == (i + 1)
-            filled = cnd.binary_fill_holes(msk)
-            masks[slc][filled] = i + 1
+            # assign back through the slice view (np.where dispatches to cupy);
+            # avoids chained-indexing ``masks[slc][filled] = ...``
+            filled = cnd.binary_fill_holes(masks[slc] == (i + 1))
+            masks[slc] = np.where(filled, i + 1, masks[slc])
 
     if min_size > 0:
         masks = _filter_small(masks, min_size)

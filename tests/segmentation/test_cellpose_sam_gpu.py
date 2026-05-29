@@ -216,6 +216,23 @@ def test_parity_stitch_vs_stock(gpu_available: bool) -> None:
     )
 
 
+def test_fill_holes_fills_interior(gpu_available: bool) -> None:
+    """_fill_holes_and_size_filter actually fills interior holes (writes back)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    cp = pytest.importorskip("cupy")
+    from cubic.segmentation.cellpose_dynamics import _fill_holes_and_size_filter
+
+    lbl = cp.zeros((40, 40), dtype=cp.uint16)
+    yy, xx = cp.mgrid[0:40, 0:40]
+    r2 = (yy - 20) ** 2 + (xx - 20) ** 2
+    lbl[(r2 <= 12**2) & (r2 > 4**2)] = 1  # annulus: solid disk with a hole
+    assert int(lbl[20, 20]) == 0  # hole present before filling
+
+    out = _fill_holes_and_size_filter(lbl.copy(), min_size=5)
+    assert int(out[20, 20]) == 1  # interior hole filled (slice write-back works)
+
+
 def test_residency_single_download(gpu_available: bool) -> None:
     """download=False: only the final mask leaves the GPU; flows stay CuPy."""
     if not gpu_available:
