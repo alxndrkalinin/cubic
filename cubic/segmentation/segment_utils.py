@@ -142,7 +142,7 @@ def _remove_small_objects(label_img: np.ndarray, min_size: int) -> np.ndarray:
     if get_device(label_img) == "GPU":
         return _cu_morphology.remove_small_objects(label_img, min_size=min_size)
     if _SKIMAGE_USES_MAX_SIZE:
-        return _sk_morphology.remove_small_objects(label_img, max_size=min_size - 1)
+        return _sk_morphology.remove_small_objects(label_img, max_size=min_size - 1)  # type: ignore[call-arg]
     return _sk_morphology.remove_small_objects(label_img, min_size=min_size)
 
 
@@ -156,7 +156,7 @@ def _remove_small_holes(mask: np.ndarray, area_threshold: int) -> np.ndarray:
     if get_device(mask) == "GPU":
         return _cu_morphology.remove_small_holes(mask, area_threshold=area_threshold)
     if _SKIMAGE_USES_MAX_SIZE:
-        return _sk_morphology.remove_small_holes(mask, max_size=area_threshold)
+        return _sk_morphology.remove_small_holes(mask, max_size=area_threshold)  # type: ignore[call-arg]
     return _sk_morphology.remove_small_holes(mask, area_threshold=area_threshold)
 
 
