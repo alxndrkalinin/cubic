@@ -37,7 +37,8 @@ Repository = "https://github.com/alxndrkalinin/cubic"
 
 [project.optional-dependencies]
 cellpose = [
-    "cellpose>=2.0,<4.0",
+    "cellpose>=4.0",
+    "torch",
 ]
 mesh = [
     "trimesh>=3.3.0",

@@ -147,7 +147,7 @@ def asnumpy(array: np.ndarray) -> np.ndarray:
     return np.asarray(array)
 
 
-def ascupy(array: np.ndarray) -> object:
+def ascupy(array: Any) -> Any:
     """Move (or keep) array to GPU.
 
     For torch CUDA tensors and other CUDA Array Interface (CAI) producers,
@@ -157,8 +157,79 @@ def ascupy(array: np.ndarray) -> object:
     ``tests/test_cuda.py::test_metrics_do_not_mutate_input``); third-party
     code that wants to write into the GPU buffer should explicitly copy
     with ``cp.array(x, copy=True)`` first.
+
+    Note:
+        This is **float-dtype-agnostic at the bridge**: ``cupy`` has no
+        ``bfloat16`` dtype, so ``cp.asarray`` on a torch ``bfloat16`` tensor
+        silently produces an opaque ``|V2`` (2-byte void) array rather than
+        raising. Route network outputs through :func:`ascupy_f32` instead.
     """
     cp = CUDAManager().get_cp()
     if cp is not None:
         return cp.asarray(array)
     raise RuntimeError("GPU requested but not available.")
+
+
+def to_torch(array: Any, device: Any = None, dtype: Any = None) -> Any:
+    """Move (or wrap) an array as a torch tensor, zero-copy from CuPy when possible.
+
+    The inverse of :func:`ascupy` for the cubic↔torch bridge:
+
+    - CuPy array → ``torch.as_tensor`` (zero-copy view via the CUDA Array
+      Interface; shares storage with the source).
+    - NumPy array → ``torch.from_numpy`` then moved to ``device``.
+    - torch.Tensor → moved/cast to ``device``/``dtype`` as requested.
+
+    torch is imported lazily so ``cubic`` still imports without torch installed
+    (mirrors :func:`_is_torch_tensor`).
+
+    Args:
+        array: CuPy/NumPy array or torch tensor.
+        device: Target torch device (e.g. ``"cuda"`` or ``torch.device(...)``).
+            For CuPy inputs, defaults to ``"cuda"``; for tensors, left as-is
+            unless provided.
+        dtype: Optional torch dtype to cast to. The cast happens on-device, so
+            a CuPy float32 input can be cast to ``bfloat16`` for the network
+            without leaving the GPU.
+
+    Returns
+    -------
+        torch.Tensor on the requested device/dtype.
+    """
+    import torch  # lazy: keep base cubic importable without torch
+
+    if isinstance(array, torch.Tensor):
+        if device is not None or dtype is not None:
+            return array.to(device=device, dtype=dtype)
+        return array
+
+    cp = CUDAManager().get_cp()
+    if cp is not None and isinstance(array, cp.ndarray):
+        # zero-copy view via CUDA Array Interface; default to the array's own
+        # CUDA device (e.g. cuda:1) rather than a hard-coded "cuda"
+        dev = f"cuda:{array.device.id}" if device is None else device
+        tensor = torch.as_tensor(array, device=dev)
+        return tensor.to(dtype) if dtype is not None else tensor
+
+    tensor = torch.from_numpy(np.asarray(array))
+    if device is not None:
+        tensor = tensor.to(device)
+    return tensor.to(dtype) if dtype is not None else tensor
+
+
+def ascupy_f32(array: Any) -> Any:
+    """Move (or keep) an array on the GPU as a CuPy array, fp32-safe at the bridge.
+
+    Identical to :func:`ascupy` except that torch tensors are first cast to
+    ``float32`` **on-device**. This guards the silent-corruption failure mode
+    where ``cupy.asarray`` on a torch ``bfloat16`` tensor yields an opaque
+    ``|V2`` array (CuPy has no ``bfloat16``). Use at the network-output
+    boundary, where activations may be ``bfloat16``.
+
+    Non-torch inputs are forwarded to :func:`ascupy` unchanged.
+    """
+    if _is_torch_tensor(array):
+        import torch  # lazy
+
+        array = array.to(torch.float32)
+    return ascupy(array)
