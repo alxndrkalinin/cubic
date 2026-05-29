@@ -761,11 +761,11 @@ def test_resolution_returns_nan_when_curve_below_threshold() -> None:
     freqs = np.linspace(0.05, 1.0, 50)
 
     # Case 1: below-threshold-everywhere curve (zero-correlation prediction).
+    # Deterministic constant well below 0.143 so the scenario is invariant
+    # across NumPy/RNG versions.
     below = FourierCorrelationData()
     below.correlation["frequency"] = freqs
-    below.correlation["correlation"] = 0.02 + 0.05 * np.random.default_rng(
-        0
-    ).standard_normal(50)
+    below.correlation["correlation"] = np.full(50, 0.02)
     below.correlation["points-x-bin"] = np.full(50, 100.0)
     coll = FourierCorrelationDataCollection()
     coll[0] = below

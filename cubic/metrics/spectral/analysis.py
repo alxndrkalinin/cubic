@@ -391,13 +391,15 @@ class FourierCorrelationAnalysis(object):
             return abs(frc_eq(x) - threshold)
 
         def first_guess(x, y, thr):
+            # Returns ``None`` when no meaningful seed exists. The caller
+            # interprets that as "no measurable resolution" and sets
+            # ``resolution = NaN``.
             difference = y - thr
             crossings = np.where(difference <= 0)[0]
             if len(crossings) == 0:
                 # Never crosses the threshold — resolution is beyond Nyquist
                 # (or the prediction is so close to GT that FSC stays above
-                # threshold everywhere). No measurable resolution: return NaN
-                # rather than reporting Nyquist as a floor.
+                # threshold everywhere). No measurable resolution.
                 return None
             if crossings[0] == 0:
                 # Curve starts already below threshold at the lowest measured
@@ -405,7 +407,7 @@ class FourierCorrelationAnalysis(object):
                 # correlation to GT. There is no above-to-below crossing to
                 # report; fmin started here would wander into extrapolated
                 # territory and yield absurd roots (e.g. negative or near-zero,
-                # producing million-µm resolutions). Return NaN.
+                # producing million-µm resolutions).
                 return None
             return x[crossings[0] - 1]
 
