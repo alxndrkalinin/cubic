@@ -743,3 +743,88 @@ def test_preprocess_images_centers_before_padding_non_cubic_input() -> None:
         f"centered reference — preprocess_images must mean-center before "
         f"pad_image_to_cube"
     )
+
+
+def test_resolution_returns_nan_when_curve_below_threshold() -> None:
+    """FSC/FRC curves that never start above the threshold must yield NaN.
+
+    Regression guard: predictions with near-zero correlation to GT
+    produce curves that sit below 0.143 from the lowest measured
+    frequency. ``first_guess`` previously returned ``x[0]`` in that
+    case, feeding an unbounded ``fmin`` that wandered into extrapolated
+    territory and produced absurd roots (negative or near-zero),
+    yielding resolutions of millions of µm via ``2 * spacing / root``.
+    The fix returns ``None`` (→ NaN) when the curve starts already
+    below the threshold and also rejects fmin roots outside the data's
+    frequency range.
+    """
+    freqs = np.linspace(0.05, 1.0, 50)
+
+    # Case 1: below-threshold-everywhere curve (zero-correlation prediction).
+    below = FourierCorrelationData()
+    below.correlation["frequency"] = freqs
+    below.correlation["correlation"] = 0.02 + 0.05 * np.random.default_rng(
+        0
+    ).standard_normal(50)
+    below.correlation["points-x-bin"] = np.full(50, 100.0)
+    coll = FourierCorrelationDataCollection()
+    coll[0] = below
+    res_below = (
+        FourierCorrelationAnalysis(
+            coll,
+            spacing=0.108,
+            resolution_threshold="fixed",
+            threshold_value=0.143,
+            curve_fit_type="smooth-spline",
+        )
+        .execute(z_correction=1.0)[0]
+        .resolution["resolution"]
+    )
+    assert np.isnan(res_below), (
+        f"Below-threshold curve must return NaN, got {res_below} "
+        "(unbounded fmin previously produced millions-of-µm resolutions)"
+    )
+
+    # Case 2: above-threshold-everywhere curve (perfect prediction).
+    above = FourierCorrelationData()
+    above.correlation["frequency"] = freqs
+    above.correlation["correlation"] = np.full(50, 0.9)
+    above.correlation["points-x-bin"] = np.full(50, 100.0)
+    coll2 = FourierCorrelationDataCollection()
+    coll2[0] = above
+    res_above = (
+        FourierCorrelationAnalysis(
+            coll2,
+            spacing=0.108,
+            resolution_threshold="fixed",
+            threshold_value=0.143,
+            curve_fit_type="smooth-spline",
+        )
+        .execute(z_correction=1.0)[0]
+        .resolution["resolution"]
+    )
+    assert np.isnan(res_above), (
+        f"Above-threshold curve must return NaN, got {res_above}"
+    )
+
+    # Case 3: legitimate crossing — must still produce a finite resolution.
+    legit = FourierCorrelationData()
+    legit.correlation["frequency"] = freqs
+    legit.correlation["correlation"] = 0.9 * np.exp(-3 * freqs) + 0.02
+    legit.correlation["points-x-bin"] = np.full(50, 100.0)
+    coll3 = FourierCorrelationDataCollection()
+    coll3[0] = legit
+    res_legit = (
+        FourierCorrelationAnalysis(
+            coll3,
+            spacing=0.108,
+            resolution_threshold="fixed",
+            threshold_value=0.143,
+            curve_fit_type="smooth-spline",
+        )
+        .execute(z_correction=1.0)[0]
+        .resolution["resolution"]
+    )
+    assert np.isfinite(res_legit) and 0 < res_legit < 100, (
+        f"Legitimate crossing must yield finite reasonable resolution, got {res_legit}"
+    )
