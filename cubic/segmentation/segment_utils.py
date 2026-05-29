@@ -140,6 +140,11 @@ def _remove_small_objects(label_img: np.ndarray, min_size: int) -> np.ndarray:
     "keep size ≥ min_size" semantics. cucim still uses ``min_size``.
     """
     if get_device(label_img) == "GPU":
+        if _cu_morphology is None:
+            raise ImportError(
+                "cucim is required to process GPU arrays but is not installed; "
+                "install cubic with the GPU extras or move the input to CPU."
+            )
         return _cu_morphology.remove_small_objects(label_img, min_size=min_size)
     if _SKIMAGE_USES_MAX_SIZE:
         return _sk_morphology.remove_small_objects(label_img, max_size=min_size - 1)  # type: ignore[call-arg]
@@ -154,6 +159,11 @@ def _remove_small_holes(mask: np.ndarray, area_threshold: int) -> np.ndarray:
     still uses ``area_threshold``.
     """
     if get_device(mask) == "GPU":
+        if _cu_morphology is None:
+            raise ImportError(
+                "cucim is required to process GPU arrays but is not installed; "
+                "install cubic with the GPU extras or move the input to CPU."
+            )
         return _cu_morphology.remove_small_holes(mask, area_threshold=area_threshold)
     if _SKIMAGE_USES_MAX_SIZE:
         return _sk_morphology.remove_small_holes(mask, max_size=area_threshold)  # type: ignore[call-arg]
