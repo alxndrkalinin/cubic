@@ -323,13 +323,13 @@ def run_net_gpu(
         ya = None
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
-            ya0, stylea0 = _forward_gpu(net, IMGa[bslc])
+            # CPSAM emits zero style vectors (matching stock eval), so styles
+            # stay the allocated zeros; only the flow output is accumulated.
+            ya0, _style0 = _forward_gpu(net, IMGa[bslc])
             if ya is None:
                 nout = ya0.shape[1]
                 ya = xp.zeros((IMGa.shape[0], nout, ly, lx), np.float32)
-                stylea = xp.zeros((IMGa.shape[0], 256), np.float32)
             ya[bslc] = ya0
-            stylea[bslc] = stylea0
 
         assert imgb_shape is not None and ya is not None
         for i, b in enumerate(inds):
