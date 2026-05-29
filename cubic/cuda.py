@@ -205,8 +205,10 @@ def to_torch(array: Any, device: Any = None, dtype: Any = None) -> Any:
 
     cp = CUDAManager().get_cp()
     if cp is not None and isinstance(array, cp.ndarray):
-        # zero-copy view via CUDA Array Interface
-        tensor = torch.as_tensor(array, device="cuda" if device is None else device)
+        # zero-copy view via CUDA Array Interface; default to the array's own
+        # CUDA device (e.g. cuda:1) rather than a hard-coded "cuda"
+        dev = f"cuda:{array.device.id}" if device is None else device
+        tensor = torch.as_tensor(array, device=dev)
         return tensor.to(dtype) if dtype is not None else tensor
 
     tensor = torch.from_numpy(np.asarray(array))
@@ -215,7 +217,7 @@ def to_torch(array: Any, device: Any = None, dtype: Any = None) -> Any:
     return tensor.to(dtype) if dtype is not None else tensor
 
 
-def ascupy_f32(array: Any) -> object:
+def ascupy_f32(array: Any) -> Any:
     """Move (or keep) an array on the GPU as a CuPy array, fp32-safe at the bridge.
 
     Identical to :func:`ascupy` except that torch tensors are first cast to
