@@ -114,6 +114,17 @@ def test_building_blocks_run_on_cpu() -> None:
     out = g.normalize_img_gpu(x, **g._NORMALIZE_DEFAULT)
     assert isinstance(out, np.ndarray) and out.shape == x.shape
 
+    # tile-norm and sharpen leaves are device-agnostic too (run on NumPy)
+    tiled = g.normalize_img_gpu(
+        x.copy(), **{**g._NORMALIZE_DEFAULT, "tile_norm_blocksize": 32}
+    )
+    assert isinstance(tiled, np.ndarray) and tiled.shape == x.shape
+
+    sharp = g.normalize_img_gpu(
+        x.copy(), **{**g._NORMALIZE_DEFAULT, "sharpen_radius": 8, "smooth_radius": 2}
+    )
+    assert isinstance(sharp, np.ndarray) and sharp.shape == x.shape
+
 
 def test_parity_2d_vs_stock(gpu_available: bool) -> None:
     """Resident masks match stock CellposeModel.eval (AP >= 0.95 @ IoU 0.5)."""
@@ -129,6 +140,87 @@ def test_parity_2d_vs_stock(gpu_available: bool) -> None:
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(img, diameter=None, do_3D=False)
     m_gpu, _, _ = segment_cpsam(model, img, do_3D=False, download=True)
+
+    m_stock = m_stock.astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"AP@0.5={ap[0]:.3f} (stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
+
+
+def test_parity_tile_norm_2d_vs_stock(gpu_available: bool) -> None:
+    """tile_norm_blocksize>0 (2D) matches stock eval (AP >= 0.95 @ IoU 0.5)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cpsam
+    from cubic.metrics.average_precision import average_precision
+
+    img = _disks()
+    normalize = {"tile_norm_blocksize": 64}
+    model = CellposeModel(gpu=True, pretrained_model="cpsam")
+    m_stock, _, _ = model.eval(img, diameter=None, do_3D=False, normalize=normalize)
+    m_gpu, _, _ = segment_cpsam(
+        model, img, do_3D=False, normalize=normalize, download=True
+    )
+
+    m_stock = m_stock.astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"AP@0.5={ap[0]:.3f} (stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
+
+
+def test_parity_tile_norm_3d_vs_stock(gpu_available: bool) -> None:
+    """tile_norm_blocksize>0 (do_3D, norm3D) matches stock eval (AP >= 0.95)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cpsam
+    from cubic.metrics.average_precision import average_precision
+
+    vol = _volume_3d()
+    normalize = {"tile_norm_blocksize": 32}
+    model = CellposeModel(gpu=True, pretrained_model="cpsam")
+    m_stock, _, _ = model.eval(
+        vol, z_axis=0, diameter=None, do_3D=True, normalize=normalize
+    )
+    m_gpu, _, _ = segment_cpsam(
+        model, vol, z_axis=0, do_3D=True, normalize=normalize, download=True
+    )
+
+    m_stock = np.asarray(m_stock).astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    assert m_stock.shape == m_gpu.shape == vol.shape
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"AP@0.5={ap[0]:.3f} (stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
+
+
+def test_parity_sharpen_2d_vs_stock(gpu_available: bool) -> None:
+    """sharpen_radius/smooth_radius>0 (2D) matches stock eval (AP >= 0.95)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cpsam
+    from cubic.metrics.average_precision import average_precision
+
+    img = _disks()
+    normalize = {"sharpen_radius": 8, "smooth_radius": 2}
+    model = CellposeModel(gpu=True, pretrained_model="cpsam")
+    m_stock, _, _ = model.eval(img, diameter=None, do_3D=False, normalize=normalize)
+    m_gpu, _, _ = segment_cpsam(
+        model, img, do_3D=False, normalize=normalize, download=True
+    )
 
     m_stock = m_stock.astype(np.int32)
     m_gpu = np.asarray(m_gpu).astype(np.int32)

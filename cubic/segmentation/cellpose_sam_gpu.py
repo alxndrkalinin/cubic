@@ -448,7 +448,13 @@ def _run_net_gpu(
 
 
 # --------------------------------------------------------------------------- #
-# normalization (reuse cellpose's percentile path, which dispatches on cupy)
+# normalization
+#   - the default cellpose-SAM path (percentile / lowhigh) is pure
+#     ``np.``/``np.percentile``/``np.ptp`` and dispatches to cupy unchanged, so
+#     it is delegated to ``cellpose.transforms.normalize_img``
+#   - the tile-norm (``tile_norm_blocksize>0``) and sharpen/smooth
+#     (``sharpen_radius``/``smooth_radius>0``) sub-paths use cv2 / scipy /
+#     ``torch.from_numpy`` / ``np.array(list-of-arrays)`` and are ported here
 # --------------------------------------------------------------------------- #
 _NORMALIZE_DEFAULT = {
     "lowhigh": None,
@@ -463,25 +469,273 @@ _NORMALIZE_DEFAULT = {
 }
 
 
-def normalize_img_gpu(img: Any, **params: Any) -> Any:
-    """Percentile normalization on GPU by reusing ``cellpose.transforms.normalize_img``.
+def _smooth_sharpen_img_gpu(
+    img: Any,
+    smooth_radius: float = 6,
+    sharpen_radius: float = 12,
+    device: Any = None,
+    is3D: bool = False,
+) -> Any:
+    """Device-aware ``cellpose.transforms.smooth_sharpen_img`` (FFT stays torch).
 
-    The default cellpose-SAM normalization (percentile, no tile-norm/sharpen)
-    is pure ``np.``/``np.percentile``/``np.ptp`` and dispatches to cupy
-    unchanged (verified to match the CPU result to ~1e-9). The tile-norm and
-    sharpen/smooth sub-paths use cv2/``np.array(list)`` and are not yet ported
-    to the GPU-resident path.
+    Mirrors the upstream surround-subtraction / smoothing filter but bridges the
+    image to torch via :func:`~cubic.cuda.to_torch` (zero-copy from CuPy) instead
+    of ``torch.from_numpy``, reuses cellpose's pure-torch ``gaussian_kernel``, and
+    returns CuPy (GPU input) or NumPy (CPU input). Filtered values are written
+    into a fresh tensor so the input buffer is never mutated.
+    """
+    import torch
+
+    on_gpu = get_device(img) == "GPU"
+    img_sharpen = to_torch(img, device=device, dtype=torch.float32)
+    shape = img_sharpen.shape
+
+    is1c = img_sharpen.ndim == 2 or (is3D and img_sharpen.ndim == 3)
+    is3D = img_sharpen.ndim > 3 or (is3D and img_sharpen.ndim == 3)
+    img_sharpen = img_sharpen.unsqueeze(-1) if is1c else img_sharpen
+    img_sharpen = img_sharpen.unsqueeze(0) if img_sharpen.ndim == 3 else img_sharpen
+    Lz, Ly, Lx, nchan = img_sharpen.shape
+
+    dev = img_sharpen.device
+    if smooth_radius > 0:
+        kernel = _cp_transforms.gaussian_kernel(smooth_radius, Ly, Lx, device=dev)
+        if sharpen_radius > 0:
+            kernel += -1 * _cp_transforms.gaussian_kernel(
+                sharpen_radius, Ly, Lx, device=dev
+            )
+    elif sharpen_radius > 0:
+        kernel = -1 * _cp_transforms.gaussian_kernel(sharpen_radius, Ly, Lx, device=dev)
+        kernel[Ly // 2, Lx // 2] = 1
+
+    fhp = torch.fft.fft2(kernel)
+    out = torch.empty_like(img_sharpen)
+    for z in range(Lz):
+        for c in range(nchan):
+            img_filt = torch.real(
+                torch.fft.ifft2(
+                    torch.fft.fft2(img_sharpen[z, :, :, c]) * torch.conj(fhp)
+                )
+            )
+            out[z, :, :, c] = torch.fft.fftshift(img_filt)
+
+    out = out.reshape(shape)
+    return ascupy_f32(out) if on_gpu else out.cpu().numpy()
+
+
+def _normalize99_tile_gpu(
+    img: Any,
+    blocksize: int = 100,
+    lower: float = 1.0,
+    upper: float = 99.0,
+    tile_overlap: float = 0.1,
+    norm3D: bool = False,
+    smooth3D: int = 1,
+    is3D: bool = False,
+) -> Any:
+    """Device-aware ``cellpose.transforms.normalize99_tile`` (cv2/scipy-free).
+
+    Tiled percentile normalization with neighbor-fill of low-contrast tiles.
+    Device fixes vs upstream: ``np.zeros`` tile/x01/x99 buffers → ``xp.zeros``;
+    ``np.array(list-of-arrays)`` → ``xp.stack`` (a Python list of CuPy arrays does
+    not dispatch through ``np.array``); ``scipy.ndimage.gaussian_filter1d`` →
+    ``cubic.scipy.ndimage`` (cupyx on GPU); ``cv2.resize`` → :func:`resize_gpu`
+    (which preserves the channel axis, so the cv2 singleton re-add is dropped).
+    The upstream ``norm3D=False, Lz>1`` branch has a typo (``x99`` assigned from
+    ``x01_rsz``, forcing ``x99==x01`` → ``ZeroDivisionError``); fixed here so the
+    branch is usable.
+    """
+    from ..scipy import ndimage as _ndimage
+
+    xp = get_array_module(img)
+    is1c = img.ndim == 2 or (is3D and img.ndim == 3)
+    is3D = img.ndim > 3 or (is3D and img.ndim == 3)
+    img = img[..., np.newaxis] if is1c else img
+    img = img[np.newaxis, ...] if img.ndim == 3 else img
+    Lz, Ly, Lx, nchan = img.shape
+
+    tile_overlap = min(0.5, max(0.05, tile_overlap))
+    blocksizeY, blocksizeX = int(min(blocksize, Ly)), int(min(blocksize, Lx))
+    ny = (
+        1
+        if Ly <= blocksize
+        else int(np.ceil((1.0 + 2 * tile_overlap) * Ly / blocksize))
+    )
+    nx = (
+        1
+        if Lx <= blocksize
+        else int(np.ceil((1.0 + 2 * tile_overlap) * Lx / blocksize))
+    )
+    ystart = np.linspace(0, Ly - blocksizeY, ny).astype(int)
+    xstart = np.linspace(0, Lx - blocksizeX, nx).astype(int)
+    ysub, xsub = [], []
+    for j in range(len(ystart)):
+        for i in range(len(xstart)):
+            ysub.append([ystart[j], ystart[j] + blocksizeY])
+            xsub.append([xstart[i], xstart[i] + blocksizeX])
+
+    x01_list, x99_list = [], []
+    for z in range(Lz):
+        IMG = xp.zeros(
+            (len(ystart), len(xstart), blocksizeY, blocksizeX, nchan), "float32"
+        )
+        k = 0
+        for j in range(len(ystart)):
+            for i in range(len(xstart)):
+                IMG[j, i] = img[z, ysub[k][0] : ysub[k][1], xsub[k][0] : xsub[k][1], :]
+                k += 1
+        x01_tiles = np.percentile(IMG, lower, axis=(-3, -2))
+        x99_tiles = np.percentile(IMG, upper, axis=(-3, -2))
+
+        # fill areas with small differences with neighboring squares
+        for c in range(nchan):
+            to_fill = x99_tiles[:, :, c] - x01_tiles[:, :, c] < +1e-3
+            nfill = int(to_fill.sum())
+            if 0 < nfill < x99_tiles[:, :, c].size:
+                fill_vals = np.nonzero(to_fill)
+                fill_neigh = np.nonzero(~to_fill)
+                nearest_neigh = (
+                    (fill_vals[0] - fill_neigh[0][:, np.newaxis]) ** 2
+                    + (fill_vals[1] - fill_neigh[1][:, np.newaxis]) ** 2
+                ).argmin(axis=0)
+                x01_tiles[fill_vals[0], fill_vals[1], c] = x01_tiles[
+                    fill_neigh[0][nearest_neigh], fill_neigh[1][nearest_neigh], c
+                ]
+                x99_tiles[fill_vals[0], fill_vals[1], c] = x99_tiles[
+                    fill_neigh[0][nearest_neigh], fill_neigh[1][nearest_neigh], c
+                ]
+            elif nfill == x99_tiles[:, :, c].size:
+                x01_tiles[:, :, c] = 0
+                x99_tiles[:, :, c] = 1
+        x01_list.append(x01_tiles)
+        x99_list.append(x99_tiles)
+
+    x01_tiles_z = xp.stack(x01_list, axis=0)
+    x99_tiles_z = xp.stack(x99_list, axis=0)
+    # do not smooth over z-axis if not normalizing separately per plane
+    for a in range(2):
+        x01_tiles_z = _ndimage.gaussian_filter1d(x01_tiles_z, 1, axis=a)
+        x99_tiles_z = _ndimage.gaussian_filter1d(x99_tiles_z, 1, axis=a)
+    if norm3D:
+        smooth3D = 1 if smooth3D == 0 else smooth3D
+        x01_tiles_z = _ndimage.gaussian_filter1d(x01_tiles_z, smooth3D, axis=a)
+        x99_tiles_z = _ndimage.gaussian_filter1d(x99_tiles_z, smooth3D, axis=a)
+
+    if not norm3D and Lz > 1:
+        x01 = xp.zeros((len(x01_tiles_z), Ly, Lx, nchan), "float32")
+        x99 = xp.zeros((len(x01_tiles_z), Ly, Lx, nchan), "float32")
+        for z in range(Lz):
+            # resize_gpu keeps the channel axis (unlike cv2, which drops a
+            # singleton), so assign the result directly
+            x01[z] = resize_gpu(x01_tiles_z[z], Ly=Ly, Lx=Lx, order=1)
+            x99[z] = resize_gpu(x99_tiles_z[z], Ly=Ly, Lx=Lx, order=1)
+        if float((x99 - x01).min()) < 1e-3:
+            raise ZeroDivisionError(
+                "cannot use norm3D=False with tile_norm, sample is too sparse; "
+                "set norm3D=True or tile_norm=0"
+            )
+    else:
+        x01 = resize_gpu(x01_tiles_z.mean(axis=0), Ly=Ly, Lx=Lx, order=1)
+        x99 = resize_gpu(x99_tiles_z.mean(axis=0), Ly=Ly, Lx=Lx, order=1)
+
+    if is1c:
+        img, x01, x99 = img.squeeze(), x01.squeeze(), x99.squeeze()
+    elif not is3D:
+        img, x01, x99 = img[0], x01[0], x99[0]
+
+    # normalize
+    img -= x01
+    img /= x99 - x01
+    return img
+
+
+def _normalize_img_gpu_special(
+    img: Any,
+    *,
+    device: Any = None,
+    normalize: bool = True,
+    norm3D: bool = True,
+    invert: bool = False,
+    lowhigh: Any = None,  # always None on this path (guarded by normalize_img_gpu)
+    percentile: tuple[float, float] | None = (1.0, 99.0),
+    sharpen_radius: float = 0,
+    smooth_radius: float = 0,
+    tile_norm_blocksize: int = 0,
+    tile_norm_smooth3D: int = 1,
+) -> Any:
+    """GPU tile-norm / sharpen path (mirrors ``normalize_img``'s ordering).
+
+    Sharpen/smooth is applied first, then either tile-norm (with the invert tail)
+    or the standard percentile path delegated to ``cellpose.transforms.normalize_img``
+    (which dispatches on cupy). Channel-last (``axis=-1``) is assumed.
+    """
+    xp = get_array_module(img)
+    img_norm = img if img.dtype == xp.float32 else img.astype(xp.float32)
+    if percentile is None:
+        percentile = (1.0, 99.0)
+    elif not (0 <= percentile[0] < percentile[1] <= 100):
+        raise ValueError("Invalid percentile range, should be between 0 and 100")
+
+    if sharpen_radius > 0 or smooth_radius > 0:
+        img_norm = _smooth_sharpen_img_gpu(
+            img_norm,
+            sharpen_radius=sharpen_radius,
+            smooth_radius=smooth_radius,
+            device=device,
+        )
+
+    if tile_norm_blocksize > 0:
+        img_norm = _normalize99_tile_gpu(
+            img_norm,
+            blocksize=tile_norm_blocksize,
+            lower=percentile[0],
+            upper=percentile[1],
+            smooth3D=tile_norm_smooth3D,
+            norm3D=norm3D,
+        )
+        if invert:
+            img_norm = 1 - img_norm
+        return img_norm
+
+    # sharpen-only: finish on the standard percentile path (dispatches on cupy)
+    return _cp_transforms.normalize_img(
+        img_norm,
+        normalize=normalize,
+        norm3D=norm3D,
+        invert=invert,
+        lowhigh=None,
+        percentile=percentile,
+        tile_norm_blocksize=0,
+        tile_norm_smooth3D=tile_norm_smooth3D,
+    )
+
+
+def normalize_img_gpu(img: Any, *, device: Any = None, **params: Any) -> Any:
+    """Device-aware ``cellpose.transforms.normalize_img`` for the GPU path.
+
+    The default cellpose-SAM normalization (percentile / lowhigh) dispatches to
+    cupy unchanged (verified to match the CPU result to ~1e-9), so it is delegated
+    to ``cellpose.transforms.normalize_img``. The tile-norm
+    (``tile_norm_blocksize>0``) and sharpen/smooth (``sharpen_radius`` /
+    ``smooth_radius>0``) sub-paths are handled by :func:`_normalize_img_gpu_special`.
+    Channel-last (``axis=-1``) is assumed for the special paths.
     """
     _require_cellpose()
-    if params.get("tile_norm_blocksize", 0):
-        raise NotImplementedError(
-            "tile_norm_blocksize>0 is not supported on the GPU-resident path yet"
-        )
-    if params.get("sharpen_radius", 0) or params.get("smooth_radius", 0):
-        raise NotImplementedError(
-            "sharpen/smooth normalization is not supported on the GPU-resident path yet"
-        )
-    return _cp_transforms.normalize_img(img, **params)
+    p = {**_NORMALIZE_DEFAULT, **params}
+    axis = p.pop("axis", -1)
+
+    special = p.get("lowhigh") is None and (
+        p["sharpen_radius"] > 0
+        or p["smooth_radius"] > 0
+        or p["tile_norm_blocksize"] > 0
+    )
+    if special:
+        if axis != -1:
+            raise NotImplementedError(
+                "GPU tile-norm/sharpen normalization assumes channel-last (axis=-1)"
+            )
+        return _normalize_img_gpu_special(img, device=device, **p)
+
+    return _cp_transforms.normalize_img(img, axis=axis, **p)
 
 
 # --------------------------------------------------------------------------- #
@@ -623,12 +877,12 @@ def segment_cpsam(
     # pre-normalize the whole stack for 3D / stitching (mirror eval:276-289)
     if nimg > 1 and do_normalization and (stitch_threshold or do_3D):
         normalize_params["norm3D"] = True if do_3D else normalize_params["norm3D"]
-        x = normalize_img_gpu(x, **normalize_params)
+        x = normalize_img_gpu(x, device=model.device, **normalize_params)
         do_normalization = False
     elif normalize_params["norm3D"] and nimg > 1 and do_normalization:
         normalize_params["norm3D"] = False
     if do_normalization:
-        x = normalize_img_gpu(x, **normalize_params)
+        x = normalize_img_gpu(x, device=model.device, **normalize_params)
 
     # --- network forward (GPU-resident) ---
     dP, cellprob, styles = _run_net_gpu(
