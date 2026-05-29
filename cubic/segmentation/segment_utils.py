@@ -95,24 +95,48 @@ def downscale_and_filter(
 def check_labeled_binary(image):
     """Check if the given image is a labeled image.
 
+    Raises ``TypeError`` if the input is not integer-typed. Empty FOVs
+    (constant images, e.g. all-zero label masks) are accepted silently —
+    downstream cleanup steps are no-ops on them and crashing here would
+    require every caller to pre-check.
+
     Parameters
     ----------
     image : ndarray
         The image to be checked.
 
-    Returns
-    -------
-    None
-
     """
-    assert np.issubdtype(image.dtype, np.integer), "Image must be of integer type."
+    if not np.issubdtype(image.dtype, np.integer):
+        raise TypeError(f"Image must be of integer type, got {image.dtype}.")
 
     unique_values = np.unique(image)
-    assert len(unique_values) > 1, "Image is constant."
     if len(unique_values) == 2:
         warnings.warn(
             "Only one label was provided in the image. Make sure to label components first."
         )
+
+
+def _remove_small_objects(label_img: np.ndarray, min_size: int) -> np.ndarray:
+    """Remove objects smaller than ``min_size`` across skimage/cucim API drift.
+
+    skimage 0.26 deprecated ``min_size`` in favor of ``max_size`` (with
+    inverted threshold semantics: ``max_size=N`` removes objects with
+    size ≤ N, while ``min_size=N`` removed size < N — so the equivalent
+    is ``max_size=min_size - 1``). cucim still uses ``min_size``. Dispatch
+    per backend instead of going through the cubic.skimage proxy.
+    """
+    if get_device(label_img) == "GPU":
+        from cucim.skimage.morphology import remove_small_objects as _rso
+
+        return _rso(label_img, min_size=min_size)
+
+    import inspect
+
+    from skimage.morphology import remove_small_objects as _rso
+
+    if "max_size" in inspect.signature(_rso).parameters:
+        return _rso(label_img, max_size=min_size - 1)
+    return _rso(label_img, min_size=min_size)
 
 
 def cleanup_segmentation(
@@ -127,8 +151,7 @@ def cleanup_segmentation(
 
     # first 3 transforms preserve labels
     if min_obj_size is not None:
-        # min_obj_size = to_device(min_obj_size, get_device(label_image))
-        label_img = morphology.remove_small_objects(label_img, min_size=min_obj_size)
+        label_img = _remove_small_objects(label_img, min_size=min_obj_size)
 
     if max_obj_size is not None:
         label_img = remove_large_objects(label_img, max_size=max_obj_size)
@@ -211,8 +234,7 @@ def remove_large_objects(label_image: np.ndarray, max_size: int = 100000) -> np.
 def remove_small_objects(label_image: np.ndarray, min_size: int = 500) -> np.ndarray:
     """Remove objects with volume below specified threshold."""
     check_labeled_binary(label_image)
-    label_image = morphology.remove_small_objects(label_image, min_size=min_size)
-    return label_image
+    return _remove_small_objects(label_image, min_size=min_size)
 
 
 def clear_xy_borders(label_image: np.ndarray, buffer_size: int = 0) -> np.ndarray:
