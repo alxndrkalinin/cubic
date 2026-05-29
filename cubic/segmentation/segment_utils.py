@@ -1,10 +1,17 @@
 """Implement pre- and post-processing for segmentation."""
 
+import inspect
 import warnings
 from collections.abc import Sequence
 
 import numpy as np
+from skimage import morphology as _sk_morphology
 from skimage.segmentation import watershed
+
+try:
+    from cucim.skimage import morphology as _cu_morphology
+except ImportError:  # cucim is an optional GPU-only dep
+    _cu_morphology = None  # type: ignore[assignment]
 
 from ..cuda import asnumpy, to_device, get_device
 from ..skimage import feature, filters, transform, morphology
@@ -116,27 +123,41 @@ def check_labeled_binary(image):
         )
 
 
+# skimage 0.26 deprecated `min_size` / `area_threshold` on remove_small_objects
+# / remove_small_holes in favor of `max_size`. cucim 26.02 still uses the old
+# names. Detect once at import which kwarg the local skimage accepts; the
+# helpers below dispatch per device.
+_SKIMAGE_USES_MAX_SIZE: bool = (
+    "max_size" in inspect.signature(_sk_morphology.remove_small_objects).parameters
+)
+
+
 def _remove_small_objects(label_img: np.ndarray, min_size: int) -> np.ndarray:
     """Remove objects smaller than ``min_size`` across skimage/cucim API drift.
 
-    skimage 0.26 deprecated ``min_size`` in favor of ``max_size`` (with
-    inverted threshold semantics: ``max_size=N`` removes objects with
-    size ≤ N, while ``min_size=N`` removed size < N — so the equivalent
-    is ``max_size=min_size - 1``). cucim still uses ``min_size``. Dispatch
-    per backend instead of going through the cubic.skimage proxy.
+    skimage 0.26 ``max_size=N`` removes objects of size ≤ N; old ``min_size=N``
+    removed size < N. Pass ``max_size=min_size - 1`` to preserve the old
+    "keep size ≥ min_size" semantics. cucim still uses ``min_size``.
     """
     if get_device(label_img) == "GPU":
-        from cucim.skimage.morphology import remove_small_objects as _rso
+        return _cu_morphology.remove_small_objects(label_img, min_size=min_size)
+    if _SKIMAGE_USES_MAX_SIZE:
+        return _sk_morphology.remove_small_objects(label_img, max_size=min_size - 1)
+    return _sk_morphology.remove_small_objects(label_img, min_size=min_size)
 
-        return _rso(label_img, min_size=min_size)
 
-    import inspect
+def _remove_small_holes(mask: np.ndarray, area_threshold: int) -> np.ndarray:
+    """Fill holes smaller than ``area_threshold`` across skimage/cucim API drift.
 
-    from skimage.morphology import remove_small_objects as _rso
-
-    if "max_size" in inspect.signature(_rso).parameters:
-        return _rso(label_img, max_size=min_size - 1)
-    return _rso(label_img, min_size=min_size)
+    skimage 0.26 renamed ``area_threshold`` → ``max_size`` with identical
+    semantics (no off-by-one shift, unlike ``remove_small_objects``). cucim
+    still uses ``area_threshold``.
+    """
+    if get_device(mask) == "GPU":
+        return _cu_morphology.remove_small_holes(mask, area_threshold=area_threshold)
+    if _SKIMAGE_USES_MAX_SIZE:
+        return _sk_morphology.remove_small_holes(mask, max_size=area_threshold)
+    return _sk_morphology.remove_small_holes(mask, area_threshold=area_threshold)
 
 
 def cleanup_segmentation(
@@ -163,9 +184,7 @@ def cleanup_segmentation(
     if max_hole_size is not None:
         for label_id in np.unique(label_img)[1:]:
             mask = label_img == label_id
-            filled_mask = morphology.remove_small_holes(
-                mask, area_threshold=max_hole_size
-            )
+            filled_mask = _remove_small_holes(mask, area_threshold=max_hole_size)
             label_img[filled_mask] = label_id
 
     return label(label_img).astype(np.uint16)
@@ -446,8 +465,8 @@ def fill_holes_slicer(
                 for i in range(binary.shape[axis]):
                     slicers[axis] = slice(i, i + 1)
                     binary_slice = binary[tuple(slicers)]
-                    filled_slice = morphology.remove_small_holes(
-                        binary_slice, area_threshold
+                    filled_slice = _remove_small_holes(
+                        binary_slice, area_threshold=area_threshold
                     )
                     if filled_slice.shape != binary_slice.shape:
                         raise ValueError(
