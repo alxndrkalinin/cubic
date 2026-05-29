@@ -37,6 +37,12 @@ def cellpose_eval(
     ``pretrained_model`` (default the Cellpose-SAM weights ``"cpsam"``) and
     ``channel_axis`` for multi-channel inputs.
     """
+    if not _CELLPOSE_AVAILABLE:
+        raise ImportError(
+            "Cellpose is required for this function, but not available. "
+            "Try re-installing with `pip install cubic[cellpose]`."
+        )
+
     model = models.CellposeModel(gpu=True, pretrained_model=pretrained_model)
     masks, _, _ = model.eval(
         image,
