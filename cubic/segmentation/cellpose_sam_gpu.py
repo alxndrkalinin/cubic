@@ -3,7 +3,7 @@
 This module mirrors ``cellpose.transforms`` / ``cellpose.core`` but keeps every
 array on the GPU as a CuPy array, bridging to torch *zero-copy* only for the
 network forward. The input image is uploaded to the device exactly once
-(:func:`segment_cpsam_resident`) and only the final integer mask returns to the
+(:func:`segment_cpsam`) and only the final integer mask returns to the
 host (mask computation lives in :mod:`cubic.segmentation.cellpose_dynamics`).
 
 cellpose itself is never modified. Heavy CPU dependencies are replaced with
@@ -491,24 +491,23 @@ def _check_gpu_precondition(model: Any) -> None:
     """GPU-only contract: require CUDA + cupy + a SAM (v4) model on cuda."""
     if CUDAManager().get_cp() is None:
         raise RuntimeError(
-            "segment_cpsam_resident requires cupy + a CUDA GPU; "
-            "use CellposeModel.eval for CPU."
+            "segment_cpsam requires cupy + a CUDA GPU; use CellposeModel.eval for CPU."
         )
     if getattr(model, "device", None) is None or model.device.type != "cuda":
         raise RuntimeError(
-            "segment_cpsam_resident requires a model on a CUDA device "
+            "segment_cpsam requires a model on a CUDA device "
             f"(got device={getattr(model, 'device', None)})."
         )
     if not hasattr(model, "backbone") or not hasattr(
         getattr(model, "net", None), "dtype"
     ):
         raise RuntimeError(
-            "segment_cpsam_resident requires cellpose>=4 (SAM): "
+            "segment_cpsam requires cellpose>=4 (SAM): "
             "model.backbone / model.net.dtype not found."
         )
 
 
-def segment_cpsam_resident(
+def segment_cpsam(
     model: Any,
     x: Any,
     *,
@@ -531,11 +530,13 @@ def segment_cpsam_resident(
     tile_overlap: float = 0.1,
     download: bool = False,
 ) -> tuple[Any, list, Any]:
-    """GPU-resident cellpose-SAM eval for a single image (2D / 3D / stitch).
+    """Segment an image with Cellpose-SAM, GPU-resident (2D / 3D / stitch).
 
-    The input is uploaded to the GPU once and only the final integer mask
-    returns to the host (default). Mirrors ``CellposeModel.eval`` but keeps the
-    flow field on the device.
+    This is cubic's recommended Cellpose-SAM segmentation entry point: the
+    input is uploaded to the GPU once and only the final integer mask returns
+    to the host (default). It mirrors ``CellposeModel.eval`` but keeps the flow
+    field on the device, replacing the CPU pre/post-processing with cubic's
+    device-agnostic wrappers.
 
     Args:
         model: A pre-built ``cellpose.models.CellposeModel`` (v4/SAM) on CUDA.
@@ -562,7 +563,7 @@ def segment_cpsam_resident(
         )
         masks_out, flows_out, styles_out = [], [], []
         for i in range(nimg):
-            out = segment_cpsam_resident(
+            out = segment_cpsam(
                 model,
                 x[i],
                 batch_size=batch_size,
@@ -589,7 +590,7 @@ def segment_cpsam_resident(
             styles_out.append(out[2])
         return masks_out, flows_out, styles_out
 
-    from .cellpose_dynamics import compute_masks_resident
+    from .cellpose_dynamics import compute_masks
 
     # --- host-side layout (pure transpose/slice, no heavy compute) ---
     x = _cp_transforms.convert_image(
@@ -656,7 +657,7 @@ def segment_cpsam_resident(
     # --- mask computation (GPU-resident) ---
     niter_scale = 1 if (rescale is None or not resample) else rescale
     n_iter = int(200 / niter_scale) if (niter is None or niter == 0) else niter
-    masks = compute_masks_resident(
+    masks = compute_masks(
         x.shape,
         dP,
         cellprob,

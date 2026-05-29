@@ -532,7 +532,7 @@ def _resize_and_compute_masks(
     return mask
 
 
-def compute_masks_resident(
+def compute_masks(
     shape: tuple,
     dP: Any,
     cellprob: Any,

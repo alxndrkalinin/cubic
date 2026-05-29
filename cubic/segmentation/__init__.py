@@ -10,12 +10,12 @@ from .segment_utils import (
     remove_small_objects,
     remove_touching_objects,
 )
-from .cellpose_sam_gpu import segment_cpsam_resident
+from .cellpose_sam_gpu import segment_cpsam
 
 __all__ = [
     "cellpose_eval",
     "cellpose_segment",
-    "segment_cpsam_resident",
+    "segment_cpsam",
     "downscale_and_filter",
     "remove_touching_objects",
     "remove_small_objects",

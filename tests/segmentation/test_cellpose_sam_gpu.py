@@ -56,7 +56,7 @@ def test_segmentation_imports_without_optional_deps() -> None:
     import importlib
 
     mod = importlib.import_module("cubic.segmentation")
-    assert hasattr(mod, "segment_cpsam_resident")
+    assert hasattr(mod, "segment_cpsam")
 
 
 def test_resident_requires_cellpose(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,7 +65,7 @@ def test_resident_requires_cellpose(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(g, "_CELLPOSE_AVAILABLE", False)
     with pytest.raises(ImportError):
-        g.segment_cpsam_resident(object(), np.zeros((32, 32), np.float32))
+        g.segment_cpsam(object(), np.zeros((32, 32), np.float32))
 
 
 def test_resident_rejects_non_cuda_model() -> None:
@@ -84,7 +84,7 @@ def test_resident_rejects_non_cuda_model() -> None:
         device = torch.device("cpu")
 
     with pytest.raises(RuntimeError):
-        g.segment_cpsam_resident(_Model(), np.zeros((32, 32), np.float32))
+        g.segment_cpsam(_Model(), np.zeros((32, 32), np.float32))
 
 
 def test_sam_model_exposes_v4_api(gpu_available: bool) -> None:
@@ -122,13 +122,13 @@ def test_parity_2d_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam_resident
+    from cubic.segmentation import segment_cpsam
     from cubic.metrics.average_precision import average_precision
 
     img = _disks()
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(img, diameter=None, do_3D=False)
-    m_gpu, _, _ = segment_cpsam_resident(model, img, do_3D=False, download=True)
+    m_gpu, _, _ = segment_cpsam(model, img, do_3D=False, download=True)
 
     m_stock = m_stock.astype(np.int32)
     m_gpu = np.asarray(m_gpu).astype(np.int32)
@@ -145,15 +145,13 @@ def test_list_input_returns_per_image_lists(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam_resident
+    from cubic.segmentation import segment_cpsam
     from cubic.metrics.average_precision import average_precision
 
     imgs = [_disks(), _disks(centers=[(60, 60), (160, 160), (60, 160)], r=18)]
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(imgs, diameter=None, do_3D=False)
-    m_gpu, flows, styles = segment_cpsam_resident(
-        model, imgs, do_3D=False, download=True
-    )
+    m_gpu, flows, styles = segment_cpsam(model, imgs, do_3D=False, download=True)
 
     assert (
         isinstance(m_gpu, list) and isinstance(flows, list) and isinstance(styles, list)
@@ -173,15 +171,13 @@ def test_parity_3d_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam_resident
+    from cubic.segmentation import segment_cpsam
     from cubic.metrics.average_precision import average_precision
 
     vol = _volume_3d()
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(vol, z_axis=0, diameter=None, do_3D=True)
-    m_gpu, _, _ = segment_cpsam_resident(
-        model, vol, z_axis=0, do_3D=True, download=True
-    )
+    m_gpu, _, _ = segment_cpsam(model, vol, z_axis=0, do_3D=True, download=True)
 
     m_stock = np.asarray(m_stock).astype(np.int32)
     m_gpu = np.asarray(m_gpu).astype(np.int32)
@@ -199,7 +195,7 @@ def test_parity_stitch_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam_resident
+    from cubic.segmentation import segment_cpsam
     from cubic.metrics.average_precision import average_precision
 
     stack = _zstack()
@@ -207,7 +203,7 @@ def test_parity_stitch_vs_stock(gpu_available: bool) -> None:
     m_stock, _, _ = model.eval(
         stack, z_axis=0, diameter=None, do_3D=False, stitch_threshold=0.5
     )
-    m_gpu, _, _ = segment_cpsam_resident(
+    m_gpu, _, _ = segment_cpsam(
         model, stack, z_axis=0, do_3D=False, stitch_threshold=0.5, download=True
     )
 
@@ -242,9 +238,7 @@ def test_residency_single_download(gpu_available: bool) -> None:
 
     g.asnumpy = _spy
     try:
-        masks, flows, _ = g.segment_cpsam_resident(
-            model, img, do_3D=False, download=False
-        )
+        masks, flows, _ = g.segment_cpsam(model, img, do_3D=False, download=False)
     finally:
         g.asnumpy = orig
 
