@@ -117,7 +117,7 @@ def clear_border(
     indices = xp.arange(number + 1)
 
     # mask all label indices that are connected to borders
-    label_mask = np.in1d(indices, borders_indices)
+    label_mask = np.isin(indices, borders_indices)
     # create mask for pixels to clear
     mask = label_mask[labels.reshape(-1)].reshape(labels.shape)
 
