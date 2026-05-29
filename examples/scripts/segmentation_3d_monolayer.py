@@ -2,27 +2,27 @@
 # coding: utf-8
 
 # ## 3D Cell Monolayer Segmentation
-#
+# 
 # This notebook demonstrates CPU/GPU-compatible 3D nuclei and cell segmentation
 # using `cubic`. The pipeline is a rough reproduction of the
 # [CellProfiler 3D monolayer tutorial](https://tutorials.cellprofiler.org/#3d-segmentation-of-cell-monolayer)
 # ([GitHub](https://github.com/CellProfiler/tutorials/tree/master/3d_monolayer))
 # and evaluates results against CellProfiler reference labels using
 # Average Precision (AP).
-#
+# 
 # By using `cubic`'s device-agnostic wrappers for scikit-image, SciPy, and
 # morphological operations, the same code runs on both CPU and GPU without
 # modification — simply transferring input arrays to the GPU enables
 # CUDA acceleration via CuPy and cuCIM.
-#
+# 
 # **Dataset**: 3D confocal images of human induced pluripotent stem cells (hiPSC)
 # from the Allen Institute for Cell Science, provided with the
 # [CellProfiler 3D monolayer tutorial](https://github.com/CellProfiler/tutorials/tree/master/3d_monolayer).
 # 3 channels: membrane (ch0), mitochondria (ch1), DNA (ch2).
 # Shape: 60 x 256 x 256 (Z x Y x X), spacing: 0.29 um (Z), 0.065 um (XY).
-#
+# 
 # **References**:
-# - [CellProfiler 3D monolayer tutorial](https://github.com/CellProfiler/tutorials/tree/master/3d_monolayer), Allen Institute for Cell Science.
+# - [CellProfiler 3D monolayer tutorial](https://github.com/CellProfiler/tutorials/tree/master/3d_monolayer), Allen Institute for Cell Science. 
 # - Kalinin et al. (2025) "cubic: CUDA-accelerated 3D BioImage Computing", ICCV Workshop.
 
 # In[10]:
@@ -122,7 +122,7 @@ plt.show()
 
 
 # ### Nuclei Segmentation
-#
+# 
 # Pipeline steps:
 # 1. Normalize intensity (percentile 0-100)
 # 2. Downscale XY by 0.5x and apply 3D cubic median filter (window size 5)
@@ -200,7 +200,7 @@ plt.show()
 
 
 # ### Cell Segmentation
-#
+# 
 # Pipeline steps:
 # 1. Multi-Otsu threshold on membrane (3 classes, nbins=128, take threshold[0]) to identify cell interiors
 # 2. Create monolayer mask: clip(DNA + membrane + mito, 0, 1), downscale 0.25x, plane-by-plane morphological closing (disk 17), upscale, Li threshold
@@ -293,7 +293,7 @@ plt.show()
 
 
 # ### Evaluation
-#
+# 
 # Compare cubic segmentation against CellProfiler reference labels using
 # Average Precision (AP) at IoU thresholds from 0.5 to 1.0.
 
@@ -386,18 +386,18 @@ plt.show()
 
 
 # ### Summary
-#
+# 
 # | Metric | CellProfiler | cubic |
 # |--------|-------------|-------|
 # | Nuclei count | 25 | 26 |
 # | Cell count | 24 | 22 |
 # | Nuclei mAP (IoU 0.5-1.0) | — | 0.709 |
 # | Cells mAP (IoU 0.5-1.0) | — | 0.588 |
-#
+# 
 # On an NVIDIA A40, the nuclei pipeline runs in ~0.2s vs ~5.4s on CPU (~30x speedup).
 # The cell pipeline speedup is limited because watershed is not yet available in cuCIM
 # and must run on CPU. Total: ~3.3s GPU vs ~9.0s CPU (~2.7x).
-#
+# 
 # The `cubic` pipeline reproduces CellProfiler's 3D monolayer segmentation
 # by aligning with CellProfiler's actual module implementations:
 # cubic median filter with `mode="constant"`, watershed seed dilation,

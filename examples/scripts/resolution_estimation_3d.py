@@ -2,21 +2,21 @@
 # coding: utf-8
 
 # ## 3D Resolution Estimation: FSC and DCR on Pollen Confocal Data
-#
+# 
 # This notebook demonstrates directional (XY and Z) resolution estimation on a 3D confocal microscopy
 # image of pollen using two complementary methods:
-#
+# 
 # - **SFSC** (Sectored Fourier Shell Correlation) — correlation-based, requires image splitting
 # - **DCR** (Decorrelation Analysis) — single-image, parameter-free
-#
+# 
 # We compare results against the reference values from Koho et al. (2019) Figure 4b:
 # XY = 0.59 µm, Z = 3.91 µm.
-#
+# 
 # **References:**
 # - Koho et al. (2019) "Fourier ring correlation simplifies image restoration in fluorescence microscopy", *Nature Communications* 10:3103.
 # - Descloux et al. (2019) "Parameter-free image resolution estimation based on decorrelation analysis", *Nature Methods* 16:918-924.
 
-# In[ ]:
+# In[1]:
 
 
 import nd2
@@ -62,7 +62,7 @@ pooch.retrieve(
 
 
 # ### Load the pollen confocal image
-#
+# 
 # 40x confocal image of pollen grain acquired with a Nikon microscope.
 # Voxel spacing: Z = 0.250 µm, Y = X = 0.0777 µm (anisotropy factor z = 3.22).
 
@@ -95,7 +95,7 @@ plt.tight_layout()
 plt.show()
 
 
-# In[ ]:
+# In[5]:
 
 
 image_gpu = ascupy(image) if USE_GPU else image
@@ -119,10 +119,10 @@ print(f"XZ slice shape: {xz_slice.shape}, spacing: {spacing_xz}")
 
 
 # ### 3D FSC (Sectored Fourier Shell Correlation)
-#
+# 
 # FSC compares two half-images obtained by checkerboard splitting. In single-image mode,
 # both forward and reverse splits are averaged to reduce variance (Koho et al. 2019).
-#
+# 
 # Key parameters:
 # - `resample_isotropic=True`: Upsample Z to isotropic voxels before FSC
 # - `angle_delta=15`: 15° angular sectors matching the paper
@@ -149,7 +149,7 @@ print(f"  Z/XY ratio:    {fsc_result['z'] / fsc_result['xy']:.1f}")
 
 
 # #### FSC correlation curves by angular sector
-#
+# 
 # Each sector captures frequencies at a different polar angle from the Z axis.
 # The XY sector (θ ≈ 82°) measures lateral resolution; the Z sector (θ ≈ 8°) measures axial resolution.
 # Resolution is where the FSC curve crosses the one-bit threshold.
@@ -210,12 +210,12 @@ plt.show()
 
 
 # ### 2D FRC on XY and XZ slices
-#
+# 
 # As a baseline comparison, we compute standard 2D FRC on individual slices extracted from the
 # volume: the middle XY slice (z = mid) for lateral resolution and the middle XZ slice (y = mid)
 # for axial resolution. This shows how single-slice estimates compare to the sectored 3D analysis.
 
-# In[ ]:
+# In[10]:
 
 
 frc_xy = calculate_frc(
@@ -234,7 +234,7 @@ print(f"  XY resolution: {frc_xy.resolution['resolution']:.4f} µm")
 print(f"  XZ resolution: {frc_xz.resolution['resolution']:.4f} µm")
 
 
-# In[19]:
+# In[11]:
 
 
 fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
@@ -248,11 +248,11 @@ plt.show()
 
 
 # ### 3D DCR (Decorrelation Analysis)
-#
+# 
 # DCR estimates resolution from a single image by finding the highest frequency with
 # reproducible phase information. It uses angular sectoring to provide separate XY and Z
 # estimates, similar to FSC (Descloux et al. 2019).
-#
+# 
 # Unlike FSC, DCR does not require isotropic resampling — it operates directly on the
 # anisotropic volume with physical spacing.
 
@@ -272,7 +272,7 @@ print(f"  Z/XY ratio:    {dcr_result['z'] / dcr_result['xy']:.1f}")
 
 
 # #### DCR decorrelation curves by angular sector
-#
+# 
 # Each curve corresponds to a different high-pass filter level (increasing sigma).
 # The resolution is determined by the highest-frequency peak across all curves.
 
@@ -307,7 +307,7 @@ plt.show()
 
 
 # ### 2D DCR on XY and XZ slices
-#
+# 
 # Same slice-based baseline as 2D FRC above, but using the decorrelation method. DCR operates
 # on a single image without splitting, so it provides an independent check of the 2D resolution
 # estimates.
@@ -341,7 +341,7 @@ plt.show()
 
 
 # ### Comparison
-#
+# 
 # Compare all estimates against the Koho et al. 2019 reference values for this pollen image.
 
 # In[17]:
@@ -366,3 +366,4 @@ for name, res in methods.items():
     xy, z = res["xy"], res["z"]
     ratio = z / xy if xy > 0 else float("nan")
     print(f"{name:<22} {xy:<12.4f} {z:<12.4f} {ratio:<8.1f}")
+

@@ -2,7 +2,7 @@
 # coding: utf-8
 
 # ## Estimate the number of Richardson-Lucy (RL) deconvolution iterations
-#
+# 
 # One issue with iterative deconvolution algorithms is the lack of clear stopping criteria. This example demonstrates how use image quality measures (PSNR, SSIM, FSC, and DCR) to track the progress of GPU-based 3D RL deconvolution.
 
 # In[ ]:
@@ -22,11 +22,11 @@ print(f"GPU available: {USE_GPU}")
 
 
 # ### Load data and the PSF
-#
+# 
 # A single 3D stack of Hoechst-stained astrocyte nuclei acquired with a Yokogawa CQ1 confocal microscope.
 # Theoretical 3D point spread function (PSF) was modeled using the Richards and Wolf algorithm from the PSFGenerator plugin for Fiji [1].
 # The image and the PSF can be [downloaded from Google Drive](../data/README.md).
-#
+# 
 # The PSF is center-cropped to 30×210×210 (capturing 99.5% of energy) — RL deconvolution zero-pads it to the image size internally. The image is cropped to a 1024×1024 cell-region patch for faster processing.
 
 # In[ ]:
@@ -74,14 +74,14 @@ plt.show()
 
 
 # ### Use PSNR improvement as a metric of decon quality
-#
+# 
 # Here we demonstrate how to use peak signal-to-noise ratio (PSNR) as a criteria for determining the number of RL iterations.
 # cubic will run RL on a GPU and at each iteration compare restored image with one from the previous iteration using psnr also calculated on GPU.
 # By default, images are padded in Z in 'reflect' mode on both sides up to 32 slices.
-#
+# 
 # When provided threshold is reached, it returns the number of iterations and an object metric gains and intermediate images from all iterations.
 # Note that the RL will run for full `max_iter` iterations.
-#
+# 
 # We use fast RL `xpy` implementation adapted from `tnia-python` library [2].
 
 # In[4]:
@@ -100,7 +100,7 @@ psnr_thresh_iter, psnr_resolution = deconv_iter_num_finder(
 
 
 # Now we can visualize the progress according to the provided metric.
-#
+# 
 # PSNR doesn't quite plateau before reaching this threshold of 80 dB, which means it can be further increased, if needed.
 
 # In[5]:
@@ -130,7 +130,7 @@ plt.show()
 
 
 # ### Use SSIM improvement as a metric of decon quality
-#
+# 
 # Now, we repeat the process using structured similarity index (SSIM) as a progress metric instead.
 
 # In[7]:
@@ -176,9 +176,9 @@ plt.show()
 
 
 # ### Use 3D FSC-based resolution estimation as a metric of decon quality
-#
+# 
 # Following Koho et al. (2019, Fig. 3), we track **absolute FSC resolution** at each RL iteration and use the derivative $\nabla d_{min}$ (rate of change in resolution per iteration) as a stopping criterion. Deconvolution stops when $|\nabla d_{min}| < \theta$, where $\theta$ is a threshold in nm/iteration.
-#
+# 
 # Key parameters for 3D FSC:
 # - `resample_isotropic=True`: Resample to isotropic voxels (recommended for anisotropic data)
 # - `exclude_axis_angle`: Exclude frequencies near Z axis to avoid piezo artifacts (typical: 5-10°)
@@ -311,9 +311,9 @@ plt.show()
 
 
 # ### Use 3D DCR-based resolution estimation as a metric of decon quality
-#
+# 
 # Decorrelation Analysis (DCR) is a single-image resolution metric that doesn't require splitting the image. For 3D volumes, DCR supports full angular sectoring (similar to FSC) to provide separate XY and Z resolution estimates.
-#
+# 
 # **Note on DCR iteration tracking:** While Descloux et al. (2019, Supplementary Results 5) demonstrate smooth DCR resolution tracking across RL iterations on 2D SOFI data, we observe quantized resolution jumps with our 3D confocal data. This is because DCR's `max(k_c)` selection operates over a discrete set of high-pass-filtered decorrelation curves (`num_highpass=10` by default), and the peak can only jump between these curves' maxima — producing ~10 discrete candidate resolution values per sector. The original Matlab implementation (ImDecorr) uses the same approach but was validated on dense 2D super-resolution data with higher SNR in the frequency domain. For tracking gradual deconvolution changes on sparse 3D confocal data, FSC provides smoother convergence curves (see above).
 
 # In[12]:
@@ -380,12 +380,12 @@ print(f"  Z:  {dcr_z[0]:.1f} → {dcr_z[-1]:.1f} nm (Δ={dcr_z[-1] - dcr_z[0]:+.
 
 
 # ### Comparison: 3D FSC vs 3D DCR
-#
+# 
 # Both FSC and DCR now provide full 3D resolution analysis with angular sectoring:
-#
+# 
 # - **FSC**: Requires checkerboard splitting, analyzes correlation between two half-images
 # - **DCR**: Single-image analysis, no splitting artifacts
-#
+# 
 # Both methods return separate XY and Z resolution estimates, allowing you to track how deconvolution improves lateral vs axial resolution differently.
 
 # In[14]:
@@ -448,23 +448,23 @@ print(f"    Z:  {dcr_z[0]:.1f} → {dcr_z[-1]:.1f} nm")
 # Both 3D FSC and 3D DCR provide directional resolution estimates:
 # - **XY resolution** improves more rapidly (lateral PSF is narrower)
 # - **Z resolution** improves more slowly (axial PSF is elongated)
-#
+# 
 # The key differences:
 # - **FSC** uses checkerboard splitting which may introduce artifacts
 # - **DCR** is a single-image metric with no splitting required
 # - Both support `exclude_axis_angle` parameter for artifact exclusion
 
 # ### Summary
-#
+# 
 # This notebook demonstrated using resolution-based metrics to track 3D deconvolution progress:
-#
+# 
 # | Metric | Dimensionality | Split Required | Directional |
 # |--------|----------------|----------------|-------------|
 # | PSNR | 3D (full volume) | No | No |
 # | SSIM | 3D (full volume) | No | No |
 # | FSC | 3D (full volume) | Yes (checkerboard) | Yes (XY/Z) |
 # | DCR | 3D (full volume) | No | Yes (XY/Z) |
-#
+# 
 # For 3D volumes, **FSC** with `resample_isotropic=True` provides the most granular assessment by tracking both lateral (XY) and axial (Z) resolution improvements separately, following the approach of Koho et al. (2019, Fig. 3).
 
 # In[15]:
@@ -507,3 +507,4 @@ print(f"  FSC:  iter {fsc_thresh_iter} (3D, |Δ| < {fsc_metric_threshold} nm/it)
 print(
     f"  DCR:  XY {dcr_xy[0]:.0f} → {dcr_xy[-1]:.0f} nm, Z {dcr_z[0]:.0f} → {dcr_z[-1]:.0f} nm (quantized, see note)"
 )
+
