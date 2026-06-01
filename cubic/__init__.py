@@ -1,3 +1,3 @@
 """Morphomeric analysis of 3D cell images."""
 
-__version__ = "0.7.0a8"
+__version__ = "0.7.0a9"
