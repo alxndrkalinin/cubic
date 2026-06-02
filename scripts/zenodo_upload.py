@@ -155,11 +155,15 @@ def main() -> int:
             )
             return 3
         with path.open("rb") as fh:
+            # (connect, read) — a 30-minute read timeout tolerates slow
+            # uploads of large depositions (Zenodo's bucket API streams
+            # chunked) but still surfaces stalled connections instead of
+            # hanging the script indefinitely.
             r = requests.put(
                 f"{bucket_url}/{remote_name}",
                 params=params,
                 data=fh,
-                timeout=None,
+                timeout=(10, 1800),
             )
         r.raise_for_status()
         info = r.json()
