@@ -8,7 +8,10 @@
 # In[ ]:
 
 
+from pathlib import Path
+
 import numpy as np
+import pooch
 import matplotlib.pyplot as plt
 from skimage.io import imread
 
@@ -25,9 +28,40 @@ print(f"GPU available: {USE_GPU}")
 # 
 # A single 3D stack of Hoechst-stained astrocyte nuclei acquired with a Yokogawa CQ1 confocal microscope.
 # Theoretical 3D point spread function (PSF) was modeled using the Richards and Wolf algorithm from the PSFGenerator plugin for Fiji [1].
-# The image and the PSF can be [downloaded from Google Drive](../data/README.md).
+# Both files are auto-downloaded from [Zenodo](https://doi.org/10.5281/zenodo.20514102) on first run.
 # 
 # The PSF is center-cropped to 30×210×210 (capturing 99.5% of energy) — RL deconvolution zero-pads it to the image size internally. The image is cropped to a 1024×1024 cell-region patch for faster processing.
+
+# In[ ]:
+
+
+DATA_DIR = Path("../data")
+
+
+# cubic example dataset: 3D astrocyte nuclei + PSF
+# Zenodo record: https://doi.org/10.5281/zenodo.20514102
+def fetch_data(filename, url, known_hash):
+    """Download file to DATA_DIR if not already present."""
+    return pooch.retrieve(
+        url=url,
+        known_hash=f"sha256:{known_hash}",
+        fname=filename,
+        path=DATA_DIR,
+    )
+
+
+fetch_data(
+    "astr_vpa_hoechst.tif",
+    "https://zenodo.org/api/records/20514102/files/astr_vpa_hoechst.tif/content",
+    "234533100739f31ea31b78c380bae6cc2ea6b9cebec2c3160eedb89c36967cdc",
+)
+
+fetch_data(
+    "astr_vpa_hoechst_psf_na095_cropped.tif",
+    "https://zenodo.org/api/records/20514102/files/astr_vpa_hoechst_psf_na095_cropped.tif/content",
+    "7a5bfef942a52b8eb683286992058e647937276cd6e5fd43bc32ef6e3134feed",
+)
+
 
 # In[ ]:
 
