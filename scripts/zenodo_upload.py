@@ -1,4 +1,9 @@
-"""Create a Zenodo deposition and upload cubic's deconvolution example data.
+"""Create a Zenodo deposition and upload a cubic example dataset.
+
+The current ``FILES_TO_UPLOAD`` / ``EXPECTED_SHA256`` / metadata JSON are
+set up for the deconvolution example data. To reuse for another dataset,
+point ``FILES_TO_UPLOAD`` and ``EXPECTED_SHA256`` at the new files and
+edit ``scripts/zenodo_metadata.json``.
 
 Usage
 -----
