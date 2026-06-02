@@ -1,13 +1,15 @@
 ### Data for running examples
 
-Use the links provided below to download example images and place them in this directory (`examples/data`).
-Resolution estimation notebooks auto-download their datasets on first run using [pooch](https://www.fatiando.org/pooch/).
+Most example notebooks auto-download their datasets on first run using [pooch](https://www.fatiando.org/pooch/) into this directory (`examples/data`). The sources, filenames, and (where helpful) direct download links are listed below.
 
 #### 1. Estimating the number of deconvolution iterations
 
-A single 3D stack of Hoechst-stained astrocyte nuclei acquired with a Yokogawa CQ1 confocal microscope: [download from Google Drive](https://drive.google.com/file/d/1TcCB2TSTLC_iTa0ntHmS8t4wWd4sqFd2/view?usp=sharing).
+Used in `examples/notebooks/deconvolution_iterations_3d.ipynb`. Auto-downloaded on first run using pooch.
 
-Theoretical 3D point spread function (PSF) modeled using the Richards and Wolf algorithm from the PSFGenerator plugin for Fiji: [download from Google Drive](https://drive.google.com/file/d/1AxBVPDXf8EqYtexXlL_WTKAUeYk-ggYc/view?usp=sharing).
+- **`astr_vpa_hoechst.tif`** — Hoechst-stained astrocyte nuclei (3D stack, 16-bit). Yokogawa CQ1 confocal, voxel 0.1625 × 0.1625 × 0.3 µm.
+- **`astr_vpa_hoechst_psf_na095_cropped.tif`** — Theoretical 3D PSF (NA = 0.95) modeled with the Richards & Wolf algorithm from the [PSFGenerator](https://bigwww.epfl.ch/algorithms/psfgenerator/) ImageJ/Fiji plugin. Center-cropped to 30 × 210 × 210 (≥ 99.5% of energy).
+
+Source: [Zenodo record](https://doi.org/10.5281/zenodo.20514102) (DOI [10.5281/zenodo.20514102](https://doi.org/10.5281/zenodo.20514102)).
 
 #### 2. 2D resolution estimation (FRC and DCR)
 
