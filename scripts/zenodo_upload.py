@@ -39,7 +39,14 @@ import hashlib
 import argparse
 from pathlib import Path
 
-import requests
+try:
+    import requests
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "zenodo_upload.py requires the `requests` package, which is not a "
+        "cubic runtime dependency. Install it into your environment first: "
+        "`pip install requests` (or `uv pip install requests`)."
+    ) from exc
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 METADATA_PATH = REPO_ROOT / "scripts" / "zenodo_metadata.json"
