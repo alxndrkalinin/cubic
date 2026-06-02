@@ -9,7 +9,7 @@ Used in `examples/notebooks/deconvolution_iterations_3d.ipynb`. Auto-downloaded 
 - **`astr_vpa_hoechst.tif`** — Hoechst-stained astrocyte nuclei (3D stack, 16-bit). Yokogawa CQ1 confocal, voxel 0.1625 × 0.1625 × 0.3 µm.
 - **`astr_vpa_hoechst_psf_na095_cropped.tif`** — Theoretical 3D PSF (NA = 0.95) modeled with the Richards & Wolf algorithm from the [PSFGenerator](https://bigwww.epfl.ch/algorithms/psfgenerator/) ImageJ/Fiji plugin. Center-cropped to 30 × 210 × 210 (≥ 99.5% of energy).
 
-Source: [Zenodo record](https://doi.org/10.5281/zenodo.20514102) (DOI [10.5281/zenodo.20514102](https://doi.org/10.5281/zenodo.20514102)).
+Source: Zenodo, DOI [10.5281/zenodo.20514102](https://doi.org/10.5281/zenodo.20514102).
 
 #### 2. 2D resolution estimation (FRC and DCR)
 
