@@ -1,0 +1,84 @@
+{
+  "metadata": {
+    "title": "Example data for cubic: 3D astrocyte nuclei and theoretical PSF for deconvolution iteration tracking",
+    "upload_type": "dataset",
+    "description": "<p>Example image data accompanying the <a href=\"https://github.com/alxndrkalinin/cubic\">cubic</a> Python library (CUDA-accelerated 3D bioimage computing).</p><p>Used by the <code>examples/notebooks/deconvolution_iterations_3d.ipynb</code> notebook to demonstrate how PSNR, SSIM, FSC, and DCR can be used to track the progress of Richardson-Lucy 3D deconvolution and inform iteration-count selection.</p><h3>Files</h3><ul><li><strong>astr_vpa_hoechst.tif</strong> &mdash; A single 3D stack of Hoechst-stained astrocyte nuclei (16-bit). Acquired on a Yokogawa CQ1 confocal microscope. Voxel size: 0.1625 &mu;m (xy) &times; 0.3 &mu;m (z).</li><li><strong>astr_vpa_hoechst_psf_na095_cropped.tif</strong> &mdash; Theoretical 3D point spread function (PSF) modeled with the Richards & Wolf algorithm from the <a href=\"https://bigwww.epfl.ch/algorithms/psfgenerator/\">PSFGenerator</a> ImageJ/Fiji plugin (NA = 0.95). Center-cropped to 30&times;210&times;210 (captures &ge; 99.5% of energy); the Richardson-Lucy deconvolution implementation zero-pads it to the image size internally.</li></ul><h3>Citation</h3><p>If you use these data, please cite the cubic paper:</p><blockquote>A. A. Kalinin, A. E. Carpenter, S. Singh, and M. J. O&rsquo;Meara, &ldquo;Cubic: CUDA-Accelerated 3D Bioimage Computing,&rdquo; in <em>2025 IEEE/CVF International Conference on Computer Vision Workshops (ICCVW)</em>, Honolulu, HI, USA, Oct. 2025, pp. 5831&ndash;5840, doi: <a href=\"https://doi.org/10.1109/ICCVW69036.2025.00608\">10.1109/ICCVW69036.2025.00608</a>.</blockquote><p>BibTeX:</p><pre>@inproceedings{kalinin2025cubic,\n  author    = {Kalinin, Alexandr A. and Carpenter, Anne E. and Singh, Shantanu and O'Meara, Matthew J.},\n  title     = {Cubic: {CUDA-Accelerated} {3D} {Bioimage} {Computing}},\n  booktitle = {2025 IEEE/CVF International Conference on Computer Vision Workshops (ICCVW)},\n  year      = {2025},\n  pages     = {5831--5840},\n  address   = {Honolulu, HI, USA},\n  publisher = {IEEE},\n  doi       = {10.1109/ICCVW69036.2025.00608}\n}</pre><p>Open access: <a href=\"https://openaccess.thecvf.com/content/ICCV2025W/BIC/papers/Kalinin_cubic_CUDA-accelerated_3D_BioImage_Computing_ICCVW_2025_paper.pdf\">CVF proceedings PDF</a>. Preprint: <a href=\"https://arxiv.org/abs/2510.14143\">arXiv:2510.14143</a>.</p>",
+    "creators": [
+      {
+        "name": "Kalinin, Alexandr A.",
+        "affiliation": "Broad Institute of MIT and Harvard"
+      },
+      {
+        "name": "Carpenter, Anne E.",
+        "affiliation": "Broad Institute of MIT and Harvard"
+      },
+      {
+        "name": "Singh, Shantanu",
+        "affiliation": "Broad Institute of MIT and Harvard"
+      },
+      {
+        "name": "O'Meara, Matthew J.",
+        "affiliation": "University of Michigan Medical School"
+      }
+    ],
+    "keywords": [
+      "bioimage analysis",
+      "fluorescence microscopy",
+      "confocal microscopy",
+      "Hoechst",
+      "astrocytes",
+      "point spread function",
+      "Richardson-Lucy deconvolution",
+      "image resolution",
+      "FSC",
+      "DCR",
+      "PSNR",
+      "SSIM",
+      "GPU",
+      "CUDA",
+      "cuPy",
+      "cuCIM",
+      "scikit-image",
+      "Python"
+    ],
+    "access_right": "open",
+    "license": "cc-by-4.0",
+    "language": "eng",
+    "related_identifiers": [
+      {
+        "identifier": "10.1109/ICCVW69036.2025.00608",
+        "relation": "isSupplementTo",
+        "resource_type": "publication-conferencepaper",
+        "scheme": "doi"
+      },
+      {
+        "identifier": "https://ieeexplore.ieee.org/document/11375500",
+        "relation": "isSupplementTo",
+        "resource_type": "publication-conferencepaper"
+      },
+      {
+        "identifier": "https://openaccess.thecvf.com/content/ICCV2025W/BIC/papers/Kalinin_cubic_CUDA-accelerated_3D_BioImage_Computing_ICCVW_2025_paper.pdf",
+        "relation": "isSupplementTo",
+        "resource_type": "publication-conferencepaper"
+      },
+      {
+        "identifier": "10.48550/arXiv.2510.14143",
+        "relation": "isPreviousVersionOf",
+        "resource_type": "publication-preprint",
+        "scheme": "doi"
+      },
+      {
+        "identifier": "arXiv:2510.14143",
+        "relation": "isPreviousVersionOf",
+        "resource_type": "publication-preprint"
+      },
+      {
+        "identifier": "https://github.com/alxndrkalinin/cubic",
+        "relation": "isSupplementTo",
+        "resource_type": "software"
+      }
+    ],
+    "version": "1.0.0",
+    "notes": "Files are reproducible with the cubic example notebook examples/notebooks/deconvolution_iterations_3d.ipynb. sha256: astr_vpa_hoechst.tif=234533100739f31ea31b78c380bae6cc2ea6b9cebec2c3160eedb89c36967cdc; astr_vpa_hoechst_psf_na095_cropped.tif=7a5bfef942a52b8eb683286992058e647937276cd6e5fd43bc32ef6e3134feed."
+  }
+}
