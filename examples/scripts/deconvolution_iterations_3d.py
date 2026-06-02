@@ -5,7 +5,7 @@
 # 
 # One issue with iterative deconvolution algorithms is the lack of clear stopping criteria. This example demonstrates how use image quality measures (PSNR, SSIM, FSC, and DCR) to track the progress of GPU-based 3D RL deconvolution.
 
-# In[ ]:
+# In[1]:
 
 
 from pathlib import Path
@@ -32,7 +32,7 @@ print(f"GPU available: {USE_GPU}")
 # 
 # The PSF is center-cropped to 30×210×210 (capturing 99.5% of energy) — RL deconvolution zero-pads it to the image size internally. The image is cropped to a 1024×1024 cell-region patch for faster processing.
 
-# In[ ]:
+# In[2]:
 
 
 DATA_DIR = Path("../data")
@@ -63,7 +63,7 @@ fetch_data(
 )
 
 
-# In[ ]:
+# In[3]:
 
 
 scale_xy = 0.1625
@@ -90,7 +90,7 @@ print(f"Device: {'GPU' if USE_GPU else 'CPU'}")
 
 # The image is cropped to $30 \times 1024 \times 1024$ from the cell region. The PSF is $30 \times 210 \times 210$ (center-cropped to 99.5% energy).
 
-# In[3]:
+# In[4]:
 
 
 fig, axes = plt.subplots(1, 2, figsize=(18, 8))
@@ -118,7 +118,7 @@ plt.show()
 # 
 # We use fast RL `xpy` implementation adapted from `tnia-python` library [2].
 
-# In[4]:
+# In[5]:
 
 
 psnr_thresh_iter, psnr_resolution = deconv_iter_num_finder(
@@ -137,7 +137,7 @@ psnr_thresh_iter, psnr_resolution = deconv_iter_num_finder(
 # 
 # PSNR doesn't quite plateau before reaching this threshold of 80 dB, which means it can be further increased, if needed.
 
-# In[5]:
+# In[6]:
 
 
 plt.plot([res["metric_gain"] for res in psnr_resolution[1:]])
@@ -148,7 +148,7 @@ plt.show()
 
 # And visualize original and restored images from the iteration at threshold next to each other.
 
-# In[6]:
+# In[7]:
 
 
 deconv_image = psnr_resolution[psnr_thresh_iter]["iter_image"]
@@ -167,7 +167,7 @@ plt.show()
 # 
 # Now, we repeat the process using structured similarity index (SSIM) as a progress metric instead.
 
-# In[7]:
+# In[8]:
 
 
 ssim_thresh_iter, ssim_resolution = deconv_iter_num_finder(
@@ -185,7 +185,7 @@ ssim_thresh_iter, ssim_resolution = deconv_iter_num_finder(
 
 # When visualized, SSIM shows reachin a plateau even before 10 iterations. This makes sense, because SSIM measures the perceived change in structural information, while PSNR estimates an absolute error.
 
-# In[8]:
+# In[9]:
 
 
 plt.plot([res["metric_gain"] for res in ssim_resolution[1:]])
@@ -194,7 +194,7 @@ plt.ylabel("SSIM", fontsize=12)
 plt.show()
 
 
-# In[9]:
+# In[10]:
 
 
 deconv_image = ssim_resolution[ssim_thresh_iter]["iter_image"]
@@ -218,7 +218,7 @@ plt.show()
 # - `exclude_axis_angle`: Exclude frequencies near Z axis to avoid piezo artifacts (typical: 5-10°)
 # - `backend='hist'`: Use GPU-accelerated vectorized backend
 
-# In[10]:
+# In[11]:
 
 
 # Track absolute FSC resolution at each iteration (Koho et al. 2019, Fig. 3b)
@@ -290,7 +290,7 @@ print(f"  Z:  {fsc_z_resolutions[0]:.1f} → {fsc_z_resolutions[-1]:.1f} nm")
 
 # FSC-based tracking provides 3D resolution assessment, capturing improvements in both lateral (XY) and axial (Z) directions separately, following the approach of Koho et al. (2019, Fig. 3).
 
-# In[11]:
+# In[12]:
 
 
 # Fig 3-style plots: absolute resolution and convergence
@@ -350,7 +350,7 @@ plt.show()
 # 
 # **Note on DCR iteration tracking:** While Descloux et al. (2019, Supplementary Results 5) demonstrate smooth DCR resolution tracking across RL iterations on 2D SOFI data, we observe quantized resolution jumps with our 3D confocal data. This is because DCR's `max(k_c)` selection operates over a discrete set of high-pass-filtered decorrelation curves (`num_highpass=10` by default), and the peak can only jump between these curves' maxima — producing ~10 discrete candidate resolution values per sector. The original Matlab implementation (ImDecorr) uses the same approach but was validated on dense 2D super-resolution data with higher SNR in the frequency domain. For tracking gradual deconvolution changes on sparse 3D confocal data, FSC provides smoother convergence curves (see above).
 
-# In[12]:
+# In[13]:
 
 
 # Track absolute DCR resolution at each iteration
@@ -387,7 +387,7 @@ richardson_lucy_iter(
 );
 
 
-# In[13]:
+# In[14]:
 
 
 # DCR resolution across iterations
@@ -422,7 +422,7 @@ print(f"  Z:  {dcr_z[0]:.1f} → {dcr_z[-1]:.1f} nm (Δ={dcr_z[-1] - dcr_z[0]:+.
 # 
 # Both methods return separate XY and Z resolution estimates, allowing you to track how deconvolution improves lateral vs axial resolution differently.
 
-# In[14]:
+# In[15]:
 
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -501,7 +501,7 @@ print(f"    Z:  {dcr_z[0]:.1f} → {dcr_z[-1]:.1f} nm")
 # 
 # For 3D volumes, **FSC** with `resample_isotropic=True` provides the most granular assessment by tracking both lateral (XY) and axial (Z) resolution improvements separately, following the approach of Koho et al. (2019, Fig. 3).
 
-# In[15]:
+# In[16]:
 
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 5), sharey=True)
