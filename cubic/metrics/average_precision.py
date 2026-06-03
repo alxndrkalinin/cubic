@@ -13,6 +13,7 @@ https://github.com/MouseLand/cellpose/blob/509ffca33737058b0b4e2e96d506514e10620
 
 import logging
 import warnings
+from typing import Literal, overload
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -145,6 +146,24 @@ def _matches_at_threshold(iou: np.ndarray, th: float) -> tuple[np.ndarray, np.nd
     return true_ind[match_ok], pred_ind[match_ok]
 
 
+@overload
+def compute_matches(
+    mask_true: np.ndarray,
+    mask_pred: np.ndarray,
+    thresholds: list[float] | np.ndarray,
+    return_iou: Literal[False] = ...,
+) -> dict[float, tuple[np.ndarray, np.ndarray]]: ...
+
+
+@overload
+def compute_matches(
+    mask_true: np.ndarray,
+    mask_pred: np.ndarray,
+    thresholds: list[float] | np.ndarray,
+    return_iou: Literal[True],
+) -> tuple[dict[float, tuple[np.ndarray, np.ndarray]], np.ndarray]: ...
+
+
 def compute_matches(
     mask_true: np.ndarray,
     mask_pred: np.ndarray,
@@ -180,7 +199,11 @@ def average_precision(
     masks_pred: np.ndarray,
     thresholds: list[float] | np.ndarray,
     matches_per_threshold: dict[float, tuple[np.ndarray, np.ndarray]] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_iou: bool = False,
+) -> (
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+):
     """Calculate average precision and other metrics for a single pair of mask images with pre-computed matches.
 
     Modified from: Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
@@ -188,9 +211,23 @@ def average_precision(
 
     , which was modified from: Copyright (c) 2018-2024, Uwe Schmidt, Martin Weigert
     https://github.com/stardist/stardist/blob/586f8ca76d063bf3443f7a9a66fe94658bc155b8/stardist/matching.py#L109
+
+    Parameters
+    ----------
+    return_iou : bool, default False
+        If True, also return the object-overlap IoU matrix (shape
+        ``(n_true, n_pred)``, background dropped, NaN replaced with 0) as a
+        fifth element so a caller that also needs a Dice/overlap metric can
+        reuse the single overlap pass instead of recomputing it.
     """
+    iou: np.ndarray | None = None
     if matches_per_threshold is None:
-        matches_per_threshold = compute_matches(masks_true, masks_pred, thresholds)  # type: ignore[assignment]
+        if return_iou:
+            matches_per_threshold, iou = compute_matches(
+                masks_true, masks_pred, thresholds, return_iou=True
+            )
+        else:
+            matches_per_threshold = compute_matches(masks_true, masks_pred, thresholds)
 
     if matches_per_threshold is None:
         raise ValueError("No matches found.")
@@ -201,4 +238,12 @@ def average_precision(
     sum_counts = tp + fp + fn
     ap = np.where(sum_counts > 0, tp / sum_counts, 0)
 
+    if return_iou:
+        if iou is None:
+            # Caller supplied matches_per_threshold, so compute_matches never
+            # ran; compute the overlap once here (matching its normalization).
+            iou = np.nan_to_num(
+                asnumpy(_intersection_over_union(masks_true, masks_pred)[1:, 1:])
+            )
+        return ap, tp, fp, fn, iou
     return ap, tp, fp, fn
