@@ -37,3 +37,18 @@ def test_regionprops_multiple_labels() -> None:
     labels_out, feats = voxel.extract_features(labels, ["area", "centroid"])
     assert labels_out.tolist() == [1, 2]
     assert feats.shape == (2, 3)
+
+
+def test_regionprops_table_preserves_property_order() -> None:
+    """Output columns follow the requested order with a deduped label last."""
+    labels = np.array([[0, 1, 1], [2, 2, 0]], dtype=np.int32)
+    # Duplicate "area" and omit "label": dedup must keep first occurrence
+    # and append "label" once at the end.
+    props = ["area", "perimeter", "area", "centroid"]
+    out = voxel.regionprops_table(labels, properties=props)
+    keys = list(out.keys())
+
+    assert sum(k == "area" for k in keys) == 1
+    assert keys.index("area") < keys.index("perimeter")
+    assert keys.index("perimeter") < keys.index("centroid-0")
+    assert keys.index("centroid-0") < keys.index("label")
