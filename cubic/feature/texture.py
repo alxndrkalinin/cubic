@@ -220,8 +220,9 @@ def glcm_features(
     ------
     ValueError
         If ``image`` is not 2D or 3D, ``mask`` shape mismatches, ``levels``
-        is below 2, or the masked region is empty when ``value_range`` is
-        derived from the image.
+        is below 2, ``distances`` is empty or contains a non-positive value,
+        or the masked region is empty when ``value_range`` is derived from
+        the image.
     """
     if image.ndim not in (2, 3):
         raise ValueError(
@@ -233,6 +234,10 @@ def glcm_features(
         )
     if levels < 2:
         raise ValueError(f"levels must be >= 2; got {levels}")
+    if not distances or any(distance < 1 for distance in distances):
+        raise ValueError(
+            f"distances must be a non-empty sequence of positive integers; got {distances}"
+        )
 
     if value_range is None:
         region = image[mask] if mask is not None else image
