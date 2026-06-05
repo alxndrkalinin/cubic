@@ -52,3 +52,26 @@ def test_regionprops_table_preserves_property_order() -> None:
     assert keys.index("area") < keys.index("perimeter")
     assert keys.index("perimeter") < keys.index("centroid-0")
     assert keys.index("centroid-0") < keys.index("label")
+
+
+def test_regionprops_table_extra_properties() -> None:
+    """extra_properties callables are forwarded and keyed by function name."""
+
+    def intensity_range(regionmask: np.ndarray, intensity: np.ndarray) -> float:
+        values = intensity[regionmask]
+        return float(values.max() - values.min())
+
+    labels = np.array([[0, 1, 1], [2, 2, 0]], dtype=np.int32)
+    intensity = np.array([[0, 10, 20], [5, 5, 0]], dtype=np.float32)
+
+    out = voxel.regionprops_table(
+        labels,
+        intensity_image=intensity,
+        properties=["area"],
+        extra_properties=(intensity_range,),
+    )
+
+    assert "intensity_range" in out
+    by_label = dict(zip(out["label"].tolist(), out["intensity_range"].tolist()))
+    assert by_label[1] == 10.0  # intensities {10, 20}
+    assert by_label[2] == 0.0  # intensities {5, 5}

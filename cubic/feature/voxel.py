@@ -14,11 +14,25 @@ def regionprops(
     label_image: npt.ArrayLike,
     intensity_image: npt.ArrayLike | None = None,
     spacing: list[float] | None = None,
+    extra_properties: tuple | None = None,
 ) -> list:
-    """Extract region-based morphological features."""
+    """Extract region-based morphological features.
+
+    Parameters
+    ----------
+    extra_properties : tuple of callable, optional
+        User-defined property functions ``func(regionmask, intensity)``
+        forwarded to ``measure.regionprops`` (both skimage and cucim
+        accept them).
+    """
     # cucim requires spacing as tuple for kernel memoization
     spacing_arg = tuple(spacing) if spacing is not None else None
-    return measure.regionprops(label_image, intensity_image, spacing=spacing_arg)
+    return measure.regionprops(
+        label_image,
+        intensity_image,
+        spacing=spacing_arg,
+        extra_properties=extra_properties,
+    )
 
 
 def regionprops_table(
@@ -26,8 +40,17 @@ def regionprops_table(
     intensity_image: npt.ArrayLike | None = None,
     properties: list[str] | None = None,
     spacing: list[float] | None = None,
+    extra_properties: tuple | None = None,
 ) -> dict[str, np.ndarray]:
-    """Extract region-based morphological features and return in pandas-compatible format."""
+    """Extract region-based morphological features and return in pandas-compatible format.
+
+    Parameters
+    ----------
+    extra_properties : tuple of callable, optional
+        User-defined property functions ``func(regionmask, intensity)``
+        forwarded to ``measure.regionprops_table`` (both skimage and
+        cucim accept them).
+    """
     if properties is not None:
         # Order-preserving dedup. A bare ``set()`` iterates in an order that
         # depends on the interpreter hash seed, which differs per spawned
@@ -39,7 +62,11 @@ def regionprops_table(
     # cucim requires spacing as tuple for kernel memoization
     spacing_arg = tuple(spacing) if spacing is not None else None
     return measure.regionprops_table(
-        label_image, intensity_image, properties=properties, spacing=spacing_arg
+        label_image,
+        intensity_image,
+        properties=properties,
+        spacing=spacing_arg,
+        extra_properties=extra_properties,
     )
 
 
