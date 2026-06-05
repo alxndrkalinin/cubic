@@ -118,8 +118,11 @@ def _direction_matrix(
         # (contrast/entropy 0, correlation 1.0 via the std guard).
         counts = np.zeros((levels, levels), dtype=np.float64)
     else:
-        counts = np.bincount(index, minlength=levels * levels).reshape(levels, levels)
-        counts = asnumpy(counts).astype(np.float64)
+        counts = (
+            asnumpy(np.bincount(index, minlength=levels * levels))
+            .reshape(levels, levels)
+            .astype(np.float64)
+        )
     if symmetric:
         counts = counts + counts.T
     if normed:
