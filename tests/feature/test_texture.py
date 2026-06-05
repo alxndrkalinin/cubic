@@ -6,9 +6,18 @@ from skimage.feature import graycoprops, graycomatrix
 
 from cubic.cuda import ascupy
 from cubic.feature import glcm_features
-from cubic.feature.texture import _PROPS, _unit_offsets
+from cubic.feature.texture import _unit_offsets
 
 _ANGLES = [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
+_EXPECTED_PROPS = {
+    "ASM",
+    "energy",
+    "entropy",
+    "contrast",
+    "correlation",
+    "homogeneity",
+    "dissimilarity",
+}
 
 
 def _skimage_reference(image: np.ndarray, levels: int) -> dict[str, float]:
@@ -72,7 +81,7 @@ def test_glcm_3d_runs_and_is_finite() -> None:
     rng = np.random.default_rng(2)
     vol = rng.random((12, 16, 18)).astype(np.float32)
     feats = glcm_features(vol, levels=16)
-    assert set(feats) == set(_PROPS)
+    assert set(feats) == _EXPECTED_PROPS
     for value in feats.values():
         assert np.isfinite(value)
 

@@ -24,17 +24,6 @@ import numpy as np
 
 from ..cuda import asnumpy
 
-# Haralick properties emitted by :func:`glcm_features`, in a fixed order.
-_PROPS: tuple[str, ...] = (
-    "ASM",
-    "energy",
-    "entropy",
-    "contrast",
-    "correlation",
-    "homogeneity",
-    "dissimilarity",
-)
-
 
 def _unit_offsets(ndim: int) -> list[tuple[int, ...]]:
     """Return the unique half-space neighbor offsets for ``ndim`` dimensions.
@@ -132,18 +121,23 @@ def _direction_matrix(
     return counts
 
 
-def _haralick_props(glcm: np.ndarray, levels: int) -> dict[str, float]:
+def _haralick_props(
+    glcm: np.ndarray,
+    i: np.ndarray,
+    j: np.ndarray,
+    diff_sq: np.ndarray,
+    abs_diff: np.ndarray,
+) -> dict[str, float]:
     """Compute Haralick properties of a normalized GLCM (host NumPy array).
+
+    ``i``/``j`` are the level-index ramps and ``diff_sq``/``abs_diff`` the
+    squared and absolute level differences; they are direction-independent,
+    so the caller computes them once and reuses them across directions.
 
     Reproduces ``skimage.feature.graycoprops`` exactly for ``contrast``,
     ``dissimilarity``, ``homogeneity``, ``ASM``, ``energy``, ``correlation``
     (including the near-zero-std guard), plus ``entropy`` (natural log).
     """
-    levels_idx = np.arange(levels)
-    i = levels_idx[:, None]
-    j = levels_idx[None, :]
-    diff = i - j
-
     asm = float(np.sum(glcm**2))
     nonzero = glcm > 0
     entropy = float(-np.sum(glcm[nonzero] * np.log(glcm[nonzero])))
@@ -164,10 +158,10 @@ def _haralick_props(glcm: np.ndarray, levels: int) -> dict[str, float]:
         "ASM": asm,
         "energy": float(np.sqrt(asm)),
         "entropy": entropy,
-        "contrast": float(np.sum(glcm * diff**2)),
+        "contrast": float(np.sum(glcm * diff_sq)),
         "correlation": correlation,
-        "homogeneity": float(np.sum(glcm / (1.0 + diff**2))),
-        "dissimilarity": float(np.sum(glcm * np.abs(diff))),
+        "homogeneity": float(np.sum(glcm / (1.0 + diff_sq))),
+        "dissimilarity": float(np.sum(glcm * abs_diff)),
     }
 
 
@@ -256,12 +250,24 @@ def glcm_features(
         for unit in _unit_offsets(image.ndim)
     ]
 
-    totals = {prop: 0.0 for prop in _PROPS}
-    for off in offsets:
-        glcm = _direction_matrix(quant, off, levels, mask, symmetric, normed)
-        props = _haralick_props(glcm, levels)
-        for prop in _PROPS:
-            totals[prop] += props[prop]
+    # Direction-independent level-index ramps, computed once and reused for
+    # every direction's property reduction.
+    levels_idx = np.arange(levels)
+    i = levels_idx[:, None]
+    j = levels_idx[None, :]
+    diff = i - j
+    diff_sq = diff * diff
+    abs_diff = np.abs(diff)
 
-    n = len(offsets)
-    return {prop: totals[prop] / n for prop in _PROPS}
+    per_direction = [
+        _haralick_props(
+            _direction_matrix(quant, off, levels, mask, symmetric, normed),
+            i,
+            j,
+            diff_sq,
+            abs_diff,
+        )
+        for off in offsets
+    ]
+    n = len(per_direction)
+    return {prop: sum(d[prop] for d in per_direction) / n for prop in per_direction[0]}
