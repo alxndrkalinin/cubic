@@ -75,3 +75,24 @@ def test_regionprops_table_extra_properties() -> None:
     by_label = dict(zip(out["label"].tolist(), out["intensity_range"].tolist()))
     assert by_label[1] == 10.0  # intensities {10, 20}
     assert by_label[2] == 0.0  # intensities {5, 5}
+
+
+def test_regionprops_extra_properties() -> None:
+    """extra_properties callables are forwarded and exposed as region attributes."""
+
+    def intensity_range(regionmask: np.ndarray, intensity: np.ndarray) -> float:
+        values = intensity[regionmask]
+        return float(values.max() - values.min())
+
+    labels = np.array([[0, 1, 1], [2, 2, 0]], dtype=np.int32)
+    intensity = np.array([[0, 10, 20], [5, 5, 0]], dtype=np.float32)
+
+    regions = voxel.regionprops(
+        labels,
+        intensity_image=intensity,
+        extra_properties=(intensity_range,),
+    )
+
+    by_label = {region.label: region.intensity_range for region in regions}
+    assert by_label[1] == 10.0  # intensities {10, 20}
+    assert by_label[2] == 0.0  # intensities {5, 5}
