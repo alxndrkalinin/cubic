@@ -29,7 +29,11 @@ def regionprops_table(
 ) -> dict[str, np.ndarray]:
     """Extract region-based morphological features and return in pandas-compatible format."""
     if properties is not None:
-        properties = list(set(properties + ["label"]))
+        # Order-preserving dedup. A bare ``set()`` iterates in an order that
+        # depends on the interpreter hash seed, which differs per spawned
+        # process worker, so it would scramble the output column order across
+        # multiprocessing workers and misalign the pooled feature matrix.
+        properties = list(dict.fromkeys([*properties, "label"]))
     else:
         properties = []
     # cucim requires spacing as tuple for kernel memoization
