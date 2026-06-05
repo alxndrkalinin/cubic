@@ -133,6 +133,10 @@ def test_glcm_rejects_bad_input() -> None:
         glcm_features(img2d, mask=np.zeros((4, 4), dtype=bool))
     with pytest.raises(ValueError, match="levels"):
         glcm_features(img2d, levels=1)
+    with pytest.raises(ValueError, match="distances"):
+        glcm_features(img2d, distances=())
+    with pytest.raises(ValueError, match="distances"):
+        glcm_features(img2d, distances=(0,))
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
