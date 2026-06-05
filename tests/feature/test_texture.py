@@ -127,6 +127,35 @@ def test_glcm_rejects_bad_input() -> None:
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
+def test_glcm_empty_pair_directions(use_gpu: bool, gpu_available: bool) -> None:
+    """Directions with no valid pairs do not raise (cupy.bincount empty case)."""
+    rng = np.random.default_rng(6)
+    # A single-row image: the vertical directions (1, 0), (1, 1), (1, -1)
+    # have an empty overlap region, so their index arrays are empty.
+    row = rng.random((1, 12)).astype(np.float32)
+    # A single foreground pixel: every direction is fully masked out.
+    img = rng.random((10, 10)).astype(np.float32)
+    mask = np.zeros(img.shape, dtype=bool)
+    mask[5, 5] = True
+
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        row = ascupy(row)
+        img = ascupy(img)
+        mask = ascupy(mask)
+
+    row_feats = glcm_features(row, levels=8)
+    assert all(np.isfinite(v) for v in row_feats.values())
+
+    masked_feats = glcm_features(img, mask=mask, levels=8)
+    assert all(np.isfinite(v) for v in masked_feats.values())
+    # All directions empty -> all-zero GLCMs -> correlation guard fires.
+    assert masked_feats["correlation"] == 1.0
+    assert masked_feats["contrast"] == 0.0
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
 def test_glcm_cpu_vs_gpu(use_gpu: bool, gpu_available: bool) -> None:
     """GLCM features agree between CPU and GPU within tolerance."""
     rng = np.random.default_rng(5)
