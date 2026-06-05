@@ -108,8 +108,18 @@ def _direction_matrix(
         center = center[valid]
         neighbor = neighbor[valid]
     index = (center * levels + neighbor).ravel()
-    counts = np.bincount(index, minlength=levels * levels).reshape(levels, levels)
-    counts = asnumpy(counts).astype(np.float64)
+    if index.size == 0:
+        # No valid pairs for this direction: an empty overlap (e.g. a
+        # single-row image's vertical offsets) or a fully masked-out
+        # direction. ``cupy.bincount`` raises on empty input (it reduces
+        # ``x.max()`` to size the output, which has no identity), so build
+        # the zero matrix directly. The resulting all-zero GLCM yields the
+        # same properties skimage gives for an empty co-occurrence matrix
+        # (contrast/entropy 0, correlation 1.0 via the std guard).
+        counts = np.zeros((levels, levels), dtype=np.float64)
+    else:
+        counts = np.bincount(index, minlength=levels * levels).reshape(levels, levels)
+        counts = asnumpy(counts).astype(np.float64)
     if symmetric:
         counts = counts + counts.T
     if normed:
