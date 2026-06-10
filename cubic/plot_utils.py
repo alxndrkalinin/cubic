@@ -35,7 +35,7 @@ def show_image_error(
     bit_depth: int = 14,
     cmap: str = "bwr",
 ) -> Figure:
-    """Display error map between teo images."""
+    """Display error map between two images."""
     fig = plt.figure(figsize=figsize)
     plt.imshow(img, cmap=cmap, vmin=-(2**bit_depth - 1), vmax=(2**bit_depth - 1))
     plt.axis("off")
