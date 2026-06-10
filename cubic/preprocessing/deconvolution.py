@@ -36,9 +36,14 @@ def richardson_lucy_skimage(
     if observer_fn is None:
         return rl_partial(image, num_iter=n_iter)
 
+    # Recompute from the original image at each depth so each observed estimate
+    # is the true i-iteration RL result and the returned value matches the
+    # no-observer path. Looping with ``num_iter=1`` on the previous output
+    # instead both re-clips every iteration (skimage clips per call) and feeds
+    # the deconvolution back as the image, diverging from a single call.
     estimate = image
     for i in range(1, n_iter + 1):
-        estimate = rl_partial(estimate, num_iter=1)
+        estimate = rl_partial(image, num_iter=i)
         observer_fn(estimate, i)
 
     return estimate
@@ -64,9 +69,7 @@ def decon_skimage(
     if observer_fn is not None:
 
         def wrapper_observer(restored_image, i, *args):
-            processed_image = restored_image[
-                pad_size_z : image.shape[0] + pad_size_z, :, :
-            ]
+            processed_image = restored_image[pad_size_z : image.shape[0] + pad_size_z]
             observer_fn(processed_image, i, *args)
 
     decon_image = richardson_lucy_skimage(
@@ -78,7 +81,7 @@ def decon_skimage(
         filter_epsilon=filter_epsilon,
     )
 
-    decon_image = decon_image[pad_size_z : image.shape[0] + pad_size_z, :, :]
+    decon_image = decon_image[pad_size_z : image.shape[0] + pad_size_z]
     return decon_image
 
 
@@ -103,9 +106,7 @@ def decon_xpy(
     if observer_fn is not None:
 
         def wrapper_observer(restored_image, i, *args):
-            processed_image = restored_image[
-                pad_size_z : image.shape[0] + pad_size_z, :, :
-            ]
+            processed_image = restored_image[pad_size_z : image.shape[0] + pad_size_z]
             observer_fn(processed_image, i, *args)
 
     decon_image = richardson_lucy_xp(
@@ -117,7 +118,7 @@ def decon_xpy(
         observer_fn=wrapper_observer,
     )
 
-    decon_image = decon_image[pad_size_z : image.shape[0] + pad_size_z, :, :]
+    decon_image = decon_image[pad_size_z : image.shape[0] + pad_size_z]
     return decon_image
 
 
