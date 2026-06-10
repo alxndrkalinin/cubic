@@ -293,9 +293,9 @@ def remove_touching_objects(
     """
     check_labeled_binary(label_image)
 
-    exclude_masks: list[int] = []
+    exclude_masks: set[int] = set()
     for mask_idx in np.unique(label_image)[1:]:
-        if mask_idx in exclude_masks:
+        if int(mask_idx) in exclude_masks:
             continue
         binary_mask = label_image == mask_idx
         dilated_mask = morphology.binary_dilation(binary_mask, morphology.cube(3))
@@ -304,7 +304,8 @@ def remove_touching_objects(
         neighbor_ids = np.unique(label_image[mask_outline])
         neighbor_ids = neighbor_ids[neighbor_ids != 0]
         if neighbor_ids.size > 0:
-            exclude_masks += [int(mask_idx), *(int(n) for n in neighbor_ids)]
+            exclude_masks.add(int(mask_idx))
+            exclude_masks.update(int(n) for n in neighbor_ids)
 
     for exclude_mask in exclude_masks:
         label_image[label_image == exclude_mask] = 0
