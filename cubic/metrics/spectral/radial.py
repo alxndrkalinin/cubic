@@ -69,9 +69,14 @@ def _radial_edges_cached(
         raise ValueError("bin_delta must be > 0")
 
     if spacing_key is None:
-        # Index units: step = bin_delta, kmax = floor(n/2)
+        # Index units: step = bin_delta, kmax = floor(n/2).
+        # Honor use_max_nyquist (max axis Nyquist) so sectioned callers that
+        # normalize by max(n // 2) reach 1.0 on anisotropic shapes; otherwise
+        # the XY-sector curve is compressed into the low-frequency quarter.
         step = float(bin_delta)
-        kmax = _kmax_index(shape)
+        kmax = (
+            float(max(n // 2 for n in shape)) if use_max_nyquist else _kmax_index(shape)
+        )
     else:
         # Physical units: one index bin in physical units along axis i: Δk_i = 1/(n_i·spacing_i)
         dk_min = min(1.0 / (n * sp) for n, sp in zip(shape, spacing_key))
