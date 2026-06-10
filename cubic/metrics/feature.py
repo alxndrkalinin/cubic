@@ -43,7 +43,10 @@ def get_true_features(
                 )
             )
         else:
-            assert all(feat in gt_features for feat in features if feat != "label"), (
+            # gt_features holds expanded column names (e.g. "centroid-0"); compare
+            # against their base names so vector properties like "centroid" match.
+            gt_base = {feat.split("-")[0] for feat in gt_features if feat != "label"}
+            assert all(feat in gt_base for feat in features if feat != "label"), (
                 "Some features not found in precomputed features."
             )
 
