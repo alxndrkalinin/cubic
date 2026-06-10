@@ -8,8 +8,20 @@ from cubic.cuda import (
     asnumpy,
     to_device,
     get_device,
+    is_gpu_array,
     check_same_device,
 )
+
+
+def test_is_gpu_array_classification(gpu_available: bool) -> None:
+    """``is_gpu_array`` is True only for GPU arrays, not NumPy or scalars."""
+    assert is_gpu_array(np.ones((2, 2))) is False
+    assert is_gpu_array(5) is False
+    assert is_gpu_array("not an array") is False
+    assert is_gpu_array([1, 2, 3]) is False
+
+    if gpu_available:
+        assert is_gpu_array(ascupy(np.ones((2, 2)))) is True
 
 
 @pytest.mark.parametrize("device", ["CPU", "GPU"])

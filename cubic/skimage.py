@@ -2,11 +2,10 @@
 
 from types import ModuleType
 from typing import Any
-from functools import wraps
 from importlib import import_module
 from collections.abc import Callable
 
-from .cuda import CUDAManager
+from .cuda import CUDAManager, asnumpy, is_gpu_array
 
 
 class SkimageProxy(ModuleType):
@@ -26,32 +25,34 @@ class SkimageProxy(ModuleType):
 
         def func_wrapper(*args: Any, **kwargs: Any) -> Any:
             """Wrap skimage or cucim functions based on device capability."""
-            base_module = "skimage"
-
+            # The io submodule routes to cubic.cucim, which manages device
+            # placement itself. Everything else dispatches on whether *any*
+            # argument is a GPU array — not just the first positional one,
+            # since skimage functions accept the array under varying names
+            # (e.g. ``label_image``, ``intensity_image``, ``coords``).
             if self.__name__ == "io":
                 base_module = "cubic.cucim"
-                array = args[1] if len(args) > 1 else kwargs.get("arr", None)
+                use_gpu = False
             else:
-                array = args[0] if args else kwargs.get("image", None)
-
-                if self.cp is not None and hasattr(array, "device"):
-                    device_val = getattr(array, "device", None)
-                    if hasattr(device_val, "id") or (
-                        isinstance(device_val, str) and device_val != "cpu"
-                    ):
-                        base_module = "cucim.skimage"
+                use_gpu = self.cp is not None and (
+                    any(is_gpu_array(a) for a in args)
+                    or any(is_gpu_array(v) for v in kwargs.values())
+                )
+                base_module = "cucim.skimage" if use_gpu else "skimage"
 
             full_func_name = f"{base_module}.{self.__name__}.{func_name}"
             module_name, method_name = full_func_name.rsplit(".", maxsplit=1)
-            module = import_module(module_name)
-            func = getattr(module, method_name)
+            func = getattr(import_module(module_name), method_name)
 
-            @wraps(func)
-            def inner_func(*args: Any, **kwargs: Any) -> Any:
-                """Inner function to call the wrapped function."""
+            if use_gpu or self.__name__ == "io":
                 return func(*args, **kwargs)
-
-            return inner_func(*args, **kwargs)
+            # CPU route: defensively coerce any stray GPU array to CPU so a raw
+            # CuPy array never reaches a host scikit-image function.
+            cpu_args = [asnumpy(a) if is_gpu_array(a) else a for a in args]
+            cpu_kwargs = {
+                k: asnumpy(v) if is_gpu_array(v) else v for k, v in kwargs.items()
+            }
+            return func(*cpu_args, **cpu_kwargs)
 
         self.__dict__[func_name] = func_wrapper
         return func_wrapper

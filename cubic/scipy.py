@@ -3,11 +3,23 @@
 import warnings
 from types import ModuleType
 from typing import Any
-from functools import wraps
 from importlib import import_module
 from collections.abc import Callable
 
-from .cuda import CUDAManager, asnumpy, to_device
+from .cuda import CUDAManager, asnumpy, to_device, is_gpu_array
+
+
+def _any_gpu_arg(args: tuple, kwargs: dict) -> bool:
+    """Return True if any positional or keyword argument is a GPU array.
+
+    Device routing must scan *every* argument, not just ``args[0]`` /
+    ``kwargs["input"]``: SciPy functions take the array under varying names
+    (e.g. ``coordinates``, ``weights``), so a GPU array elsewhere would
+    otherwise route to CPU SciPy and crash on the raw CuPy input.
+    """
+    return any(is_gpu_array(a) for a in args) or any(
+        is_gpu_array(v) for v in kwargs.values()
+    )
 
 
 class SciPyProxy(ModuleType):
@@ -26,15 +38,28 @@ class SciPyProxy(ModuleType):
             return self.__dict__[func_name]
 
         def func_wrapper(*args: Any, **kwargs: Any) -> Any:
-            array = args[0] if args else kwargs.get("input", None)
-            use_gpu = False
-            if self.cp is not None and hasattr(array, "device"):
-                device_val = getattr(array, "device", None)
-                use_gpu = hasattr(device_val, "id") or (
-                    isinstance(device_val, str) and device_val != "cpu"
-                )
+            use_gpu = self.cp is not None and _any_gpu_arg(args, kwargs)
             base_module = "cupyx.scipy" if use_gpu else "scipy"
             module_name = f"{base_module}.{self.__name__}"
+
+            def _on_cpu(func: Callable, return_to_gpu: bool) -> Any:
+                # Coerce every GPU array argument to CPU before calling SciPy,
+                # then optionally move array results back to the GPU.
+                cpu_args = [asnumpy(a) if is_gpu_array(a) else a for a in args]
+                cpu_kwargs = {
+                    k: asnumpy(v) if is_gpu_array(v) else v for k, v in kwargs.items()
+                }
+                result = func(*cpu_args, **cpu_kwargs)
+                if not return_to_gpu:
+                    return result
+                if isinstance(result, tuple):
+                    return tuple(
+                        to_device(r, "GPU") if hasattr(r, "dtype") else r
+                        for r in result
+                    )
+                if hasattr(result, "dtype"):
+                    return to_device(result, "GPU")
+                return result
 
             try:
                 module = import_module(module_name)
@@ -43,36 +68,14 @@ class SciPyProxy(ModuleType):
                 warnings.warn(
                     f"cupyx.scipy.{self.__name__}.{func_name} is unavailable, falling back to CPU."
                 )
-                module = import_module(f"scipy.{self.__name__}")
-                func = getattr(module, func_name)
+                func = getattr(import_module(f"scipy.{self.__name__}"), func_name)
+                return _on_cpu(func, return_to_gpu=use_gpu)
 
-                @wraps(func)
-                def inner_cpu(*cargs: Any, **ckwargs: Any) -> Any:
-                    cpu_args = [
-                        asnumpy(a) if hasattr(a, "device") else a for a in cargs
-                    ]
-                    cpu_kwargs = {
-                        k: asnumpy(v) if hasattr(v, "device") else v
-                        for k, v in ckwargs.items()
-                    }
-                    result = func(*cpu_args, **cpu_kwargs)
-                    if use_gpu:
-                        if isinstance(result, tuple):
-                            return tuple(
-                                to_device(r, "GPU") if hasattr(r, "dtype") else r
-                                for r in result
-                            )
-                        if hasattr(result, "dtype"):
-                            return to_device(result, "GPU")
-                    return result
-
-                return inner_cpu(*args, **kwargs)
-
-            @wraps(func)
-            def inner(*cargs: Any, **ckwargs: Any) -> Any:
-                return func(*cargs, **ckwargs)
-
-            return inner(*args, **kwargs)
+            if not use_gpu:
+                # CPU route: defensively coerce any stray GPU array to CPU so a
+                # raw CuPy array never reaches a host SciPy function.
+                return _on_cpu(func, return_to_gpu=False)
+            return func(*args, **kwargs)
 
         self.__dict__[func_name] = func_wrapper
         return func_wrapper
