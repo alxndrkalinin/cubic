@@ -88,10 +88,12 @@ def is_gpu_array(array: Any) -> bool:
     """Return True if ``array`` is a GPU array (CuPy ndarray or CUDA torch tensor).
 
     Used by the SciPy / scikit-image proxies to detect the target device across
-    *all* arguments rather than only the first positional one. Uses the same
-    strict ``device`` test as :func:`asnumpy` (a ``cupy.cuda.Device`` exposes
-    ``id``; NumPy 2.x arrays report ``device == "cpu"``), so a non-array object
-    that merely carries a ``device`` attribute is not misclassified.
+    *all* arguments rather than only the first positional one. This is a
+    ``device``-based heuristic, not a type check: a CuPy array (whose ``device``
+    is a ``cupy.cuda.Device`` exposing ``id``) and a CUDA torch tensor classify
+    as GPU; a NumPy 2.x array (``device == "cpu"``) and any object without a
+    ``device`` attribute classify as CPU. Mirroring :func:`asnumpy`, an object
+    whose ``device`` is a non-``"cpu"`` string is also treated as GPU.
     """
     if _is_torch_tensor(array):
         return array.device.type == "cuda"  # type: ignore[attr-defined]
