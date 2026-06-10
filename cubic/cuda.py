@@ -106,6 +106,31 @@ def is_gpu_array(array: Any) -> bool:
     )
 
 
+def any_gpu_arg(args: tuple, kwargs: dict) -> bool:
+    """Return True if any positional or keyword argument is a GPU array.
+
+    Device routing in the SciPy / scikit-image proxies must scan *every*
+    argument, not just the first positional one: those libraries take the
+    array under varying names (e.g. ``coordinates``, ``weights``,
+    ``label_image``), so a GPU array elsewhere would otherwise route to the
+    CPU backend and crash on the raw CuPy input.
+    """
+    return any(is_gpu_array(a) for a in args) or any(
+        is_gpu_array(v) for v in kwargs.values()
+    )
+
+
+def coerce_args_to_cpu(args: tuple, kwargs: dict) -> tuple[list, dict]:
+    """Return ``(args, kwargs)`` with every GPU array argument moved to host.
+
+    Non-array arguments pass through untouched. Used by the proxies so a raw
+    CuPy array never reaches a host SciPy / scikit-image function.
+    """
+    cpu_args = [asnumpy(a) if is_gpu_array(a) else a for a in args]
+    cpu_kwargs = {k: asnumpy(v) if is_gpu_array(v) else v for k, v in kwargs.items()}
+    return cpu_args, cpu_kwargs
+
+
 def to_device(array: np.ndarray, device: str) -> np.ndarray:
     """Move array to the requested device."""
     cp = CUDAManager().get_cp()

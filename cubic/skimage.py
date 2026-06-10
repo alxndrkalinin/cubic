@@ -5,7 +5,7 @@ from typing import Any
 from importlib import import_module
 from collections.abc import Callable
 
-from .cuda import CUDAManager, asnumpy, is_gpu_array
+from .cuda import CUDAManager, any_gpu_arg, coerce_args_to_cpu
 
 
 class SkimageProxy(ModuleType):
@@ -34,10 +34,7 @@ class SkimageProxy(ModuleType):
                 base_module = "cubic.cucim"
                 use_gpu = False
             else:
-                use_gpu = self.cp is not None and (
-                    any(is_gpu_array(a) for a in args)
-                    or any(is_gpu_array(v) for v in kwargs.values())
-                )
+                use_gpu = self.cp is not None and any_gpu_arg(args, kwargs)
                 base_module = "cucim.skimage" if use_gpu else "skimage"
 
             full_func_name = f"{base_module}.{self.__name__}.{func_name}"
@@ -48,10 +45,7 @@ class SkimageProxy(ModuleType):
                 return func(*args, **kwargs)
             # CPU route: defensively coerce any stray GPU array to CPU so a raw
             # CuPy array never reaches a host scikit-image function.
-            cpu_args = [asnumpy(a) if is_gpu_array(a) else a for a in args]
-            cpu_kwargs = {
-                k: asnumpy(v) if is_gpu_array(v) else v for k, v in kwargs.items()
-            }
+            cpu_args, cpu_kwargs = coerce_args_to_cpu(args, kwargs)
             return func(*cpu_args, **cpu_kwargs)
 
         self.__dict__[func_name] = func_wrapper
