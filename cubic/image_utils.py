@@ -234,7 +234,7 @@ def crop_corner(
         # "b"/"r" crop from the far edge (last/second-to-last axis); everything
         # else (incl. "t"/"l") crops from the near edge.
         crop_from_end = (axis == axes[-1] and "r" in corner) or (
-            axis == axes[-2] and "b" in corner
+            len(axes) >= 2 and axis == axes[-2] and "b" in corner
         )
         if crop_from_end:
             slices[axis] = slice(img.shape[axis] - size, None)
