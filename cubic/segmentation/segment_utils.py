@@ -283,24 +283,28 @@ def clear_xy_borders(label_image: np.ndarray, buffer_size: int = 0) -> np.ndarra
 def remove_touching_objects(
     label_image: np.ndarray, border_value: int = 100
 ) -> np.ndarray:
-    """Find labelled masks that overlap and remove from the image."""
+    """Find labelled masks that touch each other and remove them.
+
+    ``border_value`` is accepted for backwards compatibility but no longer
+    used: neighbouring labels are read directly from each object's dilated
+    outline. The previous additive-offset trick misclassified any label id
+    greater than ``border_value`` (Cellpose routinely emits hundreds of
+    labels), which silently deleted non-touching objects.
+    """
     check_labeled_binary(label_image)
 
-    exclude_masks = []
+    exclude_masks: list[int] = []
     for mask_idx in np.unique(label_image)[1:]:
-        if mask_idx not in exclude_masks:
-            binary_mask = label_image == mask_idx
-            dilated_mask = morphology.binary_dilation(binary_mask, morphology.cube(3))
-            mask_outline = dilated_mask & ~binary_mask
+        if mask_idx in exclude_masks:
+            continue
+        binary_mask = label_image == mask_idx
+        dilated_mask = morphology.binary_dilation(binary_mask, morphology.cube(3))
+        mask_outline = dilated_mask & ~binary_mask
 
-            masks_copy = label_image.copy()
-            masks_copy[mask_outline] += border_value
-
-            if masks_copy[masks_copy > border_value].sum() > 0:
-                overlap_masks = (
-                    np.unique(masks_copy[masks_copy > border_value]) - border_value
-                )
-                exclude_masks += [mask_idx] + list(overlap_masks)
+        neighbor_ids = np.unique(label_image[mask_outline])
+        neighbor_ids = neighbor_ids[neighbor_ids != 0]
+        if neighbor_ids.size > 0:
+            exclude_masks += [int(mask_idx), *(int(n) for n in neighbor_ids)]
 
     for exclude_mask in exclude_masks:
         label_image[label_image == exclude_mask] = 0
