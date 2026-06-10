@@ -90,7 +90,7 @@ def clear_border(
             f"are {out.shape} and {mask.shape}"
         )
         if out.shape != mask.shape:
-            raise (ValueError, err_msg)
+            raise ValueError(err_msg)
         if mask.dtype != bool:
             raise TypeError("mask should be of type bool.")
         borders = ~mask
