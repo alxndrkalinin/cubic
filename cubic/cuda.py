@@ -84,6 +84,28 @@ def get_device(array: np.ndarray) -> str:
     return "CPU"
 
 
+def is_gpu_array(array: Any) -> bool:
+    """Return True if ``array`` is a GPU array (CuPy ndarray or CUDA torch tensor).
+
+    Used by the SciPy / scikit-image proxies to detect the target device across
+    *all* arguments rather than only the first positional one. Uses the same
+    strict ``device`` test as :func:`asnumpy` (a ``cupy.cuda.Device`` exposes
+    ``id``; NumPy 2.x arrays report ``device == "cpu"``), so a non-array object
+    that merely carries a ``device`` attribute is not misclassified.
+    """
+    if _is_torch_tensor(array):
+        return array.device.type == "cuda"  # type: ignore[attr-defined]
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        return False
+    device_val = getattr(array, "device", None)
+    if device_val is None:
+        return False
+    return hasattr(device_val, "id") or (
+        isinstance(device_val, str) and device_val != "cpu"
+    )
+
+
 def to_device(array: np.ndarray, device: str) -> np.ndarray:
     """Move array to the requested device."""
     cp = CUDAManager().get_cp()
