@@ -230,9 +230,10 @@ def ms_ssim(
     ------
     ValueError
         If ``image1.shape != image2.shape``, ``image1.ndim`` is not 2 or
-        3, ``kernel_size`` is not odd-positive, ``data_range`` is not
-        finite-positive, or any spatial dim is below
-        ``2 ** (n_scales - 1) * kernel_size`` (176 for the defaults).
+        3, ``kernel_size`` is not odd-positive, ``sigma`` is not
+        finite-positive, ``data_range`` is not finite-positive, or any
+        spatial dim is below ``2 ** (n_scales - 1) * kernel_size`` (176 for
+        the defaults).
     """
     check_same_device(image1, image2)
 
@@ -247,6 +248,8 @@ def ms_ssim(
         )
     if kernel_size < 1 or kernel_size % 2 == 0:
         raise ValueError(f"kernel_size must be odd and positive; got {kernel_size}")
+    if not (np.isfinite(sigma) and sigma > 0):
+        raise ValueError(f"sigma must be finite and positive; got {sigma}")
     if not (np.isfinite(data_range) and data_range > 0):
         raise ValueError(f"data_range must be finite and positive; got {data_range}")
 
