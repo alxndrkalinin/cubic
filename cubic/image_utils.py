@@ -143,12 +143,20 @@ def pad_image_to_cube(
 def pad_image_to_shape(
     img: np.ndarray, new_shape: Sequence[int], mode: str = "constant"
 ) -> np.ndarray:
-    """Pad all image axis up to specified shape."""
+    """Pad all image axis up to specified shape.
+
+    Padding is centered to match ``crop_center``'s slicing convention so an
+    odd size difference still reaches the exact target shape (the previous
+    symmetric ``(new - dim) // 2`` on both sides fell one short for odd diffs).
+    """
+    pad_sizes = [(0, 0)] * img.ndim
     for i, dim in enumerate(img.shape):
         if dim < new_shape[i]:
-            pad_size = (new_shape[i] - dim) // 2
-            img = pad_image(img, pad_size=pad_size, axes=i, mode=mode)
+            pad_before = new_shape[i] // 2 - dim // 2
+            pad_after = new_shape[i] - dim - pad_before
+            pad_sizes[i] = (pad_before, pad_after)
 
+    img = np.pad(img, pad_sizes, mode=mode)  # type: ignore[call-overload]
     assert np.all([dim == new_shape[i] for i, dim in enumerate(img.shape)])
     return img
 
@@ -222,19 +230,16 @@ def crop_corner(
         if axis >= img.ndim:
             raise ValueError("Axis index out of range for the image dimensions.")
 
-        if "t" in corner or "l" in corner:
-            start = 0
-            end = size if size <= img.shape[axis] else img.shape[axis]
+        size = min(size, img.shape[axis])
+        # "b"/"r" crop from the far edge (last/second-to-last axis); everything
+        # else (incl. "t"/"l") crops from the near edge.
+        crop_from_end = (axis == axes[-1] and "r" in corner) or (
+            axis == axes[-2] and "b" in corner
+        )
+        if crop_from_end:
+            slices[axis] = slice(img.shape[axis] - size, None)
         else:
-            start = -size if size <= img.shape[axis] else -img.shape[axis]
-            end = None
-
-        if "r" in corner and axis == axes[-1]:
-            slices[axis] = slice(-end if end is not None else None, None)
-        elif "b" in corner and axis == axes[-2]:
-            slices[axis] = slice(-end if end is not None else None, None)
-        else:
-            slices[axis] = slice(start, end)
+            slices[axis] = slice(0, size)
 
     return img[tuple(slices)]
 

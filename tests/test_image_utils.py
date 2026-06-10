@@ -5,13 +5,37 @@ import pytest
 
 from cubic.cuda import ascupy, asnumpy
 from cubic.image_utils import (
+    crop_bl,
+    crop_br,
+    crop_tl,
+    crop_tr,
+    crop_center,
     rotate_image,
     binomial_split,
     pad_image_to_cube,
     checkerboard_split,
+    pad_image_to_shape,
     reverse_checkerboard_split,
     select_max_contrast_slices,
 )
+
+
+def test_crop_corner_all_four_corners() -> None:
+    """Each corner crop selects the right 2x2 block (br previously returned all)."""
+    img = np.arange(1, 17).reshape(4, 4)
+    np.testing.assert_array_equal(crop_tl(img, 2, axes=[0, 1]), [[1, 2], [5, 6]])
+    np.testing.assert_array_equal(crop_tr(img, 2, axes=[0, 1]), [[3, 4], [7, 8]])
+    np.testing.assert_array_equal(crop_bl(img, 2, axes=[0, 1]), [[9, 10], [13, 14]])
+    np.testing.assert_array_equal(crop_br(img, 2, axes=[0, 1]), [[11, 12], [15, 16]])
+
+
+def test_pad_image_to_shape_odd_difference_round_trips() -> None:
+    """Odd size differences reach the exact target and invert via crop_center."""
+    img = np.arange(5 * 7 * 7, dtype=np.float64).reshape(5, 7, 7)
+    target = (10, 8, 8)  # odd diff on axis 0 (5), odd on axes 1, 2 (1)
+    padded = pad_image_to_shape(img, target, mode="constant")
+    assert padded.shape == target
+    np.testing.assert_array_equal(crop_center(padded, img.shape), img)
 
 
 def test_pad_image_to_cube() -> None:
