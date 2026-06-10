@@ -77,6 +77,7 @@ def extract_features(
     """Extract features from a label image using ``trimesh``."""
     label_image = asnumpy(label_image)
     labels = np.unique(label_image)
+    labels = labels[labels != 0]  # exclude background, matching voxel.regionprops
 
     features = features or mesh_feature_list()
     feature_values = []
