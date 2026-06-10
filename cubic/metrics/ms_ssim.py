@@ -167,7 +167,7 @@ def _torchmetrics_ssim_update(
     ssim_full = ((2.0 * ux * uy + c1) * upper) / ((ux * ux + uy * uy + c1) * lower)
 
     # CS is further cropped by `pad` to match torchmetrics ssim.py:177.
-    cs_cropped = (upper / lower)[_crop_slice(image1.ndim, pad)]
+    cs_cropped = (upper / lower)[sl]
 
     # Reduce over spatial axes only; keep the batch axis so MS-SSIM can be
     # averaged per image (matches torchmetrics' elementwise_mean reduction).
