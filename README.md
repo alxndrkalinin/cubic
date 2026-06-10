@@ -10,7 +10,8 @@ statements and transferring input arrays to the target device.
 It also provides custom GPU-accelerated implementations of additional
 features, including Fourier Ring and Shell Correlation for image resolution,
 faster Richardson-Lucy deconvolution, average precision (AP) for segmentation
-quality assessment, and other features.
+quality assessment, image-quality metrics (PSNR, SSIM, MicroSSIM, MS-SSIM),
+and other features.
 
 ## Getting started
 
@@ -45,6 +46,10 @@ Optional extras from `pyproject.toml` enable additional functionality:
 pip install '.[mesh]'
 # segmentation via Cellpose
 pip install '.[cellpose]'
+# plotting helpers (matplotlib)
+pip install '.[plot]'
+# run the example notebooks (jupyter, pooch)
+pip install '.[examples]'
 # developer tools (pre-commit, pytest)
 pip install -e '.[dev]'
 # install everything
