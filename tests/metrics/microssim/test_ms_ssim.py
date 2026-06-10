@@ -76,6 +76,25 @@ def test_accepts_3d_input():
     assert isinstance(out, float)
 
 
+def test_batch_equals_mean_of_per_image():
+    """``(N, H, W)`` MS-SSIM is the mean of per-image scores, not a batch pool.
+
+    The slices are deliberately dissimilar so that pooling the maps across the
+    batch (the old behavior) would diverge from the per-image mean.
+    """
+    rng = np.random.default_rng(11)
+    gt = rng.random((3, 256, 256)).astype(np.float64)
+    pred = gt.copy()
+    pred[0] += 0.02 * rng.standard_normal(gt[0].shape)  # near-identical
+    pred[1] = rng.random((256, 256))  # unrelated
+    pred[2] += 0.2 * rng.standard_normal(gt[2].shape)  # noisy
+    dr = float(gt.max() - gt.min())
+
+    per_image = [float(ms_ssim(pred[i], gt[i], data_range=dr)) for i in range(3)]
+    batched = ms_ssim(pred, gt, data_range=dr)
+    assert abs(batched - float(np.mean(per_image))) < 1e-9
+
+
 def test_rejects_1d_input():
     """``ndim=1`` raises ``ValueError``."""
     a = np.zeros(256, dtype=np.float32)
@@ -213,3 +232,32 @@ def test_ms_ssim_matches_torchmetrics():
             f"[{name}] ours={ours:.6f} theirs={theirs:.6f} "
             f"diff={abs(ours - theirs):.6e}"
         )
+
+
+@pytest.mark.parametrize("kernel_size", [7, 9])
+def test_ms_ssim_matches_torchmetrics_non_default_kernel(kernel_size: int):
+    """Non-default ``kernel_size`` matches torchmetrics within 1e-3.
+
+    Guards the desync where the reflect-pad/crop tracked ``kernel_size`` while
+    the Gaussian radius was fixed by ``sigma``/``truncate``: for a smaller
+    kernel the Gaussian leaked ``cval=0`` into the valid region.
+    """
+    pytest.importorskip("torchmetrics")
+    torch = pytest.importorskip("torch")
+    from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
+
+    rng = np.random.default_rng(0)
+    img = rng.random((256, 256)).astype(np.float32)
+    pred = img + 0.05 * rng.standard_normal(img.shape).astype(np.float32)
+    dr = _data_range(img)
+
+    ours = ms_ssim(pred, img, data_range=dr, kernel_size=kernel_size)
+    m = MultiScaleStructuralSimilarityIndexMeasure(
+        data_range=dr, kernel_size=kernel_size
+    )
+    theirs = float(
+        m(torch.from_numpy(pred[None, None]), torch.from_numpy(img[None, None]))
+    )
+    assert abs(ours - theirs) < 1e-3, (
+        f"kernel_size={kernel_size} ours={ours:.6f} theirs={theirs:.6f}"
+    )
