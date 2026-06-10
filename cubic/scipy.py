@@ -6,20 +6,7 @@ from typing import Any
 from importlib import import_module
 from collections.abc import Callable
 
-from .cuda import CUDAManager, asnumpy, to_device, is_gpu_array
-
-
-def _any_gpu_arg(args: tuple, kwargs: dict) -> bool:
-    """Return True if any positional or keyword argument is a GPU array.
-
-    Device routing must scan *every* argument, not just ``args[0]`` /
-    ``kwargs["input"]``: SciPy functions take the array under varying names
-    (e.g. ``coordinates``, ``weights``), so a GPU array elsewhere would
-    otherwise route to CPU SciPy and crash on the raw CuPy input.
-    """
-    return any(is_gpu_array(a) for a in args) or any(
-        is_gpu_array(v) for v in kwargs.values()
-    )
+from .cuda import CUDAManager, to_device, any_gpu_arg, coerce_args_to_cpu
 
 
 class SciPyProxy(ModuleType):
@@ -38,17 +25,14 @@ class SciPyProxy(ModuleType):
             return self.__dict__[func_name]
 
         def func_wrapper(*args: Any, **kwargs: Any) -> Any:
-            use_gpu = self.cp is not None and _any_gpu_arg(args, kwargs)
+            use_gpu = self.cp is not None and any_gpu_arg(args, kwargs)
             base_module = "cupyx.scipy" if use_gpu else "scipy"
             module_name = f"{base_module}.{self.__name__}"
 
             def _on_cpu(func: Callable, return_to_gpu: bool) -> Any:
                 # Coerce every GPU array argument to CPU before calling SciPy,
                 # then optionally move array results back to the GPU.
-                cpu_args = [asnumpy(a) if is_gpu_array(a) else a for a in args]
-                cpu_kwargs = {
-                    k: asnumpy(v) if is_gpu_array(v) else v for k, v in kwargs.items()
-                }
+                cpu_args, cpu_kwargs = coerce_args_to_cpu(args, kwargs)
                 result = func(*cpu_args, **cpu_kwargs)
                 if not return_to_gpu:
                     return result
