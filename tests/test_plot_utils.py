@@ -1,6 +1,10 @@
 """Tests for plotting helpers."""
 
-import matplotlib
+import pytest
+
+pytest.importorskip("matplotlib")  # optional [plot] extra; skip when absent
+
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")  # headless backend for tests
 
