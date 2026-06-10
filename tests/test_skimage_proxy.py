@@ -13,26 +13,24 @@ def test_dispatch_on_array_passed_by_keyword(
 ) -> None:
     """A GPU array under a non-``image`` keyword routes to the cuCIM backend.
 
-    ``rescale(image=..., scale=...)`` works either way, but detection now
-    scans all arguments so a GPU array under any keyword reaches the GPU
-    implementation instead of crashing a host scikit-image call.
+    ``measure.label(label_image=...)`` passes the array under ``label_image``,
+    a keyword the old first-arg/``image``-only detection never inspected — so a
+    GPU array there routed to host scikit-image and crashed. Detection now
+    scans every argument.
     """
-    img = np.random.random((8, 8)).astype(np.float32)
-    cpu_res = mc_skimage.transform.rescale(image=img, scale=0.5, preserve_range=True)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[1:3, 1:3] = 1
+    mask[5:7, 5:7] = 1
+    cpu_res = mc_skimage.measure.label(label_image=mask)
 
     if use_gpu:
         if not gpu_available:
             pytest.skip("GPU not available")
-        gpu_res = mc_skimage.transform.rescale(
-            image=ascupy(img), scale=0.5, preserve_range=True
-        )
+        gpu_res = mc_skimage.measure.label(label_image=ascupy(mask))
         assert get_device(gpu_res) == "GPU"
-        assert np.allclose(asnumpy(gpu_res), cpu_res, atol=1e-5)
+        assert np.array_equal(asnumpy(gpu_res), cpu_res)
     else:
-        assert np.allclose(
-            mc_skimage.transform.rescale(image=img, scale=0.5, preserve_range=True),
-            cpu_res,
-        )
+        assert np.array_equal(mc_skimage.measure.label(label_image=mask), cpu_res)
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
