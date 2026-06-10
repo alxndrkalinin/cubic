@@ -232,8 +232,14 @@ def average_precision(
     if matches_per_threshold is None:
         raise ValueError("No matches found.")
     tp = np.asarray([len(matches_per_threshold[th][0]) for th in thresholds])
-    fp = asnumpy(masks_pred.max()) - tp
-    fn = asnumpy(masks_true.max()) - tp
+    # Count distinct foreground labels rather than using ``.max()``: when the
+    # caller supplies ``matches_per_threshold`` the sequential-label check in
+    # ``compute_matches`` is skipped, so a gap in the label ids would make
+    # ``.max()`` over-count objects and corrupt FP/FN/AP.
+    n_pred = int((np.unique(masks_pred) != 0).sum())
+    n_true = int((np.unique(masks_true) != 0).sum())
+    fp = n_pred - tp
+    fn = n_true - tp
 
     sum_counts = tp + fp + fn
     ap = np.where(sum_counts > 0, tp / sum_counts, 0)

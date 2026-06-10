@@ -5,6 +5,24 @@ import numpy as np
 from cubic.metrics.average_precision import compute_matches, average_precision
 
 
+def test_average_precision_supplied_matches_nonsequential_labels() -> None:
+    """Supplied matches with gapped label ids give correct FP/FN/AP.
+
+    ``.max()`` over-counted objects when label ids were non-sequential and the
+    sequential-label check (only in ``compute_matches``) was bypassed.
+    """
+    mask_true = np.array([[0, 5], [5, 9]], dtype=np.int32)  # 2 objects: 5, 9
+    mask_pred = mask_true.copy()
+    matches = {0.5: (np.array([5, 9]), np.array([5, 9]))}
+    ap, tp, fp, fn = average_precision(
+        mask_true, mask_pred, [0.5], matches_per_threshold=matches
+    )
+    assert tp[0] == 2
+    assert fp[0] == 0
+    assert fn[0] == 0
+    assert ap[0] == 1.0
+
+
 def test_average_precision_perfect_match() -> None:
     """Perfect overlap should yield perfect precision."""
     mask_true = np.array([[0, 1], [0, 2]], dtype=np.int32)
