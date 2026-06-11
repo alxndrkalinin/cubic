@@ -351,3 +351,30 @@ def test_ssim(
         win_size=3,
     )
     assert np.isclose(result_scale_inv_masked, 1.0)
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_ssim_masked_gpu_matches_cpu(ndim: int, gpu_available: bool) -> None:
+    """Masked SSIM runs on GPU and matches the CPU result.
+
+    Regression for the masked path: ``morphology.square``/``cube`` receive
+    only an int, so the proxy returns a host footprint; cuCIM's ``erosion``
+    rejected a NumPy footprint paired with a GPU mask
+    (``ValueError: footprint must be either an ndarray or Sequence``).
+    The footprint is now moved onto the mask's device first.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+
+    rng = np.random.default_rng(0)
+    shape = (64, 64) if ndim == 2 else (32, 32, 32)
+    img1 = rng.random(shape).astype(np.float32)
+    img2 = img1 + 0.05 * rng.standard_normal(shape).astype(np.float32)
+    mask = np.zeros(shape, dtype=bool)
+    sl = (slice(8, shape[0] - 8),) * ndim
+    mask[sl] = True
+
+    cpu = ssim(img1, img2, data_range=1.0, mask=mask)
+    gpu = float(ssim(ascupy(img1), ascupy(img2), data_range=1.0, mask=ascupy(mask)))
+    assert np.isclose(cpu, gpu, atol=1e-4)

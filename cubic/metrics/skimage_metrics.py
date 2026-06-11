@@ -6,7 +6,13 @@ from collections.abc import Callable
 
 import numpy as np
 
-from ..cuda import CUDAManager, asnumpy, _is_torch_tensor, check_same_device
+from ..cuda import (
+    CUDAManager,
+    asnumpy,
+    to_same_device,
+    _is_torch_tensor,
+    check_same_device,
+)
 from ..skimage import metrics, morphology
 
 
@@ -315,6 +321,12 @@ def ssim(
             footprint = morphology.cube(2 * r + 1)
         else:
             raise ValueError(f"Unsupported mask dimensions: {mask.ndim}")
+        # ``morphology.square``/``cube`` receive only an int, so the proxy
+        # cannot detect the device and always returns a NumPy footprint.
+        # cuCIM's ``erosion`` rejects a host footprint paired with a GPU mask
+        # (``_footprint_is_sequence`` requires a CuPy ndarray), so move the
+        # footprint onto the mask's device first.
+        footprint = to_same_device(footprint, mask)
         valid = morphology.erosion(mask.astype(bool), footprint)
         mssim_masked = float(np.mean(ssim_map[valid]))
 
