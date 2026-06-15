@@ -46,8 +46,9 @@ Optional extras from `pyproject.toml` enable additional functionality:
 pip install '.[mesh]'
 # segmentation via Cellpose (SAM models: cpsam, cpsam_v2)
 pip install '.[cellpose]'
-# also enable the Cellpose DINO models (cpdino, cpdino-vitb)
-pip install '.[cellpose-dino]'
+# the Cellpose DINO models (cpdino, cpdino-vitb) additionally require dinov3,
+# which is only published on GitHub:
+pip install 'git+https://github.com/facebookresearch/dinov3'
 # plotting helpers (matplotlib)
 pip install '.[plot]'
 # run the example notebooks (jupyter, pooch)

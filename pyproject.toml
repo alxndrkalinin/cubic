@@ -40,10 +40,6 @@ cellpose = [
     "cellpose>=4.2.0",
     "torch",
 ]
-cellpose-dino = [
-    "cubic[cellpose]",
-    "cellpose[dino]>=4.2.0",
-]
 mesh = [
     "trimesh>=3.3.0",
 ]
@@ -63,7 +59,6 @@ dev = [
 ]
 all = [
     "cubic[cellpose]",
-    "cubic[cellpose-dino]",
     "cubic[mesh]",
     "cubic[plot]",
     "cubic[examples]",
