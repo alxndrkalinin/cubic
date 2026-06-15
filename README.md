@@ -44,8 +44,10 @@ Optional extras from `pyproject.toml` enable additional functionality:
 ```bash
 # mesh feature extraction
 pip install '.[mesh]'
-# segmentation via Cellpose
+# segmentation via Cellpose (SAM models: cpsam, cpsam_v2)
 pip install '.[cellpose]'
+# also enable the Cellpose DINO models (cpdino, cpdino-vitb)
+pip install '.[cellpose-dino]'
 # plotting helpers (matplotlib)
 pip install '.[plot]'
 # run the example notebooks (jupyter, pooch)
