@@ -50,8 +50,9 @@ except ImportError:  # pragma: no cover - exercised in no-cellpose envs
 def _require_cellpose() -> None:
     if not _CELLPOSE_AVAILABLE:
         raise ImportError(
-            "cellpose>=4 (SAM) is required for the GPU-resident path. "
-            "Install with `pip install cubic[cellpose]`."
+            "cellpose>=4 (SAM or DINO) is required for the GPU-resident path. "
+            "Install with `pip install cubic[cellpose]` (DINO backbones also "
+            "need `dinov3`; see the README)."
         )
 
 
