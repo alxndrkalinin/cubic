@@ -438,19 +438,17 @@ def test_parity_3d_vs_stock_dino(gpu_available: bool) -> None:
     )
 
 
-def test_bsize_guard_rejects_non256_for_sam(gpu_available: bool) -> None:
-    """The SAM backbone rejects bsize != 256 (mirrors CellposeModel.eval)."""
-    if not gpu_available:
-        pytest.skip("requires a CUDA GPU")
-    _require_cellpose_v4()
-    from cellpose.models import CellposeModel
+def test_resolve_bsize_defaults_and_guard() -> None:
+    """_resolve_bsize is the single backbone->tile-size rule (no GPU/cellpose)."""
+    from cubic.segmentation import cellpose_sam_gpu as g
 
-    from cubic.segmentation import segment_cellpose
-
-    model = CellposeModel(gpu=True, pretrained_model="cpsam")
-    assert model.backbone == "sam_vitl"
+    assert g._resolve_bsize("sam_vitl", None) == 256  # SAM default
+    assert g._resolve_bsize("sam_vitl", 256) == 256
+    assert g._resolve_bsize("dino_vitl", None) == 384  # DINO default
+    assert g._resolve_bsize("dino_vitb", None) == 384
+    assert g._resolve_bsize("dino_vitl", 256) == 256  # DINO accepts other sizes
     with pytest.raises(ValueError, match="bsize"):
-        segment_cellpose(model, _disks(), do_3D=False, bsize=128)
+        g._resolve_bsize("sam_vitl", 128)  # SAM is pinned to 256
 
 
 def test_dino_bsize_override_parity(gpu_available: bool) -> None:

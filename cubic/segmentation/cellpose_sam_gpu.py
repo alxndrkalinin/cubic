@@ -393,16 +393,33 @@ def run_3D_gpu(
     return yf, style
 
 
+def _resolve_bsize(backbone: str, bsize: int | None) -> int:
+    """Resolve the tile size for a backbone, mirroring ``CellposeModel``.
+
+    The SAM backbone's position embeddings are fixed to a 256-pixel tile, so it
+    rejects any other ``bsize``; the DINO backbones default to 384 but accept
+    other sizes. This is the single source of truth for the backbone→tile-size
+    relationship.
+    """
+    if backbone == "sam_vitl":
+        if bsize not in (None, 256):
+            raise ValueError(
+                "bsize != 256 is not supported for the SAM backbone "
+                "(cpsam/cpsam_v2), please set bsize to 256."
+            )
+        return 256
+    return 384 if bsize is None else bsize
+
+
 def _run_net_gpu(
     net: Any,
     x: Any,
-    backbone: str = "sam_vitl",
     rescale: float = 1.0,
     resample: bool = True,
     augment: bool = False,
     batch_size: int = 8,
     tile_overlap: float = 0.1,
-    bsize: int | None = None,
+    bsize: int = 256,
     anisotropy: float | None = 1.0,
     do_3D: bool = False,
 ) -> tuple[Any, Any, Any]:
@@ -410,10 +427,9 @@ def _run_net_gpu(
 
     Owns the dP/cellprob split, the flow transpose, the 3D channel reassembly
     and the resample/anisotropy resize that ``run_net``/``run_3D`` do not.
+    ``bsize`` is the concrete tile size (see :func:`_resolve_bsize`).
     """
     shape = x.shape
-    if bsize is None:
-        bsize = 256 if backbone == "sam_vitl" else 384
 
     if do_3D:
         Lz, Ly, Lx = shape[:-1]
@@ -824,14 +840,7 @@ def segment_cellpose(
     """
     _require_cellpose()
     _check_gpu_precondition(model)
-
-    # mirror cellpose: the SAM backbone's position embeddings are fixed to a
-    # 256-pixel tile, so only the DINO backbones may change bsize.
-    if bsize is not None and model.backbone == "sam_vitl" and bsize != 256:
-        raise ValueError(
-            "bsize != 256 is not supported for the SAM backbone (cpsam/cpsam_v2), "
-            "please set bsize to 256."
-        )
+    bsize = _resolve_bsize(model.backbone, bsize)
 
     # list / 5D-array of images: process one at a time (mirror CellposeModel.eval)
     if isinstance(x, list) or (hasattr(x, "ndim") and x.squeeze().ndim == 5):
@@ -913,7 +922,6 @@ def segment_cellpose(
     dP, cellprob, styles = _run_net_gpu(
         model.net,
         x,
-        backbone=model.backbone,
         rescale=rescale,
         resample=resample,
         augment=augment,
