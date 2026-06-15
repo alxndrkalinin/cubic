@@ -1,9 +1,14 @@
-"""GPU-resident Cellpose-SAM inference: preprocessing, tiling and network forward.
+"""GPU-resident Cellpose v4 inference: preprocessing, tiling and network forward.
+
+Supports every Cellpose v4 model -- the SAM backbone (``cpsam``, ``cpsam_v2``)
+and the DINOv3 backbones (``cpdino``, ``cpdino-vitb``). The backbones differ only
+in the default tile size (256 for ``sam_vitl``, 384 for ``dino_*``); both emit the
+same ``(flow, style)`` forward contract, so the rest of the path is shared.
 
 This module mirrors ``cellpose.transforms`` / ``cellpose.core`` but keeps every
 array on the GPU as a CuPy array, bridging to torch *zero-copy* only for the
 network forward. The input image is uploaded to the device exactly once
-(:func:`segment_cpsam`) and only the final integer mask returns to the
+(:func:`segment_cellpose`) and only the final integer mask returns to the
 host (mask computation lives in :mod:`cubic.segmentation.cellpose_dynamics`).
 
 cellpose itself is never modified. Heavy CPU dependencies are replaced with
@@ -17,6 +22,7 @@ the building-block transforms remain device-agnostic and run on NumPy too.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -44,8 +50,9 @@ except ImportError:  # pragma: no cover - exercised in no-cellpose envs
 def _require_cellpose() -> None:
     if not _CELLPOSE_AVAILABLE:
         raise ImportError(
-            "cellpose>=4 (SAM) is required for the GPU-resident path. "
-            "Install with `pip install cubic[cellpose]`."
+            "cellpose>=4 (SAM or DINO) is required for the GPU-resident path. "
+            "Install with `pip install cubic[cellpose]` (DINO backbones also "
+            "need `dinov3`; see the README)."
         )
 
 
@@ -323,8 +330,10 @@ def run_net_gpu(
         ya = None
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
-            # CPSAM emits zero style vectors (matching stock eval), so styles
-            # stay the allocated zeros; only the flow output is accumulated.
+            # the network's second output is a vestigial style vector (zeros for
+            # CPSAM, random noise for CPDINO) that stock eval keeps only for CP3
+            # back-compat and never feeds into the masks; we discard it and keep
+            # the allocated zeros, accumulating only the flow output.
             ya0, _style0 = _forward_gpu(net, IMGa[bslc])
             if ya is None:
                 nout = ya0.shape[1]
@@ -385,16 +394,37 @@ def run_3D_gpu(
     return yf, style
 
 
+def _resolve_bsize(backbone: str, bsize: int | None) -> int:
+    """Resolve the tile size for a backbone, mirroring ``CellposeModel``.
+
+    The SAM backbone's position embeddings are fixed to a 256-pixel tile, so it
+    rejects any other ``bsize``; the DINO backbones default to 384 but accept
+    other sizes. This is the single source of truth for the backbone→tile-size
+    relationship.
+    """
+    if backbone == "sam_vitl":
+        if bsize not in (None, 256):
+            raise ValueError(
+                "bsize != 256 is not supported for the SAM backbone "
+                "(cpsam/cpsam_v2), please set bsize to 256."
+            )
+        return 256
+    if bsize is None:
+        return 384
+    if bsize <= 0:
+        raise ValueError(f"bsize must be a positive integer, got {bsize}.")
+    return bsize
+
+
 def _run_net_gpu(
     net: Any,
     x: Any,
-    backbone: str = "sam_vitl",
     rescale: float = 1.0,
     resample: bool = True,
     augment: bool = False,
     batch_size: int = 8,
     tile_overlap: float = 0.1,
-    bsize: int | None = None,
+    bsize: int = 256,
     anisotropy: float | None = 1.0,
     do_3D: bool = False,
 ) -> tuple[Any, Any, Any]:
@@ -402,10 +432,9 @@ def _run_net_gpu(
 
     Owns the dP/cellprob split, the flow transpose, the 3D channel reassembly
     and the resample/anisotropy resize that ``run_net``/``run_3D`` do not.
+    ``bsize`` is the concrete tile size (see :func:`_resolve_bsize`).
     """
     shape = x.shape
-    if bsize is None:
-        bsize = 256 if backbone == "sam_vitl" else 384
 
     if do_3D:
         Lz, Ly, Lx = shape[:-1]
@@ -742,26 +771,27 @@ def normalize_img_gpu(img: Any, *, device: Any = None, **params: Any) -> Any:
 # orchestrator
 # --------------------------------------------------------------------------- #
 def _check_gpu_precondition(model: Any) -> None:
-    """GPU-only contract: require CUDA + cupy + a SAM (v4) model on cuda."""
+    """GPU-only contract: require CUDA + cupy + a Cellpose v4 model on cuda."""
     if CUDAManager().get_cp() is None:
         raise RuntimeError(
-            "segment_cpsam requires cupy + a CUDA GPU; use CellposeModel.eval for CPU."
+            "segment_cellpose requires cupy + a CUDA GPU; "
+            "use CellposeModel.eval for CPU."
         )
     if getattr(model, "device", None) is None or model.device.type != "cuda":
         raise RuntimeError(
-            "segment_cpsam requires a model on a CUDA device "
+            "segment_cellpose requires a model on a CUDA device "
             f"(got device={getattr(model, 'device', None)})."
         )
     if not hasattr(model, "backbone") or not hasattr(
         getattr(model, "net", None), "dtype"
     ):
         raise RuntimeError(
-            "segment_cpsam requires cellpose>=4 (SAM): "
+            "segment_cellpose requires cellpose>=4 (SAM or DINO): "
             "model.backbone / model.net.dtype not found."
         )
 
 
-def segment_cpsam(
+def segment_cellpose(
     model: Any,
     x: Any,
     *,
@@ -782,20 +812,27 @@ def segment_cpsam(
     niter: int | None = None,
     augment: bool = False,
     tile_overlap: float = 0.1,
+    bsize: int | None = None,
     download: bool = False,
 ) -> tuple[Any, list, Any]:
-    """Segment an image with Cellpose-SAM, GPU-resident (2D / 3D / stitch).
+    """Segment an image with Cellpose v4 (SAM or DINO), GPU-resident.
 
-    This is cubic's recommended Cellpose-SAM segmentation entry point: the
-    input is uploaded to the GPU once and only the final integer mask returns
-    to the host (default). It mirrors ``CellposeModel.eval`` but keeps the flow
-    field on the device, replacing the CPU pre/post-processing with cubic's
-    device-agnostic wrappers.
+    This is cubic's recommended Cellpose v4 segmentation entry point, for both
+    the SAM backbone (``cpsam``, ``cpsam_v2``) and the DINOv3 backbones
+    (``cpdino``, ``cpdino-vitb``): the input is uploaded to the GPU once and only
+    the final integer mask returns to the host (default). It mirrors
+    ``CellposeModel.eval`` but keeps the flow field on the device, replacing the
+    CPU pre/post-processing with cubic's device-agnostic wrappers.
 
     Args:
-        model: A pre-built ``cellpose.models.CellposeModel`` (v4/SAM) on CUDA.
+        model: A pre-built ``cellpose.models.CellposeModel`` (v4, SAM or DINO)
+            on CUDA.
         x: A single image (2D/3D/4D), or a list / 5D array of images (processed
             one at a time, each uploaded to the GPU once; returns lists).
+        bsize: Tile block size. If ``None`` (default), uses 256 for the SAM
+            backbone and 384 for the DINO backbones (matching ``CellposeModel``).
+            A non-256 value is rejected for the SAM backbone (mirrors cellpose);
+            the DINO backbones accept other sizes.
         download: If ``False`` (default), return ``masks`` as NumPy (the single
             device→host transfer) and ``[None, dP, cellprob]`` + ``styles`` as
             CuPy (GPU-resident). If ``True``, also move ``dP``/``cellprob``/
@@ -808,6 +845,7 @@ def segment_cpsam(
     """
     _require_cellpose()
     _check_gpu_precondition(model)
+    bsize = _resolve_bsize(model.backbone, bsize)
 
     # list / 5D-array of images: process one at a time (mirror CellposeModel.eval)
     if isinstance(x, list) or (hasattr(x, "ndim") and x.squeeze().ndim == 5):
@@ -817,7 +855,7 @@ def segment_cpsam(
         )
         masks_out, flows_out, styles_out = [], [], []
         for i in range(nimg):
-            out = segment_cpsam(
+            out = segment_cellpose(
                 model,
                 x[i],
                 batch_size=batch_size,
@@ -837,6 +875,7 @@ def segment_cpsam(
                 niter=niter,
                 augment=augment,
                 tile_overlap=tile_overlap,
+                bsize=bsize,
                 download=download,
             )
             masks_out.append(out[0])
@@ -888,12 +927,12 @@ def segment_cpsam(
     dP, cellprob, styles = _run_net_gpu(
         model.net,
         x,
-        backbone=model.backbone,
         rescale=rescale,
         resample=resample,
         augment=augment,
         batch_size=batch_size,
         tile_overlap=tile_overlap,
+        bsize=bsize,
         do_3D=do_3D,
         anisotropy=anisotropy,
     )
@@ -939,3 +978,21 @@ def segment_cpsam(
             asnumpy(styles),
         )
     return asnumpy(masks), [None, dP, cellprob], styles
+
+
+def segment_cpsam(*args: Any, **kwargs: Any) -> tuple[Any, list, Any]:
+    """Forward to :func:`segment_cellpose` (deprecated alias).
+
+    .. deprecated:: 0.8
+        Renamed to :func:`segment_cellpose` now that the GPU-resident path also
+        supports the DINO backbones (``cpdino``, ``cpdino-vitb``), not just SAM.
+        ``segment_cpsam`` forwards to :func:`segment_cellpose` and will be
+        removed in a future release.
+    """
+    warnings.warn(
+        "segment_cpsam is deprecated; use segment_cellpose instead "
+        "(the GPU-resident path now supports the DINO backbones too).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return segment_cellpose(*args, **kwargs)
