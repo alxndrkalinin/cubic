@@ -479,6 +479,10 @@ def test_resolve_bsize_defaults_and_guard() -> None:
     assert g._resolve_bsize("dino_vitl", 256) == 256  # DINO accepts other sizes
     with pytest.raises(ValueError, match="bsize"):
         g._resolve_bsize("sam_vitl", 128)  # SAM is pinned to 256
+    with pytest.raises(ValueError, match="positive"):
+        g._resolve_bsize("dino_vitl", 0)  # non-positive tile size rejected
+    with pytest.raises(ValueError, match="positive"):
+        g._resolve_bsize("dino_vitb", -16)
 
 
 def test_dino_bsize_override_parity(

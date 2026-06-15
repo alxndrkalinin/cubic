@@ -409,7 +409,11 @@ def _resolve_bsize(backbone: str, bsize: int | None) -> int:
                 "(cpsam/cpsam_v2), please set bsize to 256."
             )
         return 256
-    return 384 if bsize is None else bsize
+    if bsize is None:
+        return 384
+    if bsize <= 0:
+        raise ValueError(f"bsize must be a positive integer, got {bsize}.")
+    return bsize
 
 
 def _run_net_gpu(
