@@ -30,12 +30,14 @@ def cellpose_eval(
     flow_threshold: float = 0.4,
     cellprob_threshold: float = 0.0,
 ) -> np.ndarray:
-    """Run a pretrained Cellpose-SAM (v4) model and return masks.
+    """Run a pretrained Cellpose v4 model and return masks.
 
     Cellpose 4 removed the ``Cellpose`` class and the ``model_type``/``omni``/
     ``channels`` arguments; this uses ``CellposeModel`` with a
-    ``pretrained_model`` (default the Cellpose-SAM weights ``"cpsam"``) and
-    ``channel_axis`` for multi-channel inputs.
+    ``pretrained_model`` and ``channel_axis`` for multi-channel inputs. Any v4
+    model name is accepted -- the SAM backbone (``"cpsam"`` (default),
+    ``"cpsam_v2"``) or the DINOv3 backbones (``"cpdino"``, ``"cpdino-vitb"``) --
+    or a path to a custom model.
     """
     if not _CELLPOSE_AVAILABLE:
         raise ImportError(
@@ -69,7 +71,7 @@ def cellpose_segment(
     border_value: int = 100,
     min_size: int = 500,
 ) -> np.ndarray:
-    """Preprocess image, run Cellpose-SAM and postprocessing."""
+    """Preprocess image, run a Cellpose v4 model (SAM or DINO) and postprocess."""
     if not _CELLPOSE_AVAILABLE:
         raise ImportError(
             "Cellpose is required for this function, but not available. "

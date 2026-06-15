@@ -4,6 +4,8 @@ Module-level imports stay free of optional deps (cellpose/cupy/torch) so the
 suite collects on CPU/no-GPU CI; GPU/cellpose-dependent tests skip cleanly.
 """
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -56,7 +58,30 @@ def test_segmentation_imports_without_optional_deps() -> None:
     import importlib
 
     mod = importlib.import_module("cubic.segmentation")
-    assert hasattr(mod, "segment_cpsam")
+    assert hasattr(mod, "segment_cellpose")
+    assert hasattr(mod, "segment_cpsam")  # deprecated alias still exported
+
+
+def test_deprecated_segment_cpsam_alias_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``segment_cpsam`` warns and forwards verbatim to ``segment_cellpose``."""
+    from cubic.segmentation import cellpose_sam_gpu as g
+
+    captured: dict[str, Any] = {}
+
+    def _stub(model: Any, x: Any, **kwargs: Any) -> tuple[Any, list, Any]:
+        captured["model"], captured["x"], captured["kwargs"] = model, x, kwargs
+        return "masks", [None], "styles"
+
+    monkeypatch.setattr(g, "segment_cellpose", _stub)
+    sentinel = object()
+    with pytest.warns(DeprecationWarning, match="segment_cellpose"):
+        out = g.segment_cpsam(sentinel, 123, bsize=384, do_3D=True)
+
+    assert out == ("masks", [None], "styles")
+    assert captured["model"] is sentinel and captured["x"] == 123
+    assert captured["kwargs"] == {"bsize": 384, "do_3D": True}
 
 
 def test_resident_requires_cellpose(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,7 +90,7 @@ def test_resident_requires_cellpose(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(g, "_CELLPOSE_AVAILABLE", False)
     with pytest.raises(ImportError):
-        g.segment_cpsam(object(), np.zeros((32, 32), np.float32))
+        g.segment_cellpose(object(), np.zeros((32, 32), np.float32))
 
 
 def test_resident_rejects_non_cuda_model() -> None:
@@ -84,7 +109,7 @@ def test_resident_rejects_non_cuda_model() -> None:
         device = torch.device("cpu")
 
     with pytest.raises(RuntimeError):
-        g.segment_cpsam(_Model(), np.zeros((32, 32), np.float32))
+        g.segment_cellpose(_Model(), np.zeros((32, 32), np.float32))
 
 
 def test_sam_model_exposes_v4_api(gpu_available: bool) -> None:
@@ -133,13 +158,13 @@ def test_parity_2d_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam
+    from cubic.segmentation import segment_cellpose
     from cubic.metrics.average_precision import average_precision
 
     img = _disks()
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(img, diameter=None, do_3D=False)
-    m_gpu, _, _ = segment_cpsam(model, img, do_3D=False, download=True)
+    m_gpu, _, _ = segment_cellpose(model, img, do_3D=False, download=True)
 
     m_stock = m_stock.astype(np.int32)
     m_gpu = np.asarray(m_gpu).astype(np.int32)
@@ -156,14 +181,14 @@ def test_parity_tile_norm_2d_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam
+    from cubic.segmentation import segment_cellpose
     from cubic.metrics.average_precision import average_precision
 
     img = _disks()
     normalize = {"tile_norm_blocksize": 64}
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(img, diameter=None, do_3D=False, normalize=normalize)
-    m_gpu, _, _ = segment_cpsam(
+    m_gpu, _, _ = segment_cellpose(
         model, img, do_3D=False, normalize=normalize, download=True
     )
 
@@ -182,7 +207,7 @@ def test_parity_tile_norm_3d_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam
+    from cubic.segmentation import segment_cellpose
     from cubic.metrics.average_precision import average_precision
 
     vol = _volume_3d()
@@ -191,7 +216,7 @@ def test_parity_tile_norm_3d_vs_stock(gpu_available: bool) -> None:
     m_stock, _, _ = model.eval(
         vol, z_axis=0, diameter=None, do_3D=True, normalize=normalize
     )
-    m_gpu, _, _ = segment_cpsam(
+    m_gpu, _, _ = segment_cellpose(
         model, vol, z_axis=0, do_3D=True, normalize=normalize, download=True
     )
 
@@ -211,14 +236,14 @@ def test_parity_sharpen_2d_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam
+    from cubic.segmentation import segment_cellpose
     from cubic.metrics.average_precision import average_precision
 
     img = _disks()
     normalize = {"sharpen_radius": 8, "smooth_radius": 2}
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(img, diameter=None, do_3D=False, normalize=normalize)
-    m_gpu, _, _ = segment_cpsam(
+    m_gpu, _, _ = segment_cellpose(
         model, img, do_3D=False, normalize=normalize, download=True
     )
 
@@ -237,13 +262,13 @@ def test_list_input_returns_per_image_lists(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam
+    from cubic.segmentation import segment_cellpose
     from cubic.metrics.average_precision import average_precision
 
     imgs = [_disks(), _disks(centers=[(60, 60), (160, 160), (60, 160)], r=18)]
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(imgs, diameter=None, do_3D=False)
-    m_gpu, flows, styles = segment_cpsam(model, imgs, do_3D=False, download=True)
+    m_gpu, flows, styles = segment_cellpose(model, imgs, do_3D=False, download=True)
 
     assert (
         isinstance(m_gpu, list) and isinstance(flows, list) and isinstance(styles, list)
@@ -263,13 +288,13 @@ def test_parity_3d_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam
+    from cubic.segmentation import segment_cellpose
     from cubic.metrics.average_precision import average_precision
 
     vol = _volume_3d()
     model = CellposeModel(gpu=True, pretrained_model="cpsam")
     m_stock, _, _ = model.eval(vol, z_axis=0, diameter=None, do_3D=True)
-    m_gpu, _, _ = segment_cpsam(model, vol, z_axis=0, do_3D=True, download=True)
+    m_gpu, _, _ = segment_cellpose(model, vol, z_axis=0, do_3D=True, download=True)
 
     m_stock = np.asarray(m_stock).astype(np.int32)
     m_gpu = np.asarray(m_gpu).astype(np.int32)
@@ -287,7 +312,7 @@ def test_parity_stitch_vs_stock(gpu_available: bool) -> None:
     _require_cellpose_v4()
     from cellpose.models import CellposeModel
 
-    from cubic.segmentation import segment_cpsam
+    from cubic.segmentation import segment_cellpose
     from cubic.metrics.average_precision import average_precision
 
     stack = _zstack()
@@ -295,7 +320,7 @@ def test_parity_stitch_vs_stock(gpu_available: bool) -> None:
     m_stock, _, _ = model.eval(
         stack, z_axis=0, diameter=None, do_3D=False, stitch_threshold=0.5
     )
-    m_gpu, _, _ = segment_cpsam(
+    m_gpu, _, _ = segment_cellpose(
         model, stack, z_axis=0, do_3D=False, stitch_threshold=0.5, download=True
     )
 
@@ -347,7 +372,7 @@ def test_residency_single_download(gpu_available: bool) -> None:
 
     g.asnumpy = _spy
     try:
-        masks, flows, _ = g.segment_cpsam(model, img, do_3D=False, download=False)
+        masks, flows, _ = g.segment_cellpose(model, img, do_3D=False, download=False)
     finally:
         g.asnumpy = orig
 
@@ -356,3 +381,97 @@ def test_residency_single_download(gpu_available: bool) -> None:
     assert get_device(flows[1]) == "GPU"  # dP stays resident
     assert get_device(flows[2]) == "GPU"  # cellprob stays resident
     assert calls["n"] == 1  # exactly one device->host array transfer
+
+
+# new Cellpose v4 backbones: cpsam_v2 (SAM-ViTL), cpdino (DINOv3-ViTL),
+# cpdino-vitb (DINOv3-ViTB). Each routes through segment_cellpose with the
+# backbone-appropriate default tile size (256 for SAM, 384 for DINO).
+@pytest.mark.parametrize("pretrained_model", ["cpsam_v2", "cpdino", "cpdino-vitb"])
+def test_parity_2d_vs_stock_new_models(
+    gpu_available: bool, pretrained_model: str
+) -> None:
+    """Each new v4 model's resident masks match stock eval (AP >= 0.95)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cellpose
+    from cubic.metrics.average_precision import average_precision
+
+    img = _disks()
+    model = CellposeModel(gpu=True, pretrained_model=pretrained_model)
+    m_stock, _, _ = model.eval(img, diameter=None, do_3D=False)
+    m_gpu, _, _ = segment_cellpose(model, img, do_3D=False, download=True)
+
+    m_stock = np.asarray(m_stock).astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"{pretrained_model} AP@0.5={ap[0]:.3f} "
+        f"(stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
+
+
+def test_parity_3d_vs_stock_dino(gpu_available: bool) -> None:
+    """A DINO backbone (cpdino) matches stock eval in 3D (AP >= 0.95)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cellpose
+    from cubic.metrics.average_precision import average_precision
+
+    vol = _volume_3d()
+    model = CellposeModel(gpu=True, pretrained_model="cpdino")
+    assert model.backbone == "dino_vitl"
+    m_stock, _, _ = model.eval(vol, z_axis=0, diameter=None, do_3D=True)
+    m_gpu, _, _ = segment_cellpose(model, vol, z_axis=0, do_3D=True, download=True)
+
+    m_stock = np.asarray(m_stock).astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    assert m_stock.shape == m_gpu.shape == vol.shape
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"AP@0.5={ap[0]:.3f} (stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
+
+
+def test_bsize_guard_rejects_non256_for_sam(gpu_available: bool) -> None:
+    """The SAM backbone rejects bsize != 256 (mirrors CellposeModel.eval)."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cellpose
+
+    model = CellposeModel(gpu=True, pretrained_model="cpsam")
+    assert model.backbone == "sam_vitl"
+    with pytest.raises(ValueError, match="bsize"):
+        segment_cellpose(model, _disks(), do_3D=False, bsize=128)
+
+
+def test_dino_bsize_override_parity(gpu_available: bool) -> None:
+    """A custom bsize threads through for DINO and matches stock eval at bsize."""
+    if not gpu_available:
+        pytest.skip("requires a CUDA GPU")
+    _require_cellpose_v4()
+    from cellpose.models import CellposeModel
+
+    from cubic.segmentation import segment_cellpose
+    from cubic.metrics.average_precision import average_precision
+
+    img = _disks()
+    model = CellposeModel(gpu=True, pretrained_model="cpdino-vitb")
+    assert model.backbone == "dino_vitb"
+    m_stock, _, _ = model.eval(img, diameter=None, do_3D=False, bsize=256)
+    m_gpu, _, _ = segment_cellpose(model, img, do_3D=False, bsize=256, download=True)
+
+    m_stock = np.asarray(m_stock).astype(np.int32)
+    m_gpu = np.asarray(m_gpu).astype(np.int32)
+    ap, _, _, _ = average_precision(m_stock, m_gpu, [0.5])
+    assert ap[0] >= 0.95, (
+        f"AP@0.5={ap[0]:.3f} (stock n={m_stock.max()}, gpu n={m_gpu.max()})"
+    )
