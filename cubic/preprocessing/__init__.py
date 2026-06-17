@@ -1,6 +1,7 @@
 """Expose preprocessing functions."""
 
 from .thresholding import get_threshold_otsu, select_nonempty_patches
+from .backprojector import create_backprojector
 from .deconvolution import (
     decon_xpy,
     decon_skimage,
@@ -17,4 +18,5 @@ __all__ = [
     "deconv_iter_num_finder",
     "select_nonempty_patches",
     "get_threshold_otsu",
+    "create_backprojector",
 ]
