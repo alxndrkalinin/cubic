@@ -240,7 +240,7 @@ def deconv_iter_num_finder(
     Parameters
     ----------
     implementation : str, optional
-        Which LR implementation to use, ``"skimage"`` (default) or ``"xpy"``.
+        Which LR implementation to use, ``"xpy"`` (default) or ``"skimage"``.
     noncirc : bool, optional
         When ``implementation='xpy'``, enable non-circulant edge handling.
     backprojector : np.ndarray | None, optional
