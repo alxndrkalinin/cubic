@@ -63,10 +63,10 @@ def _fwhm_1d(y: np.ndarray) -> float:
 
     # Trailing crossing: search outward starting just past the center.
     i = center + 1
-    while i <= n - 1 and np.sign(y[i] - lev) == np.sign(y[i - 1] - lev):
+    while i < n and np.sign(y[i] - lev) == np.sign(y[i - 1] - lev):
         i += 1
-    if i == n - 1 and np.sign(y[i] - lev) == np.sign(y[i - 1] - lev):
-        # No second edge found (step-like pulse).
+    if i >= n:
+        # No second edge found (step-like / unresolved pulse).
         return float("nan")
     interp = (lev - y[i - 1]) / (y[i] - y[i - 1])
     ttrail = (i - 1) + interp
@@ -221,6 +221,14 @@ def create_backprojector(
 
     # --- Per-axis FWHM (host floats) and resolution cutoffs ----------------
     fwhm = _fwhm_psf(f)
+    # FWHM is unused only for res_flag=2 with a non-Gaussian projector; otherwise
+    # a profile with no half-maximum crossing (NaN) means the PSF is not resolved
+    # within its array, so fail with a clear message rather than downstream NaN.
+    if (bp_type == "gaussian" or res_flag != 2) and not all(np.isfinite(fwhm)):
+        raise ValueError(
+            f"Could not estimate the PSF FWHM (got {fwhm}); the PSF may be too "
+            "wide for its array. Pass explicit cutoffs via res_flag=2 and i_res."
+        )
     if res_flag == 0:
         res = tuple(w / np.sqrt(2.0) for w in fwhm)
     elif res_flag == 1:

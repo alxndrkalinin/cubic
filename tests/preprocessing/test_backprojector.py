@@ -120,3 +120,20 @@ def test_res_flag2_requires_i_res() -> None:
     """res_flag=2 without i_res raises ValueError."""
     with pytest.raises(ValueError, match="res_flag=2 requires i_res"):
         create_backprojector(_psf_3d(), "butterworth", res_flag=2, i_res=None)
+
+
+def test_fwhm_1d_no_trailing_crossing_returns_nan() -> None:
+    """A profile with no second half-max crossing yields NaN, not IndexError."""
+    from cubic.preprocessing.backprojector import _fwhm_1d
+
+    assert np.isnan(_fwhm_1d(np.arange(10.0)))  # monotonic rising
+    assert np.isnan(_fwhm_1d(np.linspace(1.0, 0.0, 10)))  # monotonic falling
+
+
+def test_create_backprojector_unresolvable_psf_raises() -> None:
+    """A corner-peaked PSF (no FWHM crossing through the peak) raises clearly."""
+    z, y, x = np.mgrid[0:8, 0:8, 0:8]
+    psf = np.exp(-(z + y + x).astype(np.float32))
+    psf /= psf.sum()
+    with pytest.raises(ValueError, match="FWHM"):
+        create_backprojector(psf, "wiener-butterworth")
