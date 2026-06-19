@@ -214,7 +214,12 @@ def create_backprojector(
     # Float dtype to preserve on output (keep float32 in, float32 out).
     out_dtype = psf.dtype if np.issubdtype(psf.dtype, np.floating) else np.dtype(float)
     f = psf.astype(out_dtype)
-    f = f / f.sum()  # normalized forward PSF, sum == 1
+    psf_sum = float(asnumpy(f.sum()))
+    if not np.isfinite(psf_sum) or psf_sum == 0.0:
+        raise ValueError(
+            f"psf must have a finite, non-zero sum to be normalized; got {psf_sum}."
+        )
+    f = f / psf_sum  # normalized forward PSF, sum == 1
 
     shape = f.shape
     ndim = f.ndim

@@ -130,6 +130,20 @@ def test_fwhm_1d_no_trailing_crossing_returns_nan() -> None:
     assert np.isnan(_fwhm_1d(np.linspace(1.0, 0.0, 10)))  # monotonic falling
 
 
+@pytest.mark.parametrize(
+    "psf",
+    [
+        np.zeros((7, 7, 7), dtype=np.float32),  # zero sum
+        np.full((7, 7, 7), np.nan, dtype=np.float32),  # non-finite sum
+    ],
+    ids=["zero_sum", "nan_sum"],
+)
+def test_create_backprojector_unnormalizable_psf_raises(psf: np.ndarray) -> None:
+    """A PSF that cannot be sum-normalized raises before producing NaNs."""
+    with pytest.raises(ValueError, match="finite, non-zero sum"):
+        create_backprojector(psf, "wiener-butterworth")
+
+
 def test_create_backprojector_unresolvable_psf_raises() -> None:
     """A corner-peaked PSF (no FWHM crossing through the peak) raises clearly."""
     z, y, x = np.mgrid[0:8, 0:8, 0:8]
