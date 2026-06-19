@@ -55,8 +55,47 @@ def richardson_lucy_xp(
     noncirc: bool = False,
     mask: np.ndarray | None = None,
     observer_fn: Callable | None = None,
+    backprojector: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Lucy-Richardson deconvolution implemented with NumPy or CuPy."""
+    """Lucy-Richardson deconvolution implemented with NumPy or CuPy.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image to deconvolve.
+    psf : np.ndarray
+        Forward point spread function (forward projector).
+    n_iter : int, default=10
+        Number of iterations.
+    noncirc : bool, default=False
+        Enable non-circulant edge handling (matched path only).
+    mask : np.ndarray | None, default=None
+        Mask array (matched path only).
+    observer_fn : Callable | None, default=None
+        Function called after each iteration with ``(estimate, i)``.
+    backprojector : np.ndarray | None, default=None
+        Optional back projector PSF (e.g. Wiener-Butterworth). When provided,
+        an unmatched Richardson-Lucy update is used so that an unmatched back
+        projector can drive ~1-2 iteration convergence. The unmatched path is
+        circulant only (it raises ``NotImplementedError`` when ``noncirc`` is
+        set or a ``mask`` is given) and returns an array of ``image.shape``.
+
+        Note: passing a matched (``traditional``-type) back projector does NOT
+        reproduce the default matched path bit-for-bit, because the unmatched
+        branch sum-normalizes the forward PSF (the matched path never
+        normalizes ``psf``). This is expected.
+
+    """
+    if backprojector is not None:
+        if noncirc or mask is not None:
+            raise NotImplementedError(
+                "Unmatched/Wiener-Butterworth back projector currently supports "
+                "circulant mode without a mask (noncirc=False, mask=None)."
+            )
+        return _richardson_lucy_unmatched(
+            image, psf, backprojector, n_iter, observer_fn
+        )
+
     xp = get_array_module(image)
     check_same_device(image, psf)
 
@@ -116,5 +155,62 @@ def richardson_lucy_xp(
 
     if mask is not None:
         estimate = estimate * mask + mask_values
+
+    return estimate
+
+
+def _richardson_lucy_unmatched(
+    image: np.ndarray,
+    psf: np.ndarray,
+    backprojector: np.ndarray,
+    n_iter: int,
+    observer_fn: Callable | None,
+) -> np.ndarray:
+    """Unmatched Richardson-Lucy update with a separate back projector.
+
+    Faithful port of the reference ``DeconSingleView.m`` unmatched RL loop with
+    ``ConvFFT3_S(x, OTF) = real(ifftn(fftn(x) * OTF))``: no ``H^T 1`` term, no
+    ``correction < 0`` clip and no epsilon on the ratio denominator. The
+    division is safe without an epsilon because the forward PSF sums to one, so
+    the reblurred estimate is a convex combination of values >= ``small_value``
+    and therefore strictly positive. Circulant only; returns ``image.shape``.
+    """
+    xp = get_array_module(image)
+    check_same_device(image, psf, backprojector)
+
+    image = util.img_as_float(image)
+    psf = util.img_as_float(psf)
+    bp = util.img_as_float(backprojector)
+
+    if bp.shape != psf.shape:
+        raise ValueError(
+            f"backprojector shape {bp.shape} must match psf shape {psf.shape}"
+        )
+
+    # Normalize the forward PSF and back projector to sum=1 (only in this branch).
+    psf = psf / psf.sum()
+    bp = bp / bp.sum()
+
+    if image.shape != psf.shape:
+        psf = pad_image_to_shape(psf, image.shape, mode="constant")
+    if image.shape != bp.shape:
+        bp = pad_image_to_shape(bp, image.shape, mode="constant")
+
+    otf_f = xp.fft.fftn(xp.fft.ifftshift(psf))
+    otf_bp = xp.fft.fftn(xp.fft.ifftshift(bp))
+
+    small_value = 1e-3
+    image = xp.maximum(image, small_value)
+    estimate = image
+
+    for i in range(1, n_iter + 1):
+        reblurred = xp.real(xp.fft.ifftn(xp.fft.fftn(estimate) * otf_f))
+        ratio = image / reblurred
+        correction = xp.real(xp.fft.ifftn(xp.fft.fftn(ratio) * otf_bp))
+        estimate = estimate * correction
+        estimate = xp.maximum(estimate, small_value)
+
+        if observer_fn is not None:
+            observer_fn(estimate, i)
 
     return estimate

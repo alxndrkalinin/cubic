@@ -95,9 +95,21 @@ def decon_xpy(
     noncirc: bool = False,
     mask: np.ndarray | None = None,
     observer_fn: Callable | None = None,
+    backprojector: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Perform NumPy-based deconvolution with optional non-circulant edges."""
-    check_same_device(image, psf)
+    """Perform NumPy-based deconvolution with optional non-circulant edges.
+
+    When ``backprojector`` is given, an unmatched Richardson-Lucy update is
+    used (see :func:`richardson_lucy_xp`). The back projector is not padded; it
+    must stay PSF-shaped, so ``pad_psf`` must be ``False`` in that case.
+    """
+    arrays = (image, psf) if backprojector is None else (image, psf, backprojector)
+    check_same_device(*arrays)
+    if backprojector is not None and pad_psf:
+        raise ValueError(
+            "pad_psf=True is not supported with a backprojector; the back "
+            "projector must stay PSF-shaped (pass pad_psf=False)."
+        )
 
     padded_img = pad_image(image, pad_size_z, mode="reflect")
     padded_psf = pad_image(psf, pad_size_z, mode="reflect") if pad_psf else psf
@@ -116,6 +128,7 @@ def decon_xpy(
         noncirc=noncirc,
         mask=mask,
         observer_fn=wrapper_observer,
+        backprojector=backprojector,
     )
 
     decon_image = decon_image[pad_size_z : image.shape[0] + pad_size_z]
@@ -134,6 +147,7 @@ def richardson_lucy_iter(
     filter_epsilon: float | None = None,
     noncirc: bool = False,
     mask: np.ndarray | None = None,
+    backprojector: np.ndarray | None = None,
 ) -> np.ndarray:
     """Unified Richardson-Lucy deconvolution function with iteration observer function.
 
@@ -161,6 +175,9 @@ def richardson_lucy_iter(
         Enable non-circulant edge handling (xp only).
     mask : np.ndarray | None, default=None
         Mask array (xp only).
+    backprojector : np.ndarray | None, default=None
+        Optional unmatched back projector PSF (xp only). See
+        :func:`richardson_lucy_xp`.
 
     Returns
     -------
@@ -170,10 +187,13 @@ def richardson_lucy_iter(
     Raises
     ------
     ValueError
-        If implementation is not "skimage" or "xp".
+        If implementation is not "skimage" or "xp", or if ``backprojector`` is
+        given with ``implementation='skimage'``.
 
     """
     if implementation == "skimage":
+        if backprojector is not None:
+            raise ValueError("backprojector is only supported with implementation='xp'")
         return decon_skimage(
             image=image,
             psf=psf,
@@ -194,6 +214,7 @@ def richardson_lucy_iter(
             noncirc=noncirc,
             mask=mask,
             observer_fn=observer_fn,
+            backprojector=backprojector,
         )
     else:
         raise ValueError(
@@ -212,17 +233,23 @@ def deconv_iter_num_finder(
     verbose: bool = False,
     implementation: str = "xpy",
     noncirc: bool = False,
+    backprojector: np.ndarray | None = None,
 ) -> tuple[int, list[dict[str, int | float | np.ndarray]]]:
     """Find number of LR deconvolution iterations using an image similarity metric.
 
     Parameters
     ----------
     implementation : str, optional
-        Which LR implementation to use, ``"skimage"`` (default) or ``"xpy"``.
+        Which LR implementation to use, ``"xpy"`` (default) or ``"skimage"``.
     noncirc : bool, optional
         When ``implementation='xpy'``, enable non-circulant edge handling.
+    backprojector : np.ndarray | None, optional
+        Optional unmatched back projector PSF (``"xpy"`` only). See
+        :func:`richardson_lucy_xp`.
 
     """
+    if backprojector is not None and implementation == "skimage":
+        raise ValueError("backprojector is only supported with implementation='xpy'")
     verboseprint = print if verbose else lambda *a, **k: None
 
     image = util.img_as_float(image)
@@ -294,6 +321,7 @@ def deconv_iter_num_finder(
             noncirc=noncirc,
             observer_fn=observer,
             pad_size_z=pad_size_z,
+            backprojector=backprojector,
         )
     else:
         raise ValueError(f"Unknown implementation: {implementation}")
