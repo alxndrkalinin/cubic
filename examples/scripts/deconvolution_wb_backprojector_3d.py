@@ -2,11 +2,11 @@
 # coding: utf-8
 
 # # Fast Richardson-Lucy deconvolution with a Wiener-Butterworth back projector
-#
+# 
 # Iterative Richardson-Lucy (RL) deconvolution uses a *back projector* to map the residual between the measured image and the current re-blurred estimate back into object space. The textbook choice is the **matched** back projector (the flipped PSF / conjugate OTF), which converges slowly — typically 10-50 iterations.
-#
+# 
 # Guo et al. (2020, *Nat. Biotechnol.* 38:1337) showed that replacing it with an **unmatched** back projector chosen so the combined transfer function $|\,\mathrm{FT}(f)\cdot\mathrm{FT}(b)\,|$ is flat across the passband makes RL converge in just **1-2 iterations**. The recommended design is the **Wiener-Butterworth (WB)** back projector: a Wiener inverse (which flattens the passband for one-step convergence) multiplied by a Butterworth low-pass (which rolls off past the OTF cutoff to suppress the noise the Wiener term would amplify).
-#
+# 
 # The speedup is **iteration reduction**, not a cheaper per-iteration cost: each WB iteration costs the same four FFTs as a matched one, but far fewer are needed. This notebook builds a WB back projector with `cubic.preprocessing.create_backprojector`, toggles it into `richardson_lucy_iter`, and compares matched vs WB RL on a 3D astrocyte-nuclei stack using absolute FSC resolution.
 
 # In[1]:
@@ -29,7 +29,7 @@ print(f"GPU available: {USE_GPU}")
 
 
 # ## Load the data and PSF
-#
+# 
 # A single 3D stack of Hoechst-stained astrocyte nuclei (Yokogawa CQ1 confocal) with a theoretical Richards-Wolf PSF, the same dataset used in the *Deconvolution Iterations* notebook. Both files are auto-downloaded from [Zenodo](https://doi.org/10.5281/zenodo.20514102) on first run. We crop a 512$\times$512 cell region for a quick demo; voxel size is $(0.3, 0.1625, 0.1625)\,\mu m$ in $(Z, Y, X)$.
 
 # In[2]:
@@ -67,7 +67,7 @@ if USE_GPU:
 
 
 # ## Build the Wiener-Butterworth back projector
-#
+# 
 # `create_backprojector` returns a spatial-domain back-projector PSF (same shape, device, and dtype as the forward PSF, normalized to sum 1). The defaults follow the reference implementation: `alpha=0.05` (Wiener regularization), `beta=1.0` (auto — uses the forward-projector cutoff gain), `n=10` (Butterworth order). Other `bp_type` options are `'traditional'`, `'gaussian'`, `'butterworth'`, and `'wiener'`.
 
 # In[3]:
@@ -127,7 +127,7 @@ plt.show()
 # The WB combined transfer function (right) stays close to flat across the passband before rolling off near the resolution cutoff, whereas the matched product $|OTF_f|^2$ is sharply peaked at low frequencies — that flatness is what lets RL converge in one or two steps.
 
 # ## Track convergence: PSNR, SSIM, and FSC vs iteration
-#
+# 
 # We run matched RL (`backprojector=None`) and WB RL (`backprojector=bp_wb`) through the same `richardson_lucy_iter` call, capturing the estimate at every iteration with an observer. Using the matched result at a high iteration count as a *converged reference*, we measure **PSNR** and **SSIM** of each iterate against it, plus the absolute 3D **FSC resolution** (lateral XY and axial Z, in nm). FSC is a single-image resolution metric that needs no ground truth (FRC is its 2D analog).
 
 # In[4]:
@@ -255,14 +255,14 @@ plt.show()
 
 
 # ## Summary
-#
+# 
 # Toggling an unmatched **Wiener-Butterworth** back projector into `richardson_lucy_iter` via the `backprojector` argument reaches matched-RL-converged resolution in about **1-2 iterations instead of 10-20** — a roughly 10$\times$ reduction in iteration count (and wall-clock time) at equal per-iteration cost.
-#
+# 
 # Practical guidance:
-#
+# 
 # - **Iterations:** 1-2 (occasionally 3). WB is not meant to be run to convergence; further iterations re-amplify noise.
 # - **`alpha`** (Wiener regularization, default `0.05`): larger values suppress more noise; values that are too small over-amplify high frequencies.
 # - **`beta=1.0`** (auto) and **`n=10`** (Butterworth order) follow the reference defaults and rarely need tuning.
 # - The default `backprojector=None` keeps the original matched RL behavior unchanged; the WB path supports circulant deconvolution (no `noncirc` / `mask`).
-#
+# 
 # **Reference:** Guo, M. et al. "Rapid image deconvolution and multiview fusion for optical microscopy." *Nat. Biotechnol.* 38, 1337-1346 (2020).
