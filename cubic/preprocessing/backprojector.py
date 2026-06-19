@@ -13,6 +13,8 @@ input array's device location; no code changes are required to switch devices.
 Reference: Guo, M. et al. Nat Biotechnol 38, 1337-1346 (2020).
 """
 
+from typing import Any
+
 import numpy as np
 
 from cubic.cuda import asnumpy, get_array_module
@@ -114,14 +116,40 @@ def _cutoff_gain(magnitude_shifted: np.ndarray, axis: int, t: float) -> float:
     OTF magnitude). Max-project over all axes except ``axis`` to get a 1-D
     profile, then average the two endpoint values at the cutoff.
     """
-    ndim = magnitude_shifted.ndim
-    other_axes = tuple(d for d in range(ndim) if d != axis)
-    profile = magnitude_shifted
-    # Reduce other axes one at a time (descending) so axis positions stay valid.
-    for d in sorted(other_axes, reverse=True):
-        profile = profile.max(axis=d)
+    other_axes = tuple(d for d in range(magnitude_shifted.ndim) if d != axis)
+    # max is order-independent, so a single multi-axis reduction is exact.
+    profile = (
+        magnitude_shifted.max(axis=other_axes) if other_axes else magnitude_shifted
+    )
     idx_minus, idx_plus = _endpoint_indices(magnitude_shifted.shape[axis], t)
     return float(asnumpy(profile[idx_minus]) + asnumpy(profile[idx_plus])) / 2.0
+
+
+def _butterworth_mask(
+    shape: tuple[int, ...],
+    kc: tuple[float, ...],
+    ee: float,
+    n: int,
+    xp: Any,
+    dtype: Any,
+) -> np.ndarray:
+    """DC-centered Butterworth mask ``1 / sqrt(1 + ee * w**n)``.
+
+    ``w = sum_d (q_d / kc_d)**2`` is the squared ellipsoidal radius with centered
+    coordinates ``q_d = idx - (S_d - 1) / 2`` built on the input device via ``xp``.
+    """
+    ndim = len(shape)
+    w = xp.zeros(shape, dtype=dtype)
+    for d in range(ndim):
+        axis_shape = [1] * ndim
+        axis_shape[d] = shape[d]
+        q = (
+            (xp.arange(shape[d]) - (shape[d] - 1) / 2.0)
+            .reshape(axis_shape)
+            .astype(dtype)
+        )
+        w = w + (q / kc[d]) ** 2
+    return 1.0 / np.sqrt(1.0 + ee * w**n)
 
 
 def create_backprojector(
@@ -207,32 +235,15 @@ def create_backprojector(
     else:
         raise ValueError(f"res_flag must be 0, 1, or 2, got {res_flag}.")
 
-    # Frequency cutoff in Fourier pixels per axis: t_d = S_d / res_d.
+    # Frequency cutoff in Fourier pixels per axis: t_d = S_d / res_d (= Butterworth kc).
     t = tuple(shape[d] / res[d] for d in range(ndim))
-    kc = t  # Butterworth cutoff width per axis equals t.
 
-    # --- Flipped forward PSF (traditional back projector) and its OTF ------
     flipped = f[(slice(None, None, -1),) * ndim]
-    otf_flip = np.fft.fftn(np.fft.ifftshift(flipped))
-    m = float(asnumpy(np.abs(otf_flip).max()))
-    otf_flip_norm = otf_flip / m
 
-    # --- Forward-projector cutoff gain beta_fp (axis-averaged) -------------
-    flip_mag_shifted = np.fft.fftshift(np.abs(otf_flip_norm))
-    beta_fp = float(
-        np.mean([_cutoff_gain(flip_mag_shifted, d, t[d]) for d in range(ndim)])
-    )
-
-    # Auto-substitution: 1.0 means "use beta_fp" (matches the reference).
-    if beta == 1.0:
-        beta = beta_fp
-    if alpha == 1.0:
-        alpha = beta_fp
-
-    # --- Wiener filter (complex) -------------------------------------------
-    otf_wiener = otf_flip_norm / (np.abs(otf_flip_norm) ** 2 + alpha)
-
-    # --- Assemble the back-projector OTF/PSF by type -----------------------
+    # --- Assemble the back-projector PSF by type ---------------------------
+    # ``traditional`` and ``gaussian`` use neither the flipped OTF nor the
+    # Wiener filter, so those (full-size, complex) intermediates are built only
+    # inside the branches that consume them.
     if bp_type == "traditional":
         # OTF_bp = OTF_flip; round-trip returns the flipped PSF.
         psf_bp = flipped.copy()
@@ -240,48 +251,52 @@ def create_backprojector(
     elif bp_type == "gaussian":
         # Centered Gaussian PSF with sigma_d = FWHM_d / 2.3548.
         sigma = tuple(w / 2.3548 for w in fwhm)
-        coords = [xp.arange(shape[d]) - (shape[d] - 1) / 2.0 for d in range(ndim)]
         d2 = xp.zeros(shape, dtype=out_dtype)
         for d in range(ndim):
             axis_shape = [1] * ndim
             axis_shape[d] = shape[d]
-            q = coords[d].reshape(axis_shape).astype(out_dtype)
+            q = (xp.arange(shape[d]) - (shape[d] - 1) / 2.0).reshape(axis_shape)
+            q = q.astype(out_dtype)
             d2 = d2 + (q * q) / (2.0 * sigma[d] ** 2)
         psf_bp = np.exp(-d2)
 
-    elif bp_type == "wiener":
-        otf_bp = otf_wiener
-        psf_bp = np.fft.fftshift(np.real(np.fft.ifftn(otf_bp)))
-
     else:
-        # butterworth and wiener-butterworth share the DC-centered mask.
-        coords = [xp.arange(shape[d]) - (shape[d] - 1) / 2.0 for d in range(ndim)]
-        w = xp.zeros(shape, dtype=out_dtype)
-        for d in range(ndim):
-            axis_shape = [1] * ndim
-            axis_shape[d] = shape[d]
-            q = coords[d].reshape(axis_shape).astype(out_dtype)
-            w = w + (q / kc[d]) ** 2  # squared ellipsoidal radius
+        # wiener, butterworth, and wiener-butterworth all start from the
+        # normalized flipped-PSF OTF and the forward-projector cutoff gain.
+        otf_flip = np.fft.fftn(np.fft.ifftshift(flipped))
+        m = float(asnumpy(np.abs(otf_flip).max()))
+        otf_flip_norm = otf_flip / m
+        mag = np.abs(otf_flip_norm)
+        flip_mag_shifted = np.fft.fftshift(mag)
+        beta_fp = float(
+            np.mean([_cutoff_gain(flip_mag_shifted, d, t[d]) for d in range(ndim)])
+        )
+        # Auto-substitution: 1.0 means "use beta_fp" (matches the reference).
+        if beta == 1.0:
+            beta = beta_fp
+        if alpha == 1.0:
+            alpha = beta_fp
 
         if bp_type == "butterworth":
             ee = 1.0 / beta**2 - 1.0
-            mask = 1.0 / np.sqrt(1.0 + ee * w**n)
-            otf_bp = np.fft.ifftshift(mask)
-        else:  # wiener-butterworth
-            # beta_wiener: single X-axis scalar from the Wiener OTF magnitude.
-            aw = np.fft.fftshift(np.abs(otf_wiener))
-            if ndim == 3:
-                aw_plane = aw[shape[0] // 2]  # central-Z slice -> (Y, X)
-            else:
-                aw_plane = aw  # (Y, X)
-            xprof = aw_plane.max(axis=0)  # max over Y -> X profile
-            idx_minus, idx_plus = _endpoint_indices(shape[-1], t[-1])
-            beta_wiener = (
-                float(asnumpy(xprof[idx_minus]) + asnumpy(xprof[idx_plus])) / 2.0
-            )
-            ee = beta_wiener / beta**2 - 1.0
-            mask = 1.0 / np.sqrt(1.0 + ee * w**n)
-            otf_bp = np.fft.ifftshift(mask) * otf_wiener
+            otf_bp = np.fft.ifftshift(_butterworth_mask(shape, t, ee, n, xp, out_dtype))
+        else:
+            # wiener / wiener-butterworth need the (complex) Wiener filter.
+            otf_wiener = otf_flip_norm / (mag**2 + alpha)
+            if bp_type == "wiener":
+                otf_bp = otf_wiener
+            else:  # wiener-butterworth
+                # beta_wiener: single X-axis scalar from the Wiener OTF magnitude.
+                aw = np.fft.fftshift(np.abs(otf_wiener))
+                aw_plane = aw[shape[0] // 2] if ndim == 3 else aw  # central-Z -> (Y, X)
+                xprof = aw_plane.max(axis=0)  # max over Y -> X profile
+                idx_minus, idx_plus = _endpoint_indices(shape[-1], t[-1])
+                beta_wiener = (
+                    float(asnumpy(xprof[idx_minus]) + asnumpy(xprof[idx_plus])) / 2.0
+                )
+                ee = beta_wiener / beta**2 - 1.0
+                mask = _butterworth_mask(shape, t, ee, n, xp, out_dtype)
+                otf_bp = np.fft.ifftshift(mask) * otf_wiener
 
         psf_bp = np.fft.fftshift(np.real(np.fft.ifftn(otf_bp)))
 
