@@ -6,6 +6,7 @@ import pytest
 from cubic.cuda import asnumpy, to_device
 from cubic.image_utils import pad_image_to_shape
 from cubic.preprocessing.deconvolution import (
+    decon_xpy,
     richardson_lucy_iter,
     deconv_iter_num_finder,
     richardson_lucy_skimage,
@@ -225,3 +226,12 @@ def test_deconv_iter_num_finder_skimage_backprojector_raises() -> None:
             implementation="skimage",
             backprojector=bp,
         )
+
+
+def test_decon_xpy_backprojector_pad_psf_raises() -> None:
+    """A back projector with pad_psf=True is rejected with a clear error."""
+    image = np.ones((6, 6, 6), dtype=np.float32)
+    psf = _gaussian_psf((3, 3, 3), sigmas=(1.0, 1.0, 1.0))
+    bp = _gaussian_psf((3, 3, 3), sigmas=(1.2, 1.2, 1.2))
+    with pytest.raises(ValueError, match="pad_psf=True is not supported"):
+        decon_xpy(image, psf, n_iter=1, pad_psf=True, backprojector=bp)

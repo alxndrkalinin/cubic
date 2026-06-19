@@ -103,9 +103,13 @@ def decon_xpy(
     used (see :func:`richardson_lucy_xp`). The back projector is not padded; it
     must stay PSF-shaped, so ``pad_psf`` must be ``False`` in that case.
     """
-    check_same_device(image, psf)
-    if backprojector is not None:
-        check_same_device(image, psf, backprojector)
+    arrays = (image, psf) if backprojector is None else (image, psf, backprojector)
+    check_same_device(*arrays)
+    if backprojector is not None and pad_psf:
+        raise ValueError(
+            "pad_psf=True is not supported with a backprojector; the back "
+            "projector must stay PSF-shaped (pass pad_psf=False)."
+        )
 
     padded_img = pad_image(image, pad_size_z, mode="reflect")
     padded_psf = pad_image(psf, pad_size_z, mode="reflect") if pad_psf else psf
