@@ -2,18 +2,18 @@
 # coding: utf-8
 
 # ## 3D Feature Extraction: CPU vs GPU
-#
+# 
 # This notebook demonstrates **device-agnostic** morphological and intensity
 # feature extraction from 3D labeled volumes with `cubic`. The exact same
 # `regionprops_table` call runs on CPU (scikit-image) or GPU (cuCIM) depending
 # only on where the input arrays live — no code changes. We extract features on
 # both devices, verify the results are identical up to floating-point precision,
 # and compare wall-clock time.
-#
+# 
 # **Dataset**: `cells3d` from scikit-image — a 3D fluorescence microscopy volume
 # (60 × 256 × 256, ZYX) with membrane and nuclei channels; voxel size
 # (0.29, 0.26, 0.26) µm.
-#
+# 
 # **References**:
 # - Kalinin et al. (2025) "cubic: CUDA-accelerated 3D BioImage Computing", ICCV Workshop.
 
@@ -69,7 +69,7 @@ plt.show()
 
 
 # ### Segment nuclei
-#
+# 
 # A simple threshold + cleanup pipeline creates a label image. These operations
 # are themselves device-agnostic; we run them on CPU here so both the CPU and GPU
 # feature-extraction paths receive identical labels.
@@ -112,11 +112,11 @@ plt.show()
 
 
 # ### Extract features on CPU and GPU
-#
+# 
 # The same `regionprops_table` call runs on both devices — only the input array's
 # location changes. We extract a set of scalar 3D morphometric and intensity
 # properties.
-#
+# 
 # Two properties are intentionally excluded so the two backends return the same
 # columns and values:
 # - raw image moments (`moments*`): scikit-image emits them to order 3, cuCIM to
@@ -260,15 +260,15 @@ plt.show()
 
 
 # ### Summary
-#
+# 
 # `cubic` extracts the identical feature matrix on CPU and GPU from a single
 # `regionprops_table` call — only the input array's device changes. Across all 16
 # morphometric and intensity properties, CPU (scikit-image) and GPU (cuCIM) values
 # agree to floating-point precision (max absolute difference printed above).
-#
+# 
 # On an NVIDIA A40, GPU feature extraction runs roughly **8× faster** than CPU
 # for this 18-nucleus volume (~0.5 s vs ~4 s).
-#
+# 
 # Notes:
 # - Raw image moments (`moments*`) are omitted because scikit-image emits them to
 #   order 3 and cuCIM to order 2, so the backends return different column counts.
