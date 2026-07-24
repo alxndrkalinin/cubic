@@ -116,7 +116,7 @@ def resize_gpu(
                     else (img.shape[0], Ly, Lx, img.shape[-1])
                 )
                 out = xp.zeros(shp, ri.dtype)
-            out[i] = ri if (ri.ndim > 2 or no_channels) else ri[..., None]
+            out[i] = ri
         return out
     return _resize2d(img, Ly, Lx, order, no_channels)
 
@@ -477,13 +477,7 @@ def _run_net_gpu(
 
 
 # --------------------------------------------------------------------------- #
-# normalization
-#   - the default cellpose-SAM path (percentile / lowhigh) is pure
-#     ``np.``/``np.percentile``/``np.ptp`` and dispatches to cupy unchanged, so
-#     it is delegated to ``cellpose.transforms.normalize_img``
-#   - the tile-norm (``tile_norm_blocksize>0``) and sharpen/smooth
-#     (``sharpen_radius``/``smooth_radius>0``) sub-paths use cv2 / scipy /
-#     ``torch.from_numpy`` / ``np.array(list-of-arrays)`` and are ported here
+# normalization (see :func:`normalize_img_gpu` for the CPU/GPU path split)
 # --------------------------------------------------------------------------- #
 _NORMALIZE_DEFAULT = {
     "lowhigh": None,
@@ -646,6 +640,7 @@ def _normalize99_tile_gpu(
         x99_tiles_z = _ndimage.gaussian_filter1d(x99_tiles_z, 1, axis=a)
     if norm3D:
         smooth3D = 1 if smooth3D == 0 else smooth3D
+        # axis=a (=1) is the leaked loop index above; mirrors upstream cellpose
         x01_tiles_z = _ndimage.gaussian_filter1d(x01_tiles_z, smooth3D, axis=a)
         x99_tiles_z = _ndimage.gaussian_filter1d(x99_tiles_z, smooth3D, axis=a)
 
@@ -948,7 +943,7 @@ def segment_cellpose(
             dP = _ndimage.gaussian_filter(dP, [0, *flow3D_smooth])
 
     # --- mask computation (GPU-resident) ---
-    niter_scale = 1 if (rescale is None or not resample) else rescale
+    niter_scale = 1 if not resample else rescale
     n_iter = int(200 / niter_scale) if (niter is None or niter == 0) else niter
     masks = compute_masks(
         x.shape,

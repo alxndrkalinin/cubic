@@ -7,10 +7,8 @@ from ..skimage import measure
 
 
 # https://github.com/scikit-image/scikit-image/blob/main/skimage/segmentation/_clear_border.py
-def clear_border(
-    labels, buffer_size=0, bgval=0, in_place=False, mask=None, *, out=None
-):
-    """Clear objects connected to the label image border.
+def clear_border(labels, buffer_size=0, bgval=0, mask=None, *, out=None):
+    """Clear objects connected to the label image border (device-agnostic).
 
     Parameters
     ----------
@@ -21,9 +19,6 @@ def clear_border(
         that touch the outside of the image are removed.
     bgval : float or int, optional
         Cleared objects are set to this value.
-    in_place : bool, optional
-        Whether or not to manipulate the labels array in-place.
-        Deprecated since version 0.19. Please use `out` instead.
     mask : ndarray of bool, same shape as `image`, optional.
         Image data mask. Objects in labels image overlapping with
         False pixels of mask will be removed. If defined, the
@@ -37,37 +32,6 @@ def clear_border(
     out : (M[, N[, ..., P]]) array
         Imaging data labels with cleared borders
 
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from skimage.segmentation import clear_border
-    >>> labels = np.array([[0, 0, 0, 0, 0, 0, 0, 1, 0],
-    ...                    [1, 1, 0, 0, 1, 0, 0, 1, 0],
-    ...                    [1, 1, 0, 1, 0, 1, 0, 0, 0],
-    ...                    [0, 0, 0, 1, 1, 1, 1, 0, 0],
-    ...                    [0, 1, 1, 1, 1, 1, 1, 1, 0],
-    ...                    [0, 0, 0, 0, 0, 0, 0, 0, 0]])
-    >>> clear_border(labels)
-    array([[0, 0, 0, 0, 0, 0, 0, 0, 0],
-           [0, 0, 0, 0, 1, 0, 0, 0, 0],
-           [0, 0, 0, 1, 0, 1, 0, 0, 0],
-           [0, 0, 0, 1, 1, 1, 1, 0, 0],
-           [0, 1, 1, 1, 1, 1, 1, 1, 0],
-           [0, 0, 0, 0, 0, 0, 0, 0, 0]])
-    >>> mask = np.array([[0, 0, 1, 1, 1, 1, 1, 1, 1],
-    ...                  [0, 0, 1, 1, 1, 1, 1, 1, 1],
-    ...                  [1, 1, 1, 1, 1, 1, 1, 1, 1],
-    ...                  [1, 1, 1, 1, 1, 1, 1, 1, 1],
-    ...                  [1, 1, 1, 1, 1, 1, 1, 1, 1],
-    ...                  [1, 1, 1, 1, 1, 1, 1, 1, 1]]).astype(bool)
-    >>> clear_border(labels, mask=mask)
-    array([[0, 0, 0, 0, 0, 0, 0, 1, 0],
-           [0, 0, 0, 0, 1, 0, 0, 1, 0],
-           [0, 0, 0, 1, 0, 1, 0, 0, 0],
-           [0, 0, 0, 1, 1, 1, 1, 0, 0],
-           [0, 1, 1, 1, 1, 1, 1, 1, 0],
-           [0, 0, 0, 0, 0, 0, 0, 0, 0]])
-
     """
     xp = get_array_module(labels)
 
@@ -75,14 +39,10 @@ def clear_border(
         # ignore buffer_size if mask
         raise ValueError("buffer size may not be greater than labels size")
 
-    if out is not None:
-        np.copyto(out, labels, casting="no")
-        in_place = True
-
-    if not in_place:
+    if out is None:
         out = labels.copy()
-    elif out is None:
-        out = labels
+    else:
+        np.copyto(out, labels, casting="no")
 
     if mask is not None:
         err_msg = (
@@ -110,18 +70,18 @@ def clear_border(
 
     # Re-label, in case we are dealing with a binary out
     # and to get consistent labeling
-    labels, number = measure.label(out, background=0, return_num=True)
+    relabeled, number = measure.label(out, background=0, return_num=True)
 
     # determine all objects that are connected to borders
-    borders_indices = np.unique(labels[borders])
+    borders_indices = np.unique(relabeled[borders])
     indices = xp.arange(number + 1)
 
     # mask all label indices that are connected to borders
     label_mask = np.isin(indices, borders_indices)
     # create mask for pixels to clear
-    mask = label_mask[labels.reshape(-1)].reshape(labels.shape)
+    clear_mask = label_mask[relabeled.reshape(-1)].reshape(relabeled.shape)
 
     # clear border pixels
-    out[mask] = bgval
+    out[clear_mask] = bgval
 
     return out
