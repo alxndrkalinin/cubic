@@ -4,9 +4,13 @@ import numpy as np
 import pytest
 from skimage.feature import graycoprops, graycomatrix
 
-from cubic.cuda import ascupy
+from cubic.cuda import ascupy, asnumpy
 from cubic.feature import glcm_features
-from cubic.feature.texture import _unit_offsets
+from cubic.feature.texture import (
+    _unit_offsets,
+    _slices_for_offset,
+    _direction_matrices,
+)
 
 _ANGLES = [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
 _EXPECTED_PROPS = {
@@ -161,11 +165,100 @@ def test_glcm_empty_pair_directions(use_gpu: bool, gpu_available: bool) -> None:
     row_feats = glcm_features(row, levels=8)
     assert all(np.isfinite(v) for v in row_feats.values())
 
-    masked_feats = glcm_features(img, mask=mask, levels=8)
-    assert all(np.isfinite(v) for v in masked_feats.values())
-    # All directions empty -> all-zero GLCMs -> correlation guard fires.
-    assert masked_feats["correlation"] == 1.0
-    assert masked_feats["contrast"] == 0.0
+    # Every direction empty leaves nothing to average, which is an error rather
+    # than a set of all-zero properties silently reported as features.
+    with pytest.raises(ValueError, match="No voxel pair"):
+        glcm_features(img, mask=mask, levels=8)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_glcm_ignores_empty_directions(use_gpu: bool, gpu_available: bool) -> None:
+    """A flat 3D object scores exactly like the same voxels seen as 2D.
+
+    9 of the 13 3D directions have no pairs for a single-slice volume. Averaging
+    those all-zero matrices in scaled ASM/energy/entropy/contrast/homogeneity/
+    dissimilarity by 4/13 and flipped the sign of correlation, making every
+    texture feature depend on the object's thickness.
+    """
+    rng = np.random.default_rng(7)
+    plane = rng.random((16, 16)).astype(np.float64)
+    volume = plane[None]  # (1, 16, 16): only the 4 in-plane directions are valid
+    mask = np.ones(volume.shape, dtype=bool)
+
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        plane = ascupy(plane)
+        volume = ascupy(volume)
+        mask = ascupy(mask)
+
+    feats_2d = glcm_features(plane, levels=8, value_range=(0.0, 1.0))
+    feats_3d = glcm_features(volume, levels=8, value_range=(0.0, 1.0))
+    feats_3d_masked = glcm_features(volume, mask=mask, levels=8, value_range=(0.0, 1.0))
+
+    for prop in feats_2d:
+        assert feats_3d[prop] == pytest.approx(feats_2d[prop], abs=1e-12), prop
+        assert feats_3d_masked[prop] == pytest.approx(feats_2d[prop], abs=1e-12), prop
+
+
+def test_glcm_rejects_non_bool_mask() -> None:
+    """An integer mask raises instead of silently bitwise-ANDing and fancy-indexing."""
+    rng = np.random.default_rng(8)
+    img = rng.random((10, 10))
+    mask = np.zeros(img.shape, dtype=np.uint8)
+    mask[2:8, 2:8] = 1
+
+    with pytest.raises(ValueError, match="boolean"):
+        glcm_features(img, mask=mask, levels=8)
+
+    # The equivalent boolean mask is accepted.
+    assert np.isfinite(glcm_features(img, mask=mask.astype(bool), levels=8)["entropy"])
+
+
+def test_glcm_distance_larger_than_extent_raises() -> None:
+    """A distance that empties every direction raises rather than returning zeros."""
+    rng = np.random.default_rng(9)
+    img = rng.random((4, 4))
+    with pytest.raises(ValueError, match="No voxel pair"):
+        glcm_features(img, levels=8, distances=(4,))
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_direction_matrices_keep_directions_separate(
+    use_gpu: bool, gpu_available: bool
+) -> None:
+    """Every direction's counts land in its own slice of the shared histogram.
+
+    All directions are accumulated into one flat histogram offset by
+    ``direction * levels ** 2``, so a wrong stride would silently blend two
+    directions' co-occurrences. Checked against an independent per-direction
+    count.
+    """
+    rng = np.random.default_rng(10)
+    levels = 4
+    quant = rng.integers(0, levels, size=(6, 7, 8)).astype(np.int64)
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        quant = ascupy(quant)
+
+    offsets = _unit_offsets(3)
+    matrices, nonempty = _direction_matrices(
+        quant, offsets, levels, None, symmetric=False, normed=False
+    )
+
+    assert matrices.shape == (13, levels, levels)
+    assert nonempty.all()
+    for direction, off in enumerate(offsets):
+        center_sl, neighbor_sl = _slices_for_offset(off, quant.shape)
+        expected = np.zeros((levels, levels))
+        centers = asnumpy(quant[center_sl]).ravel()
+        neighbors = asnumpy(quant[neighbor_sl]).ravel()
+        for center, neighbor in zip(centers, neighbors):
+            expected[center, neighbor] += 1
+        np.testing.assert_array_equal(
+            matrices[direction], expected, err_msg=f"offset {off}"
+        )
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
