@@ -1,11 +1,13 @@
 """Tests for the SciPy proxy implementation."""
 
+import warnings
 from typing import Any
 
 import numpy as np
 import pytest
 from scipy import signal as sp_signal
 
+import cubic.cuda as mc_cuda
 import cubic.scipy as mc_scipy
 from cubic.cuda import ascupy, asnumpy, get_device
 
@@ -62,14 +64,14 @@ def test_gpu_fallback_to_cpu_when_cupyx_unavailable(
     if not gpu_available:
         pytest.skip("GPU not available")
 
-    real_import_module = mc_scipy.import_module
+    real_import_module = mc_cuda.import_module
 
     def fake_import_module(name: str, *args: Any, **kwargs: Any) -> Any:
         if name.startswith("cupyx"):
             raise ModuleNotFoundError(f"simulated missing module: {name}")
         return real_import_module(name, *args, **kwargs)
 
-    monkeypatch.setattr(mc_scipy, "import_module", fake_import_module)
+    monkeypatch.setattr(mc_cuda, "import_module", fake_import_module)
 
     a = np.array([1.0, 2.0, 3.0, 4.0])
     b = np.array([0.5, 0.5])
@@ -80,3 +82,32 @@ def test_gpu_fallback_to_cpu_when_cupyx_unavailable(
 
     assert get_device(gpu_res) == "GPU"
     assert np.allclose(asnumpy(gpu_res), cpu_res)
+
+
+def test_cpu_route_unknown_function_raises_without_warning() -> None:
+    """An unknown function on the host route raises without a bogus warning.
+
+    ``module_name`` was already ``scipy.<sub>`` on the CPU route, so the proxy
+    warned ``cupyx.scipy.<sub>.<name> is unavailable, falling back to CPU`` and
+    then re-raised the very same ``AttributeError`` it had just caught.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning here fails the test
+        with pytest.raises(AttributeError):
+            mc_scipy.ndimage.definitely_not_a_scipy_function(np.zeros(4))
+
+
+def test_missing_cupyx_function_falls_back_to_cpu(gpu_available: bool) -> None:
+    """A function absent from ``cupyx.scipy`` runs on the host for GPU input."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    # cupyx.scipy.ndimage has no ``distance_transform_cdt``
+    from scipy.ndimage import distance_transform_cdt
+
+    img = np.array([[0, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=np.uint8)
+    cpu_res = distance_transform_cdt(img)
+
+    with pytest.warns(UserWarning, match="falling back to CPU"):
+        gpu_res = mc_scipy.ndimage.distance_transform_cdt(ascupy(img))
+    assert get_device(gpu_res) == "GPU"
+    np.testing.assert_array_equal(asnumpy(gpu_res), cpu_res)

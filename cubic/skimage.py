@@ -5,7 +5,7 @@ from typing import Any
 from importlib import import_module
 from collections.abc import Callable
 
-from .cuda import CUDAManager, any_gpu_arg, coerce_args_to_cpu
+from .cuda import dispatch_device_call
 
 
 class SkimageProxy(ModuleType):
@@ -13,40 +13,27 @@ class SkimageProxy(ModuleType):
 
     _loaded_modules: dict[str, "SkimageProxy"] = {}
 
-    def __init__(self, name: str) -> None:
-        """Initialize the proxy module."""
-        super().__init__(name)
-        self.cp = CUDAManager().get_cp()
-
     def __getattr__(self, func_name: str) -> Callable:
         """Dynamically wrap skimage or cucim.skimage functions based on device capability."""
-        if func_name in self.__dict__:
-            return self.__dict__[func_name]
 
         def func_wrapper(*args: Any, **kwargs: Any) -> Any:
             """Wrap skimage or cucim functions based on device capability."""
             # The io submodule routes to cubic.cucim, which manages device
-            # placement itself. Everything else dispatches on whether *any*
-            # argument is a GPU array — not just the first positional one,
-            # since skimage functions accept the array under varying names
-            # (e.g. ``label_image``, ``intensity_image``, ``coords``).
+            # placement itself, so it bypasses device dispatch entirely.
             if self.__name__ == "io":
-                base_module = "cubic.cucim"
-                use_gpu = False
-            else:
-                use_gpu = self.cp is not None and any_gpu_arg(args, kwargs)
-                base_module = "cucim.skimage" if use_gpu else "skimage"
-
-            full_func_name = f"{base_module}.{self.__name__}.{func_name}"
-            module_name, method_name = full_func_name.rsplit(".", maxsplit=1)
-            func = getattr(import_module(module_name), method_name)
-
-            if use_gpu or self.__name__ == "io":
+                func = getattr(import_module(f"cubic.cucim.{self.__name__}"), func_name)
                 return func(*args, **kwargs)
-            # CPU route: defensively coerce any stray GPU array to CPU so a raw
-            # CuPy array never reaches a host scikit-image function.
-            cpu_args, cpu_kwargs = coerce_args_to_cpu(args, kwargs)
-            return func(*cpu_args, **cpu_kwargs)
+            # Everything else dispatches on whether *any* argument is a GPU
+            # array — not just the first positional one, since skimage functions
+            # accept the array under varying names (e.g. ``label_image``,
+            # ``intensity_image``, ``coords``).
+            return dispatch_device_call(
+                func_name,
+                args,
+                kwargs,
+                gpu_module=f"cucim.skimage.{self.__name__}",
+                cpu_module=f"skimage.{self.__name__}",
+            )
 
         self.__dict__[func_name] = func_wrapper
         return func_wrapper

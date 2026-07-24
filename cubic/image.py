@@ -21,9 +21,8 @@ class Image:
         """Create image object with data stored either as NumPy array (CPU) or CuPy array (GPU)."""
         if device is None:
             device = get_device(images)
-        else:
-            assert device in ["CPU", "GPU"]
 
+        # ``to_device`` raises ValueError for anything other than "CPU"/"GPU".
         self.data = to_device(images, device)
 
         if as_float:

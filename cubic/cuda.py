@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import warnings
+import threading
 from types import ModuleType
 from typing import Any
-from collections.abc import Callable
+from importlib import import_module
 
 import numpy as np
 
@@ -15,15 +15,25 @@ class CUDAManager:
     """Manages CUDA resources."""
 
     _instance: CUDAManager | None = None
-    cp: ModuleType | None
-    cucim: ModuleType | None
-    num_gpus: int
+    _lock = threading.Lock()
+    # Class-level defaults so a partially initialized instance still answers
+    # ``cp``/``cucim``/``num_gpus`` with a CPU fallback instead of AttributeError.
+    cp: ModuleType | None = None
+    cucim: ModuleType | None = None
+    num_gpus: int = 0
 
     def __new__(cls):
         """Ensure only one instance of CUDAManager is created."""
         if cls._instance is None:
-            cls._instance = super(CUDAManager, cls).__new__(cls)
-            cls._instance.init_gpu()
+            with cls._lock:
+                # Re-check inside the lock: another thread may have finished
+                # constructing the singleton while this one waited.
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance.init_gpu()
+                    # Publish only once fully initialized so a concurrent
+                    # caller never sees a half-built manager.
+                    cls._instance = instance
         return cls._instance
 
     def init_gpu(self) -> None:
@@ -133,6 +143,56 @@ def coerce_args_to_cpu(args: tuple, kwargs: dict) -> tuple[list, dict]:
     return cpu_args, cpu_kwargs
 
 
+def dispatch_device_call(
+    func_name: str,
+    args: tuple,
+    kwargs: dict,
+    gpu_module: str,
+    cpu_module: str,
+) -> Any:
+    """Call ``func_name`` on the GPU or CPU backend matching the arguments' device.
+
+    Shared by the :mod:`cubic.scipy` and :mod:`cubic.skimage` proxies so both
+    route identically:
+
+    - No GPU array among the arguments → call ``cpu_module``, defensively moving
+      any stray GPU array to host first.
+    - A GPU array is present → call ``gpu_module``.
+    - A GPU array is present but ``gpu_module`` lacks ``func_name`` → warn, run
+      the ``cpu_module`` implementation on host copies, then move array results
+      back to the GPU so the caller still gets a device-consistent result.
+
+    An unknown ``func_name`` on the pure-CPU route raises ``AttributeError``
+    from ``cpu_module`` without warning: there is no GPU backend involved, so a
+    "falling back to CPU" warning would be misleading.
+    """
+    use_gpu = CUDAManager().get_cp() is not None and any_gpu_arg(args, kwargs)
+
+    def _on_cpu(return_to_gpu: bool) -> Any:
+        func = getattr(import_module(cpu_module), func_name)
+        cpu_args, cpu_kwargs = coerce_args_to_cpu(args, kwargs)
+        result = func(*cpu_args, **cpu_kwargs)
+        if not return_to_gpu:
+            return result
+        if isinstance(result, tuple):
+            return tuple(
+                to_device(r, "GPU") if hasattr(r, "dtype") else r for r in result
+            )
+        if hasattr(result, "dtype"):
+            return to_device(result, "GPU")
+        return result
+
+    if not use_gpu:
+        return _on_cpu(return_to_gpu=False)
+
+    try:
+        func = getattr(import_module(gpu_module), func_name)
+    except (ModuleNotFoundError, AttributeError):
+        warnings.warn(f"{gpu_module}.{func_name} is unavailable, falling back to CPU.")
+        return _on_cpu(return_to_gpu=True)
+    return func(*args, **kwargs)
+
+
 def to_device(array: np.ndarray, device: str) -> np.ndarray:
     """Move array to the requested device."""
     cp = CUDAManager().get_cp()
@@ -142,7 +202,9 @@ def to_device(array: np.ndarray, device: str) -> np.ndarray:
         else:
             raise RuntimeError("GPU requested but not available.")
     elif device == "CPU":
-        return np.asarray(array)
+        # ``np.asarray`` raises TypeError on CuPy input (implicit conversion is
+        # disallowed), so route through ``asnumpy``, which handles CuPy/torch.
+        return asnumpy(array)
     else:
         raise ValueError(
             f"Device should be 'CPU' or 'GPU', unknown requested: {device}."
