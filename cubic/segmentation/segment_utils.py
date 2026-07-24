@@ -115,6 +115,14 @@ def check_labeled_binary(image):
         raise TypeError(f"Image must be of integer type, got {image.dtype}.")
 
     unique_values = np.unique(image)
+    if unique_values.size and int(unique_values[0]) < 0:
+        # Negative ids are not labels, and downstream helpers index arrays by
+        # label value (``remove_touching_objects``) or call ``np.bincount``
+        # (``remove_large_objects``), both of which fail obscurely on them.
+        raise ValueError(
+            f"Label image must not contain negative values; got "
+            f"{int(unique_values[0])}."
+        )
     if len(unique_values) == 2:
         warnings.warn(
             "Only one label was provided in the image. Make sure to label components first."
@@ -247,7 +255,18 @@ def find_objects(label_image, max_label=None):
         `l-1` in the returned list.
 
     """
-    return _ndimage.find_objects(label_image, max_label or 0)
+    if not np.issubdtype(label_image.dtype, np.integer):
+        raise TypeError(
+            f"label_image must be of integer type, got {label_image.dtype}."
+        )
+    if max_label is not None and max_label < 0:
+        raise ValueError(f"max_label must be >= 0, got {max_label}.")
+    # scipy overloads 0 as "all labels", but here it means "search up to label
+    # 0", i.e. none. Answer that directly rather than letting it be silently
+    # reinterpreted as the opposite.
+    if max_label == 0:
+        return []
+    return _ndimage.find_objects(label_image, 0 if max_label is None else max_label)
 
 
 def _iter_label_boxes(

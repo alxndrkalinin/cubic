@@ -106,6 +106,30 @@ def test_mask2mesh_pads_border_touching_mask() -> None:
     assert border.area == pytest.approx(interior.area)
 
 
+@pytest.mark.parametrize("spacing", [None, (4.0, 1.0, 1.0)])
+def test_mask2mesh_vertices_stay_in_the_input_frame(
+    spacing: tuple[float, float, float] | None,
+) -> None:
+    """The 1-voxel pad must not shift the mesh out of the image frame.
+
+    ``mask2mesh`` pads to close border-touching surfaces, so the pad has to be
+    subtracted again. Left in, every vertex sat one voxel high on each axis —
+    scaled by ``spacing``, so a z-spacing of 4 displaced the mesh by 4.0
+    physical units, and ``bounds``/``centroid`` no longer overlaid the image.
+    """
+    mask = np.zeros((6, 6, 6), dtype=bool)
+    mask[2:4, 2:4, 2:4] = True  # voxel centres 2 and 3 on every axis
+
+    kwargs = {"spacing": spacing} if spacing is not None else {}
+    got = mesh.mask2mesh(mask, marching_cubes_kwargs=kwargs)
+
+    step = np.asarray(spacing if spacing is not None else (1.0, 1.0, 1.0))
+    # Marching cubes puts the surface midway between the on and off voxels.
+    np.testing.assert_allclose(got.centroid, 2.5 * step)
+    np.testing.assert_allclose(got.bounds[0], 1.5 * step)
+    np.testing.assert_allclose(got.bounds[1], 3.5 * step)
+
+
 def test_mask2mesh_spacing_scales_geometry() -> None:
     """Voxel spacing reaches marching cubes, so anisotropy is not ignored."""
     mask = _cube_volume(4) == 1

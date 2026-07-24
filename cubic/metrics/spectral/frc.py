@@ -1523,17 +1523,29 @@ def _crop_slice_resolutions(
         xy_resolutions.append(xy_slice_resolutions)
         xz_resolutions.append(xz_slice_resolutions)
 
-    if aggregate is None:
-        return {
-            "max_projection": np.asarray(max_projection_resolutions),
-            "xy": np.asarray(xy_resolutions),
-            "xz": np.asarray(xz_resolutions),
-        }
-    return {
-        "max_projection": aggregate(max_projection_resolutions, axis=0),
-        "xy": aggregate(xy_resolutions, axis=0),
-        "xz": aggregate(xz_resolutions, axis=0),
+    measured = {
+        "max_projection": max_projection_resolutions,
+        "xy": xy_resolutions,
+        "xz": xz_resolutions,
     }
+    if aggregate is None:
+        return {key: np.asarray(values) for key, values in measured.items()}
+
+    # The default ``np.nanmedian`` warns only when *every* input to an output
+    # position is NaN, so a tile that measured nothing at any plane vanishes
+    # from the aggregate silently -- the caller cannot tell what fraction of the
+    # sampled field produced no measurement.
+    for key, values in measured.items():
+        arr = np.asarray(values, dtype=float)
+        n_nan = int(np.isnan(arr).sum())
+        if n_nan:
+            warnings.warn(
+                f"{n_nan} of {arr.size} {key} tile measurement(s) had no "
+                "threshold crossing and are excluded from the aggregate",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+    return {key: aggregate(values, axis=0) for key, values in measured.items()}
 
 
 def _validate_crop_inputs(

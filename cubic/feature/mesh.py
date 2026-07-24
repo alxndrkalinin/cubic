@@ -197,6 +197,13 @@ def mask2mesh(
             )
         marching_cubes_kwargs["spacing"] = tuple(float(s) for s in spacing)
     verts, faces, _, _ = marching_cubes(np.pad(mask_3d, 1), **marching_cubes_kwargs)
+    # Undo the 1-voxel pad so vertices stay in the input's coordinate frame.
+    # Without this every vertex, and therefore ``bounds`` and ``centroid``, sits
+    # one voxel high on each axis -- scaled by ``spacing``, so the offset is in
+    # physical units. Every feature in ``mesh_feature_list`` is
+    # translation-invariant, but ``mask2mesh`` is public and its mesh is
+    # expected to overlay the image.
+    verts = verts - np.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
     mesh = trimesh.Trimesh(vertices=verts, faces=faces)
     trimesh.repair.fix_normals(mesh)
     return mesh

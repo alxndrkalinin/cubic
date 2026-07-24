@@ -163,12 +163,30 @@ def test_remove_touching_objects_diagonal_contact_counts() -> None:
 def test_remove_touching_objects_without_background() -> None:
     """An image fully covered by labels is handled (no background pixel).
 
-    Every label touches another, so nothing survives; the old
-    ``np.unique(...)[1:]`` would have skipped the lowest label id.
+    The shifted-comparison pass builds its ``touching`` flags by indexing on
+    raw label values, so it must not assume a 0 is present. Note this does not
+    guard the ``np.unique(...)[1:]`` slice: for *this* function a skipped
+    lowest id is still flagged as some other label's neighbour, so that slice
+    was never a bug here — see the ``_label_ids`` tests, which do guard it.
     """
     image = np.ones((8, 8), dtype=np.int32)
     image[4:, :] = 2
     assert set(np.unique(remove_touching_objects(image)).tolist()) == {0}
+
+
+def test_remove_touching_objects_rejects_negative_labels() -> None:
+    """Negative ids are not labels and must be rejected up front.
+
+    ``touching`` is indexed by raw label value, so a negative id wrapped around
+    into ``IndexError: index -4 is out of bounds`` (and an all-negative image
+    hit ``np.zeros(negative)``).
+    """
+    image = np.zeros((4, 8, 8), dtype=np.int16)
+    image[1:3, 1:3, 1:3] = 1
+    image[1:3, 5:7, 5:7] = -4
+
+    with pytest.raises(ValueError, match="must not contain negative values"):
+        remove_touching_objects(image)
 
 
 def test_remove_touching_objects_border_value_is_inert() -> None:
