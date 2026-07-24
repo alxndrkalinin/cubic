@@ -617,7 +617,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "rtree", marker = "extra == 'mesh'", specifier = ">=1.0" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "scikit-image", specifier = ">=0.16.1" },
+    { name = "scikit-image", specifier = ">=0.25" },
     { name = "torch", marker = "extra == 'cellpose'" },
     { name = "trimesh", marker = "extra == 'mesh'", specifier = ">=3.3.0" },
 ]
