@@ -459,6 +459,46 @@ def test_sectioned_fsc_projects_z_onto_the_axis() -> None:
     assert 0.78 <= result["z"] / (1.0 / kz_cut) <= 1.15
 
 
+def test_resampled_fsc_uses_koho_anisotropy_not_the_geometric_projection() -> None:
+    """Isotropic resampling swaps the geometric projection for Koho eq. (5).
+
+    Interpolating Z up to isotropic voxels adds no information, so the volume's
+    real axial band limit stays at the *original* Z Nyquist while the grid now
+    runs to the XY one; ``1 + (anisotropy - 1)|cos(theta)|`` converts back. That
+    is a different error from the sector-geometry projection, and applying the
+    projection instead moved the Koho et al. Fig. 4b pollen stack from 4.36 um
+    (12% above the published 3.91) to 2.02 um (48% below it).
+    """
+    fsc_data = {angle: _single_bin_sector(crosses=True) for angle in (8, 22, 38)}
+    kwargs: dict[str, Any] = dict(
+        spacing_list=[0.0777, 0.0777, 0.0777],
+        max_freq=6.435,
+        single_image=False,
+        resolution_threshold="fixed",
+        threshold_value=0.143,
+    )
+
+    geometric = _fsc_extract_resolution(fsc_data, **kwargs)
+    anisotropy = 3.22
+    resampled = _fsc_extract_resolution(
+        fsc_data, resampled_anisotropy=anisotropy, **kwargs
+    )
+
+    # Both start from the same measured 38-degree sector.
+    cos38 = float(np.cos(np.deg2rad(38)))
+    measured = geometric["z"] * cos38
+    assert resampled["z"] == pytest.approx(
+        measured * (1 + (anisotropy - 1) * cos38), rel=1e-6
+    )
+    # The two corrections are not combined, and differ enough to matter.
+    assert resampled["z"] / geometric["z"] == pytest.approx(
+        (1 + (anisotropy - 1) * cos38) * cos38, rel=1e-6
+    )
+    assert resampled["z"] > geometric["z"] * 1.5
+    # XY takes no axial correction either way.
+    assert resampled["xy"] == pytest.approx(geometric["xy"])
+
+
 def _single_bin_sector(crosses: bool) -> FourierCorrelationData:
     """Return one sector's curve, either decaying through 0.143 or staying above."""
     freq = np.linspace(0, 1, 50)

@@ -916,11 +916,12 @@ def _resample_isotropic_for_fsc(
     image2: np.ndarray | None,
     spacing: list[float],
     resample_order: int = 1,
-) -> tuple[np.ndarray, np.ndarray | None, list[float]]:
+) -> tuple[np.ndarray, np.ndarray | None, list[float], float]:
     """Resample images to isotropic voxel size for FSC calculation.
 
     Handles target_z_size calculation, rescale_isotropic calls for
-    image1/image2, and even-dim cropping.
+    image1/image2, even-dim cropping, and the anisotropy ratio that the axial
+    correction needs.
 
     Parameters
     ----------
@@ -941,6 +942,9 @@ def _resample_isotropic_for_fsc(
         Resampled second image (if provided).
     spacing_iso : list[float]
         Isotropic spacing (XY spacing for all axes).
+    anisotropy : float
+        Original ``z_spacing / xy_spacing``, for the Koho eq. (5) axial
+        correction; see :func:`_fsc_extract_resolution`.
     """
     spacing_tuple = tuple(spacing)
     iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
@@ -982,7 +986,7 @@ def _resample_isotropic_for_fsc(
             image2 = image2[slices]
 
     spacing_iso = [iso_spacing] * image1.ndim
-    return image1, image2, spacing_iso
+    return image1, image2, spacing_iso, spacing_tuple[0] / iso_spacing
 
 
 def _fsc_hist_compute(
@@ -1093,6 +1097,7 @@ def _fsc_extract_resolution(
     single_image: bool,
     resolution_threshold: str,
     threshold_value: float,
+    resampled_anisotropy: float | None = None,
     xy_curve_fit_type: str = "smooth-spline",
     z_curve_fit_type: str = "smooth-spline",
     apply_cutoff: bool = True,
@@ -1117,12 +1122,17 @@ def _fsc_extract_resolution(
       about the axial cutoff, and ``1 / cos(theta)`` would amplify it by up to
       7x. When no sector below 45° yields a crossing the result is ``nan``.
 
-    Note this projection is purely geometric — it carries no spacing term. An
-    earlier version instead applied the Koho et al. (2019) eq. (5) multiplier
-    ``1 + (z_spacing / xy_spacing - 1) * |cos(theta)|`` here, which both
-    double-counted anisotropy the physical-frequency grid already encodes and
-    used the wrong functional form. ``FourierCorrelationAnalysis`` still exposes
-    ``z_correction`` for callers reproducing miplib numbers.
+    That projection is purely geometric and carries no spacing term. It applies
+    to a grid whose axes already carry their true physical Nyquists. When the
+    volume was interpolated up to isotropic voxels instead, pass
+    *resampled_anisotropy* and the Koho et al. (2019) eq. (5) multiplier
+    ``1 + (anisotropy - 1) * |cos(theta)|`` is used in its place: resampling adds
+    no information, so the real axial band limit stays at the original Z Nyquist
+    while the grid now runs to the XY one, and that factor is what converts back.
+    The two corrections address different errors and are not combined.
+
+    ``FourierCorrelationAnalysis`` also still exposes ``z_correction`` directly,
+    for callers reproducing miplib numbers.
 
     Parameters
     ----------
@@ -1134,6 +1144,10 @@ def _fsc_extract_resolution(
         Nyquist frequency the FSC frequency axis was normalized by.
     single_image : bool
         Whether single-image mode (for cutoff correction).
+    resampled_anisotropy : float, optional
+        ``z_spacing / xy_spacing`` of the *original* volume, when the input was
+        interpolated up to isotropic voxels. None (default) means the frequency
+        grid carries true per-axis Nyquists, so Z is projected geometrically.
     resolution_threshold : str
         Threshold criterion for resolution calculation.
     threshold_value : float
@@ -1195,10 +1209,20 @@ def _fsc_extract_resolution(
                 RuntimeWarning,
                 stacklevel=3,
             )
-    else:
+    elif resampled_anisotropy is None:
         # Project the sector's shell radius onto Z: the measured period is
         # cos(theta) / k_z, and the axial period is 1 / k_z.
         z_resolution = z_measured / float(np.cos(np.deg2rad(z_angle)))
+    else:
+        # Koho et al. (2019) eq. (5). Interpolating Z up to isotropic voxels adds
+        # no information, so the volume's real axial band limit stays at the
+        # *original* Z Nyquist while the grid now runs to the XY one; this factor
+        # converts back. That is a different job from the geometric projection
+        # above, and on the pollen stack of Koho et al. Fig. 4b it is the one
+        # that reproduces the published 3.91 um (projecting instead gave 2.02).
+        z_resolution = z_measured * (
+            1.0 + (resampled_anisotropy - 1.0) * abs(float(np.cos(np.deg2rad(z_angle))))
+        )
 
     return {"xy": xy_resolution, "z": z_resolution}
 
@@ -1320,17 +1344,23 @@ def fsc_resolution(
         )
 
     # --- Isotropic resampling (optional) ---
+    # None keeps the geometric axial projection; resampling swaps in the Koho
+    # eq. (5) correction instead (see _fsc_extract_resolution).
+    resampled_anisotropy: float | None = None
+
     if resample_isotropic:
         if spacing is None:
             raise ValueError("resample_isotropic=True requires spacing to be provided")
         spacing_list = _normalize_spacing(spacing, image1.ndim)
         if spacing_list is None:
             raise RuntimeError("_normalize_spacing returned None with non-None spacing")
-        image1, image2, spacing_list = _resample_isotropic_for_fsc(
-            image1,
-            image2,
-            spacing_list,  # type: ignore[arg-type]
-            resample_order,
+        image1, image2, spacing_list, resampled_anisotropy = (
+            _resample_isotropic_for_fsc(
+                image1,
+                image2,
+                spacing_list,  # type: ignore[arg-type]
+                resample_order,
+            )
         )
         spacing = spacing_list
 
@@ -1416,6 +1446,7 @@ def fsc_resolution(
                 spacing_list=spacing_list,
                 max_freq=max_freq,
                 single_image=True,
+                resampled_anisotropy=resampled_anisotropy,
                 resolution_threshold=resolution_threshold,
                 threshold_value=threshold_value,
                 xy_curve_fit_type=xy_curve_fit_type,
@@ -1461,6 +1492,7 @@ def fsc_resolution(
         spacing_list=spacing_list,
         max_freq=max_freq,
         single_image=single_image,
+        resampled_anisotropy=resampled_anisotropy,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         xy_curve_fit_type=xy_curve_fit_type,
