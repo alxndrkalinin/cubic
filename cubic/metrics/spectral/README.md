@@ -89,6 +89,20 @@ ring correlation." *Optics Express* 32(12):21767, 2024.
 | `exclude_axis_angle` | 0.0 | Exclude frequencies near Z axis (degrees) |
 | `backend` | `"hist"` | GPU-accelerated histogram-based backend |
 
+`fsc_resolution` returns `{"xy": ..., "z": ...}`. A sector centred on polar angle
+theta measures the shell radius `|k| = k_z / cos(theta)`, not `k_z`, so the two
+keys are extracted differently:
+
+- `xy` comes from the most XY-dominated sector, reported as measured.
+- `z` comes from the highest sector *below* 45 degrees that crosses the
+  threshold, with its period divided by `cos(theta)` to project onto the Z axis.
+  Sectors at or above 45 degrees are XY-limited and are never used for `z`; when
+  none below 45 degrees crosses, `z` is `nan` with a warning rather than an
+  in-plane number relabelled as axial.
+
+`spacing=None` is the same frequency grid as `spacing=1.0` — cycles per pixel —
+so resolutions come back in pixels.
+
 ### DCR
 
 | Parameter | Default | Description |

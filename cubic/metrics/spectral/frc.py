@@ -827,7 +827,9 @@ def _calculate_fsc_sectioned_hist(
         Nyquist frequency the ``"frequency"`` axis was normalized by. Callers
         must convert crossings back to physical units with this value.
     """
-    n_angle = _validate_angle_delta(angle_delta)
+    # Two sectors minimum: a single sector spanning 0-90° cannot separate the
+    # axial from the in-plane cutoff, so it has no Z resolution to report.
+    n_angle = _validate_angle_delta(angle_delta, min_sectors=2)
 
     # Compute FFT
     fft_image1 = np.fft.fftn(image1 - image1.mean())
@@ -914,12 +916,11 @@ def _resample_isotropic_for_fsc(
     image2: np.ndarray | None,
     spacing: list[float],
     resample_order: int = 1,
-) -> tuple[np.ndarray, np.ndarray | None, list[float], float]:
+) -> tuple[np.ndarray, np.ndarray | None, list[float]]:
     """Resample images to isotropic voxel size for FSC calculation.
 
-    Extracts the isotropic resampling block from fsc_resolution. Handles
-    target_z_size calculation, rescale_isotropic calls for image1/image2,
-    even-dim cropping, and z_factor computation.
+    Handles target_z_size calculation, rescale_isotropic calls for
+    image1/image2, and even-dim cropping.
 
     Parameters
     ----------
@@ -940,11 +941,8 @@ def _resample_isotropic_for_fsc(
         Resampled second image (if provided).
     spacing_iso : list[float]
         Isotropic spacing (XY spacing for all axes).
-    z_factor : float
-        Anisotropy factor for k(theta) correction.
     """
     spacing_tuple = tuple(spacing)
-    original_spacing_z = spacing_tuple[0]
     iso_spacing = spacing_tuple[1]  # Y spacing (assumes Y == X)
     if not np.isclose(spacing_tuple[1], spacing_tuple[2], rtol=1e-3):
         raise ValueError(
@@ -952,8 +950,6 @@ def _resample_isotropic_for_fsc(
             f"got Y={spacing_tuple[1]}, X={spacing_tuple[2]}"
         )
 
-    # z_factor from ORIGINAL spacing for k(theta) correction
-    z_factor = original_spacing_z / iso_spacing
     target_z_size = int(round(image1.shape[0] * spacing_tuple[0] / iso_spacing))
     if target_z_size % 2 != 0:
         target_z_size -= 1  # Make even for checkerboard split
@@ -986,7 +982,7 @@ def _resample_isotropic_for_fsc(
             image2 = image2[slices]
 
     spacing_iso = [iso_spacing] * image1.ndim
-    return image1, image2, spacing_iso, z_factor
+    return image1, image2, spacing_iso
 
 
 def _fsc_hist_compute(
@@ -1095,7 +1091,6 @@ def _fsc_extract_resolution(
     spacing_list: list[float] | None,
     max_freq: float,
     single_image: bool,
-    z_factor: float,
     resolution_threshold: str,
     threshold_value: float,
     xy_curve_fit_type: str = "smooth-spline",
@@ -1108,16 +1103,26 @@ def _fsc_extract_resolution(
     the frequency-axis normalization (see :func:`_normalization_spacing`), so a
     crossing at ``f_c`` maps to ``1 / (f_c * max_freq)``.
 
-    XY and Z are then processed separately because the k(theta) anisotropy
-    correction only applies to some sectors:
+    A sector centered on the polar angle theta measures the *shell radius*
+    ``|k| = k_z / cos(theta)`` at which correlation dies, not ``k_z`` itself, so
+    XY and Z are extracted differently:
 
-    - **XY**: The highest-angle sector (most XY-dominated) is processed with
-      ``z_correction=1``.
-    - **Z**: Sectors are processed with ``z_correction=z_factor``, which is 1
-      unless the volume was resampled to isotropic voxels. The cascade starts
-      from the highest angle below 45° and moves downward (where k(theta) is
-      large and statistics are reasonable), then falls back to angles above 45°
-      if no crossing is found below.
+    - **XY**: reported as measured, from the highest-angle (most XY-dominated)
+      sector. For theta near 90° the shell radius already is the in-plane
+      frequency.
+    - **Z**: the sector's period is divided by ``cos(theta)`` to project the
+      shell radius onto the Z axis. The cascade starts from the highest sector
+      below 45° (best statistics) and moves toward the axis. Sectors at or above
+      45° are never used: they are XY-limited, so their band edge says nothing
+      about the axial cutoff, and ``1 / cos(theta)`` would amplify it by up to
+      7x. When no sector below 45° yields a crossing the result is ``nan``.
+
+    Note this projection is purely geometric — it carries no spacing term. An
+    earlier version instead applied the Koho et al. (2019) eq. (5) multiplier
+    ``1 + (z_spacing / xy_spacing - 1) * |cos(theta)|`` here, which both
+    double-counted anisotropy the physical-frequency grid already encodes and
+    used the wrong functional form. ``FourierCorrelationAnalysis`` still exposes
+    ``z_correction`` for callers reproducing miplib numbers.
 
     Parameters
     ----------
@@ -1129,10 +1134,6 @@ def _fsc_extract_resolution(
         Nyquist frequency the FSC frequency axis was normalized by.
     single_image : bool
         Whether single-image mode (for cutoff correction).
-    z_factor : float
-        Anisotropy factor for k(theta) correction (z_spacing / xy_spacing).
-        Only meaningful for isotropically resampled data — a physical-spacing
-        frequency grid already encodes the anisotropy.
     resolution_threshold : str
         Threshold criterion for resolution calculation.
     threshold_value : float
@@ -1152,8 +1153,8 @@ def _fsc_extract_resolution(
 
     angles = sorted(fsc_data.keys())
 
-    def _resolution(cascade: list[int], fit_type: str, z_correction: float) -> float:
-        """Return the first finite resolution along a sector cascade."""
+    def _resolution(cascade: list[int], fit_type: str) -> tuple[float, int | None]:
+        """Return the first finite resolution along a cascade, and its sector."""
         for angle in cascade:
             coll = FourierCorrelationDataCollection()
             coll[angle] = fsc_data[angle]
@@ -1164,21 +1165,40 @@ def _fsc_extract_resolution(
                 threshold_value=threshold_value,
                 curve_fit_type=fit_type,
             )
-            analyzed = analyzer.execute(z_correction=z_correction)
+            analyzed = analyzer.execute()
             if single_image and apply_cutoff:
                 _apply_cutoff_correction(analyzed[angle])
             res = analyzed[angle].resolution["resolution"]
             if np.isfinite(res) and res > 0:
-                return float(res)
-        return float("nan")
+                return float(res), angle
+        return float("nan"), None
 
-    # --- XY: no k(theta) correction, highest-angle (most XY-like) sector first
-    xy_resolution = _resolution(list(reversed(angles)), xy_curve_fit_type, 1.0)
+    # --- XY: highest-angle (most XY-like) sector first, reported as measured
+    xy_resolution, _ = _resolution(list(reversed(angles)), xy_curve_fit_type)
 
-    # --- Z: cascade from the highest angle below 45° downward (best statistics
-    # with significant k(theta)), then fall back to angles above 45°.
-    z_cascade = [a for a in reversed(angles) if a < 45] + [a for a in angles if a >= 45]
-    z_resolution = _resolution(z_cascade, z_curve_fit_type, z_factor)
+    # --- Z: only sectors below 45°, from the highest (best statistics) inward
+    z_cascade = [a for a in reversed(angles) if a < 45]
+    z_measured, z_angle = _resolution(z_cascade, z_curve_fit_type)
+    if z_angle is None:
+        z_resolution = float("nan")
+        if z_cascade:
+            warnings.warn(
+                f"No FSC threshold crossing in any Z-dominated sector "
+                f"{z_cascade}; axial resolution is nan",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        else:
+            warnings.warn(
+                f"angle_delta leaves no sector below 45° (centers {angles}), so "
+                "axial resolution cannot be separated from XY; z is nan",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+    else:
+        # Project the sector's shell radius onto Z: the measured period is
+        # cos(theta) / k_z, and the axial period is 1 / k_z.
+        z_resolution = z_measured / float(np.cos(np.deg2rad(z_angle)))
 
     return {"xy": xy_resolution, "z": z_resolution}
 
@@ -1300,19 +1320,13 @@ def fsc_resolution(
         )
 
     # --- Isotropic resampling (optional) ---
-    # z_factor drives the k(theta) correction and stays 1 unless the volume was
-    # resampled onto isotropic voxels: a physical-spacing frequency grid already
-    # measures Z-dominated shells in cycles per micron, so correcting again
-    # would scale Z by the anisotropy ratio a second time.
-    z_factor = 1.0
-
     if resample_isotropic:
         if spacing is None:
             raise ValueError("resample_isotropic=True requires spacing to be provided")
         spacing_list = _normalize_spacing(spacing, image1.ndim)
         if spacing_list is None:
             raise RuntimeError("_normalize_spacing returned None with non-None spacing")
-        image1, image2, spacing_list, z_factor = _resample_isotropic_for_fsc(
+        image1, image2, spacing_list = _resample_isotropic_for_fsc(
             image1,
             image2,
             spacing_list,  # type: ignore[arg-type]
@@ -1402,7 +1416,6 @@ def fsc_resolution(
                 spacing_list=spacing_list,
                 max_freq=max_freq,
                 single_image=True,
-                z_factor=z_factor,
                 resolution_threshold=resolution_threshold,
                 threshold_value=threshold_value,
                 xy_curve_fit_type=xy_curve_fit_type,
@@ -1448,7 +1461,6 @@ def fsc_resolution(
         spacing_list=spacing_list,
         max_freq=max_freq,
         single_image=single_image,
-        z_factor=z_factor,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         xy_curve_fit_type=xy_curve_fit_type,

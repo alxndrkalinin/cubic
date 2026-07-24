@@ -20,6 +20,7 @@ from cubic.metrics.spectral.frc import (
     _fsc_hist_compute,
     preprocess_images,
     _calibration_factor,
+    _normalization_spacing,
     _fsc_extract_resolution,
 )
 from cubic.metrics.spectral.radial import (
@@ -344,11 +345,11 @@ def test_fsc_resolution_single_image(
 def test_fsc_all_sectors_processed(
     cells_volume: tuple[np.ndarray, list[float]],
 ) -> None:
-    """Test that FSC processes all sectors with per-sector k(theta) correction.
+    """Test that FSC reports both directions from the sectioned data.
 
-    Following Koho et al. 2019: all sectors are analyzed at once with k(theta)
-    correction applied internally.  XY is read from the most XY-dominated
-    sector; Z from the most Z-dominated sector that crosses the threshold.
+    XY is read from the most XY-dominated sector as measured; Z from the highest
+    sector below 45 degrees that crosses the threshold, projected onto the Z
+    axis (see :func:`_fsc_extract_resolution`).
     """
     volume, spacing = cells_volume
 
@@ -369,6 +370,144 @@ def test_fsc_all_sectors_processed(
     # Z may or may not be finite depending on data, but if finite must be positive
     if np.isfinite(result["z"]):
         assert result["z"] > 0, "Z resolution should be positive when finite"
+
+
+def _axially_band_limited_pair(
+    shape: tuple[int, int, int] = (64, 64, 64),
+    spacing: tuple[float, float, float] = (0.5, 0.19, 0.19),
+    kz_cut: float = 0.5,
+    kxy_cut: float = 1.5,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return two noisy views of a volume with an exact axial frequency cutoff.
+
+    The object's Fourier support is an ideal box: zero beyond ``kz_cut`` along Z
+    and beyond ``kxy_cut`` in XY, both in physical cycles per unit. Two
+    independent noise realizations therefore correlate only inside that box, so
+    the true axial resolution is exactly the period at the cutoff, ``1 / kz_cut``.
+    """
+    rng = np.random.default_rng(seed)
+    kz = np.fft.fftfreq(shape[0], d=spacing[0])
+    ky = np.fft.fftfreq(shape[1], d=spacing[1])
+    kx = np.fft.fftfreq(shape[2], d=spacing[2])
+    KZ, KY, KX = np.meshgrid(kz, ky, kx, indexing="ij")
+    band = (np.abs(KZ) <= kz_cut) & (np.sqrt(KY**2 + KX**2) <= kxy_cut)
+
+    obj = np.real(np.fft.ifftn(np.fft.fftn(rng.normal(size=shape)) * band))
+    obj = (obj - obj.mean()) / obj.std()
+    image1 = (obj + rng.normal(0, 1.0, shape)).astype(np.float32)
+    image2 = (obj + rng.normal(0, 1.0, shape)).astype(np.float32)
+    return image1, image2
+
+
+def test_sectioned_fsc_projects_z_onto_the_axis() -> None:
+    """The reported z is the sector's shell radius divided by cos(theta).
+
+    A sector centred on theta measures ``|k| = k_z / cos(theta)``, not ``k_z``,
+    and the cascade normally reports the 38-degree sector -- so the raw sector
+    period understates the axial period by ``cos(theta)``. Against a volume with
+    an exact axial cutoff at 0.5 cycles/um (true axial period 2.0 um), the
+    unprojected number read 1.369 um (1.46x too fine); the old Koho eq. (5)
+    multiplier ``1 + (spacing_z/spacing_xy - 1)|cos(theta)|`` read 3.13 um
+    (1.56x too coarse).
+    """
+    spacing = (0.5, 0.19, 0.19)
+    kz_cut = 0.5
+    image1, image2 = _axially_band_limited_pair(spacing=spacing, kz_cut=kz_cut)
+
+    result = fsc_resolution(
+        image1, image2, spacing=list(spacing), angle_delta=15, use_max_nyquist=True
+    )
+
+    # Per-sector crossings, uncorrected, so the projection can be pinned exactly.
+    fsc_data, max_freq = _fsc_hist_compute(
+        image1,
+        image2,
+        bin_delta=1,
+        angle_delta=15,
+        spacing_list=list(spacing),
+        exclude_axis_angle=0.0,
+        use_max_nyquist=True,
+        zero_padding=False,
+        average=False,
+    )
+    spacing_eff = _normalization_spacing(max_freq)
+    per_sector: dict[int, float] = {}
+    for angle in sorted(fsc_data):
+        coll = FourierCorrelationDataCollection()
+        coll[angle] = fsc_data[angle]
+        analyzed = FourierCorrelationAnalysis(
+            coll,
+            spacing_eff,
+            resolution_threshold="fixed",
+            threshold_value=0.143,
+            curve_fit_type="smooth-spline",
+        ).execute()
+        res = analyzed[angle].resolution["resolution"]
+        if np.isfinite(res) and res > 0:
+            per_sector[angle] = float(res)
+
+    # The cascade takes the highest sector below 45 degrees that crossed.
+    reporting = max(a for a in per_sector if a < 45)
+    expected = per_sector[reporting] / np.cos(np.deg2rad(reporting))
+    assert result["z"] == pytest.approx(expected, rel=1e-6)
+    # Guard against the projection silently becoming a no-op.
+    assert expected > per_sector[reporting] * 1.05
+
+    # Physical check: within the threshold-crossing bias of the true 2.0 um.
+    # Unprojected this ratio is 0.685, and with the old z_factor it is 1.56.
+    assert 0.78 <= result["z"] / (1.0 / kz_cut) <= 1.15
+
+
+def _single_bin_sector(crosses: bool) -> FourierCorrelationData:
+    """Return one sector's curve, either decaying through 0.143 or staying above."""
+    freq = np.linspace(0, 1, 50)
+    ds = FourierCorrelationData()
+    ds.correlation["correlation"] = (
+        np.maximum(1.0 - 2.0 * freq, -0.1) if crosses else np.full_like(freq, 0.9)
+    )
+    ds.correlation["frequency"] = freq
+    ds.correlation["points-x-bin"] = np.ones(50)
+    return ds
+
+
+def test_sectioned_fsc_never_reports_z_from_an_xy_sector() -> None:
+    """When no sector below 45 degrees crosses, z is nan rather than an XY number.
+
+    Sectors at or above 45 degrees are XY-limited: their band edge is set by the
+    in-plane cutoff, so it carries no axial information, and dividing by
+    ``cos(82 degrees)`` would inflate it 7x. The cascade used to fall back to
+    them, silently reporting an in-plane number as the axial resolution.
+    """
+    fsc_data = {
+        angle: _single_bin_sector(crosses=angle >= 45)
+        for angle in (8, 22, 38, 52, 68, 82)
+    }
+
+    with pytest.warns(RuntimeWarning, match="No FSC threshold crossing"):
+        result = _fsc_extract_resolution(
+            fsc_data,
+            spacing_list=[0.5, 0.19, 0.19],
+            max_freq=2.6316,
+            single_image=False,
+            resolution_threshold="fixed",
+            threshold_value=0.143,
+        )
+
+    assert np.isnan(result["z"])
+    # The XY sectors did cross, so xy is still reported.
+    assert np.isfinite(result["xy"]) and result["xy"] > 0
+
+
+def test_sectioned_fsc_rejects_a_single_sector() -> None:
+    """angle_delta=90 gives one sector, which cannot separate Z from XY.
+
+    Previously this produced a number: the lone 0-90 degree sector was reported
+    as both xy and z.
+    """
+    image1, image2 = _axially_band_limited_pair(shape=(32, 32, 32))
+    with pytest.raises(ValueError, match="required to separate XY from Z"):
+        fsc_resolution(image1, image2, angle_delta=90)
 
 
 def test_z_correction_at_boundary_angles() -> None:
@@ -1028,7 +1167,6 @@ def test_fsc_resolution_inverts_its_own_frequency_axis() -> None:
         spacing_list=spacing,
         max_freq=max_freq,
         single_image=False,
-        z_factor=1.0,
         resolution_threshold="fixed",
         threshold_value=0.143,
     )
