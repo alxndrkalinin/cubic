@@ -9,12 +9,25 @@ from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
 from cubic.skimage import filters
-from cubic.metrics.spectral import calculate_frc, frc_resolution, fsc_resolution
-from cubic.metrics.spectral.frc import preprocess_images, _calibration_factor
+from cubic.metrics.spectral import (
+    calculate_frc,
+    frc_resolution,
+    fsc_resolution,
+    five_crop_resolution,
+    grid_crop_resolution,
+)
+from cubic.metrics.spectral.frc import (
+    _fsc_hist_compute,
+    preprocess_images,
+    _calibration_factor,
+    _fsc_extract_resolution,
+)
+from cubic.metrics.spectral.radial import _kmax_phys
 from cubic.metrics.spectral.analysis import (
     FourierCorrelationData,
     FourierCorrelationAnalysis,
     FourierCorrelationDataCollection,
+    calculate_resolution_threshold_curve,
 )
 
 
@@ -401,18 +414,6 @@ def test_z_correction_at_boundary_angles() -> None:
         )
 
 
-def test_backward_compat_shim() -> None:
-    """Verify backward-compatibility imports from cubic.metrics.frc still work."""
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        from cubic.metrics.frc import frc_resolution, fsc_resolution
-
-    assert callable(frc_resolution)
-    assert callable(fsc_resolution)
-
-
 # ---------- Binomial split FRC/FSC tests ----------
 
 
@@ -589,7 +590,6 @@ def test_fsc_binomial_basic() -> None:
     rate += 20.0
     vol = rng.poisson(rate).astype(np.float32)
 
-    # Use physical spacing different from 1.0 to avoid the index-unit ambiguity
     result = fsc_resolution(
         vol,
         spacing=[0.5, 0.5, 0.5],
@@ -828,3 +828,336 @@ def test_resolution_returns_nan_when_curve_below_threshold() -> None:
     assert np.isfinite(res_legit) and 0 < res_legit < 100, (
         f"Legitimate crossing must yield finite reasonable resolution, got {res_legit}"
     )
+
+
+# ---------- Regression tests ----------
+
+
+def _band_limited_volume(
+    shape: tuple[int, int, int] = (16, 300, 300),
+    sigma: tuple[float, float, float] = (2.0, 4.0, 4.0),
+    seed: int = 5,
+) -> np.ndarray:
+    """Smoothed Poisson noise: broadband structure with a clear FRC crossing."""
+    rng = np.random.default_rng(seed)
+    vol = filters.gaussian(
+        rng.normal(size=shape).astype(np.float32), sigma=sigma, preserve_range=True
+    )
+    vol = (vol - vol.min()) / (vol.max() - vol.min()) * 200.0
+    return rng.poisson(vol).astype(np.float32)
+
+
+@pytest.mark.parametrize("crop_fn", [five_crop_resolution, grid_crop_resolution])
+def test_crop_resolution_returns_per_slice_floats(crop_fn: Any) -> None:
+    """Tiled resolution helpers must return scalars, not crash on 2D slices.
+
+    Regression guard: both helpers fed 2D slices (``loc_image.max(0)`` and
+    ``loc_image[i]``) to the 3D-only ``fsc_resolution``, which raised
+    ``IndexError: tuple index out of range`` while unpacking a third axis, and
+    would then have handed dicts to ``np.median(..., axis=0)``.
+    """
+    volume = _band_limited_volume()
+    result = crop_fn(volume, spacing=(0.2, 0.065, 0.065), crop_size=128)
+
+    assert set(result) == {"max_projection", "xy", "xz"}
+    # One aggregated value for the projection, one per Z plane for the slices.
+    assert np.ndim(result["max_projection"]) == 0
+    assert np.asarray(result["xy"]).shape == (volume.shape[0],)
+    assert np.asarray(result["xz"]).shape == (volume.shape[0],)
+
+    assert np.isfinite(result["max_projection"]) and result["max_projection"] > 0
+    for key, floor in (("xy", 2 * 0.065), ("xz", 2 * 0.2)):
+        values = np.asarray(result[key], dtype=float)
+        assert np.all(np.isfinite(values)), f"{key} has non-finite entries: {values}"
+        # A raw crossing gives 1 / (f_c * kmax) >= 2 * spacing, but the
+        # single-image checkerboard estimate is then divided by the empirical
+        # calibration factor, which exceeds 1 for crossings at the band edge.
+        assert np.all(values >= floor / _calibration_factor(1.0)), (
+            f"{key} values implausibly below the {floor} um floor: {values}"
+        )
+        assert np.median(values) >= floor, f"{key} median below {floor} um: {values}"
+
+
+@pytest.mark.parametrize("crop_fn", [five_crop_resolution, grid_crop_resolution])
+def test_crop_resolution_measures_xz_slices_unpadded(
+    crop_fn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """XZ slices must reach the FRC at their native rectangular shape.
+
+    They used to be reflect-padded along Z up to ``crop_size``, replicating the
+    real data 2-16x; both checkerboard halves then stayed near-identical and the
+    FRC curve never descended through the threshold, so ``xz`` came back NaN for
+    most slices and inflated ~4x for the rest.
+    """
+    from cubic.metrics.spectral import frc as frc_mod
+
+    seen: list[tuple[int, ...]] = []
+    real_frc_resolution = frc_mod.frc_resolution
+
+    def recording_frc_resolution(image: np.ndarray, *args: Any, **kwargs: Any) -> float:
+        seen.append(image.shape)
+        return real_frc_resolution(image, *args, **kwargs)
+
+    monkeypatch.setattr(frc_mod, "frc_resolution", recording_frc_resolution)
+
+    n_z = 32
+    volume = _band_limited_volume(shape=(n_z, 300, 300))
+    crop_fn(volume, spacing=(0.2, 0.065, 0.065), crop_size=128)
+
+    # XY planes and the max projection are square; XZ slices keep (n_z, 128).
+    assert (n_z, 128) in seen, f"no XZ slice was measured unpadded, saw {set(seen)}"
+    assert all(shape in {(128, 128), (n_z, 128)} for shape in seen), (
+        f"unexpected slice shapes: {sorted(set(seen))}"
+    )
+
+
+@pytest.mark.parametrize("n_z", [8, 32])
+@pytest.mark.parametrize("crop_fn", [five_crop_resolution, grid_crop_resolution])
+def test_crop_resolution_xz_is_measurable(crop_fn: Any, n_z: int) -> None:
+    """Most XZ slices must yield a finite resolution above the 2*spacing_z floor.
+
+    Guards the padding removal at several Z depths: with reflect padding the
+    replication factor was crop_size / n_z, so the shallower the stack the more
+    thoroughly the FRC curve was flattened — per-slice XZ came back NaN for
+    almost every slice and the plain-median aggregate was NaN too. A shape-only
+    check cannot catch that; this asserts the values themselves.
+    """
+    spacing = (0.2, 0.065, 0.065)
+    volume = _band_limited_volume(shape=(n_z, 300, 300))
+
+    per_slice = np.asarray(
+        crop_fn(volume, spacing=spacing, crop_size=128, aggregate=None)["xz"],
+        dtype=float,
+    )
+    finite = np.isfinite(per_slice)
+    assert finite.mean() > 0.5, (
+        f"only {finite.sum()}/{finite.size} XZ slices are measurable at Z={n_z}"
+    )
+    floor = 2 * spacing[0]
+    assert np.median(per_slice[finite]) >= floor
+
+    # The default nan-aware aggregate must not be poisoned by the NaN slices.
+    aggregated = np.asarray(
+        crop_fn(volume, spacing=spacing, crop_size=128)["xz"], float
+    )
+    assert np.all(np.isfinite(aggregated))
+    assert np.all(aggregated >= floor / _calibration_factor(1.0))
+    assert np.median(aggregated) >= floor
+
+
+def _anisotropic_volume() -> tuple[np.ndarray, list[float]]:
+    """Anisotropic blob volume with spacing whose Z Nyquist is the limit."""
+    rng = np.random.default_rng(0)
+    zz, yy, xx = np.meshgrid(
+        np.arange(32), np.arange(128), np.arange(128), indexing="ij", copy=False
+    )
+    vol = np.exp(
+        -(
+            (zz - 16) ** 2 / (2 * 4.0**2)
+            + (yy - 64) ** 2 / (2 * 8.0**2)
+            + (xx - 64) ** 2 / (2 * 8.0**2)
+        )
+    )
+    vol += 0.01 * rng.normal(size=vol.shape)
+    return vol.astype(np.float32), [0.2, 0.065, 0.065]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"use_max_nyquist": True},
+        {"resample_isotropic": True},
+    ],
+)
+def test_fsc_resolution_respects_two_pixel_floor(kwargs: dict[str, Any]) -> None:
+    """Sectioned FSC must never report a resolution below the sampling limit.
+
+    Regression guard for the Nyquist mismatch: ``_calculate_fsc_sectioned_hist``
+    normalizes the frequency axis by the *minimum* Nyquist (Z), but the analyzer
+    was handed the XY spacing, which it inverts as ``2 * spacing / root``. On
+    (32, 128, 128) at [0.2, 0.065, 0.065] that reported XY = 0.1225 µm — below
+    the 2 * 0.065 µm pixel floor, so physically impossible.
+    """
+    volume, spacing = _anisotropic_volume()
+    result = fsc_resolution(volume, spacing=spacing, angle_delta=15, **kwargs)
+
+    floor_xy = 2 * spacing[2]
+    assert np.isfinite(result["xy"]), "XY resolution should be measurable"
+    assert result["xy"] >= floor_xy, (
+        f"XY resolution {result['xy']:.4f} is below the {floor_xy} µm pixel floor"
+    )
+    if np.isfinite(result["z"]):
+        assert result["z"] >= floor_xy
+
+
+def test_fsc_resolution_inverts_its_own_frequency_axis() -> None:
+    """Reported resolution must equal ``1 / (f_c * max_freq)``.
+
+    Two-image mode skips the checkerboard calibration factor, so the conversion
+    from the crossing frequency is exact and the Nyquist used for normalization
+    must be the one used for inversion.
+    """
+    volume, spacing = _anisotropic_volume()
+    rng = np.random.default_rng(7)
+    # Independent noise well above the signal's high-frequency content, so the
+    # FSC actually falls through the threshold within the measured range.
+    vol_a = volume + 0.3 * rng.normal(size=volume.shape)
+    vol_b = volume + 0.3 * rng.normal(size=volume.shape)
+
+    fsc_data, max_freq = _fsc_hist_compute(
+        vol_a,
+        vol_b,
+        bin_delta=1,
+        angle_delta=45,
+        spacing_list=spacing,
+        exclude_axis_angle=0.0,
+        use_max_nyquist=False,
+        zero_padding=False,
+        average=True,
+    )
+    assert max_freq == pytest.approx(_kmax_phys(vol_a.shape, spacing))
+
+    result = _fsc_extract_resolution(
+        fsc_data,
+        spacing_list=spacing,
+        max_freq=max_freq,
+        single_image=False,
+        z_factor=1.0,
+        resolution_threshold="fixed",
+        threshold_value=0.143,
+    )
+
+    # Re-derive the XY crossing frequency independently.
+    xy_angle = max(fsc_data)
+    coll = FourierCorrelationDataCollection()
+    coll[xy_angle] = fsc_data[xy_angle]
+    analyzed = FourierCorrelationAnalysis(
+        coll,
+        1.0 / (2.0 * max_freq),
+        resolution_threshold="fixed",
+        threshold_value=0.143,
+        curve_fit_type="smooth-spline",
+    ).execute(z_correction=1)[xy_angle]
+    f_c = analyzed.resolution["resolution-point"][1]
+
+    assert np.isfinite(f_c)
+    assert result["xy"] == pytest.approx(1.0 / (f_c * max_freq), rel=1e-6)
+
+
+@pytest.mark.parametrize("backend", ["mask", "hist"])
+def test_frc_spacing_one_matches_index_units(backend: str) -> None:
+    """``spacing=1.0`` must behave exactly like ``spacing=None``.
+
+    Regression guard: ``radial_bin_id`` treated an all-ones spacing as None and
+    switched to index units while ``radial_edges`` stayed in physical units, so
+    ``np.digitize`` clipped every non-DC voxel into the last bin — the hist
+    backend returned NaN for ``spacing=1.0`` and a valid number for None.
+    """
+    volume, _ = _anisotropic_volume()
+    image = volume[16]
+
+    res_one = frc_resolution(image, spacing=1.0, backend=backend)
+    res_none = frc_resolution(image, spacing=None, backend=backend)
+
+    assert np.isfinite(res_one), "spacing=1.0 must yield a finite resolution"
+    assert res_one == pytest.approx(res_none, rel=1e-9)
+
+
+@pytest.mark.parametrize("backend", ["mask", "hist"])
+def test_frc_frequency_axis_reaches_nyquist_on_non_square_input(backend: str) -> None:
+    """The FRC frequency axis must span [0, 1] regardless of aspect ratio.
+
+    Normalizing by ``shape[0] // 2`` compressed the axis for non-square input
+    (shape (128, 64) reached only 0.48), halving every crossing frequency and so
+    doubling the reported resolution.
+    """
+    volume, _ = _anisotropic_volume()
+    image = volume[16][:, :64]
+
+    result = calculate_frc(
+        image, spacing=1.0, backend=backend, zero_padding=False, bin_delta=1
+    )
+    freq = np.asarray(result.correlation["frequency"])
+    assert freq.max() > 0.95, f"frequency axis stops at {freq.max():.3f}"
+    assert freq.max() <= 1.0
+
+
+def test_frc_backends_agree_on_non_square_input() -> None:
+    """Both backends must land on the same axis for non-square input."""
+    volume, _ = _anisotropic_volume()
+    image = volume[16][:, :64]
+    kwargs: dict[str, Any] = dict(spacing=1.0, zero_padding=False, bin_delta=1)
+
+    res_mask = frc_resolution(image, backend="mask", **kwargs)
+    res_hist = frc_resolution(image, backend="hist", **kwargs)
+    assert res_mask == pytest.approx(res_hist, rel=0.02)
+
+
+@pytest.mark.parametrize("angle_delta", [20, 100, 0, -15])
+@pytest.mark.parametrize("backend", ["mask", "hist"])
+def test_fsc_rejects_angle_delta_not_dividing_90(
+    angle_delta: int, backend: str
+) -> None:
+    """``n_angle = 90 // angle_delta`` truncated non-divisors silently.
+
+    An angle_delta of 20 folded the leftover 80-90 degree wedge into the last
+    sector; anything above 90 produced zero sectors and NaN resolutions.
+    """
+    volume, spacing = _anisotropic_volume()
+    with pytest.raises(ValueError, match="angle_delta"):
+        fsc_resolution(
+            volume, spacing=spacing, angle_delta=angle_delta, backend=backend
+        )
+
+
+def test_threshold_curve_does_not_mutate_stored_points() -> None:
+    """Computing a threshold curve must not patch the stored FRC data."""
+    data_set = FourierCorrelationData()
+    points = np.array([10.0, 20.0, 30.0, 0.0])
+    data_set.correlation["frequency"] = np.linspace(0.1, 1.0, 4)
+    data_set.correlation["correlation"] = np.linspace(1.0, 0.0, 4)
+    data_set.correlation["points-x-bin"] = points
+
+    calculate_resolution_threshold_curve(data_set, "one-bit", 0.143, 7.0)
+
+    np.testing.assert_array_equal(
+        data_set.correlation["points-x-bin"], [10.0, 20.0, 30.0, 0.0]
+    )
+    np.testing.assert_array_equal(points, [10.0, 20.0, 30.0, 0.0])
+
+
+def test_data_collection_iteration_is_restartable() -> None:
+    """A broken-out-of iteration must not leave the collection half-consumed.
+
+    The shared ``iter_index`` was only reset on ``StopIteration``, so any
+    ``break`` made the next loop start mid-collection.
+    """
+    coll = FourierCorrelationDataCollection()
+    for key in (0, 45, 90):
+        coll[key] = FourierCorrelationData()
+
+    for _ in coll:
+        break
+
+    assert [key for key, _ in coll] == ["0", "45", "90"]
+    # Nested iteration must be independent too.
+    pairs = [(a, b) for a, _ in coll for b, _ in coll]
+    assert len(pairs) == 9
+
+
+@pytest.mark.skipif(not _gpu_available(), reason="requires a CUDA GPU")
+def test_sectioned_fsc_matches_between_devices() -> None:
+    """The sectioned hist backend must give identical results on CPU and GPU.
+
+    Covers the device handling in ``_calculate_fsc_sectioned_hist``, where the
+    radial and angular edges are built on the host and moved to the input's
+    device.
+    """
+    volume, spacing = _anisotropic_volume()
+
+    res_cpu = fsc_resolution(volume, spacing=spacing, angle_delta=15)
+    res_gpu = fsc_resolution(ascupy(volume), spacing=spacing, angle_delta=15)
+
+    for key in ("xy", "z"):
+        assert res_cpu[key] == pytest.approx(res_gpu[key], rel=1e-9, nan_ok=True)

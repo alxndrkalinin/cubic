@@ -101,7 +101,8 @@ ring correlation." *Optics Express* 32(12):21767, 2024.
 
 - `frc.py` — FRC (2D) and FSC (3D) implementations
 - `dcr.py` — DCR following Descloux et al. 2019
-- `radial.py` — Shared radial binning utilities
+- `radial.py` — Shared radial binning utilities and per-bin reducers
+- `iterators.py` — Fourier ring/shell mask iterators (`backend="mask"`)
 - `analysis.py` — Curve fitting and resolution extraction
 - `plot.py` — Plotting utilities (requires matplotlib)
 

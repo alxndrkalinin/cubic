@@ -56,37 +56,11 @@
 
 """Utilities for Fourier ring and shell correlation analysis."""
 
-from argparse import Namespace
+import warnings
 
 import numpy as np
 import scipy.optimize as optimize
 from scipy.interpolate import UnivariateSpline, interp1d
-
-
-def get_frc_options(
-    bin_delta: int = 1,
-    angle_delta: int = 15,
-    extract_angle_delta: float = 0.1,
-    resolution_threshold: str = "fixed",
-    curve_fit_type: str = "spline",
-    smoothing_factor: float = 0.05,
-    disable_hamming: bool = False,
-    verbose: bool = False,
-) -> Namespace:
-    """Return a :class:`argparse.Namespace` with common FRC/FSC parameters."""
-    return Namespace(
-        d_bin=bin_delta,
-        d_angle=angle_delta,
-        d_extract_angle=extract_angle_delta,
-        disable_hamming=disable_hamming,
-        resolution_threshold_criterion=resolution_threshold,
-        resolution_threshold_value=0.143,
-        resolution_snr_value=7.0,
-        frc_curve_fit_degree=3,
-        frc_curve_fit_type=curve_fit_type,
-        smoothing_factor=smoothing_factor,
-        verbose=verbose,
-    )
 
 
 class FixedDictionary(object):
@@ -137,8 +111,6 @@ class FourierCorrelationDataCollection(object):
         """Create an empty collection."""
         self._data = {}
 
-        self.iter_index = 0
-
     def __setitem__(self, key, value):
         """Store ``value`` under integer ``key``."""
         assert isinstance(key, (int, np.integer))
@@ -151,19 +123,13 @@ class FourierCorrelationDataCollection(object):
         return self._data[str(key)]
 
     def __iter__(self):
-        """Return iterator over stored datasets."""
-        return self
+        """Return a fresh iterator over the stored ``(key, value)`` pairs.
 
-    def __next__(self):
-        """Return next ``(key, value)`` pair."""
-        try:
-            item = list(self._data.items())[self.iter_index]
-        except IndexError:
-            self.iter_index = 0
-            raise StopIteration
-
-        self.iter_index += 1
-        return item
+        Safe to use while :meth:`FourierCorrelationAnalysis.execute` reassigns
+        datasets mid-loop: ``__setitem__`` only overwrites existing keys, so the
+        dict never changes size during iteration.
+        """
+        return iter(self._data.items())
 
     def __len__(self):
         """Return number of stored datasets."""
@@ -177,15 +143,9 @@ class FourierCorrelationDataCollection(object):
         """Return a list of ``(key, value)`` pairs."""
         return list(self._data.items())
 
-    def nitems(self):
-        """Alias for :func:`__len__`."""
-        return len(self._data)
-
 
 class FourierCorrelationData(object):
     """Container for Fourier correlation data."""
-
-    # todo: the dictionary format here is a bit clumsy. Maybe change to a simpler structure
 
     def __init__(self, data=None):
         """Initialise the data structure with optional ``data`` mapping."""
@@ -222,8 +182,6 @@ def fit_frc_curve(data_set, degree, fit_type="spline", smoothing_factor=0.05):
     if fit_type == "smooth-spline":
         equation = UnivariateSpline(data_set.correlation["frequency"], data)
         equation.set_smoothing_factor(smoothing_factor)
-        # equation = interp1d(data_set.correlation["frequency"],
-        #                     data, kind='slinear')
 
     elif fit_type == "spline":
         equation = interp1d(
@@ -243,7 +201,10 @@ def fit_frc_curve(data_set, degree, fit_type="spline", smoothing_factor=0.05):
         )
         equation = np.poly1d(coeff)
     else:
-        raise AttributeError(fit_type)
+        raise ValueError(
+            f"Unknown fit_type {fit_type!r}; expected 'smooth-spline', "
+            "'spline' or 'polynomial'"
+        )
 
     data_set.correlation["curve-fit"] = equation(data_set.correlation["frequency"])
 
@@ -261,7 +222,9 @@ def calculate_resolution_threshold_curve(data_set, criterion, threshold, snr):
     """Compute resolution threshold curve for a given criterion."""
     assert isinstance(data_set, FourierCorrelationData)
 
-    points_x_bin = data_set.correlation["points-x-bin"]
+    # Copy: patching the empty trailing bin below must not corrupt the stored
+    # FRC data as a side effect of computing a threshold curve.
+    points_x_bin = np.array(data_set.correlation["points-x-bin"], copy=True)
 
     if points_x_bin[-1] == 0:
         points_x_bin[-1] = points_x_bin[-2]
@@ -282,16 +245,17 @@ def calculate_resolution_threshold_curve(data_set, criterion, threshold, snr):
         )
 
     elif criterion == "fixed":
-        points = threshold * np.ones(len(data_set.correlation["points-x-bin"]))
+        points = np.full(points_x_bin.shape, threshold)
     elif criterion == "snr":
         points = calculate_snr_threshold_value(points_x_bin, snr)
 
     else:
-        raise AttributeError()
+        raise ValueError(
+            f"Unknown resolution threshold criterion {criterion!r}; expected "
+            "'one-bit', 'half-bit', 'three-sigma', 'fixed' or 'snr'"
+        )
 
     if criterion != "fixed":
-        # coeff = np.polyfit(data_set.correlation["frequency"], points, 3)
-        # equation = np.poly1d(coeff)
         equation = interp1d(
             data_set.correlation["frequency"],
             points,
@@ -362,6 +326,14 @@ class FourierCorrelationAnalysis(object):
 
         return self.data_collection
 
+    def _no_resolution(self, data_set, criterion):
+        """Mark *data_set* as having no measurable resolution (NaN, not inf)."""
+        data_set.resolution["resolution-point"] = (np.nan, np.nan)
+        data_set.resolution["criterion"] = criterion
+        data_set.resolution["resolution"] = np.nan
+        data_set.resolution["spacing"] = self.spacing
+        return data_set
+
     def _process_dataset(
         self,
         key,
@@ -378,6 +350,22 @@ class FourierCorrelationAnalysis(object):
         """Process a single dataset and return updated data."""
         if verbose:
             print(f"Calculating resolution point for dataset {key}")
+
+        # Every fit type needs at least 4 points (a cubic spline or polynomial
+        # needs m > k). Fewer means the data has almost no populated frequency
+        # bins — a strongly anisotropic slice whose min-Nyquist circle covers
+        # little of the sampled k-plane, for instance. There is no resolution to
+        # measure, but it is worth saying so rather than letting FITPACK raise.
+        n_bins = len(data_set.correlation["frequency"])
+        if n_bins < 4:
+            warnings.warn(
+                f"Dataset {key} has only {n_bins} populated frequency bin(s); "
+                "too few to fit a resolution curve. Reporting NaN — check the "
+                "spacing and shape, or widen bin_delta.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return self._no_resolution(data_set, criterion)
 
         frc_eq = fit_frc_curve(data_set, degree, fit_type, smoothing_factor)
         two_sigma_eq = calculate_resolution_threshold_curve(
@@ -420,11 +408,7 @@ class FourierCorrelationAnalysis(object):
 
         # Handle case where correlation never crosses threshold
         if fit_start is None:
-            data_set.resolution["resolution-point"] = (np.nan, np.nan)
-            data_set.resolution["criterion"] = criterion
-            data_set.resolution["resolution"] = np.nan
-            data_set.resolution["spacing"] = self.spacing
-            return data_set
+            return self._no_resolution(data_set, criterion)
 
         if verbose:
             print(f"Fit starts at {fit_start}")
@@ -440,11 +424,7 @@ class FourierCorrelationAnalysis(object):
         # produce spurious threshold crossings). Resolution = 2*spacing/root
         # blows up for root ≈ 0 and is meaningless for root < 0 or root > 1.
         if not (freqs[0] <= root <= freqs[-1]):
-            data_set.resolution["resolution-point"] = (np.nan, np.nan)
-            data_set.resolution["criterion"] = criterion
-            data_set.resolution["resolution"] = np.nan
-            data_set.resolution["spacing"] = self.spacing
-            return data_set
+            return self._no_resolution(data_set, criterion)
 
         data_set.resolution["resolution-point"] = (frc_eq(root), root)
         data_set.resolution["criterion"] = criterion

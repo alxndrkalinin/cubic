@@ -16,7 +16,14 @@ from .radial import (
     _kmax_phys_max,
     sectioned_bin_id,
     _normalize_spacing,
+    _validate_angle_delta,
 )
+
+# Peak-detection tuning from Descloux et al. 2019, Supplementary Note 1.1.
+# Not exposed: no caller has needed to tune them, and they only make sense
+# together with the boundary/prominence logic in _find_peak_in_curve.
+_PEAK_MIN_PROMINENCE = 0.001
+_PEAK_BOUNDARY_THRESHOLD = 0.8
 
 
 def _preprocess_dcr_image(image: np.ndarray, windowing: bool = True) -> np.ndarray:
@@ -39,18 +46,26 @@ def _kc_to_resolution(k_c_norm: float, k_max: float) -> float:
     Parameters
     ----------
     k_c_norm : float
-        Normalized cutoff frequency (0-1 range).
+        Normalized cutoff frequency (0-1 range). ``_find_peak_in_curve`` returns
+        0 when the decorrelation curve has no interior peak — it rises all the
+        way to the edge of the measured range, which happens when the data stays
+        correlated out to the sampling limit (barely-smoothed noise along a
+        short axis, for instance).
     k_max : float
         Maximum physical frequency (Nyquist limit).
 
     Returns
     -------
     float
-        Physical resolution = 1 / (k_c_norm * k_max), or inf if either is zero.
+        Physical resolution ``1 / (k_c_norm * k_max)``, or NaN when no cutoff
+        frequency was found. NaN rather than inf: there is no measurement, and
+        inf would claim infinitely poor resolution while also reading as a
+        divide-by-zero escaping. This matches the FRC/FSC convention, where a
+        curve that never crosses the threshold also yields NaN.
     """
     if k_c_norm > 0 and k_max > 0:
         return 1.0 / (k_c_norm * k_max)
-    return float("inf")
+    return float("nan")
 
 
 def _refinement_ranges(
@@ -69,8 +84,11 @@ def _refinement_ranges(
     ----------
     peaks : np.ndarray, shape (N, 2)
         Array of [r_peak, amplitude] pairs from the coarse pass.
-    sigmas : np.ndarray
-        High-pass sigma array used in the coarse pass.
+    sigmas : np.ndarray, shape (N,)
+        The high-pass sigma that produced each peak, ascending. Peak ``i`` must
+        come from ``sigmas[i]``: the anchor indices below are used to look up
+        neighbouring sigmas, so a misaligned or unsorted array silently returns
+        an inverted range.
     r_max_pad : float
         Padding added above the maximum peak frequency for the refined range.
 
@@ -78,6 +96,12 @@ def _refinement_ranges(
     -------
     (r_min, r_max, sigma_min, sigma_max) or None if no valid peaks exist.
     """
+    if len(peaks) != len(sigmas):
+        raise ValueError(
+            f"peaks ({len(peaks)}) and sigmas ({len(sigmas)}) must be aligned "
+            "one-to-one"
+        )
+
     r_peaks = peaks[:, 0]
     a_peaks = peaks[:, 1]
     valid = r_peaks > 0
@@ -95,17 +119,11 @@ def _refinement_ranges(
     r_min = max(0.0, min(kc_gm, kc_max) - 0.05)
     r_max = min(1.0, max(kc_gm, kc_max) + r_max_pad)
 
-    # Narrow sigma range
+    # Narrow sigma range to the anchors' neighbourhood
     idx_lo = max(0, min(gm_idx, max_idx) - 1)
     idx_hi = max(gm_idx, max_idx)
-    if idx_hi < len(sigmas):
-        sigma_min = float(sigmas[idx_lo])
-        sigma_max = float(sigmas[idx_hi])
-    else:
-        sigma_min = float(sigmas[0]) if len(sigmas) > 0 else 1.0
-        sigma_max = float(sigmas[-1]) if len(sigmas) > 0 else 1.0
 
-    return r_min, r_max, sigma_min, sigma_max
+    return r_min, r_max, float(sigmas[idx_lo]), float(sigmas[idx_hi])
 
 
 def _smooth_curve(d_curve: np.ndarray, window: int | None) -> np.ndarray:
@@ -116,7 +134,9 @@ def _smooth_curve(d_curve: np.ndarray, window: int | None) -> np.ndarray:
     if win % 2 == 0:
         win -= 1
     if win >= 3:
-        return savgol_filter(d_curve, window_length=win, polyorder=3)
+        # scipy requires polyorder < window_length, so a window of 3 caps the
+        # polynomial at order 2.
+        return savgol_filter(d_curve, window_length=win, polyorder=min(3, win - 1))
     return d_curve
 
 
@@ -125,8 +145,6 @@ def _find_peak_in_curve(
     d_curve: np.ndarray,
     r_min: float = 0.0,
     r_max: float = 0.9,
-    min_prominence: float = 0.001,
-    boundary_threshold: float = 0.8,
     min_amplitude: float = 0.0,
 ) -> tuple[float, float]:
     """
@@ -166,13 +184,12 @@ def _find_peak_in_curve(
         # rejected by the boundary check.
         lookahead = max(3, n // 20)
         end_idx = min(peak_idx + lookahead, n)
-        if peak_idx + 1 < end_idx:
-            if np.all(d_curve[peak_idx + 1 : end_idx] >= a_peak):
-                d_work[peak_idx] = -np.inf
-                continue
+        if peak_idx + 1 < end_idx and np.all(d_curve[peak_idx + 1 : end_idx] >= a_peak):
+            d_work[peak_idx] = -np.inf
+            continue
 
         # For peaks near boundary, reject if curve is mostly increasing (>80%)
-        if r_peak > boundary_threshold:
+        if r_peak > _PEAK_BOUNDARY_THRESHOLD:
             valid_start = int(np.searchsorted(radii, r_min))
             if peak_idx > valid_start:
                 diffs = np.diff(d_curve[valid_start : peak_idx + 1])
@@ -183,7 +200,7 @@ def _find_peak_in_curve(
         # Prominence check: peak must exceed subsequent local minimum
         if peak_idx < n - 1:
             prom_end = min(peak_idx + max(10, n // 5), n)
-            if a_peak - np.min(d_curve[peak_idx + 1 : prom_end]) < min_prominence:
+            if a_peak - np.min(d_curve[peak_idx + 1 : prom_end]) < _PEAK_MIN_PROMINENCE:
                 d_work[peak_idx] = -np.inf
                 continue
 
@@ -247,7 +264,8 @@ def dcr_curve(
     Returns
     -------
     resolution : float
-        Estimated resolution (k_c = max of all peak positions)
+        Estimated resolution (k_c = max of all peak positions), or NaN when no
+        decorrelation peak was found — see :func:`_kc_to_resolution`.
     radii : np.ndarray
         Normalized frequency values for mask radii
     all_curves : list of np.ndarray
@@ -281,19 +299,14 @@ def dcr_curve(
 
     # Normalize spacing
     spacing_list = _normalize_spacing(spacing, image.ndim)
-    if spacing_list is not None:
-        spacing_arr = np.array(spacing_list, dtype=np.float32)
-    else:
-        spacing_arr = np.ones(image.ndim, dtype=np.float32)
 
-    # Generate log-spaced high-pass filter sigmas (in pixels)
-    # Following NanoPyx convention: sigma from 0.5 to min(shape)/2
+    # Log-spaced high-pass sigmas from 1.0 px to min(shape)/2, ascending
     sigmas = _generate_highpass_sigmas(image.shape, num_highpass)
 
     # Storage for all curves and peaks
     all_curves = []
     all_peaks = []
-    k_max = None  # Will be set from first call
+    k_max: float | None = None
 
     # Process each high-pass filtered version
     for sigma_hp in sigmas:
@@ -373,8 +386,10 @@ def dcr_curve(
     else:
         k_c_norm = float(np.max(r_peaks))
 
+    # k_max is set by every _compute_decorrelation_curve call above; None would
+    # mean the sigma loop never ran, so there is nothing to convert.
     resolution = (
-        _kc_to_resolution(k_c_norm, k_max) if k_max is not None else float("inf")
+        _kc_to_resolution(k_c_norm, k_max) if k_max is not None else float("nan")
     )
 
     return resolution, radii, all_curves, all_peaks_arr
@@ -484,59 +499,60 @@ def _compute_decorrelation_curve_sectioned(
 
     Uses polar angle from Z axis (0-90°):
     theta ≈ 0° → Z resolution, theta ≈ 90° → XY resolution.
+
+    Only the two extreme sectors are returned: the lowest-angle one (purest
+    Z-dominated) as ``"z"`` and the highest-angle one (purest XY-dominated) as
+    ``"xy"``. A finer *angle_delta* therefore yields purer sectors rather than
+    more keys — the intermediate sectors have no XY/Z interpretation.
     """
     if image.ndim != 3:
         raise ValueError("Sectioned DCR requires 3D images")
 
+    n_angle = _validate_angle_delta(angle_delta, min_sectors=2)
     shape = image.shape
 
+    # Index units and spacing=1.0 are the same thing here: keeping the grid in
+    # cycles per pixel makes k_max 0.5 per axis, matching radial_k_grid and so
+    # the non-sectioned DCR path. Binning in cycles per image instead would
+    # make the reported resolution a fraction of the image extent, off by ~n.
+    spacing_list = [1.0] * 3 if spacing is None else [float(s) for s in spacing]
+
     F = np.fft.fftn(image)
-    absF = np.abs(F)
-    absF_flat = absF.ravel()
+    absF_flat = np.abs(F).ravel()
 
     # Use max Nyquist so radial bins extend to XY frequencies.
     # Per-sector k_max handles the different normalization for Z vs XY.
     r_edges_raw, radii_raw = radial_edges(
         shape,
         bin_delta=bin_delta,
-        spacing=spacing,
+        spacing=spacing_list,
         use_max_nyquist=True,
     )
     n_radial_raw = len(radii_raw)
-    r_edges = to_same_device(r_edges_raw, image)
 
     # Angular edges (polar 0-90°)
-    n_angle = 90 // angle_delta
-    angle_edges_cpu = np.array(
+    angle_edges = np.array(
         [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
     )
-    angle_edges = to_same_device(angle_edges_cpu, image)
 
     # Per-sector k_max for resolution conversion
     # XY sector uses XY-Nyquist (max), Z sector uses Z-Nyquist (min)
-    if spacing is not None:
-        k_max_z = _kmax_phys(shape, spacing)
-        k_max_xy = _kmax_phys_max(shape, spacing)
-    else:
-        k_max_z = min(n // 2 for n in shape)
-        k_max_xy = max(n // 2 for n in shape)
+    k_max_z = _kmax_phys(shape, spacing_list)
+    k_max_xy = _kmax_phys_max(shape, spacing_list)
 
     # Get sectioned bin IDs
     radial_id, angle_id = sectioned_bin_id(
         shape,  # type: ignore[arg-type]
-        r_edges,
-        angle_edges,
-        spacing=list(spacing) if spacing is not None else None,
+        to_same_device(r_edges_raw, image),
+        to_same_device(angle_edges, image),
+        spacing=spacing_list,
         exclude_axis_angle=exclude_axis_angle,
     )
 
     results = {}
 
-    # Process each angular sector
-    # Sectors with center < 45° are Z-dominated, >= 45° are XY-dominated
-    for aid in range(n_angle):
-        center_angle = (aid + 0.5) * angle_delta
-        sector_name = "z" if center_angle < 45 else "xy"
+    # Extreme sectors only: aid 0 is Z-dominated, aid n_angle - 1 XY-dominated
+    for aid, sector_name in ((0, "z"), (n_angle - 1, "xy")):
         sector_k_max = k_max_z if sector_name == "z" else k_max_xy
         sector_mask = (angle_id == aid) & (radial_id >= 0)
 
@@ -628,6 +644,9 @@ def _dcr_curve_3d_sectioned(
     r0 = {}
     all_peaks: dict[str, list[tuple[float, float]]] = {"xy": [], "z": []}
     all_curves: dict[str, list[np.ndarray]] = {"xy": [], "z": []}
+    # Sigma that produced each entry of all_peaks, so _refinement_ranges can
+    # look up neighbouring sigmas by peak index. d₀ is unfiltered → sigma 0.
+    peak_sigmas: dict[str, list[float]] = {"xy": [0.0], "z": [0.0]}
     for sector_name in ["xy", "z"]:
         radii, d_curve, _ = d0_results[sector_name]
         r_peak, a_peak = _find_peak_in_curve(
@@ -663,13 +682,22 @@ def _dcr_curve_3d_sectioned(
             sigma_min=sigma_min_adaptive,
             sigma_max=max(sigma_max_adaptive, sigma_min_adaptive + 0.1),
         )
-        # Prepend extra weak-HP entry (like ImDecorr line 111)
-        sector_sigmas[sector_name] = np.concatenate([[sigma_extra_weak], base_sigmas])
+        # Prepend extra weak-HP entry (like ImDecorr line 111) and sort:
+        # sigma_extra_weak is not the smallest, and _refinement_ranges reads
+        # neighbouring sigmas by index, which only means anything if they
+        # increase monotonically.
+        sector_sigmas[sector_name] = np.sort(
+            np.concatenate([[sigma_extra_weak], base_sigmas]).astype(np.float32)
+        )
 
     # --- Step 3: Coarse pass with adaptive sigmas ---
-    # Use the union of both sector sigma sets
-    all_sigmas_set = set(sector_sigmas["xy"].tolist() + sector_sigmas["z"].tolist())
-    all_sigmas = np.array(sorted(all_sigmas_set), dtype=np.float32)
+    # Sweep the union so each filter/FFT is computed once, but score a sector
+    # only at its own sigmas — evaluating both everywhere would defeat the
+    # per-sector adaptive ranges chosen above.
+    sector_sigma_sets = {
+        name: {float(s) for s in arr} for name, arr in sector_sigmas.items()
+    }
+    all_sigmas = np.unique(np.concatenate([sector_sigmas["xy"], sector_sigmas["z"]]))
 
     for sigma_hp in all_sigmas:
         filtered_image = _highpass_filter(image, sigma_hp)
@@ -678,11 +706,14 @@ def _dcr_curve_3d_sectioned(
             **common_kwargs,  # type: ignore[arg-type]
         )
         for sector_name in ["xy", "z"]:
+            if float(sigma_hp) not in sector_sigma_sets[sector_name]:
+                continue
             radii, d_curve, _ = sector_results[sector_name]
             r_peak, a_peak = _find_peak_in_curve(
                 radii, d_curve, min_amplitude=min_amplitude
             )
             all_peaks[sector_name].append((r_peak, a_peak))
+            peak_sigmas[sector_name].append(float(sigma_hp))
             if return_curves:
                 all_curves[sector_name].append(asnumpy(d_curve))
         del filtered_image
@@ -691,7 +722,7 @@ def _dcr_curve_3d_sectioned(
     if refine:
         for sector_name in ["xy", "z"]:
             peaks = np.array(all_peaks[sector_name])
-            s_arr = sector_sigmas[sector_name]
+            s_arr = np.array(peak_sigmas[sector_name], dtype=np.float32)
             refined = _refinement_ranges(peaks, s_arr, r_max_pad=0.4)
             if refined is None:
                 continue
@@ -712,6 +743,7 @@ def _dcr_curve_3d_sectioned(
                     radii, d_curve, min_amplitude=min_amplitude
                 )
                 all_peaks[sector_name].append((r_peak, a_peak))
+                peak_sigmas[sector_name].append(float(sigma_hp))
                 del filtered
 
     # --- Step 5: Compute resolution for each sector ---
@@ -790,7 +822,8 @@ def dcr_curve_3d_sectioned(
     dict[str, dict]
         Keys ``"xy"`` and ``"z"``, each containing:
 
-        - ``"resolution"`` : float — estimated resolution in physical units
+        - ``"resolution"`` : float — estimated resolution in physical units,
+          or NaN when the sector's curve has no interior peak
         - ``"radii"`` : np.ndarray — normalized frequencies (0..1)
         - ``"curves"`` : list[np.ndarray] — decorrelation curves (d₀ + highpass)
         - ``"peaks"`` : np.ndarray, shape (N, 2) — [r_peak, amplitude] per curve
@@ -914,6 +947,12 @@ def dcr_resolution(
         For 2D: Estimated resolution in physical units (if spacing provided)
         For 3D: Dict with 'xy' and 'z' resolutions
 
+        A direction whose decorrelation curve has no interior peak yields NaN,
+        not a number: the curve rising to the edge of the measured range means
+        the data stays correlated out to the sampling limit, so no cutoff was
+        measured. Axial DCR does this routinely on short Z stacks whose axial
+        content is not band-limited well below the Z Nyquist.
+
     Examples
     --------
     >>> from cubic.metrics.spectral import dcr_resolution
@@ -976,6 +1015,7 @@ def dcr_resolution(
                 num_radii=num_radii,
                 num_highpass=num_highpass,
                 windowing=windowing,
+                refine=refine,
                 quantize=quantize,
                 min_amplitude=min_amplitude,
             )
@@ -990,6 +1030,7 @@ def dcr_resolution(
                 num_radii=num_radii,
                 num_highpass=num_highpass,
                 windowing=windowing,
+                refine=refine,
                 quantize=quantize,
                 min_amplitude=min_amplitude,
             )

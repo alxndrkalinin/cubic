@@ -5,6 +5,7 @@ Requires matplotlib (install with ``pip install cubic[plot]``).
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -47,9 +48,13 @@ def plot_fsc_sectors(
     Parameters
     ----------
     fsc_data : dict
-        Per-sector FSC data from ``_calculate_fsc_sectioned_hist``.
+        Per-sector FSC data — the first element returned by
+        ``_calculate_fsc_sectioned_hist``.
     spacing_iso : float
-        Isotropic spacing in physical units (used for resolution calculation).
+        Spacing implied by the frequency-axis normalization, i.e.
+        ``1 / (2 * max_freq)`` for the ``max_freq`` that
+        ``_calculate_fsc_sectioned_hist`` returned alongside the data. For
+        isotropically resampled volumes that is just the isotropic spacing.
     threshold : str
         Threshold type for resolution curve ("one-bit", "half-bit", "fixed").
     curve_fit_type : str
@@ -103,7 +108,15 @@ def plot_fsc_sectors(
             analyzed = analyzer.execute()[0]
             res_val = analyzed.resolution["resolution"]
             thr_curve = analyzed.resolution["threshold"]
-        except Exception:
+        except ValueError as exc:
+            # Curve fitting is the only expected failure: a sector with too few
+            # populated bins cannot be splined. Anything else is a real bug and
+            # must not be silently plotted as "no crossing".
+            warnings.warn(
+                f"FSC analysis failed for the {label} sector ({angle}°): {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             res_val = np.nan
             thr_curve = None
 
