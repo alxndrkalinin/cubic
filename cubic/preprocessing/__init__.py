@@ -6,6 +6,7 @@ from .deconvolution import (
     decon_xpy,
     decon_skimage,
     richardson_lucy_xp,
+    richardson_lucy_iter,
     deconv_iter_num_finder,
     richardson_lucy_skimage,
 )
@@ -13,6 +14,7 @@ from .deconvolution import (
 __all__ = [
     "richardson_lucy_skimage",
     "richardson_lucy_xp",
+    "richardson_lucy_iter",
     "decon_skimage",
     "decon_xpy",
     "deconv_iter_num_finder",

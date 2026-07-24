@@ -3,6 +3,7 @@
 import numpy as np
 import numpy.typing as npt
 
+from ..cuda import asnumpy
 from ..skimage import util, filters
 from ..image_utils import get_xy_block, get_xy_block_coords
 
@@ -19,18 +20,23 @@ def get_threshold_otsu(
 
 
 def select_nonempty_patches(
-    image: npt.ArrayLike,
+    image: np.ndarray,
     patch_size: int = 512,
     min_nonzeros: float = 0.02,
     threshold: float | None = None,
     verbose: bool = False,
-) -> list[list[int]]:
-    """Select XY patches from 3D image by percent of nonzero voxels."""
+) -> list[np.ndarray]:
+    """Select XY patches from 3D image by percent of nonzero voxels.
+
+    Returns the selected rows of :func:`get_xy_block_coords`, i.e. NumPy int
+    arrays of ``(y_start, y_end, x_start, x_end)``. CuPy input is moved to the
+    host first, since the returned coordinates are host values either way.
+    """
     verboseprint = print if verbose else lambda *a, **k: None
 
-    selected_patches: list[list[int]] = []
+    selected_patches: list[np.ndarray] = []
 
-    image_np = np.asarray(image)
+    image_np = asnumpy(image)
 
     if threshold is None:
         threshold = float(get_threshold_otsu(image_np))
