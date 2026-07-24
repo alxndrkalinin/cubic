@@ -11,16 +11,14 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 https://github.com/MouseLand/cellpose/blob/509ffca33737058b0b4e2e96d506514e10620eb3/cellpose/metrics.py
 """
 
-import logging
 import warnings
 from typing import Literal, overload
+from functools import cache
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from ..cuda import ascupy, asnumpy, get_device
-
-logger = logging.getLogger(__name__)
+from ..cuda import asnumpy, get_device, get_array_module
 
 # Hoist numba JIT outside function body so the decorated helper is compiled
 # once and cached across calls, not re-wrapped on every invocation.
@@ -40,22 +38,51 @@ except ImportError:
     _HAS_NUMBA = False
 
 
+def _check_has_background(mask: np.ndarray) -> bool:
+    """Return True if *mask* contains background (label 0) pixels."""
+    return bool((mask == 0).any())
+
+
 def _check_sequential_labels(mask: np.ndarray) -> bool:
+    """Return True if the distinct labels of *mask* are consecutive.
+
+    Paired with :func:`_check_has_background`, which pins the first label
+    at 0, this makes the foreground labels run 1..n with no gaps.
+    """
     labels = np.unique(mask)
-    return bool((labels[0] == 0) and np.all(np.diff(labels) == 1))
+    return bool(np.all(np.diff(labels) == 1))
 
 
-def _label_overlap_gpu(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Measure label overlap on GPU using CuPy.
+def _as_label_index(a: np.ndarray) -> np.ndarray:
+    """Cast a label image to ``uint32`` indices, rejecting invalid values.
 
-    Copyright (c) 2024 Alexandr Kalinin
+    Both the CPU and the GPU overlap kernels index an accumulator with the
+    label values, so the input must be a non-negative integer image. The
+    cast is done here rather than per-backend so a float label image
+    (common after a lossy I/O round-trip) behaves identically on both
+    devices instead of raising only on CPU.
+    """
+    if not (np.issubdtype(a.dtype, np.integer) or a.dtype == bool):
+        if not bool((a == np.floor(a)).all()):
+            raise ValueError(
+                f"Label image must hold integer values; got dtype {a.dtype} "
+                "with non-integral entries."
+            )
+    if bool((a < 0).any()):
+        raise ValueError("Label image must not contain negative labels.")
+    # ``copy=False`` is safe: both backends only read the label arrays.
+    return a.astype(np.uint32, copy=False)
+
+
+@cache
+def _label_overlap_kernel():
+    """Compile the CuPy raw kernel for label overlap once, then reuse it.
+
+    ``jit.rawkernel`` wraps the Python function in a new kernel object on
+    every call, which defeats CuPy's per-object compilation cache, so the
+    wrapping must not happen inside the hot path.
     """
     from cupyx import jit
-
-    x = x.ravel().astype(np.uint32)
-    y = y.ravel().astype(np.uint32)
-    overlap = np.zeros((1 + int(x.max()), 1 + int(y.max())), dtype=np.uint32)
-    overlap = ascupy(overlap)  # type: ignore[assignment]
 
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -63,15 +90,30 @@ def _label_overlap_gpu(x: np.ndarray, y: np.ndarray) -> np.ndarray:
         )
 
         @jit.rawkernel()
-        def label_overlap_kernel(x, y, overlap, N):
+        def kernel(x, y, overlap, N):
             idx = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
             if idx < N:
                 jit.atomic_add(overlap, (x[idx], y[idx]), 1)
 
+    return kernel
+
+
+def _label_overlap_gpu(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Measure label overlap on GPU using CuPy.
+
+    Copyright (c) 2024 Alexandr Kalinin
+    """
+    x = x.ravel()
+    y = y.ravel()
+    # Allocate on device directly: a host allocation plus ``ascupy`` copies a
+    # multi-MB accumulator across the bus on every call for no benefit.
+    xp = get_array_module(x)
+    overlap = xp.zeros((1 + int(x.max()), 1 + int(y.max())), dtype=np.uint32)
+
     N = np.uint32(x.size)
     threads_per_block = 128
     blocks_per_grid = (N + threads_per_block - 1) // threads_per_block
-    label_overlap_kernel[blocks_per_grid, threads_per_block](x, y, overlap, N)
+    _label_overlap_kernel()[blocks_per_grid, threads_per_block](x, y, overlap, N)
     return overlap
 
 
@@ -104,6 +146,9 @@ def _label_overlap(x: np.ndarray, y: np.ndarray) -> np.ndarray:
             f"x and y should have the same shape. Got {x.shape} and {y.shape} instead."
         )
 
+    x = _as_label_index(x)
+    y = _as_label_index(y)
+
     if device_x == "GPU":
         return _label_overlap_gpu(x, y)
     else:
@@ -113,7 +158,25 @@ def _label_overlap(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 def _intersection_over_union(
     masks_true: np.ndarray, masks_pred: np.ndarray
 ) -> np.ndarray:
-    """Calculate the intersection over union of all mask pairs, device agnostic.
+    """Calculate the intersection over union of all object pairs, device agnostic.
+
+    Returns
+    -------
+    np.ndarray
+        The ``(n_true, n_pred)`` object-to-object matrix. **The background
+        row and column are EXCLUDED**: they are consumed by the per-label
+        pixel counts and dropped before the division, so a mask with no
+        background pixels does not evaluate 0/0 at the background entry.
+
+        Callers must therefore *not* apply ``[1:, 1:]`` themselves. Three
+        call sites depend on this: ``compute_matches`` and
+        ``average_precision`` in this module, and
+        ``cubic.segmentation.cellpose_dynamics._stitch3D``. Re-adding the
+        slice — or reverting this function to return the full
+        ``(1 + max_true, 1 + max_pred)`` matrix without updating all three
+        — drops the first true and first predicted label and makes
+        ``_stitch3D`` mis-stitch **silently, with no exception**. Change
+        both sides together.
 
     Modified from: Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
     https://github.com/MouseLand/cellpose/blob/0ce365352c9d43ce7a15ebff6955f24f2035a303/cellpose/metrics.py#L168
@@ -124,8 +187,14 @@ def _intersection_over_union(
     overlap = _label_overlap(masks_true, masks_pred)
     n_pixels_pred = overlap.sum(axis=0, keepdims=True)
     n_pixels_true = overlap.sum(axis=1, keepdims=True)
-    iou = overlap / (n_pixels_pred + n_pixels_true - overlap)
-    return iou
+    objects = overlap[1:, 1:]
+    denom = n_pixels_pred[:, 1:] + n_pixels_true[1:, :] - objects
+    return objects / denom
+
+
+def _iou_host(masks_true: np.ndarray, masks_pred: np.ndarray) -> np.ndarray:
+    """Object IoU matrix as a host array with NaN (absent labels) → 0."""
+    return np.nan_to_num(asnumpy(_intersection_over_union(masks_true, masks_pred)))
 
 
 def _matches_at_threshold(iou: np.ndarray, th: float) -> tuple[np.ndarray, np.ndarray]:
@@ -180,13 +249,25 @@ def compute_matches(
 
     , which was modified from: Copyright (c) 2018-2024, Uwe Schmidt, Martin Weigert
     https://github.com/stardist/stardist/blob/586f8ca76d063bf3443f7a9a66fe94658bc155b8/stardist/matching.py#L109
+
+    Raises
+    ------
+    ValueError
+        If either mask has no background (label 0) pixels, or if its
+        foreground labels are not contiguous. Also, via
+        ``_matches_at_threshold``, ``"No masks to match"`` when a mask is
+        entirely background so there is nothing to assign.
     """
-    if not _check_sequential_labels(mask_true):
-        raise ValueError("mask_true should have sequential labels.")
-    if not _check_sequential_labels(mask_pred):
-        raise ValueError("mask_pred should have sequential labels.")
-    iou = _intersection_over_union(mask_true, mask_pred)[1:, 1:]
-    iou = np.nan_to_num(asnumpy(iou))
+    for name, mask in (("mask_true", mask_true), ("mask_pred", mask_pred)):
+        # Reported separately: "sequential labels" is a confusing complaint
+        # about a fully-labelled mask whose ids are in fact contiguous.
+        if not _check_has_background(mask):
+            raise ValueError(
+                f"{name} has no background pixels; label 0 must be present."
+            )
+        if not _check_sequential_labels(mask):
+            raise ValueError(f"{name} should have sequential labels.")
+    iou = _iou_host(mask_true, mask_pred)
     matches = {}
     for th in thresholds:
         th_matches = _matches_at_threshold(iou, th)
@@ -221,23 +302,26 @@ def average_precision(
         reuse the single overlap pass instead of recomputing it.
     """
     iou: np.ndarray | None = None
+    counts: tuple[int, int] | None = None
     if matches_per_threshold is None:
-        if return_iou:
-            matches_per_threshold, iou = compute_matches(
-                masks_true, masks_pred, thresholds, return_iou=True
-            )
-        else:
-            matches_per_threshold = compute_matches(masks_true, masks_pred, thresholds)
+        # ``compute_matches`` builds the IoU matrix either way, so asking for it
+        # is free and its shape gives the object counts: the labels are known to
+        # be contiguous from 1 because ``compute_matches`` just verified it.
+        matches_per_threshold, iou = compute_matches(
+            masks_true, masks_pred, thresholds, return_iou=True
+        )
+        counts = (int(iou.shape[0]), int(iou.shape[1]))
 
-    if matches_per_threshold is None:
-        raise ValueError("No matches found.")
     tp = np.asarray([len(matches_per_threshold[th][0]) for th in thresholds])
-    # Count distinct foreground labels rather than using ``.max()``: when the
-    # caller supplies ``matches_per_threshold`` the sequential-label check in
-    # ``compute_matches`` is skipped, so a gap in the label ids would make
-    # ``.max()`` over-count objects and corrupt FP/FN/AP.
-    n_pred = int((np.unique(masks_pred) != 0).sum())
-    n_true = int((np.unique(masks_true) != 0).sum())
+    if counts is None:
+        # Caller-supplied matches bypass the label checks in ``compute_matches``,
+        # so count distinct foreground labels rather than using ``.max()``, which
+        # would over-count across a gap in the label ids and corrupt FP/FN/AP.
+        counts = (
+            int(np.count_nonzero(np.unique(masks_true))),
+            int(np.count_nonzero(np.unique(masks_pred))),
+        )
+    n_true, n_pred = counts
     fp = n_pred - tp
     fn = n_true - tp
 
@@ -248,8 +332,6 @@ def average_precision(
         if iou is None:
             # Caller supplied matches_per_threshold, so compute_matches never
             # ran; compute the overlap once here (matching its normalization).
-            iou = np.nan_to_num(
-                asnumpy(_intersection_over_union(masks_true, masks_pred)[1:, 1:])
-            )
+            iou = _iou_host(masks_true, masks_pred)
         return ap, tp, fp, fn, iou
     return ap, tp, fp, fn
