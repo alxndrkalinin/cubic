@@ -18,10 +18,23 @@ from ..skimage import metrics, morphology
 #: Denominators below this magnitude are treated as zero (matches ``pcc``).
 _ZERO_TOL = 1e-12
 
-#: skimage's own ``win_size`` defaults: ``2 * int(3.5 * 1.5 + 0.5) + 1`` for
-#: ``gaussian_weights=True`` (truncate=3.5, sigma=1.5), else 7.
-_DEFAULT_WIN_GAUSSIAN = 11
+#: skimage hard-codes ``truncate = 3.5`` on the Gaussian path (identical in
+#: 0.22 through 0.26), so its window depends only on ``sigma``.
+_GAUSSIAN_TRUNCATE = 3.5
+_DEFAULT_SIGMA = 1.5
+#: skimage's ``win_size`` default for ``gaussian_weights=False``.
 _DEFAULT_WIN_UNIFORM = 7
+
+
+def _gaussian_win_size(sigma: float) -> int:
+    """Return the ``win_size`` skimage derives from *sigma*.
+
+    Mirrors ``_structural_similarity``: ``2 * int(truncate * sigma + 0.5) + 1``.
+    Hard-coding the ``sigma=1.5`` result (11) silently under-erodes whenever a
+    caller passes a larger ``sigma`` — at ``sigma=3.0`` skimage's window is 23,
+    so out-of-mask pixels leak back into the "masked" mean.
+    """
+    return 2 * int(_GAUSSIAN_TRUNCATE * float(sigma) + 0.5) + 1
 
 
 def _canonicalize_torch(*arrays: Any) -> tuple[Any, ...]:
@@ -375,6 +388,15 @@ def ssim(
             **kwargs,
         )
     else:
+        # The masked branch forces ``full=True`` to get the SSIM map, so a
+        # ``gradient=True`` request would make skimage return a 3-tuple into a
+        # 2-target unpack. There is also no sensible way to reduce a gradient
+        # over the valid-centre mask.
+        if gradient:
+            raise ValueError(
+                "gradient=True is not supported with mask (the masked path "
+                "reduces the SSIM map over valid centers only)"
+            )
         # Compute SSIM map on the full image, then average over valid centers
         # whose SSIM window fits entirely inside the foreground mask.
         _, ssim_map = metrics.structural_similarity(
@@ -395,7 +417,7 @@ def ssim(
         if win_size is not None:
             effective_win = win_size
         elif gaussian_weights:
-            effective_win = _DEFAULT_WIN_GAUSSIAN
+            effective_win = _gaussian_win_size(kwargs.get("sigma", _DEFAULT_SIGMA))
         else:
             effective_win = _DEFAULT_WIN_UNIFORM
         if mask.ndim not in (2, 3):

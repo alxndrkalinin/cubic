@@ -14,7 +14,9 @@ authors = [
 ]
 dependencies = [
     "numpy>=1.20.0",
-    "scikit-image>=0.16.1",
+    # >=0.25 for morphology.footprint_rectangle, which replaces square/cube
+    # (removed in 0.27) and is the only variant cuCIM provides.
+    "scikit-image>=0.25",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

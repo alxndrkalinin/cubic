@@ -431,6 +431,66 @@ def test_footprint_rectangle_matches_square_and_cube(width: int) -> None:
         )
 
 
+@pytest.mark.parametrize("sigma", [0.8, 1.5, 3.0])
+def test_masked_ssim_erosion_follows_sigma(sigma: float) -> None:
+    """The erosion window tracks ``sigma``, not a hard-coded 11.
+
+    skimage derives ``win_size = 2 * int(3.5 * sigma + 0.5) + 1``, and ``sigma``
+    reaches it through ``**kwargs``. Pinning 11 (the ``sigma=1.5`` value)
+    under-erodes for any larger sigma: at ``sigma=3.0`` skimage's window is 23,
+    so out-of-mask pixels leaked back into the "masked" mean and this fixture
+    returned 0.2067 instead of the correct value.
+    """
+    from skimage.metrics import structural_similarity as sk_ssim
+
+    from cubic.skimage import morphology
+
+    rng = np.random.default_rng(1)
+    a = rng.random((64, 64))
+    b = a + 0.02 * rng.random((64, 64))
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[16:48, 16:48] = True
+    b[~mask] = 999.0  # corrupt everything outside the mask
+
+    win = 2 * int(3.5 * sigma + 0.5) + 1
+    _, ssim_map = sk_ssim(
+        a, b, data_range=1.0, gaussian_weights=True, sigma=sigma, full=True
+    )
+    valid = morphology.erosion(mask, morphology.footprint_rectangle((win, win)))
+    expected = float(ssim_map[valid].mean())
+
+    got = ssim(a, b, data_range=1.0, mask=mask, gaussian_weights=True, sigma=sigma)
+    assert got == pytest.approx(expected, abs=1e-9)
+
+
+def test_masked_ssim_window_larger_than_mask_is_nan_not_a_number() -> None:
+    """No valid centre must report NaN rather than averaging invalid windows."""
+    rng = np.random.default_rng(1)
+    a = rng.random((64, 64))
+    b = a + 0.02 * rng.random((64, 64))
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[16:48, 16:48] = True  # 32 px, smaller than sigma=5.0's 37 px window
+
+    got = ssim(a, b, data_range=1.0, mask=mask, gaussian_weights=True, sigma=5.0)
+    assert np.isnan(got)
+
+
+def test_masked_ssim_rejects_gradient() -> None:
+    """The masked path forces ``full=True``, so ``gradient`` cannot be honoured.
+
+    Previously this reached skimage and raised
+    ``ValueError: too many values to unpack (expected 2)`` from the 3-tuple.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.random((32, 32))
+    b = a + 0.01
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[8:24, 8:24] = True
+
+    with pytest.raises(ValueError, match="gradient=True is not supported with mask"):
+        ssim(a, b, data_range=1.0, mask=mask, gradient=True)
+
+
 def test_masked_ssim_explicit_win_size_takes_precedence() -> None:
     """An explicit ``win_size`` still drives the erosion footprint."""
     rng = np.random.default_rng(2)
