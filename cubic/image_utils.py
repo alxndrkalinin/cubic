@@ -1,13 +1,15 @@
 """Implements utility functions that operate on 3D images."""
 
 import warnings
+from types import ModuleType
 from typing import Any, Literal
 from collections.abc import Callable, Sequence
 
 import numpy as np
 import numpy.typing as npt
 
-from .cuda import asnumpy, to_same_device, get_array_module
+from .cuda import asnumpy, is_gpu_array, to_same_device, get_array_module
+from .scipy import ndimage
 from .skimage import measure, exposure, transform
 
 # Thresholds for binomial_split calibration warnings
@@ -29,7 +31,7 @@ def image_stats(
         "max": np.max(img),
         "mean": np.mean(img),
         "percentile_min": q_min,
-        "precentile_max": q_max,
+        "percentile_max": q_max,
     }
 
 
@@ -98,22 +100,60 @@ def img_mse(
     b: np.ndarray,
 ) -> float:
     """Calculate pixel-wise MSE between two images."""
-    assert len(a) == len(b)
+    if a.shape != b.shape:
+        raise ValueError(
+            f"Images must have the same shape, got {a.shape} and {b.shape}"
+        )
     return np.square(a - b).mean()
 
 
 def pad_image(
     img: np.ndarray,
-    pad_size: int | Sequence[int],
+    pad_size: int | Sequence[int | tuple[int, int]],
     axes: int | Sequence[int] = 0,
     mode: str = "reflect",
-    deps: dict | None = None,
 ) -> np.ndarray:
-    """Pad an image."""
-    npad = np.asarray([(0, 0)] * img.ndim)
-    axes = [axes] if isinstance(axes, int) else axes
-    for ax in axes:
-        npad[ax] = [pad_size] * 2 if isinstance(pad_size, int) else [pad_size[ax]] * 2
+    """Pad an image along the requested axes.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Input array.
+    pad_size : int or sequence
+        An ``int`` pads every axis in *axes* by that amount both before and
+        after. A sequence must have one entry per axis in *axes* and is aligned
+        positionally with it (**not** indexed by axis number); each entry is
+        either an ``int`` (symmetric) or a ``(before, after)`` pair.
+    axes : int or sequence of int
+        Axis or axes to pad. Axes not listed are left unpadded.
+    mode : str
+        Padding mode forwarded to :func:`numpy.pad`.
+
+    Raises
+    ------
+    ValueError
+        If a sequence *pad_size* does not have the same length as *axes*.
+    """
+    axes = [axes] if isinstance(axes, int) else list(axes)
+
+    if isinstance(pad_size, int | np.integer):
+        pad_widths = [(int(pad_size), int(pad_size))] * len(axes)
+    else:
+        if len(pad_size) != len(axes):
+            raise ValueError(
+                f"'pad_size' has {len(pad_size)} entries but 'axes' has {len(axes)}; "
+                "a sequence 'pad_size' must align positionally with 'axes'."
+            )
+        pad_widths = [
+            (int(p), int(p))
+            if isinstance(p, int | np.integer)
+            else (int(p[0]), int(p[1]))
+            for p in pad_size
+        ]
+
+    npad = [(0, 0)] * img.ndim
+    for ax, width in zip(axes, pad_widths):
+        npad[ax] = width
     return np.pad(img, pad_width=npad, mode=mode)  # type: ignore[call-overload]
 
 
@@ -123,9 +163,23 @@ def pad_image_to_cube(
     mode: str = "constant",
     axes: Sequence[int] | None = None,
 ) -> np.ndarray:
-    """Pad all image axes up to cubic shape."""
+    """Pad all image axes up to cubic shape.
+
+    Raises
+    ------
+    ValueError
+        If *cube_size* is smaller than the input along any padded axis —
+        padding cannot shrink an image.
+    """
     axes = list(range(img.ndim)) if axes is None else axes
-    cube_size = cube_size if cube_size is not None else np.max(img.shape)
+    cube_size = int(cube_size if cube_size is not None else np.max(img.shape))
+
+    too_large = [ax for ax in axes if img.shape[ax] > cube_size]
+    if too_large:
+        raise ValueError(
+            f"'cube_size'={cube_size} is smaller than the input shape {img.shape} "
+            f"along axes {too_large}; padding cannot shrink an image."
+        )
 
     pad_sizes = [(0, 0)] * img.ndim
     for ax in axes:
@@ -135,9 +189,7 @@ def pad_image_to_cube(
             pad_after = cube_size - dim - pad_before
             pad_sizes[ax] = (pad_before, pad_after)
 
-    img = np.pad(img, pad_sizes, mode=mode)  # type: ignore[call-overload]
-    assert np.all([img.shape[i] == cube_size for i in axes])
-    return img
+    return np.pad(img, pad_sizes, mode=mode)  # type: ignore[call-overload]
 
 
 def pad_image_to_shape(
@@ -145,10 +197,25 @@ def pad_image_to_shape(
 ) -> np.ndarray:
     """Pad all image axis up to specified shape.
 
-    Padding is centered to match ``crop_center``'s slicing convention so an
-    odd size difference still reaches the exact target shape (the previous
-    symmetric ``(new - dim) // 2`` on both sides fell one short for odd diffs).
+    Padding is centered to match ``crop_center``'s slicing convention.
+
+    Raises
+    ------
+    ValueError
+        If *new_shape* does not have one entry per image axis, or is smaller
+        than the input along any axis — padding cannot shrink an image.
     """
+    if len(new_shape) != img.ndim:
+        raise ValueError(
+            f"'new_shape' has {len(new_shape)} entries but the image is {img.ndim}D."
+        )
+    too_large = [i for i, dim in enumerate(img.shape) if dim > new_shape[i]]
+    if too_large:
+        raise ValueError(
+            f"'new_shape'={tuple(new_shape)} is smaller than the input shape "
+            f"{img.shape} along axes {too_large}; padding cannot shrink an image."
+        )
+
     pad_sizes = [(0, 0)] * img.ndim
     for i, dim in enumerate(img.shape):
         if dim < new_shape[i]:
@@ -156,9 +223,7 @@ def pad_image_to_shape(
             pad_after = new_shape[i] - dim - pad_before
             pad_sizes[i] = (pad_before, pad_after)
 
-    img = np.pad(img, pad_sizes, mode=mode)  # type: ignore[call-overload]
-    assert np.all([dim == new_shape[i] for i, dim in enumerate(img.shape)])
-    return img
+    return np.pad(img, pad_sizes, mode=mode)  # type: ignore[call-overload]
 
 
 def pad_to_matching_shape(
@@ -167,45 +232,37 @@ def pad_to_matching_shape(
     """Apply zero padding to make the size of two Images match."""
     shape = tuple(max(x, y) for x, y in zip(img1.shape, img2.shape))
 
-    if any(map(lambda x, y: x != y, img1.shape, shape)):
+    if img1.shape != shape:
         img1 = pad_image_to_shape(img1, shape, mode=mode)
-    if any(map(lambda x, y: x != y, img2.shape, shape)):
+    if img2.shape != shape:
         img2 = pad_image_to_shape(img2, shape, mode=mode)
 
     return img1, img2
 
 
 def crop_tl(
-    img: np.ndarray,
-    crop_size: int | Sequence[int],
-    axes: Sequence[int] | None = None,
+    img: np.ndarray, crop_size: int | Sequence[int], axes: Sequence[int] | None = None
 ) -> np.ndarray:
     """Crop from the top-left corner."""
     return crop_corner(img, crop_size, axes, "tl")
 
 
 def crop_bl(
-    img: np.ndarray,
-    crop_size: int | Sequence[int],
-    axes: Sequence[int] | None = None,
+    img: np.ndarray, crop_size: int | Sequence[int], axes: Sequence[int] | None = None
 ) -> np.ndarray:
     """Crop from the bottom-left corner."""
     return crop_corner(img, crop_size, axes, "bl")
 
 
 def crop_tr(
-    img: np.ndarray,
-    crop_size: int | Sequence[int],
-    axes: Sequence[int] | None = None,
+    img: np.ndarray, crop_size: int | Sequence[int], axes: Sequence[int] | None = None
 ) -> np.ndarray:
     """Crop from the top-right corner."""
     return crop_corner(img, crop_size, axes, "tr")
 
 
 def crop_br(
-    img: np.ndarray,
-    crop_size: int | Sequence[int],
-    axes: Sequence[int] | None = None,
+    img: np.ndarray, crop_size: int | Sequence[int], axes: Sequence[int] | None = None
 ) -> np.ndarray:
     """Crop from the bottom-right corner."""
     return crop_corner(img, crop_size, axes, "br")
@@ -217,12 +274,32 @@ def crop_corner(
     axes: Sequence[int] | None = None,
     corner: str = "tl",
 ) -> np.ndarray:
-    """Crop a corner from the image."""
-    axes = [1, 2] if axes is None else axes
+    """Crop a corner from the image.
+
+    The last axis in *axes* is the horizontal one ("l"/"r") and the
+    second-to-last the vertical one ("t"/"b"). With a single axis both roles
+    collapse onto it, so either "b" or "r" crops from its far edge.
+
+    Raises
+    ------
+    ValueError
+        If *axes* is not strictly ascending (corner selection keys off the last
+        two entries), if *crop_size* and *axes* have different lengths, or if an
+        axis is out of range for *img*.
+    """
+    axes = [1, 2] if axes is None else list(axes)
     crop_size = [crop_size] * len(axes) if isinstance(crop_size, int) else crop_size
 
+    if any(a >= b for a, b in zip(axes, axes[1:])):
+        raise ValueError(
+            f"'axes' must be strictly ascending, got {axes}: corner selection "
+            "keys off the last two axes."
+        )
     if len(crop_size) != len(axes):
         raise ValueError("Length of 'crop_sizes' must match the length of 'axes'.")
+
+    x_axis = axes[-1]
+    y_axis = axes[-2] if len(axes) >= 2 else axes[-1]
 
     slices = [slice(None)] * img.ndim
 
@@ -231,10 +308,10 @@ def crop_corner(
             raise ValueError("Axis index out of range for the image dimensions.")
 
         size = min(size, img.shape[axis])
-        # "b"/"r" crop from the far edge (last/second-to-last axis); everything
-        # else (incl. "t"/"l") crops from the near edge.
-        crop_from_end = (axis == axes[-1] and "r" in corner) or (
-            len(axes) >= 2 and axis == axes[-2] and "b" in corner
+        # "b"/"r" crop from the far edge; everything else (incl. "t"/"l") crops
+        # from the near edge.
+        crop_from_end = (axis == x_axis and "r" in corner) or (
+            axis == y_axis and "b" in corner
         )
         if crop_from_end:
             slices[axis] = slice(img.shape[axis] - size, None)
@@ -261,8 +338,8 @@ def crop_center(
 
     slices = []
     for axis in range(img.ndim):
-        if axis in axes and img.shape[axis] > crop_size[axes.index(axis)]:
-            idx = axes.index(axis)
+        idx = axes.index(axis) if axis in axes else None
+        if idx is not None and img.shape[axis] > crop_size[idx]:
             center = img.shape[axis] // 2
             half_crop = crop_size[idx] // 2
             start = center - half_crop
@@ -297,7 +374,7 @@ def random_crop(
 ) -> np.ndarray | tuple[np.ndarray, tuple[int, int, int, int]]:
     """Crop from a random location in the image."""
     crop_h, crop_w = (crop_hw, crop_hw) if isinstance(crop_hw, int) else crop_hw
-    height, width = img.shape[1:]
+    height, width = img.shape[-2:]
     h_start, w_start = np.random.uniform(), np.random.uniform()
     x1, y1, x2, y2 = get_random_crop_coords(
         height, width, crop_h, crop_w, h_start, w_start
@@ -333,13 +410,13 @@ def crop_to_divisor(
     if crop_type == "center":
         return crop_center(img, crop_size=crop_size, axes=axes)
     elif crop_type == "tl":
-        return crop_tl(img, crop_size)
+        return crop_tl(img, crop_size, axes=axes)
     elif crop_type == "bl":
-        return crop_bl(img, crop_size)
+        return crop_bl(img, crop_size, axes=axes)
     elif crop_type == "tr":
-        return crop_tr(img, crop_size)
+        return crop_tr(img, crop_size, axes=axes)
     elif crop_type == "br":
-        return crop_br(img, crop_size)
+        return crop_br(img, crop_size, axes=axes)
     else:
         raise ValueError(
             "Invalid crop type specified. Choose from 'center', 'tl', 'bl', 'tr', 'br'."
@@ -350,13 +427,8 @@ def rotate_image(
     image: np.ndarray, angle: float, interpolation: str = "nearest"
 ) -> np.ndarray:
     """Rotate 3D image around the Z axis by ``angle`` degrees."""
-    xp = get_array_module(image)
     order = 1 if interpolation == "linear" else 0
-    if xp.__name__ == np.__name__:
-        from scipy.ndimage import rotate
-    else:
-        from cupyx.scipy.ndimage import rotate  # type: ignore
-    return rotate(
+    return ndimage.rotate(
         image, angle, axes=(1, 2), reshape=False, order=order, mode="constant"
     )
 
@@ -366,7 +438,7 @@ def get_xy_block_coords(
 ) -> np.ndarray:
     """Compute coordinates of non-overlapping image blocks of specified shape."""
     crop_h, crop_w = (crop_hw, crop_hw) if isinstance(crop_hw, int) else crop_hw
-    height, width = image_shape[1:]
+    height, width = image_shape[-2:]
 
     block_coords = []  # type: list[tuple[int, ...]]
     for y in np.arange(0, height // crop_h) * crop_h:
@@ -399,52 +471,32 @@ def extract_patches(
 def _nd_window(
     data: np.ndarray,
     filter_function: Callable[..., np.ndarray],
-    power_function: Callable[..., np.ndarray],
     **kwargs: Any,
 ) -> np.ndarray:
     """Perform on N-dimensional spatial-domain data to mitigate boundary effects in the FFT."""
-    result = data.copy().astype(np.float32)
+    result = data.astype(np.float32)  # astype already copies
     for axis, axis_size in enumerate(data.shape):
         # set up shape for numpy broadcasting
-        filter_shape = [
-            1,
-        ] * data.ndim
+        filter_shape = [1] * data.ndim
         filter_shape[axis] = axis_size
         window = filter_function(axis_size, **kwargs).reshape(filter_shape)
         # scale the window intensities to maintain array intensity
-        power_function(window, (1.0 / data.ndim), out=window)
-        result *= window
+        result *= window ** (1.0 / data.ndim)
     return result
 
 
 def hamming_window(data: np.ndarray) -> np.ndarray:
     """Apply Hamming window to data."""
     xp = get_array_module(data)
-    return _nd_window(data, xp.hamming, xp.power)
+    return _nd_window(data, xp.hamming)
 
 
-def _tukey_window_1d(n: int, alpha: float, xp) -> np.ndarray:
-    """Create 1D Tukey window (device-agnostic, matches scipy exactly).
-
-    Parameters
-    ----------
-    n : int
-        Window length.
-    alpha : float
-        Taper fraction (0 = rectangular, 1 = Hann).
-    xp : module
-        Array module (numpy or cupy).
-
-    Returns
-    -------
-    np.ndarray
-        1D Tukey window of length *n*, dtype float32.
-    """
-    if alpha <= 0:
+def _tukey_window_1d(n: int, alpha: float, xp: ModuleType) -> np.ndarray:
+    """Create a float32 1D Tukey window of length ``n`` (matches scipy exactly)."""
+    # n <= 1 first: the tapered branch below divides by ``n - 1``.
+    if n <= 1 or alpha <= 0:
         return xp.ones(n, dtype=np.float32)
     if alpha >= 1:
-        if n <= 1:
-            return xp.ones(max(n, 0), dtype=np.float32)
         idx = xp.arange(n, dtype=np.float64)
         return (0.5 * (1 - xp.cos(2 * np.pi * idx / (n - 1)))).astype(np.float32)
 
@@ -507,7 +559,15 @@ def _checkerboard_split_impl(
     -------
     tuple[np.ndarray, np.ndarray]
         Two split images with half the size in each spatial dimension.
+
+    Raises
+    ------
+    ValueError
+        If *img* is not 2D or 3D.
     """
+    if img.ndim not in (2, 3):
+        raise ValueError(f"Expected 2D or 3D image, got {img.ndim}D")
+
     # Determine safe dtype and warn if needed
     needs_z_summing = img.ndim == 3 and not disable_3d_sum
     is_integer = np.issubdtype(img.dtype, np.integer)
@@ -528,9 +588,9 @@ def _checkerboard_split_impl(
     # Apply dtype conversion if needed
     img_safe = img if img.dtype == safe_dtype else img.astype(safe_dtype)
 
-    # Define slicing patterns based on reverse flag
-    # Pattern matches miplib implementation (Koho et al. 2019)
-    # Both images sample from the same diagonal parity for proper FSC calculation
+    # Define the in-plane (YX) slicing patterns based on the reverse flag.
+    # Pattern matches miplib implementation (Koho et al. 2019): in 2D both
+    # halves sample from the same diagonal parity, which is what FSC needs.
     if reverse:
         # Reverse pattern: (odd, even) vs (even, odd)
         pattern1_y, pattern1_x = 1, 0
@@ -540,37 +600,22 @@ def _checkerboard_split_impl(
         pattern1_y, pattern1_x = 1, 1
         pattern2_y, pattern2_x = 0, 0
 
+    # Truncate every axis to an even length so both halves have matching shapes
+    img_even = img_safe[tuple(slice(0, s // 2 * 2) for s in img_safe.shape)]
+
     if img.ndim == 2:
-        # Truncate to even dimensions to ensure matching shapes
-        h_even = img_safe.shape[0] // 2 * 2
-        w_even = img_safe.shape[1] // 2 * 2
-        img_even = img_safe[:h_even, :w_even]
         image1 = img_even[pattern1_y::2, pattern1_x::2]
         image2 = img_even[pattern2_y::2, pattern2_x::2]
     elif disable_3d_sum:
-        # Truncate all dimensions to even to ensure matching shapes
-        z_even = img_safe.shape[0] // 2 * 2
-        h_even = img_safe.shape[1] // 2 * 2
-        w_even = img_safe.shape[2] // 2 * 2
-        img_even = img_safe[:z_even, :h_even, :w_even]
+        # Full 3D checkerboard: the Z parity is fixed at 1 vs 0 independently of
+        # ``reverse``, which only flips the in-plane diagonal.
         image1 = img_even[1::2, pattern1_y::2, pattern1_x::2]
         image2 = img_even[0::2, pattern2_y::2, pattern2_x::2]
-        if preserve_range:
-            image1 = image1.astype(img.dtype)
-            image2 = image2.astype(img.dtype)
     else:
-        # Z-summing: sum consecutive Z pairs, then apply 2D checkerboard
-        # Truncate all dimensions to even to ensure matching shapes
-        z_even = img_safe.shape[0] // 2 * 2
-        h_even = img_safe.shape[1] // 2 * 2
-        w_even = img_safe.shape[2] // 2 * 2
-        img_even = img_safe[:z_even, :h_even, :w_even]
+        # Z-summing: sum consecutive Z pairs, then apply the 2D checkerboard
         z_summed = img_even[0::2] + img_even[1::2]
         image1 = z_summed[:, pattern1_y::2, pattern1_x::2]
         image2 = z_summed[:, pattern2_y::2, pattern2_x::2]
-        if preserve_range:
-            image1 = image1.astype(img.dtype)
-            image2 = image2.astype(img.dtype)
 
     return image1, image2
 
@@ -600,6 +645,11 @@ def checkerboard_split(
     -------
     tuple[np.ndarray, np.ndarray]
         Two split images with half the size in each spatial dimension.
+
+    Raises
+    ------
+    ValueError
+        If *img* is not 2D or 3D.
     """
     return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=False)
 
@@ -629,6 +679,11 @@ def reverse_checkerboard_split(
     -------
     tuple[np.ndarray, np.ndarray]
         Two split images with half the size in each spatial dimension.
+
+    Raises
+    ------
+    ValueError
+        If *img* is not 2D or 3D.
     """
     return _checkerboard_split_impl(img, disable_3d_sum, preserve_range, reverse=True)
 
@@ -807,12 +862,26 @@ def label(img: npt.ArrayLike, **kwargs: Any) -> np.ndarray:
 def select_max_contrast_slices(
     img: np.ndarray, num_slices: int = 128, return_indices: bool = False
 ) -> np.ndarray | tuple[np.ndarray, slice]:
-    """Select num_slices consecutive Z slices with maximum contrast from a 3D volume."""
-    assert img.ndim > 2, "Image should have more than 2 dimensions."
+    """Select num_slices consecutive Z slices with maximum contrast from a 3D volume.
+
+    *num_slices* is clamped to the number of available Z slices, so asking for
+    more than the volume holds returns the whole volume.
+
+    Raises
+    ------
+    ValueError
+        If *img* has 2 or fewer dimensions, or *num_slices* is below 1.
+    """
+    if img.ndim <= 2:
+        raise ValueError(f"Image should have more than 2 dimensions, got {img.ndim}D.")
+    if num_slices < 1:
+        raise ValueError(f"'num_slices' must be >= 1, got {num_slices}.")
+
+    num_slices = min(num_slices, img.shape[0])
     std_devs = asnumpy(img.std(tuple(range(1, img.ndim))))
     # calculate rolling sum of standard deviations for num_slices
     rolling_sum = np.convolve(std_devs, np.ones(num_slices), "valid")
-    max_contrast_idx = np.argmax(rolling_sum)
+    max_contrast_idx = int(np.argmax(rolling_sum))
     indices = slice(max_contrast_idx, max_contrast_idx + num_slices)
     if return_indices:
         return img[indices], indices
@@ -829,48 +898,120 @@ def distance_transform_edt(
     block_params: tuple[int, int, int] | None = None,
     float64_distances: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """Compute the Euclidean distance transform of a binary image."""
-    if isinstance(img, np.ndarray):
-        if block_params is not None or float64_distances:
-            raise ValueError(
-                "NumPy array found. 'block_params' and 'float64_distances' can only be used with CuPy arrays."
-            )
-        from scipy.ndimage import distance_transform_edt
+    """Compute the Euclidean distance transform of a binary image.
 
-        return distance_transform_edt(
-            img,
-            sampling=sampling,
-            return_distances=return_distances,
-            return_indices=return_indices,
-            distances=distances,
-            indices=indices,
-        )
-    else:
+    ``block_params`` and ``float64_distances`` are cuCIM-only and are forwarded
+    unchanged on the GPU route; passing either for a host input raises
+    ``ValueError``.
+
+    Note:
+        cuCIM accepts ``float64_distances`` but (as of cucim 25.x) never passes
+        it down to its own ``_pba_2d``/``_pba_3d`` kernels, so the returned
+        distances are float32 either way. Request float64 precision by running
+        on the host instead.
+
+    Raises
+    ------
+    ValueError
+        If a GPU-only argument is supplied for a host input.
+    """
+    if is_gpu_array(img):
         # cuCIM access interface is different from scipy.ndimage
-        from cucim.core.operations.morphology import distance_transform_edt
+        from cucim.core.operations.morphology import (
+            distance_transform_edt as _cucim_edt,
+        )
 
-        return distance_transform_edt(
+        return _cucim_edt(
             img,
             sampling=sampling,
             return_distances=return_distances,
             return_indices=return_indices,
             distances=distances,
             indices=indices,
-            block_params=None,
-            float64_distances=False,
+            block_params=block_params,
+            float64_distances=float64_distances,
         )
+
+    if block_params is not None or float64_distances:
+        raise ValueError(
+            "Host array found. 'block_params' and 'float64_distances' can only be used with CuPy arrays."
+        )
+    from scipy.ndimage import distance_transform_edt as _scipy_edt
+
+    return _scipy_edt(
+        img,
+        sampling=sampling,
+        return_distances=return_distances,
+        return_indices=return_indices,
+        distances=distances,
+        indices=indices,
+    )
 
 
 def clahe(
     img: np.ndarray,
-    kernel_size: np.ndarray | tuple[int, int, int] = (2, 3, 5),
+    n_tiles: Sequence[int] | np.ndarray = (2, 3, 5),
     clip_limit: float = 0.01,
     nbins: int = 256,
 ) -> np.ndarray:
-    """Apply CLAHE to the image."""
-    assert len(img.shape) == len(kernel_size)
-    kernel_size = np.asarray(img.shape) // kernel_size
-    img = exposure.equalize_adapthist(
+    """Apply CLAHE to the image.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Input image.
+    n_tiles : sequence of int
+        Number of contextual tiles per axis, one entry per image axis. The
+        scikit-image ``kernel_size`` (the tile *size*) is derived as
+        ``img.shape // n_tiles``, so ``n_tiles`` may not exceed the image size
+        along any axis.
+    clip_limit : float
+        Clipping limit, normalized between 0 and 1.
+    nbins : int
+        Number of gray bins for the histogram.
+
+    Raises
+    ------
+    ValueError
+        If *n_tiles* does not have one entry per image axis, any entry is below
+        1, or the requested tiling is finer than the image (``img.shape //
+        n_tiles`` below 1 on some axis).
+
+    Notes
+    -----
+    A grayscale volume whose **trailing axis is 3 or 4** cannot be processed.
+    scikit-image decorates ``equalize_adapthist`` with ``@adapt_rgb``, whose
+    ``is_rgb_like`` check treats any 3-D array shaped ``(Z, Y, 3)`` or
+    ``(Z, Y, 4)`` as an RGB/RGBA image: it converts RGB→HSV and filters only
+    the 2-D value channel. The derived ``kernel_size`` still has three entries,
+    so skimage rejects it with "Incorrect value of `kernel_size`" — for any
+    *n_tiles*, verified for ``(8, 8, 3)``, ``(8, 8, 4)`` and ``(16, 16, 3)``.
+    It fails loudly rather than silently returning a value-channel result.
+
+    cubic deliberately does not suppress ``adapt_rgb``, since doing so would
+    change behavior for genuine color images. Process such a volume slice by
+    slice with 2-element *n_tiles* instead. Only a trailing axis of exactly 3
+    or 4 is affected; ``(8, 8, 5)`` works normally.
+    """
+    if img.ndim != len(n_tiles):
+        raise ValueError(
+            f"'n_tiles' has {len(n_tiles)} entries but the image is {img.ndim}D."
+        )
+    if np.any(np.asarray(n_tiles) < 1):
+        raise ValueError(f"'n_tiles' entries must be >= 1, got {tuple(n_tiles)}.")
+
+    # Raise in the caller's vocabulary: skimage would otherwise reject the
+    # derived ``kernel_size``, naming a parameter cubic does not expose.
+    kernel_size = np.asarray(img.shape) // np.asarray(n_tiles)
+    if np.any(kernel_size < 1):
+        too_fine = [int(ax) for ax in np.flatnonzero(kernel_size < 1)]
+        raise ValueError(
+            f"'n_tiles'={tuple(int(n) for n in n_tiles)} is finer than the image "
+            f"of shape {img.shape}: the per-axis tile size 'img.shape // n_tiles' "
+            f"is {tuple(int(k) for k in kernel_size)}, which is below 1 on axes "
+            f"{too_fine}. Reduce 'n_tiles' on those axes."
+        )
+
+    return exposure.equalize_adapthist(
         img, kernel_size=kernel_size, clip_limit=clip_limit, nbins=nbins
     )
-    return img
