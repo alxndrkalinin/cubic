@@ -348,11 +348,21 @@ def test_small_value_without_backprojector_raises() -> None:
         richardson_lucy_xp(image, psf, n_iter=1, small_value=1e-6)
 
 
-def test_unmatched_all_zero_image_raises() -> None:
-    """A zero image gives a zero floor, which the epsilon-free ratio cannot use."""
+@pytest.mark.parametrize("bad", ["zeros", "inf"])
+def test_unmatched_degenerate_image_raises(bad: str) -> None:
+    """A zero or non-finite floor cannot drive the epsilon-free ratio.
+
+    ``small_value`` defaults to ``1e-6 * image.max()``. For an all-zero image
+    that is 0; for an image containing ``inf`` it is ``inf``, which passed a
+    bare ``> 0`` check and turned the whole volume into ``inf`` and then NaN
+    with no exception.
+    """
     image = np.zeros((6, 6, 6), dtype=np.float64)
+    if bad == "inf":
+        image = np.ones((6, 6, 6), dtype=np.float64)
+        image[0, 0, 0] = np.inf
     psf = _gaussian_psf((3, 3, 3), sigmas=(1.0, 1.0, 1.0)).astype(np.float64)
-    with pytest.raises(ValueError, match="small_value must be > 0"):
+    with pytest.raises(ValueError, match="small_value must be finite and > 0"):
         richardson_lucy_xp(image, psf, n_iter=1, backprojector=psf.copy())
 
 

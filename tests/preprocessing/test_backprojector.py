@@ -276,6 +276,34 @@ def test_odd_shapes_match_reference_conventions(size: int) -> None:
         assert _endpoint_indices(size, t) == reference_pair
 
 
+@pytest.mark.parametrize(
+    "size,t,expected",
+    [
+        (15, 2.5, (5, 10)),  # odd: fftshift origin == the reference's (S-1)/2
+        (16, 0.0, (8, 8)),
+        (16, 2.5, (6, 11)),  # even: (S-1)/2 would give (5, 10)
+        (20, 3.7, (6, 14)),  # even: (S-1)/2 would give (6, 13)
+    ],
+)
+def test_endpoint_indices_use_the_fftshift_origin(
+    size: int, t: float, expected: tuple[int, int]
+) -> None:
+    """Cutoff endpoints are measured from the fftshift DC index, ``size // 2``.
+
+    The odd-size assertions in ``test_odd_shapes_match_reference_conventions``
+    cannot catch a regression here, because ``size // 2`` and ``(size - 1) / 2``
+    round to the same index for odd sizes. These even sizes separate them, and
+    the endpoints set ``beta_fp`` and ``beta_wiener``, so a wrong origin
+    silently reshapes the Wiener and Butterworth filters for every even PSF.
+    """
+    assert _endpoint_indices(size, t) == expected
+
+    # The t=0 endpoint must land exactly on the fftshift DC bin.
+    dc = np.zeros(size)
+    dc[0] = 1.0
+    assert _endpoint_indices(size, 0.0)[0] == int(np.argmax(np.fft.fftshift(dc)))
+
+
 # --- res_flag / i_res drive the gaussian projector ---------------------------
 
 

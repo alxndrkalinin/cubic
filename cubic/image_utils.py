@@ -379,7 +379,12 @@ def random_crop(
     x1, y1, x2, y2 = get_random_crop_coords(
         height, width, crop_h, crop_w, h_start, w_start
     )
-    cropped = img[:, y1:y2, x1:x2] if img.ndim > 2 else img[y1:y2, x1:x2]
+    # Crop the trailing two axes, whatever the rank: hard-coding axes 1 and 2
+    # applied the Y range to axis 1 for 4-D input, silently returning an empty
+    # array instead of a crop.
+    slices = [slice(None)] * img.ndim
+    slices[-2], slices[-1] = slice(y1, y2), slice(x1, x2)
+    cropped = img[tuple(slices)]
     if return_coordinates:
         return (cropped, (y1, y2, x1, x2))
     else:

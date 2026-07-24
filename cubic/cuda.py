@@ -160,27 +160,45 @@ def dispatch_device_call(
     - A GPU array is present → call ``gpu_module``.
     - A GPU array is present but ``gpu_module`` lacks ``func_name`` → warn, run
       the ``cpu_module`` implementation on host copies, then move array results
-      back to the GPU so the caller still gets a device-consistent result.
+      back to the GPU. Arrays nested in returned lists/tuples are moved too.
 
     An unknown ``func_name`` on the pure-CPU route raises ``AttributeError``
     from ``cpu_module`` without warning: there is no GPU backend involved, so a
     "falling back to CPU" warning would be misleading.
+
+    Limitation of the host-fallback route: arguments the callee writes into
+    (``out``, ``output``, ``distances``, ``indices``) are coerced to host
+    copies, so the host function would write into the copy and leave the
+    caller's GPU array untouched. Passing a GPU array under one of those names
+    raises rather than silently discarding the result.
     """
+    _OUTPUT_KWARGS = ("out", "output", "distances", "indices")
     use_gpu = CUDAManager().get_cp() is not None and any_gpu_arg(args, kwargs)
+
+    def _to_gpu(value: Any) -> Any:
+        """Move arrays back to the GPU, recursing into lists and tuples."""
+        if hasattr(value, "dtype"):
+            return to_device(value, "GPU")
+        if isinstance(value, (list, tuple)):
+            moved = [_to_gpu(v) for v in value]
+            return type(value)(moved) if isinstance(value, list) else tuple(moved)
+        return value
 
     def _on_cpu(return_to_gpu: bool) -> Any:
         func = getattr(import_module(cpu_module), func_name)
+        if return_to_gpu:
+            written = [k for k in _OUTPUT_KWARGS if is_gpu_array(kwargs.get(k))]
+            if written:
+                raise NotImplementedError(
+                    f"{gpu_module}.{func_name} is unavailable, and the host "
+                    f"fallback cannot honour the output argument(s) "
+                    f"{written}: they would be written on the host and the "
+                    "caller's GPU array left unchanged. Move the inputs to "
+                    "host, call the function, and move the result back."
+                )
         cpu_args, cpu_kwargs = coerce_args_to_cpu(args, kwargs)
         result = func(*cpu_args, **cpu_kwargs)
-        if not return_to_gpu:
-            return result
-        if isinstance(result, tuple):
-            return tuple(
-                to_device(r, "GPU") if hasattr(r, "dtype") else r for r in result
-            )
-        if hasattr(result, "dtype"):
-            return to_device(result, "GPU")
-        return result
+        return _to_gpu(result) if return_to_gpu else result
 
     if not use_gpu:
         return _on_cpu(return_to_gpu=False)

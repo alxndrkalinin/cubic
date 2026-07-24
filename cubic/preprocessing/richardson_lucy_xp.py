@@ -251,11 +251,12 @@ def _richardson_lucy_unmatched(
 
     if small_value is None:
         small_value = 1e-6 * float(image.max())
-    if not small_value > 0.0:
+    if not (small_value > 0.0 and np.isfinite(small_value)):
         raise ValueError(
-            f"small_value must be > 0, got {small_value}; the epsilon-free ratio "
-            "needs a strictly positive floor (an all-zero or all-negative image "
-            "cannot be deconvolved on this path)."
+            f"small_value must be finite and > 0, got {small_value}; the "
+            "epsilon-free ratio needs a strictly positive floor (an all-zero, "
+            "all-negative or non-finite image cannot be deconvolved on this "
+            "path)."
         )
     image = np.maximum(image, small_value)
     estimate = image
