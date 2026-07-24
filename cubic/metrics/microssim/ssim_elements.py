@@ -22,7 +22,6 @@ Behavior contract
 
 from __future__ import annotations
 
-from typing import Any
 from dataclasses import dataclass
 
 import numpy as np
@@ -50,11 +49,9 @@ class SSIMElements:
         ``cov_norm * (uxy - ux*uy)``. Order matches upstream
         (``vxy`` precedes ``vx`` / ``vy``).
     vx : numpy.ndarray
-        ``cov_norm * (uxx - ux*ux)``. NOT clamped to be non-negative;
-        matches upstream ``ssim_utils.py:235-237``.
+        ``cov_norm * (uxx - ux*ux)``.
     vy : numpy.ndarray
-        ``cov_norm * (uyy - uy*uy)``. NOT clamped to be non-negative;
-        matches upstream ``ssim_utils.py:235-237``.
+        ``cov_norm * (uyy - uy*uy)``.
     C1 : float
         ``(K1 * data_range) ** 2``.
     C2 : float
@@ -149,9 +146,10 @@ def compute_ssim_elements(
         ``gaussian_weights=True``.
     use_sample_covariance : bool, default=True
         If True, scale the covariance and variance by
-        ``cov_norm = NP / (NP - 1)`` with ``NP = win_size**2``; otherwise
-        use ``cov_norm = 1.0``. (Spatial filter is always 2-D; the leading
-        batch axis is never aggregated.)
+        ``cov_norm = NP / (NP - 1)`` with ``NP = win_size**2``, which
+        requires ``win_size >= 3``; otherwise use ``cov_norm = 1.0``.
+        (Spatial filter is always 2-D; the leading batch axis is never
+        aggregated.)
     K1 : float, default=0.01
         SSIM stability constant for the luminance term.
     K2 : float, default=0.03
@@ -170,19 +168,16 @@ def compute_ssim_elements(
     ------
     ValueError
         If ``image1.ndim`` is not 2 or 3, ``image1.shape != image2.shape``,
-        ``win_size`` is even or non-positive, the smaller spatial extent
-        is less than ``win_size``, or ``data_range`` is not finite-positive.
+        ``win_size`` is even or non-positive, ``win_size < 3`` while
+        ``use_sample_covariance=True`` (``NP / (NP - 1)`` is undefined for
+        ``NP = 1``), the smaller spatial extent is less than ``win_size``,
+        or ``data_range`` is not finite-positive.
 
     Notes
     -----
     The invariant "always 2-D spatial, optional leading batch axis" is
     enforced by ``ValueError`` (not ``assert``), because asserts are
     stripped under ``python -O``.
-
-    ``vx``, ``vy`` are NOT clamped to be non-negative — matches upstream
-    ``ssim_utils.py:235-237``. Tiny negative values can appear from
-    floating-point round-off when ``uxx ≈ ux**2``; callers that need a
-    non-negative variance must clamp themselves.
     """
     check_same_device(image1, image2)
 
@@ -207,6 +202,15 @@ def compute_ssim_elements(
             win_size = 7
     if win_size < 1 or win_size % 2 == 0:
         raise ValueError(f"win_size must be odd and positive; got {win_size}")
+    if use_sample_covariance and win_size < 3:
+        # NP = win_size**2 = 1 makes cov_norm = NP / (NP - 1) a division by
+        # zero. Raise instead of letting ZeroDivisionError escape below.
+        raise ValueError(
+            "win_size must be >= 3 when use_sample_covariance=True "
+            "(NP / (NP - 1) is undefined for NP = win_size**2 = 1); "
+            f"got win_size={win_size}. Pass use_sample_covariance=False "
+            "to use the population estimator instead."
+        )
     if min(image1.shape[-2:]) < win_size:
         raise ValueError(
             f"Spatial dims must be >= win_size={win_size}; "
@@ -254,10 +258,11 @@ def compute_ssim_elements(
 
     if crop:
         pad = (win_size - 1) // 2
-        sl: tuple[Any, ...] = (slice(None),) * (ndim - 2) + (
-            slice(pad, -pad),
-            slice(pad, -pad),
-        )
+        # ``pad == 0`` (win_size == 1) must be a no-op: a bare
+        # ``slice(pad, -pad)`` is ``slice(0, 0)``, which would silently
+        # return empty element arrays.
+        edge = slice(pad, -pad) if pad else slice(None)
+        sl: tuple[slice, ...] = (slice(None),) * (ndim - 2) + (edge, edge)
         ux = ux[sl]
         uy = uy[sl]
         vxy = vxy[sl]

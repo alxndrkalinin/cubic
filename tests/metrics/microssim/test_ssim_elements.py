@@ -311,6 +311,44 @@ def test_raises_on_zero_win_size() -> None:
         compute_ssim_elements(a, b, data_range=1.0, gaussian_weights=False, win_size=0)
 
 
+def test_raises_on_win_size_1_with_sample_covariance() -> None:
+    """``win_size=1`` + sample covariance raises ValueError, not ZeroDivisionError.
+
+    ``win_size=1`` is odd and positive so it passed validation, then
+    ``cov_norm = NP / (NP - 1)`` with ``NP = 1`` divided by zero.
+    """
+    a = np.zeros((16, 16))
+    b = np.zeros((16, 16))
+    with pytest.raises(ValueError, match="win_size must be >= 3"):
+        compute_ssim_elements(a, b, data_range=1.0, gaussian_weights=False, win_size=1)
+
+
+def test_win_size_1_allowed_without_sample_covariance() -> None:
+    """``win_size=1`` is legal with the population estimator (``cov_norm = 1``).
+
+    The per-pixel window has zero variance by construction, and ``crop=True``
+    must be a no-op rather than the empty ``slice(0, -0)``.
+    """
+    rng = np.random.default_rng(50)
+    img1 = rng.random((16, 16)).astype(np.float64)
+    img2 = rng.random((16, 16)).astype(np.float64)
+    e = compute_ssim_elements(
+        img1,
+        img2,
+        data_range=1.0,
+        gaussian_weights=False,
+        win_size=1,
+        use_sample_covariance=False,
+        crop=True,
+    )
+    # No crop applied for pad == 0, so the full extent survives.
+    assert e.ux.shape == (16, 16)
+    np.testing.assert_allclose(e.ux, img1)
+    np.testing.assert_allclose(e.uy, img2)
+    np.testing.assert_allclose(e.vx, 0.0, atol=1e-12)
+    np.testing.assert_allclose(e.vy, 0.0, atol=1e-12)
+
+
 def test_raises_on_win_size_larger_than_image() -> None:
     """``win_size`` exceeding the spatial extent raises ValueError."""
     a = np.zeros((8, 8))

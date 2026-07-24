@@ -16,7 +16,7 @@ from .ri_factor import (
     ALPHA_MAX_DEFAULT,
     ALPHA_MIN_DEFAULT,
     get_global_ri_factor,
-    _validate_alpha_bounds,
+    validate_alpha_bounds,
 )
 from .ssim_elements import compute_ssim_elements
 from .image_processing import (
@@ -76,7 +76,7 @@ class MicroSSIM:
         alpha_min: float = ALPHA_MIN_DEFAULT,
         alpha_max: float = ALPHA_MAX_DEFAULT,
     ) -> None:
-        _validate_alpha_bounds(alpha_min, alpha_max)
+        validate_alpha_bounds(alpha_min, alpha_max)
         self._bg_percentile = bg_percentile
         self._offset_pred = offset_pred
         self._offset_gt = offset_gt
@@ -179,30 +179,24 @@ class MicroSSIM:
         self._initialized = True
         return self
 
-    def score(
-        self,
-        gt: np.ndarray,
-        pred: np.ndarray,
-        return_individual_components: bool = False,
-        **kwargs: Any,
-    ) -> float:
-        """Compute MicroSSIM between two 2-D images.
+    def _prepare(
+        self, gt: np.ndarray, pred: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Validate a scoring pair and apply the fitted normalization.
+
+        Shared by :meth:`score` and :meth:`MicroMS3IM.score`.
 
         Parameters
         ----------
         gt, pred : np.ndarray
             2-D ground-truth and prediction images with matching shapes.
-        return_individual_components : bool, default=False
-            Currently unused; accepted for upstream-signature parity.
-        **kwargs
-            Forwarded to :func:`compute_ssim_elements` (e.g., ``sigma``,
-            ``K1``, ``K2``) to match upstream's pass-through contract at
-            ``micro_ssim.py:377-383``.
 
         Returns
         -------
-        float
-            Scalar mean of the SSIM map on the cropped extent.
+        tuple
+            ``(gt_norm, pred_norm_scaled, data_range)`` — the normalized
+            ground truth, the normalized prediction multiplied by the fitted
+            RI factor, and the ``gt_norm`` dynamic range.
 
         Raises
         ------
@@ -226,14 +220,64 @@ class MicroSSIM:
         gt_norm = cast(np.ndarray, normalize_min_max(gt, offset_gt, max_val))
         pred_norm = cast(np.ndarray, normalize_min_max(pred, offset_pred, max_val))
         data_range = float(gt_norm.max() - gt_norm.min())
+        return gt_norm, pred_norm * ri_factor, data_range
+
+    def score(
+        self,
+        gt: np.ndarray,
+        pred: np.ndarray,
+        return_individual_components: bool = False,
+        **kwargs: Any,
+    ) -> float:
+        """Compute MicroSSIM between two 2-D images.
+
+        Parameters
+        ----------
+        gt, pred : np.ndarray
+            2-D ground-truth and prediction images with matching shapes.
+        return_individual_components : bool, default=False
+            Not supported; accepted only for upstream-signature parity.
+            Passing ``True`` raises ``NotImplementedError`` rather than
+            silently returning the pooled score. Call
+            :func:`compute_ssim_elements` directly to build the individual
+            luminance / contrast-structure terms.
+        **kwargs
+            Forwarded to :func:`compute_ssim_elements` (e.g., ``sigma``,
+            ``K1``, ``K2``) to match upstream's pass-through contract at
+            ``micro_ssim.py:377-383``. ``gaussian_weights=True`` and
+            ``crop=True`` are defaults, not hardcoded — both can be
+            overridden here.
+
+        Returns
+        -------
+        float
+            Scalar mean of the SSIM map on the cropped extent.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``return_individual_components`` is True.
+        ValueError
+            If ``fit()`` has not been called, gt/pred shapes differ, or
+            ``gt.ndim != 2``.
+        """
+        if return_individual_components:
+            raise NotImplementedError(
+                "return_individual_components is not implemented; it is "
+                "accepted only for upstream-signature parity. Call "
+                "cubic.metrics.microssim.compute_ssim_elements directly to "
+                "build the individual SSIM components."
+            )
+        gt_norm, pred_scaled, data_range = self._prepare(gt, pred)
         # Score path: gaussian_weights=True matches _compute_micro_ssim's
         # default at micro_ssim.py:31 (gaussian filter, sigma=1.5, win_size=11).
+        # setdefault, not hardcoded, so the documented pass-through works.
+        kwargs.setdefault("gaussian_weights", True)
+        kwargs.setdefault("crop", True)
         e = compute_ssim_elements(
             gt_norm,
-            pred_norm * ri_factor,
+            pred_scaled,
             data_range=data_range,
-            gaussian_weights=True,
-            crop=True,
             **kwargs,
         )
         a1 = 2.0 * e.ux * e.uy + e.C1
@@ -269,23 +313,47 @@ class MicroSSIM:
             "ri_factor": self._ri_factor,
         }
 
+    @classmethod
+    def fit_and_score(
+        cls,
+        gt: np.ndarray | list[np.ndarray],
+        pred: np.ndarray | list[np.ndarray],
+    ) -> float | list[float]:
+        """Fit a fresh instance on ``(gt, pred)``, then score every slice.
+
+        Mirrors upstream ``micro_ssim.py:172-203``. Subclasses inherit this
+        unchanged, so :class:`MicroMS3IM` gets the same stack / list
+        semantics with its own ``score``.
+
+        Parameters
+        ----------
+        gt, pred : np.ndarray or list of np.ndarray
+            Ground-truth and prediction images, as accepted by :meth:`fit`.
+
+        Returns
+        -------
+        float or list of float
+            A list of per-slice scores for list / 3-D input, or a single
+            float for a 2-D pair. Slices are scored one at a time because
+            ``score`` itself rejects ``ndim != 2`` (upstream behavior).
+        """
+        metric = cls().fit(gt, pred)
+        if isinstance(gt, list):
+            pred_l = cast(list[np.ndarray], pred)
+            return [float(metric.score(g, p)) for g, p in zip(gt, pred_l)]
+        pred_a = cast(np.ndarray, pred)
+        if gt.ndim == 3:
+            return [float(metric.score(gt[i], pred_a[i])) for i in range(gt.shape[0])]
+        return float(metric.score(gt, pred_a))
+
 
 def micro_structural_similarity(
     gt: np.ndarray | list[np.ndarray],
     pred: np.ndarray | list[np.ndarray],
 ) -> float | list[float]:
-    """Fit a MicroSSIM on ``(gt, pred)`` then score each slice.
+    """Fit a :class:`MicroSSIM` on ``(gt, pred)`` then score each slice.
 
-    Mirrors upstream ``micro_ssim.py:172-203``: returns a list of per-slice
-    floats for list / 3-D inputs, or a single float for a 2-D pair. Do NOT
-    call ``MicroSSIM.score`` on a 3-D stack — upstream raises on
-    ``ndim != 2``.
+    Thin wrapper over :meth:`MicroSSIM.fit_and_score`; see that method for
+    the list / 3-D / 2-D return contract.
     """
-    ms = MicroSSIM().fit(gt, pred)
-    if isinstance(gt, list):
-        pred_l = cast(list[np.ndarray], pred)
-        return [float(ms.score(g, p)) for g, p in zip(gt, pred_l)]
-    pred_a = cast(np.ndarray, pred)
-    if gt.ndim == 3:
-        return [float(ms.score(gt[i], pred_a[i])) for i in range(gt.shape[0])]
-    return float(ms.score(gt, pred_a))
+    return MicroSSIM.fit_and_score(gt, pred)

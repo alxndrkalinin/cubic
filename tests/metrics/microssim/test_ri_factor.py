@@ -5,11 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from cubic.metrics.microssim import ri_factor as ri
 from cubic.metrics.microssim.ri_factor import (
     get_ri_factor,
     _compute_S_mean,
     _compute_dS_mean,
-    _flatten_elements,
     get_global_ri_factor,
 )
 from cubic.metrics.microssim.ssim_elements import (
@@ -58,9 +58,8 @@ def test_linear_scaling_optimum_exists() -> None:
         gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
     )
     alpha_star = get_ri_factor(elements)
-    flat = _flatten_elements(elements)
-    s_star = _compute_S_mean(alpha_star, flat)
-    s_one = _compute_S_mean(1.0, flat)
+    s_star = _compute_S_mean(alpha_star, elements)
+    s_one = _compute_S_mean(1.0, elements)
     # Ascent (with slack); positive alpha.
     assert alpha_star > 0.0
     assert s_star >= s_one - 1e-12
@@ -162,11 +161,10 @@ def test_scipy_parity() -> None:
         gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
     )
 
-    flat = _flatten_elements(elements)
     alpha_bisect = get_ri_factor(elements)
 
     def neg_s(alpha_arr: np.ndarray) -> float:
-        return -_compute_S_mean(float(alpha_arr[0]), flat)
+        return -_compute_S_mean(float(alpha_arr[0]), elements)
 
     res = minimize(neg_s, x0=np.array([1.0]))
     alpha_bfgs = float(res.x[0])
@@ -190,26 +188,25 @@ def test_bisection_terminates_quickly() -> None:
     elements = compute_ssim_elements(
         gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
     )
-    flat = _flatten_elements(elements)
-    f1 = _compute_dS_mean(1.0, flat)
+    f1 = _compute_dS_mean(1.0, elements)
     # The setup above should yield a non-trivial root — skip if the input
     # accidentally already satisfies |f(1)| ~ 0.
     if abs(f1) < 1e-14:
         pytest.skip("f(1) already at machine zero; iter count not meaningful")
-    lo, hi, f_lo, f_hi = _bracket_root(flat, f1, alpha_min=1e-3, alpha_max=1e3)
+    lo, hi, f_lo = _bracket_root(elements, f1, alpha_min=1e-3, alpha_max=1e3)
 
     iters = 0
     mid = 0.5 * (lo + hi)
-    f_mid = _compute_dS_mean(mid, flat)
+    f_mid = _compute_dS_mean(mid, elements)
     while iters < 200:
         if abs(f_mid) < 1e-10 and abs(hi - lo) < 1e-8:
             break
-        if f_lo * f_mid <= 0.0:
-            hi, f_hi = mid, f_mid
+        if (f_lo > 0.0) != (f_mid > 0.0):
+            hi = mid
         else:
             lo, f_lo = mid, f_mid
         mid = 0.5 * (lo + hi)
-        f_mid = _compute_dS_mean(mid, flat)
+        f_mid = _compute_dS_mean(mid, elements)
         iters += 1
 
     assert iters < 100, f"bisection took {iters} iterations"
@@ -486,6 +483,129 @@ def test_alpha_max_cap_probed_when_loop_overshoots() -> None:
     alpha = get_ri_factor(elements, alpha_max=1.5)
     assert np.isfinite(alpha)
     assert 1.0 <= alpha <= 1.5, f"expected root in [1.0, 1.5]; got {alpha}"
+
+
+def test_element_layout_does_not_change_alpha() -> None:
+    """2-D, 3-D batched, and pre-raveled elements all yield the same alpha.
+
+    Pins the removal of the ``_flatten_elements`` no-op: ``.mean()`` already
+    reduces over every element pixel, so the solver must be layout-agnostic
+    without an explicit ravel (which cost five array copies per call, since
+    cropped element arrays are non-contiguous views).
+    """
+    rng = np.random.default_rng(40)
+    gt = rng.random((3, 32, 32)).astype(np.float64)
+    pred = gt * 1.4 + 0.05 * rng.standard_normal((3, 32, 32))
+    dr = float(gt.max() - gt.min())
+    batched = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    raveled = SSIMElements(
+        ux=batched.ux.ravel(),
+        uy=batched.uy.ravel(),
+        vxy=batched.vxy.ravel(),
+        vx=batched.vx.ravel(),
+        vy=batched.vy.ravel(),
+        C1=batched.C1,
+        C2=batched.C2,
+    )
+    assert get_ri_factor(batched) == get_ri_factor(raveled)
+
+    # A single 2-D slice pooled on its own must also work unchanged.
+    single = compute_ssim_elements(
+        gt[0], pred[0], data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    assert get_ri_factor(single) == get_ri_factor(
+        SSIMElements(
+            ux=single.ux.ravel(),
+            uy=single.uy.ravel(),
+            vxy=single.vxy.ravel(),
+            vx=single.vx.ravel(),
+            vy=single.vy.ravel(),
+            C1=single.C1,
+            C2=single.C2,
+        )
+    )
+
+
+@pytest.mark.parametrize("scale", [1e-4, 0.1, 0.5, 1.5, 3.0, 100.0, 1e5])
+def test_matches_brute_force_argmax(scale: float) -> None:
+    """``get_ri_factor`` recovers the brute-force argmax of ``mean S(alpha)``.
+
+    End-to-end guard on the solver after the ``_terms`` extraction, the
+    ``_flatten_elements`` removal, and the switch from a ``f_lo * f_mid``
+    product test to a direct sign comparison. A dense log-spaced sweep
+    around the returned root must not find a better objective value.
+    """
+    rng = np.random.default_rng(41)
+    gt = rng.random((32, 32)).astype(np.float64)
+    # Noise scales with the signal so the optimum stays near 1 / scale
+    # instead of being swamped at small scale factors.
+    pred = scale * (gt + 0.02 * rng.standard_normal((32, 32)))
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    alpha = get_ri_factor(elements)
+    s_alpha = _compute_S_mean(alpha, elements)
+
+    grid = np.logspace(np.log10(alpha) - 1.0, np.log10(alpha) + 1.0, 401)
+    best = max(_compute_S_mean(float(a), elements) for a in grid)
+    assert s_alpha >= best - 1e-12, (
+        f"scale={scale}: solver S={s_alpha} below grid best S={best} at alpha={alpha}"
+    )
+
+
+def test_exact_zero_derivative_probe_returns_that_alpha(monkeypatch) -> None:
+    """A probe landing exactly on the root returns it via a degenerate bracket.
+
+    ``_bracket_root`` returns ``lo == hi`` when ``f(alpha) == 0.0`` exactly.
+    This is the one case where the direct sign comparison in the bisection
+    loop would misbehave if the bracket kept a zero-valued endpoint, so pin
+    the degenerate-bracket contract.
+    """
+    rng = np.random.default_rng(42)
+    gt = rng.random((16, 16)).astype(np.float64)
+    elements = compute_ssim_elements(
+        gt,
+        gt,
+        data_range=float(gt.max() - gt.min()),
+        gaussian_weights=False,
+        win_size=7,
+        crop=True,
+    )
+
+    def fake_dS(alpha: float, _elements: SSIMElements) -> float:
+        return 0.0 if alpha == 2.0 else 1.0
+
+    monkeypatch.setattr(ri, "_compute_dS_mean", fake_dS)
+    monkeypatch.setattr(ri, "_compute_S_mean", lambda alpha, _e: float(alpha))
+
+    lo, hi, f_lo = ri._bracket_root(elements, 1.0, 1e-6, 1e6)
+    assert (lo, hi, f_lo) == (2.0, 2.0, 0.0)
+    assert ri.get_ri_factor(elements) == 2.0
+
+
+def test_non_ascent_raises_value_error(monkeypatch) -> None:
+    """The ascent invariant raises ``ValueError``, not ``AssertionError``.
+
+    ``assert`` is stripped under ``python -O``, which would silently return
+    a descending iterate. Force a violation by monkeypatching the objective
+    so ``S(alpha*) < S(1)``.
+    """
+    rng = np.random.default_rng(43)
+    gt = rng.random((32, 32)).astype(np.float64)
+    pred = gt * 1.4
+    dr = float(gt.max() - gt.min())
+    elements = compute_ssim_elements(
+        gt, pred, data_range=dr, gaussian_weights=False, win_size=7, crop=True
+    )
+    # S(1) = 1.0, S(anything else) = 0.0 -> guaranteed non-ascent.
+    monkeypatch.setattr(
+        ri, "_compute_S_mean", lambda alpha, _e: 1.0 if alpha == 1.0 else 0.0
+    )
+    with pytest.raises(ValueError, match="non-ascent"):
+        ri.get_ri_factor(elements)
 
 
 def test_alpha_min_cap_probed_when_loop_undershoots() -> None:

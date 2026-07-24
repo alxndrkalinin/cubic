@@ -10,6 +10,7 @@ from .ri_factor import (
     ALPHA_MIN_DEFAULT,
     get_ri_factor,
     get_global_ri_factor,
+    validate_alpha_bounds,
 )
 from .micro_ssim import MicroSSIM, micro_structural_similarity
 from .micro_ms3im import MicroMS3IM, micro_multiscale_structural_similarity
@@ -34,4 +35,5 @@ __all__ = [
     "micro_multiscale_structural_similarity",
     "micro_structural_similarity",
     "normalize_min_max",
+    "validate_alpha_bounds",
 ]
