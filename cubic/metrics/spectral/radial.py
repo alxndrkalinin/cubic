@@ -24,9 +24,24 @@ def _normalize_spacing(
     return [float(s) for s in spacing]
 
 
-def _kmax_index(shape: tuple[int, ...]) -> float:
-    """Compute minimum Nyquist frequency in index units (unshifted FFT)."""
-    return float(min(n // 2 for n in shape))
+def _spacing_or_unit(spacing: Sequence[float] | None, ndim: int) -> tuple[float, ...]:
+    """Return *spacing* as a tuple, treating ``None`` as one unit per axis.
+
+    ``None`` means "index units", which is the same frequency grid as a spacing
+    of 1: cycles per pixel. Keeping them as one code path matters for non-square
+    input. Scaling each axis by its own length instead (the old index-unit
+    branch, ``fftfreq(n) * n``) makes a constant-radius ring an *ellipse* in
+    physical frequency once the axes differ in length, so a single bin averaged
+    unlike frequencies together, and ``None`` and ``1.0`` disagreed: a (64, 128)
+    array gave 32 bins for ``None`` against 64 for ``1.0``, with different
+    per-voxel bin assignments. Square input was unaffected, which is why this
+    survived.
+    """
+    if spacing is None:
+        return (1.0,) * ndim
+    if len(spacing) != ndim:
+        raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
+    return tuple(float(s) for s in spacing)
 
 
 def _kmax_phys(shape: tuple[int, ...], spacing: Sequence[float]) -> float:
@@ -47,7 +62,7 @@ def _kmax_phys_max(shape: tuple[int, ...], spacing: Sequence[float]) -> float:
 def _radial_edges_cached(
     shape: tuple[int, ...],
     bin_delta: float,
-    spacing_key: tuple[float, ...] | None,
+    spacing_key: tuple[float, ...],
     use_max_nyquist: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -56,7 +71,7 @@ def _radial_edges_cached(
     Args:
         shape: Image shape (tuple of ints)
         bin_delta: Bin width in index bins
-        spacing_key: Physical spacing tuple (hashable) or None
+        spacing_key: Physical spacing tuple (hashable); all ones for index units
         use_max_nyquist: If True, use maximum Nyquist (for SFSC with
             anisotropic data). Default False uses minimum Nyquist.
 
@@ -68,23 +83,13 @@ def _radial_edges_cached(
     if bin_delta <= 0:
         raise ValueError("bin_delta must be > 0")
 
-    if spacing_key is None:
-        # Index units: step = bin_delta, kmax = floor(n/2).
-        # Honor use_max_nyquist (max axis Nyquist) so sectioned callers that
-        # normalize by max(n // 2) reach 1.0 on anisotropic shapes; otherwise
-        # the XY-sector curve is compressed into the low-frequency quarter.
-        step = float(bin_delta)
-        kmax = (
-            float(max(n // 2 for n in shape)) if use_max_nyquist else _kmax_index(shape)
-        )
+    # One index bin in physical units along axis i: Δk_i = 1/(n_i·spacing_i)
+    dk_min = min(1.0 / (n * sp) for n, sp in zip(shape, spacing_key))
+    step = float(bin_delta) * dk_min
+    if use_max_nyquist:
+        kmax = _kmax_phys_max(shape, spacing_key)
     else:
-        # Physical units: one index bin in physical units along axis i: Δk_i = 1/(n_i·spacing_i)
-        dk_min = min(1.0 / (n * sp) for n, sp in zip(shape, spacing_key))
-        step = float(bin_delta) * dk_min
-        if use_max_nyquist:
-            kmax = _kmax_phys_max(shape, spacing_key)
-        else:
-            kmax = _kmax_phys(shape, spacing_key)
+        kmax = _kmax_phys(shape, spacing_key)
 
     # Build edges from 0 to kmax with step size
     nb = max(1, int(np.ceil(kmax / step)))
@@ -113,8 +118,8 @@ def radial_edges(
     Args:
         shape: Image shape (2D or 3D)
         bin_delta: Bin width in index bins (default: 1.0)
-        spacing: Physical spacing per axis. None uses index units,
-                 given uses physical frequency (cycles per length).
+        spacing: Physical spacing per axis. None means one unit per axis, i.e.
+                 cycles per pixel (see :func:`_spacing_or_unit`).
         use_max_nyquist: If True, use maximum Nyquist frequency across all axes
                          instead of minimum. Useful for sectioned FSC where
                          XY-dominant sectors need to extend to XY Nyquist.
@@ -125,18 +130,12 @@ def radial_edges(
         edges: (M+1,) radial bin edges from 0 to kmax
         radii: (M,) radial bin centers (midpoints)
     """
-    # Validate spacing dimensions
-    if spacing is not None:
-        ndim = len(shape)
-        if len(spacing) != ndim:
-            raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
-        spacing_key = tuple(float(s) for s in spacing)
-    else:
-        spacing_key = None
-
     # Convert to hashable types and call cached implementation
     return _radial_edges_cached(
-        tuple(int(n) for n in shape), float(bin_delta), spacing_key, use_max_nyquist
+        tuple(int(n) for n in shape),
+        float(bin_delta),
+        _spacing_or_unit(spacing, len(shape)),
+        use_max_nyquist,
     )
 
 
@@ -188,18 +187,11 @@ def radial_bin_id(
     if ndim not in (2, 3):
         raise ValueError("Only 2D and 3D images are supported")
 
-    if spacing is not None:
-        if len(spacing) != ndim:
-            raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
-
-    if spacing is not None:
-        # xp.fft.fftfreq needed to create arrays on correct device
-        axes = [
-            xp.fft.fftfreq(n, d=sp).astype(np.float32) for n, sp in zip(shape, spacing)
-        ]
-    else:
-        # xp.fft.fftfreq needed to create arrays on correct device
-        axes = [xp.fft.fftfreq(n).astype(np.float32) * n for n in shape]
+    # xp.fft.fftfreq needed to create arrays on correct device
+    axes = [
+        xp.fft.fftfreq(n, d=sp).astype(np.float32)
+        for n, sp in zip(shape, _spacing_or_unit(spacing, ndim))
+    ]
 
     # Build K with broadcasting
     if ndim == 2:
@@ -248,7 +240,8 @@ def radial_k_grid(
     shape : tuple
         Image shape (2D or 3D)
     spacing : sequence of float, optional
-        Physical spacing per axis. If None, uses index units.
+        Physical spacing per axis. None means one unit per axis, i.e. cycles per
+        pixel (see :func:`_spacing_or_unit`).
 
     Returns
     -------
@@ -261,19 +254,15 @@ def radial_k_grid(
     if ndim not in (2, 3):
         raise ValueError("Only 2D and 3D images are supported")
 
-    if spacing is not None:
-        if len(spacing) != ndim:
-            raise ValueError(f"spacing length {len(spacing)} must match dims {ndim}")
-        # Physical frequency coordinates: fftfreq(n, d=sp) gives cycles per unit
-        axes = [
-            np.fft.fftfreq(n, d=float(sp)).astype(np.float32)
-            for n, sp in zip(shape, spacing)
-        ]
-        k_max = _kmax_phys(shape, spacing)
-    else:
-        # Index frequency coordinates
-        axes = [np.fft.fftfreq(n).astype(np.float32) for n in shape]
-        k_max = 0.5  # Nyquist in index units
+    spacing = _spacing_or_unit(spacing, ndim)
+    # Physical frequency coordinates: fftfreq(n, d=sp) gives cycles per unit.
+    # k_max is derived, not hardcoded to 0.5: an odd axis tops out at
+    # (n // 2) / n, which is below Nyquist.
+    axes = [
+        np.fft.fftfreq(n, d=float(sp)).astype(np.float32)
+        for n, sp in zip(shape, spacing)
+    ]
+    k_max = _kmax_phys(shape, spacing)
 
     # Build k_radius using broadcasting for efficiency
     if ndim == 2:
@@ -424,7 +413,8 @@ def sectioned_bin_id(
         - 90° = XY-dominated frequencies (k_xy >> |kz|) → XY resolution
         where k_xy = sqrt(kx² + ky²). This captures all lateral frequencies.
     spacing : sequence of float, optional
-        Physical spacing per axis [z, y, x]. If None, uses index units.
+        Physical spacing per axis [z, y, x]. None means one unit per axis, i.e.
+        cycles per pixel (see :func:`_spacing_or_unit`).
     exclude_axis_angle : float, optional
         Exclude frequencies within this angle (in degrees) from the Z axis.
         This follows Koho et al. 2019 to avoid piezo/interpolation artifacts
@@ -445,15 +435,10 @@ def sectioned_bin_id(
     if len(shape) != 3:
         raise ValueError("sectioned_bin_id requires 3D shape")
 
-    if spacing is not None and len(spacing) != 3:
-        raise ValueError("spacing must have 3 elements for 3D")
-
-    if spacing is not None:
-        axes = [
-            xp.fft.fftfreq(n, d=sp).astype(np.float32) for n, sp in zip(shape, spacing)
-        ]
-    else:
-        axes = [xp.fft.fftfreq(n).astype(np.float32) * n for n in shape]
+    axes = [
+        xp.fft.fftfreq(n, d=sp).astype(np.float32)
+        for n, sp in zip(shape, _spacing_or_unit(spacing, 3))
+    ]
 
     # Build frequency grids with broadcasting
     kz = axes[0][:, None, None]

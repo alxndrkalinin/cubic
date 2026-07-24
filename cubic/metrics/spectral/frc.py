@@ -69,7 +69,7 @@ def _make_repeat_rngs(
     return [np.random.default_rng(s) for s in ss.spawn(n_repeats)]
 
 
-def _normalization_spacing(max_freq: float, spacing: Sequence[float] | None) -> float:
+def _normalization_spacing(max_freq: float) -> float:
     """Return the spacing implied by a normalized frequency axis.
 
     :class:`FourierCorrelationAnalysis` inverts a threshold crossing as
@@ -78,12 +78,11 @@ def _normalization_spacing(max_freq: float, spacing: Sequence[float] | None) -> 
     normalized by. Passing a raw axis spacing instead silently rescales every
     resolution by the anisotropy ratio.
 
-    With ``spacing=None`` the frequency grid is in index units (cycles per
-    image) but the Nyquist of the limiting axis is still 0.5 cycles per pixel,
-    so the implied spacing is 1 pixel.
+    ``spacing=None`` needs no special case: the grid is then in cycles per pixel,
+    where ``max_freq`` is 0.5 for even axes and the implied spacing is 1 pixel.
+    Returning a hardcoded 1.0 was wrong for odd axes, which top out at
+    ``(n // 2) / n`` rather than 0.5.
     """
-    if spacing is None:
-        return 1.0
     return 1.0 / (2.0 * max_freq)
 
 
@@ -423,7 +422,7 @@ def _calculate_frc_single_pass(
         )
 
     edges, _ = radial_edges(image1_proc.shape, bin_delta, spacing=spacing_adj)
-    return frc_data, _normalization_spacing(float(edges[-1]), spacing_adj)
+    return frc_data, _normalization_spacing(float(edges[-1]))
 
 
 def calculate_frc(
@@ -770,7 +769,7 @@ def calculate_sectioned_fsc(
         data,
         # DirectionalFSC normalizes by the iterator's Nyquist, so the analyzer
         # must invert with the spacing that Nyquist implies.
-        _normalization_spacing(iterator.nyquist, spacing),
+        _normalization_spacing(iterator.nyquist),
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         snr_value=snr_value,
@@ -1149,7 +1148,7 @@ def _fsc_extract_resolution(
     dict[str, float]
         Resolution values with 'xy' and 'z' keys.
     """
-    spacing_eff = _normalization_spacing(max_freq, spacing_list)
+    spacing_eff = _normalization_spacing(max_freq)
 
     angles = sorted(fsc_data.keys())
 

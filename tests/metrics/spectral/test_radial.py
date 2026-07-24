@@ -15,21 +15,41 @@ from cubic.metrics.spectral.radial import (
 from cubic.metrics.spectral.iterators import FourierShellIterator
 
 
-def test_radial_edges_index_units_honor_use_max_nyquist() -> None:
-    """use_max_nyquist extends index-unit edges to the max axis Nyquist.
+def test_radial_edges_use_max_nyquist_is_a_noop_without_spacing() -> None:
+    """Without spacing every axis has the same Nyquist, so the flag does nothing.
 
-    For an anisotropic shape with no spacing the radial bins must reach
-    ``max(n // 2)`` when requested, so sectioned callers that normalize by the
-    XY Nyquist span the full [0, 1] range instead of being compressed into the
-    low-frequency quarter.
+    ``use_max_nyquist`` distinguishes the coarsest axis from the finest, which
+    only differ when the axes have different *physical* spacing. With no spacing
+    every axis is sampled once per pixel, so all of them top out at 0.5 cycles
+    per pixel however long they are.
+
+    This used to differ: the index-unit grid scaled each axis by its own length,
+    giving a (16, 64, 64) volume a min Nyquist of 8 against a max of 32, so the
+    flag mattered and a constant-radius ring was an ellipse in physical
+    frequency. See ``radial._spacing_or_unit``.
     """
-    shape = (16, 64, 64)  # min(n//2)=8, max(n//2)=32
+    shape = (16, 64, 64)
 
     edges_min, _ = radial_edges(shape, spacing=None, use_max_nyquist=False)
     edges_max, _ = radial_edges(shape, spacing=None, use_max_nyquist=True)
 
-    assert edges_min[-1] == 8.0
-    assert edges_max[-1] == 32.0
+    assert edges_min[-1] == 0.5
+    assert edges_max[-1] == 0.5
+    # Identical to spelling the same grid as a spacing of one.
+    edges_one, _ = radial_edges(shape, spacing=[1.0, 1.0, 1.0])
+    np.testing.assert_allclose(edges_min, edges_one)
+
+
+def test_radial_edges_use_max_nyquist_splits_on_anisotropic_spacing() -> None:
+    """With genuinely anisotropic spacing the flag still separates the axes."""
+    shape = (16, 64, 64)
+    spacing = [0.5, 0.1, 0.1]  # Z Nyquist 1.0, XY Nyquist 5.0
+
+    edges_min, _ = radial_edges(shape, spacing=spacing, use_max_nyquist=False)
+    edges_max, _ = radial_edges(shape, spacing=spacing, use_max_nyquist=True)
+
+    assert edges_min[-1] == pytest.approx(1.0)
+    assert edges_max[-1] == pytest.approx(5.0)
 
 
 def test_radial_edges_isotropic_unaffected() -> None:
@@ -37,7 +57,7 @@ def test_radial_edges_isotropic_unaffected() -> None:
     shape = (64, 64)
     edges_min, _ = radial_edges(shape, spacing=None, use_max_nyquist=False)
     edges_max, _ = radial_edges(shape, spacing=None, use_max_nyquist=True)
-    assert edges_min[-1] == edges_max[-1] == 32.0
+    assert edges_min[-1] == edges_max[-1] == 0.5
 
 
 def test_radial_bin_id_spacing_one_fills_all_bins() -> None:

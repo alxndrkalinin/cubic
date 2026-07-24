@@ -83,8 +83,9 @@ ring correlation." *Optics Express* 32(12):21767, 2024.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `spacing` | None | Physical spacing [Z, Y, X] in microns |
+| `spacing` | None | Physical spacing [Z, Y, X] in microns; None means pixels |
 | `resample_isotropic` | False | Resample to isotropic voxels before FSC |
+| `angle_delta` | 15 | Angular sector width in degrees; must divide 90 |
 | `exclude_axis_angle` | 0.0 | Exclude frequencies near Z axis (degrees) |
 | `backend` | `"hist"` | GPU-accelerated histogram-based backend |
 

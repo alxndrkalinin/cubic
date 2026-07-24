@@ -14,6 +14,7 @@ from .radial import (
     radial_edges,
     radial_k_grid,
     _kmax_phys_max,
+    _spacing_or_unit,
     sectioned_bin_id,
     _normalize_spacing,
     _validate_angle_delta,
@@ -511,11 +512,9 @@ def _compute_decorrelation_curve_sectioned(
     n_angle = _validate_angle_delta(angle_delta, min_sectors=2)
     shape = image.shape
 
-    # Index units and spacing=1.0 are the same thing here: keeping the grid in
-    # cycles per pixel makes k_max 0.5 per axis, matching radial_k_grid and so
-    # the non-sectioned DCR path. Binning in cycles per image instead would
-    # make the reported resolution a fraction of the image extent, off by ~n.
-    spacing_list = [1.0] * 3 if spacing is None else [float(s) for s in spacing]
+    # None and 1.0 are the same grid (see radial._spacing_or_unit); spelling it
+    # out keeps the per-sector k_max calls below explicit.
+    spacing_list = list(_spacing_or_unit(spacing, 3))
 
     F = np.fft.fftn(image)
     absF_flat = np.abs(F).ravel()

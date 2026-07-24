@@ -22,7 +22,12 @@ from cubic.metrics.spectral.frc import (
     _calibration_factor,
     _fsc_extract_resolution,
 )
-from cubic.metrics.spectral.radial import _kmax_phys
+from cubic.metrics.spectral.radial import (
+    _kmax_phys,
+    radial_edges,
+    radial_bin_id,
+    radial_k_grid,
+)
 from cubic.metrics.spectral.analysis import (
     FourierCorrelationData,
     FourierCorrelationAnalysis,
@@ -1062,6 +1067,46 @@ def test_frc_spacing_one_matches_index_units(backend: str) -> None:
 
     assert np.isfinite(res_one), "spacing=1.0 must yield a finite resolution"
     assert res_one == pytest.approx(res_none, rel=1e-9)
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (32, 64, 64)])
+def test_index_units_bin_identically_to_unit_spacing(shape: tuple[int, ...]) -> None:
+    """``spacing=None`` must bin exactly like ``spacing=1.0`` on non-square input.
+
+    The old index-unit branch scaled each axis by its own length
+    (``fftfreq(n) * n``), which turns a constant-radius ring into an ellipse in
+    physical frequency as soon as the axes differ in length. A (64, 128) array
+    then produced 32 bins for ``None`` against 64 for ``1.0``, with different
+    per-voxel assignments, so the two spellings of "no physical units" disagreed.
+    Square input happened to agree, which is why it went unnoticed.
+    """
+    unit = [1.0] * len(shape)
+
+    edges_none, radii_none = radial_edges(shape, 1.0, spacing=None)
+    edges_one, radii_one = radial_edges(shape, 1.0, spacing=unit)
+
+    np.testing.assert_allclose(edges_none, edges_one)
+    np.testing.assert_allclose(radii_none, radii_one)
+
+    bid_none = radial_bin_id(shape, edges_none, spacing=None)
+    bid_one = radial_bin_id(shape, edges_one, spacing=unit)
+    np.testing.assert_array_equal(bid_none, bid_one)
+
+
+def test_radial_k_grid_kmax_is_derived_not_hardcoded() -> None:
+    """An odd axis tops out below Nyquist, so k_max cannot be a constant 0.5.
+
+    ``radial_k_grid`` returned 0.5 for every index-unit grid; the highest
+    frequency an odd axis of length n actually carries is ``(n // 2) / n``.
+    """
+    k_radius, k_max = radial_k_grid((63, 63))
+
+    assert k_max == pytest.approx(31 / 63)
+    assert k_max < 0.5
+    # Nothing on the grid exceeds the reported maximum along an axis.
+    assert float(np.abs(np.fft.fftfreq(63)).max()) == pytest.approx(k_max)
+    # Even axes are unchanged at exactly Nyquist.
+    assert radial_k_grid((64, 64))[1] == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("backend", ["mask", "hist"])

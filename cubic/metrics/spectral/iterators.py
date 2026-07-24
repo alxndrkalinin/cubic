@@ -41,7 +41,7 @@ from collections.abc import Iterable, Sequence
 
 import numpy as np
 
-from .radial import _kmax_phys, _kmax_index, radial_edges
+from .radial import _kmax_phys, radial_edges, _spacing_or_unit
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -86,10 +86,10 @@ class FourierRingIterator:
 
         # Use unshifted fftfreq coordinates (no fftshift)
         # Match radial_bin_id formula for consistency
-        if spacing is not None:
-            axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing)]
-        else:
-            axes = [np.fft.fftfreq(n) * n for n in shape]
+        axes = [
+            np.fft.fftfreq(n, d=sp)
+            for n, sp in zip(shape, _spacing_or_unit(spacing, len(shape)))
+        ]
         y, x = np.meshgrid(*axes, indexing="ij")
         self.meshgrid = (y, x)
         self.r = np.sqrt(x**2 + y**2)
@@ -171,20 +171,15 @@ class FourierShellIterator:
 
         # Use unshifted fftfreq coordinates (no fftshift)
         # Match radial_bin_id formula for consistency
-        if spacing is not None:
-            axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing)]
-        else:
-            axes = [np.fft.fftfreq(n) * n for n in shape]
+        spacing_units = _spacing_or_unit(spacing, len(shape))
+        axes = [np.fft.fftfreq(n, d=sp) for n, sp in zip(shape, spacing_units)]
         z, y, x = np.meshgrid(*axes, indexing="ij")
         self.meshgrid = (z, y, x)
         self.r = np.sqrt(x**2 + y**2 + z**2)
 
         self.current_shell = self.shell_start
         # Compute Nyquist frequency using same functions as radial_edges
-        if spacing is not None:
-            self.freq_nyq = _kmax_phys(shape, spacing)
-        else:
-            self.freq_nyq = _kmax_index(shape)
+        self.freq_nyq = _kmax_phys(shape, spacing_units)
 
     @property
     def steps(self) -> np.ndarray:
