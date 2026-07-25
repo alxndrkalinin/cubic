@@ -116,14 +116,21 @@ so resolutions come back in pixels.
 #### Axial Nyquist floor
 
 A flat FSC crossing cannot land below the sampling limit, because no Fourier
-shell exists past Nyquist. Both axial corrections above break that guarantee:
-they rescale a crossing that *was* on the grid, so the product is unbounded.
-`axial_floor_factor` (default `2.0`) re-imposes the limit, reporting `nan` with a
-warning when `z` comes out finer than `2 × the original Z spacing`. The factor
-multiplies the spacing captured *before* resampling — interpolating Z refines the
-grid but adds no information, so the band limit does not move.
+shell exists past Nyquist. `axial_floor_factor` (default `2.0`) re-imposes that
+limit on `z`, reporting `nan` with a warning when the result comes out finer than
+`2 × the original Z spacing`. The factor multiplies the spacing captured *before*
+resampling — interpolating Z refines the grid but adds no information, so the
+band limit does not move.
 
-This restores a property the other methods already have. Descloux's DCR searches
+Note what does *not* cause sub-Nyquist values here. Neither axial correction can:
+`1 / cos(theta)` is `≥ 1` for every sector the `z` cascade can use, and the Koho
+eq. (5) factor `1 + (anisotropy - 1)·|cos(theta)|` is `≥ 1` whenever
+`z_spacing ≥ xy_spacing`. Both only ever make `z` coarser. The sub-Nyquist value
+arrives *before* the axial correction, from the single-image calibration —
+see below — so the floor is a downstream net over an upstream defect, and it does
+not protect `xy` at all.
+
+The floor does restore a property DCR already has: Descloux's method searches
 over `linspace(0, 1) × k_max` and inverts as `2 · spacing / k_c`, so it is
 structurally incapable of returning less than `2 · spacing`; ours additionally
 caps the peak search at `r_max=0.9`. Koho et al. (2019) require
@@ -135,9 +142,33 @@ the sampling distance", and Diebolder et al. (2015) caution that conical FSC
 rather than a quantitative method that yields absolute resolution values", since
 measurements "might rather reflect the spatial sampling".
 
-Pass `axial_floor_factor=0.0` to disable the check. Only `z` needs it: `xy` is
-reported as measured, so the frequency grid already bounds it at `2 × spacing_xy`.
-The deprecated `backend="mask"` path applies no axial correction and no floor.
+Pass `axial_floor_factor=0.0` to disable the check. The deprecated
+`backend="mask"` path applies no axial correction and no floor.
+
+#### Known issue: the single-image calibration is extrapolated near Nyquist
+
+Single-image (checkerboard) FRC/FSC divides its result by the Koho et al. (2019)
+calibration factor `a·exp(c·(r - b)) + d` at the crossing `r`, whose reciprocal
+is the paper's fit to `d_min(ref) / d_min(co1)` (Supplementary Fig. 3). That
+factor is `≈ 0.55` over most of the band — dividing by it *coarsens* the result,
+which is the point: the checkerboard split's diagonal shift compresses the curve,
+so raw single-image resolution reads too fine.
+
+The fit is an exponential centred at `b = 0.98`. It crosses `1.0` at `r ≈ 0.925`
+and reaches `1.82` at `r = 1`, so a crossing near the band edge is divided by a
+factor `> 1` and reported *finer* than the raw crossing implies — up to 45% below
+the Nyquist period. Read off Supplementary Fig. 3, the paper's calibration points
+stop around `r ≈ 0.85` (their coarsest pixel size, 113 nm), where the ratio is
+already `≈ 1.0`; everything beyond that is extrapolation, and a ratio `< 1` would
+invert the frequency-compression effect the correction models. miplib divides by
+the same unbounded factor.
+
+This affects **both** directions. `xy` has no floor guard, so a lateral crossing
+at the band edge can be reported below `2 × spacing_xy` with no warning. A
+crossing above `r ≈ 0.925` means the curve only decorrelates at the band edge —
+the image is sampling-limited, not resolution-limited — so prefer a criterion
+that crosses earlier (`resolution_threshold="half-bit"` or `"snr"`) over reading
+the number at face value.
 
 ### DCR
 
