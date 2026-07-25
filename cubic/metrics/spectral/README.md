@@ -112,6 +112,32 @@ their Fig. 4b pollen stack it gives XY 0.586 µm / Z 4.38 µm against a publishe
 `spacing=None` is the same frequency grid as `spacing=1.0` — cycles per pixel —
 so resolutions come back in pixels.
 
+#### Axial Nyquist floor
+
+A flat FSC crossing cannot land below the sampling limit, because no Fourier
+shell exists past Nyquist. Both axial corrections above break that guarantee:
+they rescale a crossing that *was* on the grid, so the product is unbounded.
+`axial_floor_factor` (default `2.0`) re-imposes the limit, reporting `nan` with a
+warning when `z` comes out finer than `2 × the original Z spacing`. The factor
+multiplies the spacing captured *before* resampling — interpolating Z refines the
+grid but adds no information, so the band limit does not move.
+
+This restores a property the other methods already have. Descloux's DCR searches
+over `linspace(0, 1) × k_max` and inverts as `2 · spacing / k_c`, so it is
+structurally incapable of returning less than `2 · spacing`; ours additionally
+caps the peak search at `r_max=0.9`. Koho et al. (2019) require
+`d_pixel ≤ d_min / (2√2)` for the single-image checkerboard split — a stricter
+`2√2 ≈ 2.83` floor, available as `axial_floor_factor=2*np.sqrt(2)`. Rieger et al.
+(2024) likewise note the method needs the derived resolution to sit "well above
+the sampling distance", and Diebolder et al. (2015) caution that conical FSC
+"should be seen as a qualitative tool for comparison of resolution isotropies
+rather than a quantitative method that yields absolute resolution values", since
+measurements "might rather reflect the spatial sampling".
+
+Pass `axial_floor_factor=0.0` to disable the check. Only `z` needs it: `xy` is
+reported as measured, so the frequency grid already bounds it at `2 × spacing_xy`.
+The deprecated `backend="mask"` path applies no axial correction and no floor.
+
 ### DCR
 
 | Parameter | Default | Description |

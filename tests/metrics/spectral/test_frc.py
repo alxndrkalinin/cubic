@@ -498,6 +498,69 @@ def test_resampled_fsc_uses_koho_anisotropy_not_the_geometric_projection() -> No
     assert resampled["xy"] == pytest.approx(geometric["xy"])
 
 
+def test_sectioned_fsc_rejects_axial_resolution_below_the_sampling_limit() -> None:
+    """The 1/cos(theta) projection must not manufacture sub-Nyquist axial values.
+
+    A flat FSC crossing is implicitly bounded because no Fourier shell exists
+    beyond Nyquist. Projecting a sector rescales a crossing that *was* on the
+    grid, so the product is unbounded — on the astrocyte stack that reported
+    0.4395 µm axial against a 2 * 0.3 = 0.6 µm limit. Descloux's own DCR
+    implementation avoids this structurally (its search runs over
+    ``linspace(0, 1)`` times Nyquist), and this guard restores the same property.
+    """
+    fsc_data = {angle: _single_bin_sector(crosses=True) for angle in (8, 22, 38)}
+    kwargs: dict[str, Any] = dict(
+        max_freq=6.435,
+        single_image=False,
+        resolution_threshold="fixed",
+        threshold_value=0.143,
+    )
+
+    raw = _fsc_extract_resolution(fsc_data, axial_floor=0.0, **kwargs)
+    assert np.isfinite(raw["z"])
+
+    # A floor just above the unguarded value must reject it.
+    floor = raw["z"] * 1.5
+    with pytest.warns(RuntimeWarning, match="finer than the axial sampling limit"):
+        guarded = _fsc_extract_resolution(fsc_data, axial_floor=floor, **kwargs)
+    assert np.isnan(guarded["z"])
+    # XY is reported as measured, so the floor must leave it untouched.
+    assert guarded["xy"] == pytest.approx(raw["xy"])
+
+    # A floor below the measured value must pass it through unchanged.
+    kept = _fsc_extract_resolution(fsc_data, axial_floor=raw["z"] * 0.5, **kwargs)
+    assert kept["z"] == pytest.approx(raw["z"])
+
+
+def test_fsc_resolution_axial_floor_derives_from_the_pre_resample_spacing() -> None:
+    """Resampling refines the grid, not the information, so the floor must not move.
+
+    With ``resample_isotropic=True`` the volume's Z spacing becomes the XY one,
+    which would drop a naive floor from 2*0.4 to 2*0.1. The floor has to be taken
+    before resampling, or the guard is silently defeated on exactly the path that
+    needs it most.
+    """
+    from cubic.metrics.spectral import frc as frc_mod
+
+    volume, spacing = _anisotropic_volume()
+    captured: list[float] = []
+    real = frc_mod._fsc_extract_resolution
+
+    def spy(*args: Any, **kw: Any) -> dict[str, float]:
+        captured.append(kw["axial_floor"])
+        return real(*args, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(frc_mod, "_fsc_extract_resolution", spy)
+        fsc_resolution(volume, spacing=spacing, angle_delta=15, resample_isotropic=True)
+
+    assert captured, "_fsc_extract_resolution was never called"
+    assert captured[0] == pytest.approx(2.0 * spacing[0]), (
+        f"axial floor {captured[0]} used the resampled spacing instead of the "
+        f"original {spacing[0]}"
+    )
+
+
 def _single_bin_sector(crosses: bool) -> FourierCorrelationData:
     """Return one sector's curve, either decaying through 0.143 or staying above."""
     freq = np.linspace(0, 1, 50)
@@ -1169,8 +1232,14 @@ def test_fsc_resolution_respects_two_pixel_floor(kwargs: dict[str, Any]) -> None
     assert result["xy"] >= floor_xy, (
         f"XY resolution {result['xy']:.4f} is below the {floor_xy} µm pixel floor"
     )
+    # Z must clear the *axial* floor, which is coarser than the lateral one. The
+    # earlier version of this assert reused floor_xy, so any axial value between
+    # the two floors passed — exactly the range the 1/cos(theta) projection lands in.
+    floor_z = 2 * spacing[0]
     if np.isfinite(result["z"]):
-        assert result["z"] >= floor_xy
+        assert result["z"] >= floor_z, (
+            f"Z resolution {result['z']:.4f} is below the {floor_z} µm axial floor"
+        )
 
 
 def test_fsc_resolution_inverts_its_own_frequency_axis() -> None:

@@ -1084,6 +1084,7 @@ def _fsc_extract_resolution(
     resolution_threshold: str,
     threshold_value: float,
     resampled_anisotropy: float | None = None,
+    axial_floor: float = 0.0,
     xy_curve_fit_type: str = "smooth-spline",
     z_curve_fit_type: str = "smooth-spline",
     apply_cutoff: bool = True,
@@ -1132,6 +1133,11 @@ def _fsc_extract_resolution(
         ``z_spacing / xy_spacing`` of the *original* volume, when the input was
         interpolated up to isotropic voxels. None (default) means the frequency
         grid carries true per-axis Nyquists, so Z is projected geometrically.
+    axial_floor : float, optional
+        Smallest reportable axial resolution, in the same units as the result.
+        A finer value is replaced by ``nan`` with a warning. 0.0 (default)
+        disables the check; callers should pass a multiple of the *original*
+        (pre-resampling) Z spacing.
     resolution_threshold : str
         Threshold criterion for resolution calculation.
     threshold_value : float
@@ -1208,6 +1214,23 @@ def _fsc_extract_resolution(
             1.0 + (resampled_anisotropy - 1.0) * abs(float(np.cos(np.deg2rad(z_angle))))
         )
 
+    # A flat FSC crossing cannot fall below the sampling limit because no
+    # Fourier shell exists beyond Nyquist. Both axial corrections above break
+    # that guarantee: they rescale a crossing that *was* on the grid, so the
+    # product is unbounded. Re-impose the band limit explicitly.
+    if axial_floor > 0.0 and np.isfinite(z_resolution) and z_resolution < axial_floor:
+        warnings.warn(
+            f"Sectioned FSC axial resolution {z_resolution:.4g} (from the "
+            f"{z_angle} degree sector) is finer than the axial sampling limit "
+            f"{axial_floor:.4g}; reporting nan. Interpolating Z, and projecting "
+            "a sector by 1/cos(theta), both rescale the frequency axis without "
+            "adding information, so the axial band limit stays at the original "
+            "Z spacing. Pass axial_floor_factor=0 to report the raw value.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        z_resolution = float("nan")
+
     return {"xy": xy_resolution, "z": z_resolution}
 
 
@@ -1223,6 +1246,7 @@ def fsc_resolution(
     resample_isotropic: bool = False,
     resample_order: int = 1,
     average: bool = True,
+    axial_floor_factor: float = 2.0,
     exclude_axis_angle: float = 0.0,
     use_max_nyquist: bool = False,
     resolution_threshold: str = "fixed",
@@ -1261,6 +1285,16 @@ def fsc_resolution(
         average: If True and single-image mode, average results from both diagonal
                  checkerboard splits (forward and reverse) to reduce variance.
                  Following Koho et al. 2019 methodology. Default: True.
+        axial_floor_factor: Multiple of the *original* (pre-resampling) Z spacing
+                 below which the axial result is reported as ``nan`` with a
+                 warning. Default 2.0 is the axial Nyquist limit. Koho et al.
+                 (2019) state the single-image checkerboard method needs
+                 ``d_pixel <= d_min / (2*sqrt(2))``, i.e. a stricter 2*sqrt(2)
+                 ~ 2.83 floor; Rieger et al. (2024) likewise require the derived
+                 resolution to sit "well above the sampling distance". Pass 0.0
+                 to disable the check and report the raw value. Only ``z`` needs
+                 this: ``xy`` is reported as measured, so the frequency grid
+                 already bounds it at 2x the lateral spacing.
         exclude_axis_angle: Exclude frequencies within this angle (in degrees) from
                             the Z axis. Following Koho et al. 2019 to avoid artifacts
                             from piezo stage motion and interpolation near the optical
@@ -1326,6 +1360,12 @@ def fsc_resolution(
             UserWarning,
             stacklevel=2,
         )
+
+    # Axial band limit, captured *before* any resampling: interpolating Z
+    # refines the grid but not the information, so the floor stays here.
+    # spacing=None means index units, where one voxel is the unit of length.
+    _original = _normalize_spacing(spacing, image1.ndim)
+    axial_floor = axial_floor_factor * (1.0 if _original is None else _original[0])
 
     # --- Isotropic resampling (optional) ---
     # None keeps the geometric axial projection; resampling swaps in the Koho
@@ -1430,6 +1470,7 @@ def fsc_resolution(
                 max_freq=max_freq,
                 single_image=True,
                 resampled_anisotropy=resampled_anisotropy,
+                axial_floor=axial_floor,
                 resolution_threshold=resolution_threshold,
                 threshold_value=threshold_value,
                 xy_curve_fit_type=xy_curve_fit_type,
@@ -1475,6 +1516,7 @@ def fsc_resolution(
         max_freq=max_freq,
         single_image=single_image,
         resampled_anisotropy=resampled_anisotropy,
+        axial_floor=axial_floor,
         resolution_threshold=resolution_threshold,
         threshold_value=threshold_value,
         xy_curve_fit_type=xy_curve_fit_type,
