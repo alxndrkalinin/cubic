@@ -1079,7 +1079,6 @@ def _fsc_hist_compute(
 def _fsc_extract_resolution(
     fsc_data: dict[int, FourierCorrelationData],
     *,
-    spacing_list: list[float] | None,
     max_freq: float,
     single_image: bool,
     resolution_threshold: str,
@@ -1125,8 +1124,6 @@ def _fsc_extract_resolution(
     ----------
     fsc_data : dict
         Per-sector FSC data from _fsc_hist_compute.
-    spacing_list : list[float] or None
-        Physical spacing [z, y, x]. None for index units.
     max_freq : float
         Nyquist frequency the FSC frequency axis was normalized by.
     single_image : bool
@@ -1430,7 +1427,6 @@ def fsc_resolution(
 
             rep_res = _fsc_extract_resolution(
                 fsc_data,
-                spacing_list=spacing_list,
                 max_freq=max_freq,
                 single_image=True,
                 resampled_anisotropy=resampled_anisotropy,
@@ -1476,7 +1472,6 @@ def fsc_resolution(
 
     result = _fsc_extract_resolution(
         fsc_data,
-        spacing_list=spacing_list,
         max_freq=max_freq,
         single_image=single_image,
         resampled_anisotropy=resampled_anisotropy,

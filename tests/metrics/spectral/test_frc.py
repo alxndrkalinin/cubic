@@ -471,7 +471,6 @@ def test_resampled_fsc_uses_koho_anisotropy_not_the_geometric_projection() -> No
     """
     fsc_data = {angle: _single_bin_sector(crosses=True) for angle in (8, 22, 38)}
     kwargs: dict[str, Any] = dict(
-        spacing_list=[0.0777, 0.0777, 0.0777],
         max_freq=6.435,
         single_image=False,
         resolution_threshold="fixed",
@@ -527,7 +526,6 @@ def test_sectioned_fsc_never_reports_z_from_an_xy_sector() -> None:
     with pytest.warns(RuntimeWarning, match="No FSC threshold crossing"):
         result = _fsc_extract_resolution(
             fsc_data,
-            spacing_list=[0.5, 0.19, 0.19],
             max_freq=2.6316,
             single_image=False,
             resolution_threshold="fixed",
@@ -1204,7 +1202,6 @@ def test_fsc_resolution_inverts_its_own_frequency_axis() -> None:
 
     result = _fsc_extract_resolution(
         fsc_data,
-        spacing_list=spacing,
         max_freq=max_freq,
         single_image=False,
         resolution_threshold="fixed",
