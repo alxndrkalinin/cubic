@@ -344,6 +344,9 @@ def remove_touching_objects(
     touching = np.zeros(max_label + 1, dtype=bool)
     touching = to_same_device(touching, label_image)  # type: ignore[arg-type]
     shape = label_image.shape
+    # loop-invariant: label_image is not written until after the loop, so the
+    # background mask is built once instead of twice per offset
+    nonzero = label_image != 0
     # half of the (3,) * ndim offsets suffices: offset d and -d yield the same
     # pairs, and both members of every pair are flagged
     for offset in itertools.product((-1, 0, 1), repeat=label_image.ndim):
@@ -358,7 +361,7 @@ def remove_touching_objects(
         )
         a = label_image[here]
         b = label_image[there]
-        adjacent = (a != b) & (a != 0) & (b != 0)
+        adjacent = (a != b) & nonzero[here] & nonzero[there]
         touching[a[adjacent]] = True
         touching[b[adjacent]] = True
 

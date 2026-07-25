@@ -213,13 +213,13 @@ def radial_bin_id(
     # the mask backend, so the final correlation value is not a true ring/shell
     # average — in 3D roughly half of all voxels land there. exclude_overflow
     # drops them instead, at the cost of a noisier last bin.
-    overflow = bid >= nbins
+    overflow = bid >= nbins if exclude_overflow else None
     bid = np.clip(bid, 0, nbins - 1).astype(np.int32, copy=False)
 
     # Exclude DC robustly using dtype-specific threshold
     tiny = np.finfo(K.dtype).tiny
     bid[K < tiny] = -1
-    if exclude_overflow:
+    if overflow is not None:
         bid[overflow] = -1
 
     return bid
@@ -474,7 +474,7 @@ def sectioned_bin_id(
     n_radial = int(radial_edges.size) - 1
     radial_id = np.digitize(k_radius, _binning_edges(radial_edges)) - 1
     # See radial_bin_id for what folding the overflow into the last shell means.
-    overflow = radial_id >= n_radial
+    overflow = radial_id >= n_radial if exclude_overflow else None
     radial_id = np.clip(radial_id, 0, n_radial - 1).astype(np.int32)
 
     # Angular binning
@@ -487,7 +487,7 @@ def sectioned_bin_id(
     radial_id[k_radius < tiny] = -1
     angle_id[k_radius < tiny] = -1
 
-    if exclude_overflow:
+    if overflow is not None:
         radial_id[overflow] = -1
         angle_id[overflow] = -1
 
