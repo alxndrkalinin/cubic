@@ -302,7 +302,6 @@ def average_precision(
         reuse the single overlap pass instead of recomputing it.
     """
     iou: np.ndarray | None = None
-    counts: tuple[int, int] | None = None
     if matches_per_threshold is None:
         # ``compute_matches`` builds the IoU matrix either way, so asking for it
         # is free and its shape gives the object counts: the labels are known to
@@ -310,18 +309,16 @@ def average_precision(
         matches_per_threshold, iou = compute_matches(
             masks_true, masks_pred, thresholds, return_iou=True
         )
-        counts = (int(iou.shape[0]), int(iou.shape[1]))
 
     tp = np.asarray([len(matches_per_threshold[th][0]) for th in thresholds])
-    if counts is None:
+    if iou is not None:
+        n_true, n_pred = int(iou.shape[0]), int(iou.shape[1])
+    else:
         # Caller-supplied matches bypass the label checks in ``compute_matches``,
         # so count distinct foreground labels rather than using ``.max()``, which
         # would over-count across a gap in the label ids and corrupt FP/FN/AP.
-        counts = (
-            int(np.count_nonzero(np.unique(masks_true))),
-            int(np.count_nonzero(np.unique(masks_pred))),
-        )
-    n_true, n_pred = counts
+        n_true = int(np.count_nonzero(np.unique(masks_true)))
+        n_pred = int(np.count_nonzero(np.unique(masks_pred)))
     fp = n_pred - tp
     fn = n_true - tp
 

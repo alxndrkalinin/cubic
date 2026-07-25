@@ -274,8 +274,8 @@ def _iter_label_boxes(
 ) -> Iterator[tuple[int, tuple[slice, ...]]]:
     """Yield ``(label_id, bbox_slices)`` for every label present in the image.
 
-    Shared by the post-processing filters so they crop to each object's bounding
-    box instead of scanning the whole image once per label.
+    Lets a per-object filter crop to each object's bounding box instead of
+    scanning the whole image once per label.
     """
     for label_id, slices in enumerate(find_objects(label_image), start=1):
         if slices is not None:
@@ -472,17 +472,6 @@ def segment_watershed(
     return to_device(labels, device)
 
 
-def _binary_fill_holes(image, **kwargs):
-    """Fill holes in binary objects."""
-    # the device-conditional import must stay local: cupyx is a GPU-only dep
-    if get_device(image) == "GPU":
-        from cupyx.scipy.ndimage import binary_fill_holes
-    else:
-        from scipy.ndimage import binary_fill_holes
-
-    return binary_fill_holes(image, **kwargs)
-
-
 def fill_label_holes(lbl_img, **binary_fill_holes_kwargs):
     """Fill small holes in label image.
 
@@ -509,9 +498,9 @@ def fill_label_holes(lbl_img, **binary_fill_holes_kwargs):
         interior = [(s.start > 0, s.stop < sz) for s, sz in zip(sl, lbl_img.shape)]
         shrink_slice = shrink(interior)
         grown_mask = lbl_img[grow(sl, interior)] == i
-        mask_filled = _binary_fill_holes(grown_mask, **binary_fill_holes_kwargs)[
-            shrink_slice
-        ]
+        mask_filled = _ndimage.binary_fill_holes(
+            grown_mask, **binary_fill_holes_kwargs
+        )[shrink_slice]
         lbl_img_filled[sl][mask_filled] = i
 
     return lbl_img_filled

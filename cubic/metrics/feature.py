@@ -171,18 +171,17 @@ def morphology_correlations(
         true_ind, pred_ind = matches_per_threshold[th]
         true_indices = np.isin(true_labels, true_ind)
         pred_indices = np.isin(pred_labels, pred_ind)
-        if true_indices.any() and pred_indices.any():
-            filtered_true_feats = true_features[true_indices]
-            filtered_pred_feats = pred_features[pred_indices]
-            if (
-                filtered_true_feats.shape[0] > 1
-                and filtered_true_feats.shape == filtered_pred_feats.shape
-            ):
-                correlations[th] = _calculate_correlations(
-                    filtered_true_feats, filtered_pred_feats, feature_names
-                )
-            else:
-                correlations[th] = _nan_dict(feature_names)
+        filtered_true_feats = true_features[true_indices]
+        filtered_pred_feats = pred_features[pred_indices]
+        # An all-False mask selects zero rows, so the row-count check below
+        # already covers the empty case — no separate .any() guard needed.
+        if (
+            filtered_true_feats.shape[0] > 1
+            and filtered_true_feats.shape == filtered_pred_feats.shape
+        ):
+            correlations[th] = _calculate_correlations(
+                filtered_true_feats, filtered_pred_feats, feature_names
+            )
         else:
             correlations[th] = _nan_dict(feature_names)
 

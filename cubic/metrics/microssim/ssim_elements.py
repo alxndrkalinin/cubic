@@ -30,6 +30,7 @@ import cubic.scipy as _sp
 import cubic.skimage as _sk
 
 from ...cuda import check_same_device
+from ..ms_ssim import _crop_slice
 
 
 @dataclass(frozen=True)
@@ -257,12 +258,7 @@ def compute_ssim_elements(
     # NO clamp on vx / vy — matches upstream microssim (ssim_utils.py:235-237).
 
     if crop:
-        pad = (win_size - 1) // 2
-        # ``pad == 0`` (win_size == 1) must be a no-op: a bare
-        # ``slice(pad, -pad)`` is ``slice(0, 0)``, which would silently
-        # return empty element arrays.
-        edge = slice(pad, -pad) if pad else slice(None)
-        sl: tuple[slice, ...] = (slice(None),) * (ndim - 2) + (edge, edge)
+        sl = _crop_slice(ndim, (win_size - 1) // 2)
         ux = ux[sl]
         uy = uy[sl]
         vxy = vxy[sl]
