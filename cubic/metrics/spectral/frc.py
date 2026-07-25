@@ -24,12 +24,10 @@ from cubic.image_utils import (
 )
 
 from .radial import (
-    _kmax_phys,
     radial_edges,
     _sector_edges,
     frc_from_sums,
     radial_bin_id,
-    _kmax_phys_max,
     reduce_frc_sums,
     sectioned_bin_id,
     _normalize_spacing,
@@ -868,19 +866,10 @@ def _calculate_fsc_sectioned_hist(
     # Compute FSC for each angle
     results = {}
 
-    # Nyquist for normalization
-    if spacing is not None:
-        max_freq = (
-            _kmax_phys_max(shape, spacing)
-            if use_max_nyquist
-            else _kmax_phys(shape, spacing)
-        )
-    else:
-        max_freq = float(
-            max(n // 2 for n in shape)
-            if use_max_nyquist
-            else min(n // 2 for n in shape)
-        )
+    # Nyquist for normalization. Read it off the edges rather than recomputing
+    # it: radial_edges spans exactly 0..kmax for the same shape/spacing/
+    # use_max_nyquist, so this cannot drift out of step with `radii`.
+    max_freq = float(r_edges[-1])
 
     spatial_freq = asnumpy(radii.astype(np.float32) / max_freq)
 
