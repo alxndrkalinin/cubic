@@ -87,6 +87,7 @@ ring correlation." *Optics Express* 32(12):21767, 2024.
 | `resample_isotropic` | False | Resample to isotropic voxels before FSC |
 | `angle_delta` | 15 | Angular sector width in degrees; must divide 90 |
 | `exclude_axis_angle` | 0.0 | Exclude frequencies near Z axis (degrees) |
+| `axial_floor_factor` | 2.0 | Report `z` as `nan` below this multiple of the pre-resampling Z spacing; 0 disables |
 | `backend` | `"hist"` | GPU-accelerated histogram-based backend |
 
 `fsc_resolution` returns `{"xy": ..., "z": ...}`. A sector centred on polar angle
