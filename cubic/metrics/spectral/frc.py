@@ -26,6 +26,7 @@ from cubic.image_utils import (
 from .radial import (
     _kmax_phys,
     radial_edges,
+    _sector_edges,
     frc_from_sums,
     radial_bin_id,
     _kmax_phys_max,
@@ -829,7 +830,11 @@ def _calculate_fsc_sectioned_hist(
     """
     # Two sectors minimum: a single sector spanning 0-90° cannot separate the
     # axial from the in-plane cutoff, so it has no Z resolution to report.
-    n_angle = _validate_angle_delta(angle_delta, min_sectors=2)
+    #
+    # Angular edges: polar angle from Z axis (0-90°)
+    # - theta ≈ 0° = Z-dominated frequencies → Z resolution
+    # - theta ≈ 90° = XY-dominated frequencies → XY resolution
+    n_angle, angle_edges = _sector_edges(angle_delta, min_sectors=2)
 
     # Compute FFT
     fft_image1 = np.fft.fftn(image1 - image1.mean())
@@ -842,13 +847,6 @@ def _calculate_fsc_sectioned_hist(
         shape, bin_delta, spacing=spacing, use_max_nyquist=use_max_nyquist
     )
     n_radial = len(radii)
-
-    # Angular edges: polar angle from Z axis (0-90°)
-    # - theta ≈ 0° = Z-dominated frequencies → Z resolution
-    # - theta ≈ 90° = XY-dominated frequencies → XY resolution
-    angle_edges = np.array(
-        [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
-    )
 
     # Get bin IDs
     shape3d = (shape[0], shape[1], shape[2])

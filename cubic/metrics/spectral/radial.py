@@ -385,6 +385,20 @@ def _validate_angle_delta(angle_delta: int, min_sectors: int = 1) -> int:
     return n_angle
 
 
+def _sector_edges(angle_delta: int, min_sectors: int = 1) -> tuple[int, np.ndarray]:
+    """Validate ``angle_delta`` and build the polar sector edges it implies.
+
+    Returns the sector count together with the ``(n_angle + 1,)`` edge array
+    spanning 0-90 degrees. Both sectioned backends (FSC and DCR) derive their
+    geometry here so they cannot drift on the edges while agreeing on the count.
+    """
+    n_angle = _validate_angle_delta(angle_delta, min_sectors=min_sectors)
+    edges = np.array(
+        [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
+    )
+    return n_angle, edges
+
+
 # --- Angular sectioning for 3D FSC ---
 
 

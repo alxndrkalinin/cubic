@@ -12,12 +12,12 @@ from cubic.image_utils import tukey_window
 from .radial import (
     _kmax_phys,
     radial_edges,
+    _sector_edges,
     radial_k_grid,
     _kmax_phys_max,
     _spacing_or_unit,
     sectioned_bin_id,
     _normalize_spacing,
-    _validate_angle_delta,
 )
 
 # Peak-detection tuning from Descloux et al. 2019, Supplementary Note 1.1.
@@ -509,7 +509,8 @@ def _compute_decorrelation_curve_sectioned(
     if image.ndim != 3:
         raise ValueError("Sectioned DCR requires 3D images")
 
-    n_angle = _validate_angle_delta(angle_delta, min_sectors=2)
+    # Angular edges (polar 0-90°)
+    n_angle, angle_edges = _sector_edges(angle_delta, min_sectors=2)
     shape = image.shape
 
     # None and 1.0 are the same grid (see radial._spacing_or_unit); spelling it
@@ -528,11 +529,6 @@ def _compute_decorrelation_curve_sectioned(
         use_max_nyquist=True,
     )
     n_radial_raw = len(radii_raw)
-
-    # Angular edges (polar 0-90°)
-    angle_edges = np.array(
-        [float(i * angle_delta) for i in range(n_angle + 1)], dtype=np.float32
-    )
 
     # Per-sector k_max for resolution conversion
     # XY sector uses XY-Nyquist (max), Z sector uses Z-Nyquist (min)
