@@ -299,6 +299,22 @@ def _calibration_factor(freq_at_crossing: float) -> float:
     threshold by imaging the same field of view at different pixel sizes
     (Supplementary Note 2, Supplementary Fig. 3, Koho et al. 2019).
 
+    The value returned is the reciprocal of the curve the paper fits, which
+    approximates ``d_min(ref) / d_min(co1)``; callers divide the raw resolution by
+    it. That ratio cannot drop below 1: the frequency compression puts the
+    one-image crossing at a *higher* radius than the two-image reference, so the
+    correction can only ever make the resolution coarser. The fit is an
+    exponential centred on ``b = 0.98``, though, so it climbs past 1.0 at
+    ``r ~ 0.925`` and reaches 1.82 at the band edge — and dividing by that reports
+    a resolution up to 45% *below* the sampling limit, since the raw crossing was
+    at most Nyquist to begin with. The paper's calibration points stop around
+    ``r ~ 0.85`` (their coarsest pixel size, 113 nm), where the ratio is already
+    ~1.0, so everything past it is extrapolation. Clamping at 1.0 keeps the
+    correction on the side of the effect it models and makes the reported
+    resolution ``1 / (root * kmax * factor)`` bounded below by ``1 / kmax``, the
+    Nyquist period, for both directions. miplib divides by the same factor
+    unbounded, so its near-Nyquist crossings are reported too fine.
+
     Parameters
     ----------
     freq_at_crossing : float
@@ -307,7 +323,8 @@ def _calibration_factor(freq_at_crossing: float) -> float:
     Returns
     -------
     float
-        Calibration factor. Divide raw resolution by this to get corrected value.
+        Calibration factor in ``(0, 1]``. Divide raw resolution by this to get
+        the corrected value.
     """
 
     def calibration_func(x: float, a: float, b: float, c: float, d: float) -> float:
@@ -315,7 +332,7 @@ def _calibration_factor(freq_at_crossing: float) -> float:
 
     # Parameters from miplib calibration (Koho et al. 2019)
     params = [0.95988146, 0.97979108, 13.90441896, 0.55146136]
-    return calibration_func(freq_at_crossing, *params)
+    return min(calibration_func(freq_at_crossing, *params), 1.0)
 
 
 def _apply_cutoff_correction(result: FourierCorrelationData) -> None:

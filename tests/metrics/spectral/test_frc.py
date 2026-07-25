@@ -22,6 +22,7 @@ from cubic.metrics.spectral.frc import (
     _calibration_factor,
     _normalization_spacing,
     _fsc_extract_resolution,
+    _apply_cutoff_correction,
 )
 from cubic.metrics.spectral.radial import (
     _kmax_phys,
@@ -300,6 +301,29 @@ def test_calibration_factor() -> None:
     assert all(factors[i] <= factors[i + 1] for i in range(len(factors) - 1)), (
         "Calibration factor should increase with frequency"
     )
+
+
+def test_calibration_factor_never_refines_the_raw_crossing() -> None:
+    """The correction may only coarsen: the factor is clamped at 1.0.
+
+    The paper fits ``d_min(ref) / d_min(co1)``, which is >= 1 because the
+    checkerboard split's diagonal shift puts the one-image crossing at a *higher*
+    radius than the two-image reference. Its fit is an exponential centred on
+    ``b = 0.98``, so unclamped it passes 1.0 near ``r = 0.925`` and reaches 1.82
+    at the band edge; dividing by that reported resolutions up to 45% below the
+    sampling limit. The paper's calibration points stop near ``r = 0.85``, so that
+    whole region is extrapolation.
+    """
+    for freq in np.linspace(0.0, 1.0, 201):
+        factor = _calibration_factor(float(freq))
+        assert 0.0 < factor <= 1.0, f"factor {factor} outside (0, 1] at r={freq}"
+
+    # Unclamped the fit climbs steeply right where crossings pile up on the band
+    # edge; those are exactly the values that used to invert the correction.
+    for freq in (0.93, 0.96, 0.98, 1.0):
+        assert _calibration_factor(freq) == 1.0, (
+            f"band-edge crossing r={freq} must not refine the raw value"
+        )
 
 
 def test_fsc_resolution_single_image(
@@ -1075,6 +1099,54 @@ def test_resolution_returns_nan_when_curve_below_threshold() -> None:
     )
 
 
+def test_band_edge_crossing_is_not_corrected_below_the_sampling_limit() -> None:
+    """A crossing at Nyquist must report the Nyquist period, not 55% of it.
+
+    The single-image correction divides by ``_calibration_factor(root)``. The
+    factor's fit is an exponential that used to reach 1.82 at ``root = 1``, so a
+    curve that only decorrelates at the band edge — meaning the image is
+    sampling-limited, not resolution-limited — came back 45% *finer* than the
+    finest period the grid can represent. Both directions were exposed; ``xy`` has
+    no floor guard of its own, so nothing downstream caught it.
+    """
+    freqs = np.linspace(0.02, 1.0, 50)
+    # Stays well above 0.143 until the very last bins, so the root lands on the
+    # band edge -- the regime the calibration was never fitted on.
+    edge = FourierCorrelationData()
+    edge.correlation["frequency"] = freqs
+    edge.correlation["correlation"] = np.where(freqs < 0.97, 0.9, 0.01)
+    edge.correlation["points-x-bin"] = np.full(50, 100.0)
+    coll = FourierCorrelationDataCollection()
+    coll[0] = edge
+
+    # kmax is whatever the axis was normalized by; spacing_eff = 1 / (2 * kmax),
+    # so the finest representable period is 2 * spacing_eff.
+    spacing_eff = 0.108
+    nyquist_period = 2 * spacing_eff
+    analyzed = FourierCorrelationAnalysis(
+        coll,
+        spacing=spacing_eff,
+        resolution_threshold="fixed",
+        threshold_value=0.143,
+        curve_fit_type="smooth-spline",
+    ).execute(z_correction=1.0)[0]
+
+    root = float(analyzed.resolution["resolution-point"][1])
+    assert root > 0.9, f"test needs a band-edge crossing, got root={root}"
+    raw = float(analyzed.resolution["resolution"])
+    assert raw >= nyquist_period, f"raw crossing already sub-Nyquist: {raw}"
+
+    _apply_cutoff_correction(analyzed)
+    corrected = float(analyzed.resolution["resolution"])
+    assert corrected >= nyquist_period, (
+        f"corrected resolution {corrected} is below the {nyquist_period} um "
+        f"sampling limit (root={root}, factor={_calibration_factor(root)})"
+    )
+    # Clamped to exactly 1.0 here, so the correction is a no-op rather than an
+    # amplifier: the reported value is the raw band-edge crossing.
+    assert corrected == pytest.approx(raw)
+
+
 # ---------- Regression tests ----------
 
 
@@ -1114,11 +1186,11 @@ def test_crop_resolution_returns_per_slice_floats(crop_fn: Any) -> None:
     for key, floor in (("xy", 2 * 0.065), ("xz", 2 * 0.2)):
         values = np.asarray(result[key], dtype=float)
         assert np.all(np.isfinite(values)), f"{key} has non-finite entries: {values}"
-        # A raw crossing gives 1 / (f_c * kmax) >= 2 * spacing, but the
-        # single-image checkerboard estimate is then divided by the empirical
-        # calibration factor, which exceeds 1 for crossings at the band edge.
-        assert np.all(values >= floor / _calibration_factor(1.0)), (
-            f"{key} values implausibly below the {floor} um floor: {values}"
+        # A raw crossing gives 1 / (f_c * kmax) >= 2 * spacing, and the
+        # single-image calibration factor is clamped at 1.0, so dividing by it
+        # cannot push the estimate below that floor.
+        assert np.all(values >= floor), (
+            f"{key} values below the {floor} um sampling floor: {values}"
         )
         assert np.median(values) >= floor, f"{key} median below {floor} um: {values}"
 
@@ -1186,7 +1258,7 @@ def test_crop_resolution_xz_is_measurable(crop_fn: Any, n_z: int) -> None:
         crop_fn(volume, spacing=spacing, crop_size=128)["xz"], float
     )
     assert np.all(np.isfinite(aggregated))
-    assert np.all(aggregated >= floor / _calibration_factor(1.0))
+    assert np.all(aggregated >= floor)
     assert np.median(aggregated) >= floor
 
 
