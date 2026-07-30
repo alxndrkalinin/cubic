@@ -169,12 +169,24 @@ def _butterworth_mask(
 
     ``w = sum_d (q_d / kc_d)**2`` is the squared ellipsoidal radius over the
     centered grid; ``reference`` supplies the output device and dtype.
+
+    The radius is accumulated in float64 regardless of ``reference``'s dtype:
+    with the default ``n = 10``, ``w ** n`` overflows float32 once ``kc`` drops
+    below about 1 Fourier pixel, and ``ee == 0`` then evaluates ``0 * inf`` and
+    yields NaN across the overflowing shell. The result is cast back, so a
+    float32 PSF still gets a float32 mask.
     """
     grids = _centered_grid(shape, reference)
-    w = (grids[0] / kc[0]) ** 2
+    w = (grids[0].astype(np.float64) / kc[0]) ** 2
     for d in range(1, len(shape)):
-        w = w + (grids[d] / kc[d]) ** 2
-    return 1.0 / np.sqrt(1.0 + ee * w**n)
+        w = w + (grids[d].astype(np.float64) / kc[d]) ** 2
+    if ee == 0.0:
+        # beta == 1 (or an auto beta_fp of 1) makes the mask identically one;
+        # short-circuit rather than evaluate 0 * w**n.
+        mask = np.ones_like(w)
+    else:
+        mask = 1.0 / np.sqrt(1.0 + ee * w**n)
+    return mask.astype(reference.dtype)
 
 
 def create_backprojector(

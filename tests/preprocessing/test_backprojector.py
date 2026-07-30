@@ -212,6 +212,30 @@ def test_butterworth_mask_ifft_is_real(size: int) -> None:
     assert np.abs(out.imag).max() / np.abs(out.real).max() < 1e-12
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_butterworth_mask_small_cutoff_stays_finite(dtype) -> None:
+    """A sub-pixel cutoff must not overflow the radius into inf/NaN.
+
+    ``w ** n`` with the default ``n = 10`` exceeds float32's range once ``kc``
+    drops below about 1 Fourier pixel. That alone degrades gracefully (``1 /
+    sqrt(inf)`` is 0, the right mask value out there), but paired with ``ee == 0``
+    it evaluates ``0 * inf`` and returns NaN across the whole overflowing shell.
+    """
+    shape = (64, 64)
+    reference = np.zeros(shape, dtype=dtype)
+    for ee in (1.0, 0.0):
+        mask = _butterworth_mask(shape, (0.5, 0.5), ee, 10, reference)
+        arr = asnumpy(mask)
+        assert np.all(np.isfinite(arr)), (
+            f"{np.dtype(dtype).name}, ee={ee}: "
+            f"{int(np.sum(~np.isfinite(arr)))} non-finite entries"
+        )
+        assert mask.dtype == dtype, "the mask must keep the reference's dtype"
+    # ee == 0 makes 1 / sqrt(1 + 0 * w**n) identically one.
+    flat = _butterworth_mask(shape, (0.5, 0.5), 0.0, 10, reference)
+    np.testing.assert_allclose(asnumpy(flat), 1.0)
+
+
 @pytest.mark.parametrize("size", [15, 16], ids=["odd", "even"])
 def test_traditional_bp_otf_is_conjugate_of_forward_otf(size: int) -> None:
     """``traditional`` must satisfy ``OTF_bp == conj(OTF_f)`` exactly.

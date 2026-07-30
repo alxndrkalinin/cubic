@@ -10,6 +10,11 @@ from importlib import import_module
 
 import numpy as np
 
+#: Keyword arguments a callee writes its result into. The host fallback in
+#: :func:`dispatch_device_call` cannot honour them, since it would write into a
+#: host copy and leave the caller's GPU array untouched.
+_OUTPUT_KWARGS = ("out", "output", "distances", "indices")
+
 
 class CUDAManager:
     """Manages CUDA resources."""
@@ -172,12 +177,17 @@ def dispatch_device_call(
     caller's GPU array untouched. Passing a GPU array under one of those names
     raises rather than silently discarding the result.
     """
-    _OUTPUT_KWARGS = ("out", "output", "distances", "indices")
     use_gpu = CUDAManager().get_cp() is not None and any_gpu_arg(args, kwargs)
 
     def _to_gpu(value: Any) -> Any:
-        """Move arrays back to the GPU, recursing into lists and tuples."""
-        if hasattr(value, "dtype"):
+        """Move arrays back to the GPU, recursing into lists and tuples.
+
+        Scalars are left on the host. NumPy scalars carry a ``dtype`` too, so
+        matching on that alone turned a count returned alongside arrays — the
+        ``return_num=True`` shape — into a 0-d device array, and ``range()`` over
+        the result raised ``TypeError``. Only genuine arrays are moved.
+        """
+        if getattr(value, "ndim", 0) > 0:
             return to_device(value, "GPU")
         if isinstance(value, (list, tuple)):
             moved = [_to_gpu(v) for v in value]
@@ -206,7 +216,13 @@ def dispatch_device_call(
     try:
         func = getattr(import_module(gpu_module), func_name)
     except (ModuleNotFoundError, AttributeError):
-        warnings.warn(f"{gpu_module}.{func_name} is unavailable, falling back to CPU.")
+        # stacklevel=3 skips this frame and the proxy's ``func_wrapper`` so the
+        # warning points at the caller's line, not at cubic's internals. Both
+        # cubic.skimage and cubic.scipy wrap this at the same depth.
+        warnings.warn(
+            f"{gpu_module}.{func_name} is unavailable, falling back to CPU.",
+            stacklevel=3,
+        )
         return _on_cpu(return_to_gpu=True)
     return func(*args, **kwargs)
 

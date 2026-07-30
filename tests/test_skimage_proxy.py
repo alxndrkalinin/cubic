@@ -96,6 +96,58 @@ def test_cpu_fallback_returns_tuple_results_to_gpu(gpu_available: bool) -> None:
         np.testing.assert_allclose(asnumpy(got), want)
 
 
+def test_cpu_fallback_leaves_scalar_results_on_the_host(gpu_available: bool) -> None:
+    """A scalar returned by the host fallback must not become a 0-d GPU array.
+
+    The return path moved anything with a ``dtype`` to the GPU, and NumPy scalars
+    have one, so a count or measurement returned alongside arrays — the
+    ``return_num=True`` shape — came back as a 0-d device array and ``range()``
+    over it raised ``TypeError``. ``measure.mesh_surface_area`` is absent from
+    cuCIM and returns a single float.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    volume = np.zeros((16, 16, 16), dtype=np.float32)
+    volume[4:12, 4:12, 4:12] = 1.0
+
+    with pytest.warns(UserWarning, match="falling back to CPU"):
+        verts, faces, _, _ = mc_skimage.measure.marching_cubes(
+            ascupy(volume), level=0.5
+        )
+    assert get_device(verts) == "GPU"
+
+    with pytest.warns(UserWarning, match="falling back to CPU"):
+        area = mc_skimage.measure.mesh_surface_area(verts, faces)
+
+    assert getattr(area, "ndim", 0) == 0, f"expected a scalar, got ndim={area.ndim}"
+    # The failure this guards: an int-like 0-d device array cannot index or
+    # drive a range, so exercise the plain-scalar contract directly.
+    assert float(area) > 0.0
+    assert range(int(area)) is not None
+
+    expected = mc_skimage.measure.mesh_surface_area(asnumpy(verts), asnumpy(faces))
+    np.testing.assert_allclose(float(area), float(expected))
+
+
+def test_cpu_fallback_warning_points_at_the_caller(gpu_available: bool) -> None:
+    """The fallback warning must name the caller's line, not cubic's internals.
+
+    Without ``stacklevel`` the warning is attributed to ``cuda.py``, which tells
+    a user nothing about which of their calls triggered it.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    volume = np.zeros((16, 16, 16), dtype=np.float32)
+    volume[4:12, 4:12, 4:12] = 1.0
+
+    with pytest.warns(UserWarning, match="falling back to CPU") as record:
+        mc_skimage.measure.marching_cubes(ascupy(volume), level=0.5)
+
+    assert record[0].filename == __file__, (
+        f"warning attributed to {record[0].filename}, expected this test file"
+    )
+
+
 def test_missing_cucim_module_falls_back_to_cpu(
     monkeypatch: pytest.MonkeyPatch, gpu_available: bool
 ) -> None:
