@@ -217,13 +217,47 @@ plt.show()
 # - `resample_isotropic=True`: Resample to isotropic voxels (recommended for anisotropic data)
 # - `exclude_axis_angle`: Exclude frequencies near Z axis to avoid piezo artifacts (typical: 5-10°)
 # - `backend='hist'`: Use GPU-accelerated vectorized backend
+# 
+# > **The axial FSC is `nan` on this stack.** The 38° Z-dominated sector only crosses
+# > the 0.143 threshold at the very band edge, so its measurement sits at the
+# > sampling limit; after the Koho eq. (5) axial correction it lands at 0.58 µm,
+# > below the 2 × 0.3 = **0.6 µm** axial Nyquist floor, and `fsc_resolution` reports
+# > `nan` with a warning (`axial_floor_factor`, default 2.0).
+# >
+# > This is the regime Koho et al. (2019) exclude: they require
+# > $d_{pixel} \le d_{min}/(2\sqrt{2})$, i.e. an axial resolution no finer than
+# > $2\sqrt{2} \times 0.3 = 0.849\,\mu m$ at 0.3 µm Z steps. The true axial resolution
+# > here is finer than that (~0.7–0.9 µm for NA 0.95), so single-image checkerboard
+# > FSC is past the edge of its stated validity in Z on this data.
+# >
+# > **The same is true laterally, less severely.** That criterion needs
+# > $d_{min} \ge 2\sqrt{2} \times 0.1625 = 0.460\,\mu m$, and the measured lateral
+# > resolution is 366 nm — an oversampling of 2.25×, short of the 2.83× required.
+# > For comparison, the RL demonstration in Koho et al. Supplementary Fig. 5 images
+# > at 29 nm pixels for a 130–220 nm resolution, i.e. 4.5–7.6×. So expect the
+# > lateral track below to move only ~29 nm in total, from 366 nm toward its own
+# > 337.5 nm sampling limit, rather than the wide ramp the paper shows.
+# >
+# > The stopping criterion below therefore tracks the **lateral** direction. For an
+# > axial number, use DCR (computed further down): it searches over
+# > `linspace(0, 1) × k_max`, so it is bounded by construction.
+# 
 
 # In[11]:
 
 
 # Track absolute FSC resolution at each iteration (Koho et al. 2019, Fig. 3b)
-# Stop when |Δresolution| < metric_threshold (nm/iteration)
-fsc_metric_threshold = 1.0  # nm/iteration
+# Stop when |Δresolution| < metric_threshold (nm/iteration). Koho et al. (2019,
+# Fig. 3c) define two: -1 nm/it, where "most of the resolution gain has been
+# made", and -0.2 nm/it, "nearly complete convergence". We use the first.
+# Applied to the lateral delta directly: axial is nan on this stack (see the note
+# above), so nanmean reduces to XY. An earlier version averaged in a *frozen*
+# axial value, which halved every delta -- a 1.0 threshold there behaved like 2.0
+# on lateral alone. Bear in mind how little range the lateral track has here: it
+# runs from 366 nm down toward the 337.5 nm sampling limit, ~29 nm in total, so
+# even -1 nm/it is a sizeable fraction of it. The stricter -0.2 nm/it is never
+# reached within the iteration budget below.
+fsc_metric_threshold = 1.0
 
 fsc_kwargs = dict(
     spacing=voxel_sizes,
@@ -239,12 +273,18 @@ _fsc_prev_avg = [None]  # mutable closure for previous average resolution
 
 
 def fsc_convergence_metric(image1, image2, **kwargs):
-    """Compute FSC resolution of current image and return -|Δavg(XY,Z)|.
+    """Compute FSC resolution of current image and return -|Δ mean(XY, Z)|.
 
     Following Koho et al. 2019: track absolute resolution, stop when
     the per-iteration change drops below threshold. Returns negative
     value so deconv_iter_num_finder's `metric_gain > metric_threshold`
     triggers correctly (stop when -|Δ| > -threshold, i.e. |Δ| < threshold).
+
+    The mean is a ``nanmean``: the axial value would have to clear the 0.6 µm
+    axial Nyquist floor to be reportable, and it does not, because the Z-dominated
+    sectors only decorrelate at the band edge (see the note above). The criterion
+    therefore tracks the lateral direction here, rather than averaging in a NaN
+    and never converging.
     """
     # Only compute FSC of the current image (image2), ignore image1
     res = fsc_resolution(image2, **fsc_kwargs)
@@ -253,7 +293,9 @@ def fsc_convergence_metric(image1, image2, **kwargs):
     fsc_xy_resolutions.append(xy_nm)
     fsc_z_resolutions.append(z_nm)
 
-    avg_res = (xy_nm + z_nm) / 2.0
+    avg_res = float(np.nanmean([xy_nm, z_nm]))
+    if np.isnan(avg_res):
+        return -1000.0  # neither direction measurable: do not stop
 
     if _fsc_prev_avg[0] is None:
         _fsc_prev_avg[0] = avg_res
@@ -268,7 +310,7 @@ def fsc_convergence_metric(image1, image2, **kwargs):
 fsc_raw = fsc_resolution(image, **fsc_kwargs)
 fsc_xy_resolutions.append(fsc_raw["xy"] * 1000)
 fsc_z_resolutions.append(fsc_raw["z"] * 1000)
-_fsc_prev_avg[0] = (fsc_xy_resolutions[0] + fsc_z_resolutions[0]) / 2.0
+_fsc_prev_avg[0] = float(np.nanmean([fsc_xy_resolutions[0], fsc_z_resolutions[0]]))
 print(f"Raw: XY={fsc_xy_resolutions[0]:.1f} nm, Z={fsc_z_resolutions[0]:.1f} nm")
 
 fsc_thresh_iter, fsc_resolution_results = deconv_iter_num_finder(

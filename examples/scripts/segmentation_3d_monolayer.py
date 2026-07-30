@@ -25,7 +25,7 @@
 # - [CellProfiler 3D monolayer tutorial](https://github.com/CellProfiler/tutorials/tree/master/3d_monolayer), Allen Institute for Cell Science. 
 # - Kalinin et al. (2025) "cubic: CUDA-accelerated 3D BioImage Computing", ICCV Workshop.
 
-# In[10]:
+# In[1]:
 
 
 from time import perf_counter
@@ -53,7 +53,7 @@ DEVICE = "GPU" if USE_GPU else "CPU"
 print(f"Device: {DEVICE}")
 
 
-# In[11]:
+# In[2]:
 
 
 from pathlib import Path
@@ -100,7 +100,7 @@ print(f"CP nuclei labels: {int(cp_nuclei.max())} objects")
 print(f"CP cell labels: {int(cp_cells.max())} objects")
 
 
-# In[12]:
+# In[3]:
 
 
 z_mid = dna.shape[0] // 2
@@ -132,7 +132,7 @@ plt.show()
 # 6. Upscale back to original resolution (nearest-neighbor)
 # 7. Remove small objects (< 50 voxels)
 
-# In[ ]:
+# In[4]:
 
 
 t0 = perf_counter()
@@ -166,7 +166,7 @@ t_nuclei = perf_counter() - t0
 print(f"Nuclei segmentation: {int(nuclei.max())} objects in {t_nuclei:.2f}s")
 
 
-# In[14]:
+# In[5]:
 
 
 def label_cmap(label_image):
@@ -209,7 +209,7 @@ plt.show()
 # 5. Marker-controlled watershed on negated distance transform within cell mask
 # 6. Remove small objects (< 100 voxels)
 
-# In[15]:
+# In[6]:
 
 
 t0 = perf_counter()
@@ -274,7 +274,7 @@ t_cells = perf_counter() - t0
 print(f"Cell segmentation: {int(cells.max())} objects in {t_cells:.2f}s")
 
 
-# In[16]:
+# In[7]:
 
 
 fig, axes = plt.subplots(1, 4, figsize=(16, 4))
@@ -297,7 +297,7 @@ plt.show()
 # Compare cubic segmentation against CellProfiler reference labels using
 # Average Precision (AP) at IoU thresholds from 0.5 to 1.0.
 
-# In[17]:
+# In[8]:
 
 
 thresholds = np.arange(0.5, 1.0 + 0.05, 0.1)
@@ -319,7 +319,7 @@ for t, nap, cap in zip(thresholds, nuclei_ap_np, cells_ap_np):
     print(f"  IoU {t:.1f}: nuclei={nap:.3f}, cells={cap:.3f}")
 
 
-# In[18]:
+# In[9]:
 
 
 height_ratio = dna.shape[0] / dna.shape[1]

@@ -215,15 +215,39 @@ ax[1, 0].set(
     ylabel="XY FSC resolution (nm)",
     title="Absolute lateral (XY) resolution",
 )
-ax[1, 1].plot(m_it, m_fz, "o-", label="matched")
-ax[1, 1].plot(w_it, w_fz, "s-", label="Wiener-Butterworth")
-ax[1, 1].set(
-    xlabel="iteration",
-    ylabel="Z FSC resolution (nm)",
-    title="Absolute axial (Z) resolution",
-)
+# The axial FSC is nan on this stack: none of the Z-dominated sectors (38/22/8
+# degrees) has a curve that crosses the 0.143 threshold, so there is no axial
+# cut-off frequency to invert and fsc_resolution warns and returns nan. That is a
+# property of these axial sectors, not of the 0.6 um axial Nyquist limit -- the
+# axial_floor_factor guard never fires here. Say so rather than show empty axes.
+axial_measurable = not (np.isnan(m_fz).all() and np.isnan(w_fz).all())
+if axial_measurable:
+    ax[1, 1].plot(m_it, m_fz, "o-", label="matched")
+    ax[1, 1].plot(w_it, w_fz, "s-", label="Wiener-Butterworth")
+    ax[1, 1].set(
+        xlabel="iteration",
+        ylabel="Z FSC resolution (nm)",
+        title="Absolute axial (Z) resolution",
+    )
+else:
+    ax[1, 1].text(
+        0.5,
+        0.5,
+        "axial FSC not measurable on this stack\n"
+        "no Z-dominated sector crosses the 0.143 threshold,\n"
+        "so there is no axial cut-off to report\n"
+        "(use DCR for an axial number)",
+        ha="center",
+        va="center",
+        transform=ax[1, 1].transAxes,
+    )
+    ax[1, 1].set(title="Absolute axial (Z) resolution - unmeasurable")
+    ax[1, 1].set_xticks([])
+    ax[1, 1].set_yticks([])
+
 for a in ax.ravel():
-    a.legend()
+    if a.get_legend_handles_labels()[0]:
+        a.legend()
     a.grid(alpha=0.3)
 fig.tight_layout()
 plt.show()
