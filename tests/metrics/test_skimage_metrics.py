@@ -143,6 +143,68 @@ def test_psnr_normalize_rejects_unknown_value() -> None:
         psnr(a, a, normalize="zscore")
 
 
+def test_ssim_normalize_min_max_matches_reference(
+    test_images: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """``normalize='min_max'`` normalizes before SSIM, as it does for psnr/nrmse.
+
+    ``ssim`` had no ``normalize`` parameter, so the keyword fell into ``**kwargs``
+    and on to ``structural_similarity``, which reads only K1/K2/sigma/
+    use_sample_covariance and drops the rest. Callers passing it to all three
+    metrics got normalized NRMSE and PSNR but raw SSIM, with no error.
+    """
+    img1, img2 = test_images
+    a = _torch_min_max(img1)
+    b = _torch_min_max(img2)
+    expected = float(ssim(a, b, data_range=1.0))
+
+    result = float(ssim(img1, img2, normalize="min_max"))
+    assert np.isclose(result, expected, rtol=1e-10)
+    # And it must differ from the unnormalized value, or the test proves nothing.
+    raw = float(ssim(img1, img2, data_range=float(img1.max() - img1.min())))
+    assert not np.isclose(result, raw, rtol=1e-6)
+
+
+def test_ssim_normalize_rejects_unknown_value() -> None:
+    """Unknown normalize values raise ValueError."""
+    a = np.ones((4, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="not supported"):
+        ssim(a, a, normalize="zscore")
+
+
+def test_ssim_rejects_kwargs_structural_similarity_would_drop() -> None:
+    """A keyword skimage ignores must raise, not silently change nothing.
+
+    ``structural_similarity`` pulls K1/K2/sigma/use_sample_covariance out of
+    ``**kwargs`` and discards anything else, so a typo used to return a value
+    computed as though the argument had never been passed.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=(32, 32)).astype(np.float32)
+    b = a + 0.1 * rng.normal(size=(32, 32)).astype(np.float32)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        ssim(a, b, data_range=1.0, gaussain_weights=True)  # typo for gaussian_
+
+    # The keywords skimage really does consume still pass through.
+    assert np.isfinite(ssim(a, b, data_range=1.0, K1=0.02, sigma=2.0))
+
+
+@pytest.mark.parametrize("metric", [nrmse, psnr, ssim])
+def test_scale_invariant_rejects_normalize(metric) -> None:
+    """``scale_invariant=True`` and ``normalize`` both set the denominator.
+
+    Combining them min-max-rescaled the already-standardized arrays while keeping
+    the pre-normalization ``data_range``, silently returning a third number
+    instead of failing.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=(32, 32)).astype(np.float32)
+    b = (2.5 * a + 0.3).astype(np.float32)
+    with pytest.raises(ValueError, match="incompatible with normalize"):
+        metric(a, b, scale_invariant=True, normalize="min_max")
+
+
 def test_ssim_spatial_dims_2_4d_matches_2d_loop() -> None:
     """4-D ``[N,C,H,W]`` dispatch averages SSIM across the N*C slabs."""
     rng = np.random.default_rng(0)

@@ -25,6 +25,13 @@ _DEFAULT_SIGMA = 1.5
 #: skimage's ``win_size`` default for ``gaussian_weights=False``.
 _DEFAULT_WIN_UNIFORM = 7
 
+#: The only extra keywords ``structural_similarity`` reads out of ``**kwargs``
+#: (identical in skimage and cuCIM). Anything else it drops on the floor, so a
+#: typo — or a keyword only some of our metrics accept, such as ``normalize``
+#: before it was implemented here — used to vanish and return a value computed
+#: without it. Validate against this set instead.
+_SSIM_EXTRA_KWARGS = frozenset({"K1", "K2", "sigma", "use_sample_covariance"})
+
 
 def _gaussian_win_size(sigma: float) -> int:
     """Return the ``win_size`` skimage derives from *sigma*.
@@ -109,15 +116,20 @@ def scale_invariant(fn: Callable) -> Callable:
         if not scale_invariant:
             return fn(image_true, image_test, *args, **kwargs)
 
-        # ``normalization`` (``nrmse`` only) picks skimage's RMSE denominator,
-        # so it conflicts with the ``data_range`` injected at the end of this
-        # branch. Reject it here to give a message that names both options.
-        if kwargs.get("normalization") is not None:
-            raise ValueError(
-                "scale_invariant=True is incompatible with normalization="
-                f"{kwargs['normalization']!r}: the scale-invariant path derives "
-                "its own data_range. Pass exactly one of the two."
-            )
+        # Both of these pick the comparison's denominator, so both conflict with
+        # the ``data_range`` injected at the end of this branch: ``normalization``
+        # (``nrmse`` only) selects skimage's RMSE denominator, and ``normalize``
+        # rescales each input to [0, 1] and implies ``data_range=1.0``. Combining
+        # either with the scale-invariant transform rescales already-standardized
+        # arrays and keeps the pre-normalization range, which silently returns a
+        # different number rather than failing.
+        for name in ("normalization", "normalize"):
+            if kwargs.get(name) is not None:
+                raise ValueError(
+                    f"scale_invariant=True is incompatible with {name}="
+                    f"{kwargs[name]!r}: the scale-invariant path derives its own "
+                    "data_range. Pass exactly one of the two."
+                )
 
         # ``mask`` is keyword-only in every decorated function, so a caller
         # cannot hide it in *args and bypass the masked branch below.
@@ -307,6 +319,7 @@ def ssim(
     gaussian_weights: bool | None = False,
     full: bool | None = False,
     *,
+    normalize: str | None = None,
     mask: np.ndarray | None = None,
     spatial_dims: int | None = None,
     **kwargs,
@@ -319,6 +332,12 @@ def ssim(
         Images to compare. Must have the same shape.
     win_size, gradient, data_range, channel_axis, gaussian_weights, full
         Forwarded to ``skimage.metrics.structural_similarity``.
+    normalize : str, optional
+        Keyword-only. Per-input pre-normalization applied before SSIM, matching
+        ``psnr`` and ``nrmse``: ``"min_max"`` independently rescales each input
+        to [0, 1] using its own min/max, and defaults ``data_range`` to 1.0.
+        Keyword-only rather than positional because the positional slots here
+        are already fixed by ``structural_similarity``'s own order.
     mask : np.ndarray, optional
         Boolean foreground mask. Keyword-only. Only valid for 2-D and 3-D
         inputs; the returned mean averages SSIM over voxels whose window
@@ -332,6 +351,24 @@ def ssim(
         ``mask``, ``full``, and ``gradient`` are not supported in the
         batched path.
     """
+    unknown = set(kwargs) - _SSIM_EXTRA_KWARGS
+    if unknown:
+        raise TypeError(
+            f"ssim() got unexpected keyword argument(s) {sorted(unknown)}; "
+            f"structural_similarity only reads {sorted(_SSIM_EXTRA_KWARGS)} out of "
+            "**kwargs and silently ignores the rest."
+        )
+
+    if normalize is not None:
+        if normalize != "min_max":
+            raise ValueError(
+                f"normalize={normalize!r} not supported; use 'min_max' or None"
+            )
+        im1 = _min_max_to_unit(im1)
+        im2 = _min_max_to_unit(im2)
+        if data_range is None:
+            data_range = 1.0
+
     if spatial_dims is not None:
         if spatial_dims not in (2, 3):
             raise ValueError(f"spatial_dims must be 2 or 3; got {spatial_dims}")
