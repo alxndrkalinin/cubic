@@ -83,10 +83,92 @@ ring correlation." *Optics Express* 32(12):21767, 2024.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `spacing` | None | Physical spacing [Z, Y, X] in microns |
+| `spacing` | None | Physical spacing [Z, Y, X] in microns; None means pixels |
 | `resample_isotropic` | False | Resample to isotropic voxels before FSC |
+| `angle_delta` | 15 | Angular sector width in degrees; must divide 90 |
 | `exclude_axis_angle` | 0.0 | Exclude frequencies near Z axis (degrees) |
+| `axial_floor_factor` | 2.0 | Report `z` as `nan` below this multiple of the pre-resampling Z spacing; 0 disables |
 | `backend` | `"hist"` | GPU-accelerated histogram-based backend |
+
+`fsc_resolution` returns `{"xy": ..., "z": ...}`. A sector centred on polar angle
+theta measures the shell radius `|k| = k_z / cos(theta)`, not `k_z`, so the two
+keys are extracted differently:
+
+- `xy` comes from the most XY-dominated sector, reported as measured.
+- `z` comes from the highest sector *below* 45 degrees that crosses the
+  threshold, with its period divided by `cos(theta)` to project onto the Z axis.
+  Sectors at or above 45 degrees are XY-limited and are never used for `z`; when
+  none below 45 degrees crosses, `z` is `nan` with a warning rather than an
+  in-plane number relabelled as axial.
+
+With `resample_isotropic=True` the axial correction changes: interpolating Z up
+to isotropic voxels adds no information, so the real axial band limit stays at
+the original Z Nyquist while the grid now runs to the XY one. The Koho et al.
+(2019) eq. (5) factor `1 + (z_spacing/xy_spacing - 1)·|cos(theta)|` converts back,
+and is used in place of the geometric projection (the two address different
+errors and are not combined). This is the path that reproduces the paper: on
+their Fig. 4b pollen stack it gives XY 0.586 µm / Z 4.38 µm against a published
+0.59 / 3.91.
+
+`spacing=None` is the same frequency grid as `spacing=1.0` — cycles per pixel —
+so resolutions come back in pixels.
+
+#### Axial Nyquist floor
+
+A flat FSC crossing cannot land below the sampling limit, because no Fourier
+shell exists past Nyquist. `axial_floor_factor` (default `2.0`) re-imposes that
+limit on `z`, reporting `nan` with a warning when the result comes out finer than
+`2 × the original Z spacing`. The factor multiplies the spacing captured *before*
+resampling — interpolating Z refines the grid but adds no information, so the
+band limit does not move.
+
+Note what does *not* cause sub-Nyquist values here. Neither axial correction can:
+`1 / cos(theta)` is `≥ 1` for every sector the `z` cascade can use, and the Koho
+eq. (5) factor `1 + (anisotropy - 1)·|cos(theta)|` is `≥ 1` whenever
+`z_spacing ≥ xy_spacing`. Both only ever make `z` coarser. The sub-Nyquist value
+arrives *before* the axial correction, from the single-image calibration —
+see below — so the floor is a downstream net over an upstream defect, and it does
+not protect `xy` at all.
+
+The floor does restore a property DCR already has: Descloux's method searches
+over `linspace(0, 1) × k_max` and inverts as `2 · spacing / k_c`, so it is
+structurally incapable of returning less than `2 · spacing`; ours additionally
+caps the peak search at `r_max=0.9`. Koho et al. (2019) require
+`d_pixel ≤ d_min / (2√2)` for the single-image checkerboard split — a stricter
+`2√2 ≈ 2.83` floor, available as `axial_floor_factor=2*np.sqrt(2)`. Rieger et al.
+(2024) likewise note the method needs the derived resolution to sit "well above
+the sampling distance", and Diebolder et al. (2015) caution that conical FSC
+"should be seen as a qualitative tool for comparison of resolution isotropies
+rather than a quantitative method that yields absolute resolution values", since
+measurements "might rather reflect the spatial sampling".
+
+Pass `axial_floor_factor=0.0` to disable the check. The deprecated
+`backend="mask"` path applies no axial correction and no floor.
+
+#### Known issue: the single-image calibration is extrapolated near Nyquist
+
+Single-image (checkerboard) FRC/FSC divides its result by the Koho et al. (2019)
+calibration factor `a·exp(c·(r - b)) + d` at the crossing `r`, whose reciprocal
+is the paper's fit to `d_min(ref) / d_min(co1)` (Supplementary Fig. 3). That
+factor is `≈ 0.55` over most of the band — dividing by it *coarsens* the result,
+which is the point: the checkerboard split's diagonal shift compresses the curve,
+so raw single-image resolution reads too fine.
+
+The fit is an exponential centred at `b = 0.98`. It crosses `1.0` at `r ≈ 0.925`
+and reaches `1.82` at `r = 1`, so a crossing near the band edge is divided by a
+factor `> 1` and reported *finer* than the raw crossing implies — up to 45% below
+the Nyquist period. Read off Supplementary Fig. 3, the paper's calibration points
+stop around `r ≈ 0.85` (their coarsest pixel size, 113 nm), where the ratio is
+already `≈ 1.0`; everything beyond that is extrapolation, and a ratio `< 1` would
+invert the frequency-compression effect the correction models. miplib divides by
+the same unbounded factor.
+
+This affects **both** directions. `xy` has no floor guard, so a lateral crossing
+at the band edge can be reported below `2 × spacing_xy` with no warning. A
+crossing above `r ≈ 0.925` means the curve only decorrelates at the band edge —
+the image is sampling-limited, not resolution-limited — so prefer a criterion
+that crosses earlier (`resolution_threshold="half-bit"` or `"snr"`) over reading
+the number at face value.
 
 ### DCR
 
@@ -101,7 +183,8 @@ ring correlation." *Optics Express* 32(12):21767, 2024.
 
 - `frc.py` — FRC (2D) and FSC (3D) implementations
 - `dcr.py` — DCR following Descloux et al. 2019
-- `radial.py` — Shared radial binning utilities
+- `radial.py` — Shared radial binning utilities and per-bin reducers
+- `iterators.py` — Fourier ring/shell mask iterators (`backend="mask"`)
 - `analysis.py` — Curve fitting and resolution extraction
 - `plot.py` — Plotting utilities (requires matplotlib)
 

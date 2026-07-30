@@ -2,28 +2,43 @@
 
 from __future__ import annotations
 
-import os
 import warnings
+import threading
 from types import ModuleType
 from typing import Any
-from collections.abc import Callable
+from importlib import import_module
 
 import numpy as np
+
+#: Keyword arguments a callee writes its result into. The host fallback in
+#: :func:`dispatch_device_call` cannot honour them, since it would write into a
+#: host copy and leave the caller's GPU array untouched.
+_OUTPUT_KWARGS = ("out", "output", "distances", "indices")
 
 
 class CUDAManager:
     """Manages CUDA resources."""
 
     _instance: CUDAManager | None = None
-    cp: ModuleType | None
-    cucim: ModuleType | None
-    num_gpus: int
+    _lock = threading.Lock()
+    # Class-level defaults so a partially initialized instance still answers
+    # ``cp``/``cucim``/``num_gpus`` with a CPU fallback instead of AttributeError.
+    cp: ModuleType | None = None
+    cucim: ModuleType | None = None
+    num_gpus: int = 0
 
     def __new__(cls):
         """Ensure only one instance of CUDAManager is created."""
         if cls._instance is None:
-            cls._instance = super(CUDAManager, cls).__new__(cls)
-            cls._instance.init_gpu()
+            with cls._lock:
+                # Re-check inside the lock: another thread may have finished
+                # constructing the singleton while this one waited.
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance.init_gpu()
+                    # Publish only once fully initialized so a concurrent
+                    # caller never sees a half-built manager.
+                    cls._instance = instance
         return cls._instance
 
     def init_gpu(self) -> None:
@@ -133,6 +148,85 @@ def coerce_args_to_cpu(args: tuple, kwargs: dict) -> tuple[list, dict]:
     return cpu_args, cpu_kwargs
 
 
+def dispatch_device_call(
+    func_name: str,
+    args: tuple,
+    kwargs: dict,
+    gpu_module: str,
+    cpu_module: str,
+) -> Any:
+    """Call ``func_name`` on the GPU or CPU backend matching the arguments' device.
+
+    Shared by the :mod:`cubic.scipy` and :mod:`cubic.skimage` proxies so both
+    route identically:
+
+    - No GPU array among the arguments → call ``cpu_module``, defensively moving
+      any stray GPU array to host first.
+    - A GPU array is present → call ``gpu_module``.
+    - A GPU array is present but ``gpu_module`` lacks ``func_name`` → warn, run
+      the ``cpu_module`` implementation on host copies, then move array results
+      back to the GPU. Arrays nested in returned lists/tuples are moved too.
+
+    An unknown ``func_name`` on the pure-CPU route raises ``AttributeError``
+    from ``cpu_module`` without warning: there is no GPU backend involved, so a
+    "falling back to CPU" warning would be misleading.
+
+    Limitation of the host-fallback route: arguments the callee writes into
+    (``out``, ``output``, ``distances``, ``indices``) are coerced to host
+    copies, so the host function would write into the copy and leave the
+    caller's GPU array untouched. Passing a GPU array under one of those names
+    raises rather than silently discarding the result.
+    """
+    use_gpu = CUDAManager().get_cp() is not None and any_gpu_arg(args, kwargs)
+
+    def _to_gpu(value: Any) -> Any:
+        """Move arrays back to the GPU, recursing into lists and tuples.
+
+        Scalars are left on the host. NumPy scalars carry a ``dtype`` too, so
+        matching on that alone turned a count returned alongside arrays — the
+        ``return_num=True`` shape — into a 0-d device array, and ``range()`` over
+        the result raised ``TypeError``. Only genuine arrays are moved.
+        """
+        if getattr(value, "ndim", 0) > 0:
+            return to_device(value, "GPU")
+        if isinstance(value, (list, tuple)):
+            moved = [_to_gpu(v) for v in value]
+            return type(value)(moved) if isinstance(value, list) else tuple(moved)
+        return value
+
+    def _on_cpu(return_to_gpu: bool) -> Any:
+        func = getattr(import_module(cpu_module), func_name)
+        if return_to_gpu:
+            written = [k for k in _OUTPUT_KWARGS if is_gpu_array(kwargs.get(k))]
+            if written:
+                raise NotImplementedError(
+                    f"{gpu_module}.{func_name} is unavailable, and the host "
+                    f"fallback cannot honour the output argument(s) "
+                    f"{written}: they would be written on the host and the "
+                    "caller's GPU array left unchanged. Move the inputs to "
+                    "host, call the function, and move the result back."
+                )
+        cpu_args, cpu_kwargs = coerce_args_to_cpu(args, kwargs)
+        result = func(*cpu_args, **cpu_kwargs)
+        return _to_gpu(result) if return_to_gpu else result
+
+    if not use_gpu:
+        return _on_cpu(return_to_gpu=False)
+
+    try:
+        func = getattr(import_module(gpu_module), func_name)
+    except (ModuleNotFoundError, AttributeError):
+        # stacklevel=3 skips this frame and the proxy's ``func_wrapper`` so the
+        # warning points at the caller's line, not at cubic's internals. Both
+        # cubic.skimage and cubic.scipy wrap this at the same depth.
+        warnings.warn(
+            f"{gpu_module}.{func_name} is unavailable, falling back to CPU.",
+            stacklevel=3,
+        )
+        return _on_cpu(return_to_gpu=True)
+    return func(*args, **kwargs)
+
+
 def to_device(array: np.ndarray, device: str) -> np.ndarray:
     """Move array to the requested device."""
     cp = CUDAManager().get_cp()
@@ -142,7 +236,9 @@ def to_device(array: np.ndarray, device: str) -> np.ndarray:
         else:
             raise RuntimeError("GPU requested but not available.")
     elif device == "CPU":
-        return np.asarray(array)
+        # ``np.asarray`` raises TypeError on CuPy input (implicit conversion is
+        # disallowed), so route through ``asnumpy``, which handles CuPy/torch.
+        return asnumpy(array)
     else:
         raise ValueError(
             f"Device should be 'CPU' or 'GPU', unknown requested: {device}."

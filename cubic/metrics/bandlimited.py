@@ -15,7 +15,12 @@ This module provides:
 * **Band-limited PCC and SSIM** (hard-cutoff filtering).
 * **Spectral PCC** (soft per-frequency weighting).
 
-All functions are device-agnostic (NumPy / CuPy).
+All functions **accept** either NumPy (CPU) or CuPy (GPU) arrays and keep
+the computation on the input's device.  Two of them always return host
+(NumPy) arrays regardless of the input device:
+:func:`butterworth_lowpass`, because its frequency grid is built with
+plain ``np.fft.fftfreq``, and :func:`radial_power_spectrum`, which
+transfers its per-bin results to the host before returning.
 
 References
 ----------
@@ -26,13 +31,15 @@ Descloux, A., et al. (2019). Parameter-free image resolution estimation
 from __future__ import annotations
 
 import warnings
+from typing import Any
 from collections.abc import Callable, Sequence
 
 import numpy as np
 
-from cubic.cuda import asnumpy, to_same_device, get_array_module, check_same_device
+from cubic.cuda import asnumpy, to_same_device, check_same_device
 from cubic.image_utils import tukey_window, hamming_window
 
+from .pcc import pcc as _pcc
 from .spectral.dcr import dcr_resolution
 from .spectral.frc import frc_resolution, fsc_resolution
 from .skimage_metrics import ssim as _ssim
@@ -41,7 +48,18 @@ from .spectral.radial import (
     reduce_power,
     radial_bin_id,
     radial_k_grid,
+    _normalize_spacing,
 )
+
+_CUTOFF_METHODS = ("dcr", "frc", "both")
+
+#: Default per-bound safety factors for :func:`estimate_cutoff`.
+_DEFAULT_SAFETY: dict[str, float] = {
+    "dcr": 1.0,
+    "frc": 1.0,
+    "otf": 0.95,
+    "nyquist": 0.9,
+}
 
 # ---------------------------------------------------------------------------
 # 1  Core building blocks
@@ -93,7 +111,6 @@ def otf_cutoff(
     numerical_aperture: float,
     wavelength_emission: float,
     modality: str = "widefield",
-    medium_refractive_index: float = 1.515,
 ) -> float:
     """Lateral OTF cutoff frequency.
 
@@ -107,9 +124,6 @@ def otf_cutoff(
     modality : ``"widefield"`` | ``"confocal"`` | ``"lightsheet"``
         Imaging modality.  ``"widefield"`` and ``"lightsheet"`` use
         ``2 NA / λ``; ``"confocal"`` uses ``4 NA / λ``.
-    medium_refractive_index : float
-        Immersion medium refractive index (unused in current formula but
-        reserved for future axial-OTF extension).
 
     Returns
     -------
@@ -156,10 +170,7 @@ def estimate_cutoff(
     wavelength_emission: float | None = None,
     modality: str = "widefield",
     method: str = "dcr",
-    dcr_safety: float = 1.0,
-    otf_safety: float = 0.95,
-    nyquist_safety: float = 0.9,
-    frc_safety: float = 1.0,
+    safety: dict[str, float] | None = None,
     dcr_kwargs: dict | None = None,
     frc_kwargs: dict | None = None,
 ) -> float:
@@ -167,15 +178,15 @@ def estimate_cutoff(
 
     Computes up to four independent bounds and returns their minimum:
 
-    * **DCR bound** — ``dcr_safety / dcr_resolution(image)`` (data-driven).
-    * **FRC/FSC bound** — ``frc_safety / frc_resolution(image)`` (data-driven).
-    * **OTF bound** — ``otf_safety * otf_cutoff(NA, λ)`` (physics).
-    * **Nyquist bound** — ``nyquist_safety * nyquist_cutoff(spacing)``.
+    * **DCR bound** — ``safety["dcr"] / dcr_resolution(image)`` (data-driven).
+    * **FRC/FSC bound** — ``safety["frc"] / frc_resolution(image)`` (data-driven).
+    * **OTF bound** — ``safety["otf"] * otf_cutoff(NA, λ)`` (physics).
+    * **Nyquist bound** — ``safety["nyquist"] * nyquist_cutoff(spacing)``.
 
     Bounds whose required parameters are absent are silently skipped.
     Data-driven bounds (DCR, FRC/FSC) that raise ``ValueError``,
-    ``RuntimeError``, or ``TypeError`` emit a warning and are excluded;
-    other exceptions propagate.  At least one bound must be computable.
+    ``RuntimeError``, or ``TypeError`` emit a warning and are excluded.
+    The Nyquist bound is always computable, so a value is always returned.
 
     Parameters
     ----------
@@ -192,8 +203,10 @@ def estimate_cutoff(
         Data-driven estimation method.  ``"dcr"`` (default) uses
         decorrelation analysis; ``"frc"`` uses FRC (2-D) or FSC (3-D);
         ``"both"`` computes both and takes the minimum.
-    dcr_safety, otf_safety, nyquist_safety, frc_safety : float
-        Safety factors applied to each bound.
+    safety : dict, optional
+        Per-bound safety factors, overriding the defaults
+        ``{"dcr": 1.0, "frc": 1.0, "otf": 0.95, "nyquist": 0.9}``.
+        Unknown keys raise ``ValueError``.
     dcr_kwargs : dict, optional
         Extra keyword arguments forwarded to ``dcr_resolution``.
     frc_kwargs : dict, optional
@@ -210,9 +223,24 @@ def estimate_cutoff(
     Raises
     ------
     ValueError
-        If no bound can be computed (should not happen — Nyquist is always
-        available).
+        If *method* is not one of ``"dcr"``, ``"frc"``, ``"both"``, or if
+        *safety* contains an unknown key.
     """
+    if method not in _CUTOFF_METHODS:
+        raise ValueError(
+            f"Unknown method '{method}'. Choose from {list(_CUTOFF_METHODS)} "
+            "(lower-case)."
+        )
+
+    factors = dict(_DEFAULT_SAFETY)
+    if safety:
+        unknown = set(safety) - set(factors)
+        if unknown:
+            raise ValueError(
+                f"Unknown safety keys {sorted(unknown)}. Choose from {sorted(factors)}."
+            )
+        factors.update({k: float(v) for k, v in safety.items()})
+
     bounds: list[float] = []
 
     # --- DCR (data-driven) bound ---
@@ -226,7 +254,7 @@ def estimate_cutoff(
             else:
                 dcr_val = dcr_res
             if np.isfinite(dcr_val) and dcr_val > 0:
-                bounds.append(dcr_safety / dcr_val)
+                bounds.append(factors["dcr"] / dcr_val)
         except (ValueError, RuntimeError, TypeError) as exc:
             warnings.warn(f"DCR resolution estimation failed: {exc}", stacklevel=2)
 
@@ -251,21 +279,17 @@ def estimate_cutoff(
             else:
                 frc_res = float("nan")
             if np.isfinite(frc_res) and frc_res > 0:
-                bounds.append(frc_safety / frc_res)
+                bounds.append(factors["frc"] / frc_res)
         except (ValueError, RuntimeError, TypeError) as exc:
             warnings.warn(f"FRC/FSC resolution estimation failed: {exc}", stacklevel=2)
 
     # --- OTF (physics) bound ---
     if numerical_aperture is not None and wavelength_emission is not None:
         f_otf = otf_cutoff(numerical_aperture, wavelength_emission, modality=modality)
-        bounds.append(otf_safety * f_otf)
+        bounds.append(factors["otf"] * f_otf)
 
-    # --- Nyquist bound ---
-    f_nyq = nyquist_cutoff(spacing)
-    bounds.append(nyquist_safety * f_nyq)
-
-    if not bounds:
-        raise ValueError("Could not compute any cutoff bound.")
+    # --- Nyquist bound (always available) ---
+    bounds.append(factors["nyquist"] * nyquist_cutoff(spacing))
 
     return float(min(bounds))
 
@@ -275,12 +299,57 @@ def estimate_cutoff(
 # ---------------------------------------------------------------------------
 
 
+def _radial_power_from_spectrum(
+    F: np.ndarray,
+    shape: tuple[int, ...],
+    spacing: Sequence[float] | None,
+    bin_delta: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Azimuthally average a **precomputed** FFT into radial bins.
+
+    Callers that already hold the spectrum they intend to correlate must
+    weight it with power derived from *that* spectrum, not from a second,
+    differently-preprocessed transform of the same image.
+
+    Returns
+    -------
+    radii : np.ndarray
+        Bin centres, on the host.
+    mean_power : np.ndarray
+        Mean |F|² per radial bin (DC excluded), on the host.
+    bin_id : np.ndarray
+        Flat per-voxel bin index on *F*'s device, reusable by the caller
+        to map per-bin values back onto the frequency grid.
+    """
+    edges_cpu, radii = radial_edges(shape, bin_delta=bin_delta, spacing=spacing)
+
+    # Move edges to same device as the spectrum for correct bin_id placement
+    edges = to_same_device(edges_cpu, F)
+    bid = radial_bin_id(shape, edges, spacing=spacing)
+    # Pass nbins so the sums always align with ``radii`` positionally; without
+    # it an empty trailing bin would return a shorter curve than ``radii``.
+    S2, N = reduce_power(F, bid, nbins=len(radii))
+
+    # Mean power per bin (avoid /0)
+    N_safe = np.maximum(N.astype(np.float64), 1.0)
+    mean_power = (S2 / N_safe).astype(np.float32)
+
+    return (
+        asnumpy(radii).astype(np.float32),
+        asnumpy(mean_power).astype(np.float32),
+        bid,
+    )
+
+
 def radial_power_spectrum(
     image: np.ndarray,
     spacing: float | Sequence[float] | None = None,
     bin_delta: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute the radial (azimuthally-averaged) power spectrum.
+
+    The image is transformed as-is: no mean subtraction and no
+    apodisation, so the DC pedestal and edge discontinuities contribute.
 
     Parameters
     ----------
@@ -294,37 +363,20 @@ def radial_power_spectrum(
     Returns
     -------
     radii : np.ndarray
-        Bin centres (physical frequency if *spacing* given).
+        Bin centres (physical frequency if *spacing* given).  Always a
+        host (NumPy) array.
     mean_power : np.ndarray
-        Mean |F|² per radial bin (DC excluded).
+        Mean |F|² per radial bin (DC excluded).  Always a host array.
     """
-    spacing_seq: Sequence[float] | None
-    if spacing is None:
-        spacing_seq = None
-    elif isinstance(spacing, (int, float)):
-        spacing_seq = [float(spacing)] * image.ndim
-    else:
-        spacing_seq = list(spacing)
-
+    spacing_seq = _normalize_spacing(spacing, image.ndim)
     F = np.fft.fftn(image.astype(np.float32))
-    edges_cpu, radii = radial_edges(
-        image.shape, bin_delta=bin_delta, spacing=spacing_seq
+    radii, mean_power, _ = _radial_power_from_spectrum(
+        F, image.shape, spacing_seq, bin_delta
     )
-
-    # Move edges to same device as image for correct bin_id device placement
-    edges = to_same_device(edges_cpu, image)
-    bid = radial_bin_id(image.shape, edges, spacing=spacing_seq)
-    S2, N = reduce_power(F, bid)
-
-    # Mean power per bin (avoid /0)
-    N_safe = np.maximum(N.astype(np.float64), 1.0)
-    mean_power = (S2 / N_safe).astype(np.float32)
-
-    return asnumpy(radii).astype(np.float32), asnumpy(mean_power).astype(np.float32)
+    return radii, mean_power
 
 
 def estimate_noise_floor(
-    radii: np.ndarray,
     power: np.ndarray,
     tail_fraction: float = 0.2,
 ) -> float:
@@ -332,10 +384,9 @@ def estimate_noise_floor(
 
     Parameters
     ----------
-    radii : np.ndarray
-        Radial-bin centres (from :func:`radial_power_spectrum`).
     power : np.ndarray
-        Mean power per bin.
+        Mean power per bin, ordered from low to high frequency (as
+        returned by :func:`radial_power_spectrum`).
     tail_fraction : float
         Fraction of the highest-frequency bins to average.
 
@@ -374,7 +425,8 @@ def spectral_weights(
     Returns
     -------
     np.ndarray
-        Weights in [0, 1] with ``max(w) == 1``.
+        Weights in [0, 1] with ``max(w) == 1``, or all-zero when no bin
+        exceeds the noise floor (nothing is left to rescale by).
     """
     w = np.maximum(power - noise_floor, 0.0)
     if cutoff is not None:
@@ -442,6 +494,52 @@ def _apply_lowpass(
     return np.fft.ifftn(F).real.astype(np.float32)
 
 
+def _filtered_pair(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    cutoff: float | None,
+    spacing: float | Sequence[float],
+    filter_order: int,
+    apodization: str,
+    **cutoff_kwargs: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate a metric's inputs and low-pass both images identically.
+
+    Shared front end of :func:`band_limited_pcc` and
+    :func:`band_limited_ssim`.  When *cutoff* is ``None`` it is estimated
+    from *target* with :func:`estimate_cutoff`, to which
+    *cutoff_kwargs* is forwarded.
+    """
+    check_same_device(prediction, target)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
+        )
+
+    spacing_seq = _require_spacing(spacing, prediction.ndim)
+
+    if cutoff is None:
+        cutoff = estimate_cutoff(target, spacing=spacing_seq, **cutoff_kwargs)
+
+    return (
+        _apply_lowpass(
+            prediction,
+            cutoff,
+            spacing=spacing_seq,
+            order=filter_order,
+            apodization=apodization,
+        ),
+        _apply_lowpass(
+            target,
+            cutoff,
+            spacing=spacing_seq,
+            order=filter_order,
+            apodization=apodization,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5  Band-limited metrics
 # ---------------------------------------------------------------------------
@@ -457,6 +555,7 @@ def band_limited_pcc(
     wavelength_emission: float | None = None,
     modality: str = "widefield",
     method: str = "dcr",
+    safety: dict[str, float] | None = None,
     filter_order: int = 2,
     apodization: str = "tukey",
     dcr_kwargs: dict | None = None,
@@ -484,6 +583,8 @@ def band_limited_pcc(
     method : str
         Data-driven estimation method (``"dcr"``, ``"frc"``, or
         ``"both"``).  Passed to :func:`estimate_cutoff`.
+    safety : dict, optional
+        Per-bound safety factors passed to :func:`estimate_cutoff`.
     filter_order : int
         Butterworth order.
     apodization : str
@@ -496,40 +597,26 @@ def band_limited_pcc(
     Returns
     -------
     float
-        Pearson *r* in [-1, 1].
+        Pearson *r* in [-1, 1], or ``nan`` when either filtered image has
+        zero variance (e.g. a constant input), matching
+        :func:`cubic.metrics.pcc`.
     """
-    check_same_device(prediction, target)
-    if prediction.shape != target.shape:
-        raise ValueError(
-            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
-        )
-
-    spacing_seq = _normalize_spacing(spacing, prediction.ndim)
-
-    if cutoff is None:
-        cutoff = estimate_cutoff(
-            target,
-            spacing=spacing_seq,
-            numerical_aperture=numerical_aperture,
-            wavelength_emission=wavelength_emission,
-            modality=modality,
-            method=method,
-            dcr_kwargs=dcr_kwargs,
-            frc_kwargs=frc_kwargs,
-        )
-
-    pred_f = _apply_lowpass(
+    pred_f, targ_f = _filtered_pair(
         prediction,
-        cutoff,
-        spacing=spacing_seq,
-        order=filter_order,
+        target,
+        cutoff=cutoff,
+        spacing=spacing,
+        filter_order=filter_order,
         apodization=apodization,
+        numerical_aperture=numerical_aperture,
+        wavelength_emission=wavelength_emission,
+        modality=modality,
+        method=method,
+        safety=safety,
+        dcr_kwargs=dcr_kwargs,
+        frc_kwargs=frc_kwargs,
     )
-    targ_f = _apply_lowpass(
-        target, cutoff, spacing=spacing_seq, order=filter_order, apodization=apodization
-    )
-
-    return float(_pearson(pred_f, targ_f))
+    return float(_pcc(pred_f, targ_f))
 
 
 def band_limited_ssim(
@@ -542,6 +629,7 @@ def band_limited_ssim(
     wavelength_emission: float | None = None,
     modality: str = "widefield",
     method: str = "dcr",
+    safety: dict[str, float] | None = None,
     filter_order: int = 2,
     apodization: str = "tukey",
     win_size: int | None = None,
@@ -569,6 +657,8 @@ def band_limited_ssim(
     method : str
         Data-driven estimation method (``"dcr"``, ``"frc"``, or
         ``"both"``).  Passed to :func:`estimate_cutoff`.
+    safety : dict, optional
+        Per-bound safety factors passed to :func:`estimate_cutoff`.
     filter_order : int
         Butterworth order.
     apodization : str
@@ -585,41 +675,35 @@ def band_limited_ssim(
     Returns
     -------
     float
-        SSIM value.
+        SSIM value, or ``nan`` when the filtered target has zero dynamic
+        range (e.g. a constant input, which mean-subtracts to all zeros)
+        and no explicit *data_range* was given.  This matches the
+        degenerate-input convention of :func:`band_limited_pcc` and
+        :func:`cubic.metrics.pcc`.
     """
-    check_same_device(prediction, target)
-    if prediction.shape != target.shape:
-        raise ValueError(
-            f"Shape mismatch: prediction {prediction.shape} vs target {target.shape}"
-        )
-
-    spacing_seq = _normalize_spacing(spacing, prediction.ndim)
-
-    if cutoff is None:
-        cutoff = estimate_cutoff(
-            target,
-            spacing=spacing_seq,
-            numerical_aperture=numerical_aperture,
-            wavelength_emission=wavelength_emission,
-            modality=modality,
-            method=method,
-            dcr_kwargs=dcr_kwargs,
-            frc_kwargs=frc_kwargs,
-        )
-
-    pred_f = _apply_lowpass(
+    pred_f, targ_f = _filtered_pair(
         prediction,
-        cutoff,
-        spacing=spacing_seq,
-        order=filter_order,
+        target,
+        cutoff=cutoff,
+        spacing=spacing,
+        filter_order=filter_order,
         apodization=apodization,
-    )
-    targ_f = _apply_lowpass(
-        target, cutoff, spacing=spacing_seq, order=filter_order, apodization=apodization
+        numerical_aperture=numerical_aperture,
+        wavelength_emission=wavelength_emission,
+        modality=modality,
+        method=method,
+        safety=safety,
+        dcr_kwargs=dcr_kwargs,
+        frc_kwargs=frc_kwargs,
     )
 
     if data_range is None:
         data_range = float(targ_f.max() - targ_f.min())
+        # data_range == 0 zeroes SSIM's c1/c2 stabilisers, so skimage would
+        # evaluate 0/0 and return nan with a RuntimeWarning. Report the
+        # undefined result directly instead.
+        if data_range <= 0:
+            return float("nan")
 
     kwargs: dict = {"data_range": data_range}
     if win_size is not None:
@@ -679,7 +763,9 @@ def spectral_pcc(
     Returns
     -------
     float
-        Weighted Pearson *r* in [-1, 1].
+        Weighted Pearson *r* in [-1, 1], or ``nan`` when the weighting
+        leaves nothing to correlate — every bin excluded, or a filtered
+        input with zero energy.  Matches :func:`cubic.metrics.pcc`.
     """
     check_same_device(prediction, target)
     if prediction.shape != target.shape:
@@ -691,7 +777,7 @@ def spectral_pcc(
     if taper_low < 0:
         raise ValueError(f"taper_low must be >= 0, got {taper_low}")
 
-    spacing_seq = _normalize_spacing(spacing, prediction.ndim)
+    spacing_seq = _require_spacing(spacing, prediction.ndim)
 
     apo_fn = _APODIZATION_FNS.get(apodization)
     if apo_fn is None:
@@ -708,11 +794,15 @@ def spectral_pcc(
     F_pred = np.fft.fftn(pred)
     F_targ = np.fft.fftn(targ)
 
-    # Radial power spectrum of target → noise floor → per-bin weights
-    radii, power = radial_power_spectrum(
-        target, spacing=spacing_seq, bin_delta=bin_delta
+    # Radial power spectrum of the *same* target spectrum that is correlated
+    # below → noise floor → per-bin weights. Deriving the power from a raw
+    # (un-centred, un-apodised) transform instead would let the DC pedestal
+    # and edge discontinuities leak into the low-frequency bins and inflate
+    # their weights. ``bid`` is reused so the radial grid is built once.
+    radii, power, bid = _radial_power_from_spectrum(
+        F_targ, prediction.shape, spacing_seq, bin_delta
     )
-    noise = estimate_noise_floor(radii, power, tail_fraction=tail_fraction)
+    noise = estimate_noise_floor(power, tail_fraction=tail_fraction)
     w_bins = spectral_weights(radii, power, noise, cutoff=cutoff)
 
     # Low-frequency exclusion (DC / background / autofluorescence)
@@ -729,23 +819,12 @@ def spectral_pcc(
         _nb = min(nbins_low, len(w_bins))
         w_bins[:_nb] = 0.0
 
-    # Guard: if all weights are zero after exclusion, return 0.0
+    # Guard: no bin survives the noise floor / exclusions — nothing to correlate
     if float(w_bins.max()) == 0.0:
-        return 0.0
+        return float("nan")
 
-    # Map per-bin weights → per-voxel weight volume
-    edges_cpu, _ = radial_edges(
-        prediction.shape,
-        bin_delta=bin_delta,
-        spacing=spacing_seq,
-    )
-    edges = to_same_device(edges_cpu, prediction)
-    bid = radial_bin_id(prediction.shape, edges, spacing=spacing_seq)
-
-    xp = get_array_module(prediction)
-    w_bins_dev = xp.asarray(w_bins) if xp is not np else w_bins
-
-    # Build weight volume: map bin weights through bin_id
+    # Map per-bin weights → per-voxel weight volume, reusing ``bid``
+    w_bins_dev = to_same_device(w_bins, prediction)
     W = np.zeros_like(bid, dtype=np.float32)
     valid = bid >= 0
     W[valid] = w_bins_dev[bid[valid]]
@@ -758,7 +837,7 @@ def spectral_pcc(
     denom = np.sqrt(denom_pred * denom_targ)
 
     if denom < 1e-12:
-        return 0.0
+        return float("nan")
     return float(np.clip(num / denom, -1.0, 1.0))
 
 
@@ -767,14 +846,23 @@ def spectral_pcc(
 # ---------------------------------------------------------------------------
 
 
-def _normalize_spacing(
-    spacing: float | Sequence[float],
+def _require_spacing(
+    spacing: float | Sequence[float] | None,
     ndim: int,
 ) -> list[float]:
-    """Ensure spacing is a list of length *ndim*."""
-    if isinstance(spacing, (int, float)):
-        return [float(spacing)] * ndim
-    sp = [float(s) for s in spacing]
+    """Expand *spacing* to a list of length *ndim*.
+
+    Wraps the shared helper from :mod:`cubic.metrics.spectral.radial` and
+    adds the two constraints the band-limited metrics need: *spacing* is
+    required (index units are meaningless for a physical cutoff), and it
+    must have one entry per axis.
+    """
+    sp = _normalize_spacing(spacing, ndim)
+    if sp is None:
+        raise ValueError(
+            "spacing is required for band-limited metrics, got None. Pass a "
+            "scalar or one value per axis, in the same length unit as cutoff."
+        )
     if len(sp) != ndim:
         raise ValueError(f"spacing length {len(sp)} != image ndim {ndim}")
     return sp
@@ -791,16 +879,3 @@ def _is_anisotropic(
     if len(values) <= 1:
         return False
     return max(values) / min(values) > ratio_threshold
-
-
-def _pearson(a: np.ndarray, b: np.ndarray) -> float:
-    """Pearson correlation between two arrays (device-agnostic)."""
-    a_flat = a.ravel().astype(np.float64)
-    b_flat = b.ravel().astype(np.float64)
-    a_c = a_flat - np.mean(a_flat)
-    b_c = b_flat - np.mean(b_flat)
-    num = float(asnumpy(np.sum(a_c * b_c)))
-    denom = float(np.sqrt(asnumpy(np.sum(a_c**2)) * asnumpy(np.sum(b_c**2))))
-    if denom < 1e-12:
-        return 0.0
-    return float(np.clip(num / denom, -1.0, 1.0))

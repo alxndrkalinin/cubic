@@ -64,7 +64,7 @@ def _crop_slice(ndim: int, pad: int) -> tuple:
     return (slice(None),) * (ndim - 2) + (edge, edge)
 
 
-def _torchmetrics_ssim_update(
+def _ssim_scale_component(
     image1: np.ndarray,
     image2: np.ndarray,
     *,
@@ -72,11 +72,18 @@ def _torchmetrics_ssim_update(
     c2: float,
     kernel_size: int,
     sigma: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-image ``(ssim_full, cs_cropped)`` means per torchmetrics' ``_ssim_update``.
+    full_ssim: bool,
+) -> np.ndarray:
+    """Compute the per-image mean of one MS-SSIM scale component.
+
+    Mirrors torchmetrics' ``_ssim_update`` with
+    ``return_contrast_sensitivity=True`` (``ssim.py:152-181``), except that
+    only the map the caller asks for is formed: MS-SSIM uses the cropped
+    contrast-sensitivity map at every scale but the coarsest, and the full
+    SSIM map at the coarsest scale only — never both at the same scale.
 
     Torchmetrics' boundary handling is **explicit pad + valid conv**
-    (``ssim.py:142-154``): ``F.pad(x, mode="reflect", pad=(pad, ...))``
+    (``ssim.py:141-145``): ``F.pad(x, mode="reflect", pad=(pad, ...))``
     followed by ``F.conv2d(...)`` with no further padding. scipy /
     skimage's ``gaussian(mode="reflect")`` is a separable filter that
     handles the boundary per-axis as part of the convolution pipeline,
@@ -88,16 +95,10 @@ def _torchmetrics_ssim_update(
        reflection_pad convention.
     2. Gaussian-filter the padded arrays with ``mode="constant", cval=0``
        so the kernel boundary contributes nothing past the reflected
-       region — i.e. equivalent to a "valid" convolution on padded input.
+       region — i.e. equivalent to a "valid" convolution on padded input
+       — and ``preserve_range=True`` so skimage's ``img_as_float`` does
+       not rescale the input behind the caller's ``data_range``.
     3. Slice back to the original spatial extent.
-
-    The Gaussian kernel width is tied to ``kernel_size`` (matching
-    torchmetrics, which builds a ``kernel_size``-wide kernel shaped by
-    ``sigma``): skimage's ``truncate`` is derived as ``pad / sigma`` so its
-    radius equals ``pad`` and the kernel spans exactly ``kernel_size``. This
-    keeps the pad, crop, and kernel consistent for *any* odd ``kernel_size``
-    (a fixed ``truncate`` desynced them, leaking ``cval=0`` into the valid
-    region for ``kernel_size`` below the Gaussian radius).
 
     Variance uses the **population** estimator (no ``NP / (NP - 1)``
     factor). ``vx`` and ``vy`` are clamped to ``>= 0`` to absorb
@@ -107,29 +108,50 @@ def _torchmetrics_ssim_update(
     Parameters
     ----------
     image1, image2 : numpy.ndarray
-        Same-shape, same-device images. Shape ``(H, W)`` or ``(N, H, W)``.
+        Same-shape, same-device float images. Shape ``(H, W)`` or
+        ``(N, H, W)``.
     c1, c2 : float
         SSIM stability constants ``(K1 * data_range) ** 2`` and
         ``(K2 * data_range) ** 2``.
     kernel_size : int
-        Gaussian kernel side; must be odd-positive. Pad width is
-        ``(kernel_size - 1) // 2`` and governs the kernel width.
+        Gaussian kernel side; must be odd-positive. Sets the reflect-pad
+        width ``(kernel_size - 1) // 2`` *and* the Gaussian radius — see
+        Notes for the torchmetrics divergence this implies.
     sigma : float
-        Gaussian standard deviation.
+        Gaussian standard deviation; must be positive.
+    full_ssim : bool
+        If True, return the mean of the full SSIM map (coarsest-scale
+        term). If False, return the mean of the contrast-sensitivity map
+        over an additional ``[pad:-pad, pad:-pad]`` crop
+        (``torchmetrics ssim.py:174-177``).
 
     Returns
     -------
-    tuple of numpy.ndarray
-        ``(ssim_full_mean, cs_cropped_mean)``, each reduced over the
-        spatial axes only — a scalar for ``(H, W)`` input or shape ``(N,)``
-        for ``(N, H, W)`` input, so callers can reduce per image rather
-        than pooling the whole batch. The CS map is averaged over an
-        additional ``[pad:-pad, pad:-pad]`` crop (``torchmetrics ssim.py:177``).
+    numpy.ndarray
+        The requested map reduced over the spatial axes only — a scalar
+        for ``(H, W)`` input or shape ``(N,)`` for ``(N, H, W)`` input, so
+        callers can reduce per image rather than pooling the whole batch.
+
+    Notes
+    -----
+    The Gaussian radius is derived as ``truncate = pad / sigma``, so the
+    radius equals ``pad`` and the kernel spans exactly ``kernel_size``,
+    keeping pad, crop, and kernel consistent for any odd ``kernel_size``.
+    This **diverges from torchmetrics** on the Gaussian path: torchmetrics
+    sizes its kernel from ``sigma`` alone
+    (``gauss_kernel_size = int(3.5 * sigma + 0.5) * 2 + 1``,
+    ``ssim.py:126``) and ignores ``kernel_size`` entirely. The two agree
+    exactly at the defaults (``sigma=1.5`` gives ``gauss_kernel_size=11``,
+    the default ``kernel_size``); off-default combinations differ, measured
+    on 256x256 against torchmetrics 1.9.0 as ``sigma=1.5, kernel_size=11``
+    → 6e-7, ``sigma=1.5, kernel_size=7`` → 2.6e-5, ``sigma=0.8,
+    kernel_size=11`` → 1.0e-4, ``sigma=3.0, kernel_size=7`` → 2.4e-4 —
+    all well inside the 1e-3 parity tolerance.
     """
     pad = (kernel_size - 1) // 2
     # Tie skimage's Gaussian radius to ``pad`` so the kernel is exactly
     # ``kernel_size`` wide regardless of ``kernel_size`` (radius == pad).
-    truncate = pad / sigma if sigma > 0 else 0.0
+    truncate = pad / sigma
 
     pad_widths = [(0, 0)] * (image1.ndim - 2) + [(pad, pad), (pad, pad)]
     i1p = np.pad(image1, pad_widths, mode="reflect")
@@ -139,7 +161,12 @@ def _torchmetrics_ssim_update(
 
     def _filter(arr: np.ndarray) -> np.ndarray:
         return _sk.filters.gaussian(
-            arr, sigma=sigma_axes, truncate=truncate, mode="constant", cval=0
+            arr,
+            sigma=sigma_axes,
+            truncate=truncate,
+            mode="constant",
+            cval=0,
+            preserve_range=True,
         )
 
     ux_p = _filter(i1p)
@@ -152,26 +179,22 @@ def _torchmetrics_ssim_update(
     sl = _crop_slice(image1.ndim, pad)
     ux = ux_p[sl]
     uy = uy_p[sl]
-    uxx = uxx_p[sl]
-    uyy = uyy_p[sl]
-    uxy = uxy_p[sl]
 
     # Population variance with clamp on vx, vy; vxy is signed (no clamp).
-    vx = np.maximum(uxx - ux * ux, 0.0)
-    vy = np.maximum(uyy - uy * uy, 0.0)
-    vxy = uxy - ux * uy
+    vx = np.maximum(uxx_p[sl] - ux * ux, 0.0)
+    vy = np.maximum(uyy_p[sl] - uy * uy, 0.0)
+    vxy = uxy_p[sl] - ux * uy
 
     upper = 2.0 * vxy + c2
     lower = vx + vy + c2
 
-    ssim_full = ((2.0 * ux * uy + c1) * upper) / ((ux * ux + uy * uy + c1) * lower)
-
-    # CS is further cropped by `pad` to match torchmetrics ssim.py:177.
-    cs_cropped = (upper / lower)[sl]
-
     # Reduce over spatial axes only; keep the batch axis so MS-SSIM can be
     # averaged per image (matches torchmetrics' elementwise_mean reduction).
-    return ssim_full.mean(axis=(-2, -1)), cs_cropped.mean(axis=(-2, -1))
+    if full_ssim:
+        ssim_full = ((2.0 * ux * uy + c1) * upper) / ((ux * ux + uy * uy + c1) * lower)
+        return ssim_full.mean(axis=(-2, -1))
+    # CS is further cropped by `pad` to match torchmetrics ssim.py:177.
+    return (upper / lower)[sl].mean(axis=(-2, -1))
 
 
 def ms_ssim(
@@ -196,22 +219,30 @@ def ms_ssim(
 
     For ``(N, H, W)`` input the per-scale maps are reduced per image and the
     MS-SSIM product is formed per image, then averaged over the batch — i.e.
-    ``mean_n(prod_j ...)``, matching torchmetrics' ``elementwise_mean``. (An
-    earlier version pooled the maps across the whole batch before taking the
-    product, which is not the same for dissimilar slices.)
+    ``mean_n(prod_j ...)``, matching torchmetrics' ``elementwise_mean``.
+
+    Both inputs are cast to ``float64`` after validation, so integer input
+    is handled correctly (``data_range`` keeps the caller's units and the
+    ``image * image`` intermediates cannot overflow).
 
     Parameters
     ----------
     image1, image2 : numpy.ndarray
         Same-shape, same-device images. Shape ``(H, W)`` or ``(N, H, W)``.
+        Any dtype; cast to ``float64`` internally.
     data_range : float
-        Dynamic range of the input (``max - min``). Must be finite-positive.
+        Dynamic range of the input (``max - min``) in the *input's own*
+        units. Must be finite-positive.
     betas : tuple of float, default=DEFAULT_BETAS
         Per-scale weights, finest → coarsest. The number of scales is
         ``len(betas)``.
     kernel_size : int, default=11
-        Gaussian kernel side; must be odd-positive. Governs the Gaussian
-        kernel width (shaped by ``sigma``), matching torchmetrics.
+        Gaussian kernel side; must be odd-positive. Sets both the
+        reflect-pad width and the Gaussian radius, so the kernel spans
+        exactly ``kernel_size``. torchmetrics instead sizes its Gaussian
+        from ``sigma`` alone and ignores ``kernel_size``; the two agree at
+        the defaults and differ by <= ~2e-4 off-default — see
+        :func:`_ssim_scale_component`.
     sigma : float, default=1.5
         Gaussian standard deviation.
     K1, K2 : float, default=0.01, 0.03
@@ -262,29 +293,35 @@ def ms_ssim(
             f"got spatial shape {image1.shape[-2:]}"
         )
 
+    # Integer input would wrap on ``image * image`` and would additionally be
+    # rescaled by skimage's ``img_as_float``, silently desyncing the maps from
+    # the caller's ``data_range``. Cast once, up front.
+    image1 = image1.astype(np.float64, copy=False)
+    image2 = image2.astype(np.float64, copy=False)
+
     c1 = (K1 * data_range) ** 2
     c2 = (K2 * data_range) ** 2
 
     # Per-image accumulators (scalar for (H, W), shape (N,) for (N, H, W)).
     ms_per_image: np.ndarray | float = 1.0
     for j in range(n_scales):
-        ssim_full, cs_cropped = _torchmetrics_ssim_update(
+        # Coarsest scale contributes the full SSIM map; all finer scales
+        # contribute the cropped contrast-sensitivity map.
+        is_coarsest = j == n_scales - 1
+        component = _ssim_scale_component(
             image1,
             image2,
             c1=c1,
             c2=c2,
             kernel_size=kernel_size,
             sigma=sigma,
+            full_ssim=is_coarsest,
         )
-        if j < n_scales - 1:
-            if normalize == "relu":
-                cs_cropped = np.maximum(cs_cropped, 0.0)
-            ms_per_image = ms_per_image * (cs_cropped ** betas[j])
+        if normalize == "relu":
+            component = np.maximum(component, 0.0)
+        ms_per_image = ms_per_image * (component ** betas[j])
+        if not is_coarsest:
             image1 = _avgpool2(image1)
             image2 = _avgpool2(image2)
-        else:
-            if normalize == "relu":
-                ssim_full = np.maximum(ssim_full, 0.0)
-            ms_per_image = ms_per_image * (ssim_full ** betas[j])
 
     return float(np.mean(ms_per_image))

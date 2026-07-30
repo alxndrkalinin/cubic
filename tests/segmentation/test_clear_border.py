@@ -44,3 +44,28 @@ def test_clear_border_mask_shape_mismatch_raises_valueerror() -> None:
     bad_mask = np.ones((3, 3), dtype=bool)
     with pytest.raises(ValueError, match="same shape"):
         clear_border(labels, mask=bad_mask)
+
+
+def test_clear_border_leaves_input_untouched() -> None:
+    """Without ``out``, the caller's array is copied rather than modified."""
+    labels = np.array([[1, 1, 0], [0, 2, 0], [0, 0, 0]], dtype=int)
+    original = labels.copy()
+    clear_border(labels)
+    assert np.array_equal(labels, original)
+
+
+def test_clear_border_writes_into_out() -> None:
+    """``out`` receives the result and is returned."""
+    labels = np.array([[1, 1, 0], [0, 2, 0], [0, 0, 0]], dtype=int)
+    out = np.empty_like(labels)
+    result = clear_border(labels, out=out)
+    assert result is out
+    assert 1 not in np.unique(out)
+    assert 2 in np.unique(out)
+
+
+def test_clear_border_rejects_removed_in_place_argument() -> None:
+    """``in_place`` was removed from skimage in 0.20 and is gone here too."""
+    labels = np.zeros((4, 4), dtype=int)
+    with pytest.raises(TypeError):
+        clear_border(labels, in_place=True)

@@ -205,6 +205,54 @@ def test_score_kwargs_forwarded_to_elements():
     assert default_score != bigger_K1_score
 
 
+@pytest.mark.parametrize(
+    "override", [{"gaussian_weights": False}, {"crop": False}, {"win_size": 7}]
+)
+def test_score_forwards_documented_pass_through_kwargs(override):
+    """``gaussian_weights`` / ``crop`` are defaults, not hardcoded arguments.
+
+    Both used to be passed positionally *alongside* ``**kwargs``, so
+    overriding either raised ``TypeError: got multiple values for keyword
+    argument`` even though the docstring advertised the pass-through.
+    """
+    gt, pred = _seeded_data()
+    ms = MicroSSIM().fit(gt, pred)
+    default_score = ms.score(gt[0], pred[0])
+    overridden = ms.score(gt[0], pred[0], **override)
+    assert np.isfinite(overridden)
+    assert overridden != default_score, f"{override} did not reach the elements call"
+
+
+def test_score_defaults_are_gaussian_and_cropped():
+    """The un-overridden score path still uses ``gaussian_weights=True, crop=True``."""
+    gt, pred = _seeded_data()
+    ms = MicroSSIM().fit(gt, pred)
+    assert ms.score(gt[0], pred[0]) == ms.score(
+        gt[0], pred[0], gaussian_weights=True, crop=True
+    )
+
+
+def test_return_individual_components_raises():
+    """``return_individual_components=True`` raises instead of being ignored.
+
+    It previously returned a bare float with no warning and no components,
+    silently discarding what the caller asked for.
+    """
+    gt, pred = _seeded_data()
+    ms = MicroSSIM().fit(gt, pred)
+    with pytest.raises(NotImplementedError, match="return_individual_components"):
+        ms.score(gt[0], pred[0], return_individual_components=True)
+
+
+# --- fit_and_score classmethod ---------------------------------------------
+
+
+def test_fit_and_score_matches_convenience_function():
+    """``MicroSSIM.fit_and_score`` is what the convenience wrapper delegates to."""
+    gt, pred = _seeded_data(n=3)
+    assert MicroSSIM.fit_and_score(gt, pred) == micro_structural_similarity(gt, pred)
+
+
 # --- alpha_max kwarg -------------------------------------------------------
 
 

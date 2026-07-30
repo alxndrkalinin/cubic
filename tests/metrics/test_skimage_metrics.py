@@ -1,5 +1,7 @@
 """Tests for image quality metrics."""
 
+import warnings
+
 import numpy as np
 import pytest
 from skimage import metrics as skimage_metrics
@@ -139,6 +141,68 @@ def test_psnr_normalize_rejects_unknown_value() -> None:
     a = np.ones((4, 4), dtype=np.float32)
     with pytest.raises(ValueError, match="not supported"):
         psnr(a, a, normalize="zscore")
+
+
+def test_ssim_normalize_min_max_matches_reference(
+    test_images: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """``normalize='min_max'`` normalizes before SSIM, as it does for psnr/nrmse.
+
+    ``ssim`` had no ``normalize`` parameter, so the keyword fell into ``**kwargs``
+    and on to ``structural_similarity``, which reads only K1/K2/sigma/
+    use_sample_covariance and drops the rest. Callers passing it to all three
+    metrics got normalized NRMSE and PSNR but raw SSIM, with no error.
+    """
+    img1, img2 = test_images
+    a = _torch_min_max(img1)
+    b = _torch_min_max(img2)
+    expected = float(ssim(a, b, data_range=1.0))
+
+    result = float(ssim(img1, img2, normalize="min_max"))
+    assert np.isclose(result, expected, rtol=1e-10)
+    # And it must differ from the unnormalized value, or the test proves nothing.
+    raw = float(ssim(img1, img2, data_range=float(img1.max() - img1.min())))
+    assert not np.isclose(result, raw, rtol=1e-6)
+
+
+def test_ssim_normalize_rejects_unknown_value() -> None:
+    """Unknown normalize values raise ValueError."""
+    a = np.ones((4, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="not supported"):
+        ssim(a, a, normalize="zscore")
+
+
+def test_ssim_rejects_kwargs_structural_similarity_would_drop() -> None:
+    """A keyword skimage ignores must raise, not silently change nothing.
+
+    ``structural_similarity`` pulls K1/K2/sigma/use_sample_covariance out of
+    ``**kwargs`` and discards anything else, so a typo used to return a value
+    computed as though the argument had never been passed.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=(32, 32)).astype(np.float32)
+    b = a + 0.1 * rng.normal(size=(32, 32)).astype(np.float32)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        ssim(a, b, data_range=1.0, gaussain_weights=True)  # typo for gaussian_
+
+    # The keywords skimage really does consume still pass through.
+    assert np.isfinite(ssim(a, b, data_range=1.0, K1=0.02, sigma=2.0))
+
+
+@pytest.mark.parametrize("metric", [nrmse, psnr, ssim])
+def test_scale_invariant_rejects_normalize(metric) -> None:
+    """``scale_invariant=True`` and ``normalize`` both set the denominator.
+
+    Combining them min-max-rescaled the already-standardized arrays while keeping
+    the pre-normalization ``data_range``, silently returning a third number
+    instead of failing.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=(32, 32)).astype(np.float32)
+    b = (2.5 * a + 0.3).astype(np.float32)
+    with pytest.raises(ValueError, match="incompatible with normalize"):
+        metric(a, b, scale_invariant=True, normalize="min_max")
 
 
 def test_ssim_spatial_dims_2_4d_matches_2d_loop() -> None:
@@ -353,15 +417,330 @@ def test_ssim(
     assert np.isclose(result_scale_inv_masked, 1.0)
 
 
+def test_masked_ssim_erosion_matches_gaussian_default_window() -> None:
+    """Masked SSIM erodes by the window skimage actually used.
+
+    With ``gaussian_weights=True`` and no explicit ``win_size``, skimage's
+    default is ``2 * int(3.5 * 1.5 + 0.5) + 1 == 11``, but the erosion
+    footprint was hard-coded to 7. Windows straddling the mask boundary
+    therefore survived the erosion and pulled out-of-mask pixels into the
+    "masked" mean.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.random((40, 40))
+    b = a.copy()
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[10:30, 10:30] = True
+    b[~mask] = 999.0  # everything outside the mask is corrupted
+
+    got = ssim(a, b, data_range=1.0, mask=mask, gaussian_weights=True)
+    assert got == pytest.approx(1.0, abs=1e-9)
+
+    # The valid-centre count must match the win=11 footprint (20-10 per axis).
+    from cubic.skimage import morphology
+
+    valid = morphology.erosion(mask, morphology.footprint_rectangle((11, 11)))
+    assert int(valid.sum()) == 100
+
+
+def test_masked_ssim_uniform_default_window_still_seven() -> None:
+    """Without ``gaussian_weights``, skimage's default window stays 7."""
+    rng = np.random.default_rng(1)
+    a = rng.random((40, 40))
+    b = a.copy()
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[10:30, 10:30] = True
+    b[~mask] = 999.0
+
+    got = ssim(a, b, data_range=1.0, mask=mask, gaussian_weights=False)
+    assert got == pytest.approx(1.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_masked_ssim_footprint_is_not_deprecated(ndim: int) -> None:
+    """The validity footprint uses ``footprint_rectangle``, not ``square``/``cube``.
+
+    ``morphology.square``/``cube`` are deprecated in scikit-image 0.25 and
+    removed in 0.27, so the masked path emitted a live ``FutureWarning``.
+    ``footprint_rectangle`` produces a byte-identical footprint for these
+    symmetric widths, which is what keeps the win_size=11 erosion correct.
+    """
+    rng = np.random.default_rng(10)
+    shape = (24, 24) if ndim == 2 else (12, 12, 12)
+    a = rng.random(shape)
+    b = a + 0.05 * rng.standard_normal(shape)
+    mask = np.zeros(shape, dtype=bool)
+    mask[(slice(4, shape[0] - 4),) * ndim] = True
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        result = ssim(a, b, data_range=1.0, mask=mask, win_size=3)
+    assert np.isfinite(result)
+
+
+@pytest.mark.parametrize("width", [3, 7, 11])
+def test_footprint_rectangle_matches_square_and_cube(width: int) -> None:
+    """Pin the equivalence the migration relies on, for 2-D and 3-D."""
+    from cubic.skimage import morphology
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        np.testing.assert_array_equal(
+            morphology.footprint_rectangle((width, width)), morphology.square(width)
+        )
+        np.testing.assert_array_equal(
+            morphology.footprint_rectangle((width,) * 3), morphology.cube(width)
+        )
+
+
+@pytest.mark.parametrize("sigma", [0.8, 1.5, 3.0])
+def test_masked_ssim_erosion_follows_sigma(sigma: float) -> None:
+    """The erosion window tracks ``sigma``, not a hard-coded 11.
+
+    skimage derives ``win_size = 2 * int(3.5 * sigma + 0.5) + 1``, and ``sigma``
+    reaches it through ``**kwargs``. Pinning 11 (the ``sigma=1.5`` value)
+    under-erodes for any larger sigma: at ``sigma=3.0`` skimage's window is 23,
+    so out-of-mask pixels leaked back into the "masked" mean and this fixture
+    returned 0.2067 instead of the correct value.
+    """
+    from skimage.metrics import structural_similarity as sk_ssim
+
+    from cubic.skimage import morphology
+
+    rng = np.random.default_rng(1)
+    a = rng.random((64, 64))
+    b = a + 0.02 * rng.random((64, 64))
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[16:48, 16:48] = True
+    b[~mask] = 999.0  # corrupt everything outside the mask
+
+    win = 2 * int(3.5 * sigma + 0.5) + 1
+    _, ssim_map = sk_ssim(
+        a, b, data_range=1.0, gaussian_weights=True, sigma=sigma, full=True
+    )
+    valid = morphology.erosion(mask, morphology.footprint_rectangle((win, win)))
+    expected = float(ssim_map[valid].mean())
+
+    got = ssim(a, b, data_range=1.0, mask=mask, gaussian_weights=True, sigma=sigma)
+    assert got == pytest.approx(expected, abs=1e-9)
+
+
+def test_masked_ssim_window_larger_than_mask_is_nan_not_a_number() -> None:
+    """No valid centre must report NaN rather than averaging invalid windows."""
+    rng = np.random.default_rng(1)
+    a = rng.random((64, 64))
+    b = a + 0.02 * rng.random((64, 64))
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[16:48, 16:48] = True  # 32 px, smaller than sigma=5.0's 37 px window
+
+    got = ssim(a, b, data_range=1.0, mask=mask, gaussian_weights=True, sigma=5.0)
+    assert np.isnan(got)
+
+
+def test_masked_ssim_rejects_gradient() -> None:
+    """The masked path forces ``full=True``, so ``gradient`` cannot be honoured.
+
+    Previously this reached skimage and raised
+    ``ValueError: too many values to unpack (expected 2)`` from the 3-tuple.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.random((32, 32))
+    b = a + 0.01
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[8:24, 8:24] = True
+
+    with pytest.raises(ValueError, match="gradient=True is not supported with mask"):
+        ssim(a, b, data_range=1.0, mask=mask, gradient=True)
+
+
+def test_masked_ssim_explicit_win_size_takes_precedence() -> None:
+    """An explicit ``win_size`` still drives the erosion footprint."""
+    rng = np.random.default_rng(2)
+    a = rng.random((40, 40))
+    b = a.copy()
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[10:30, 10:30] = True
+    b[~mask] = 999.0
+
+    got = ssim(a, b, data_range=1.0, mask=mask, win_size=3)
+    assert got == pytest.approx(1.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("flag", ["full", "gradient"])
+def test_ssim_spatial_dims_rejects_tuple_returning_flags(flag: str) -> None:
+    """``full``/``gradient`` are rejected in the batched path, not crashed on.
+
+    ``structural_similarity`` returns a tuple for either flag, and the
+    batched branch wrapped its result in ``float()``, so both raised an
+    opaque ``TypeError: float() argument must be ... not 'tuple'``.
+    """
+    rng = np.random.default_rng(3)
+    a = rng.random((1, 1, 8, 8))
+    b = rng.random((1, 1, 8, 8))
+    with pytest.raises(ValueError, match=f"{flag}=True is not supported"):
+        ssim(a, b, spatial_dims=2, data_range=1.0, **{flag: True})
+
+
+def test_ssim_spatial_dims_allows_falsy_flags() -> None:
+    """Explicitly-false ``full``/``gradient`` are still accepted."""
+    rng = np.random.default_rng(4)
+    a = rng.random((1, 1, 8, 8))
+    b = a + 0.01 * rng.random((1, 1, 8, 8))
+    result = ssim(
+        a, b, spatial_dims=2, data_range=1.0, win_size=3, full=False, gradient=False
+    )
+    assert isinstance(result, float)
+
+
+@pytest.mark.parametrize("metric", [nrmse, psnr, ssim])
+def test_mask_is_keyword_only(metric) -> None:
+    """``mask`` cannot be supplied positionally.
+
+    ``scale_invariant`` reads the mask from ``kwargs``, so a positionally
+    supplied mask landed in ``*args``, the unmasked normalization branch
+    ran, and ``alpha``/``range_param`` were computed over the whole image.
+    """
+    rng = np.random.default_rng(5)
+    # Large enough that the default 7-wide SSIM window still leaves valid
+    # centres after the mask is eroded.
+    a = rng.random((16, 16))
+    b = a + 0.1 * rng.random((16, 16))
+    m = np.zeros((16, 16), dtype=bool)
+    m[2:14, 2:14] = True
+    # One positional per pre-mask parameter, then the mask.
+    n_positional = {nrmse: 3, psnr: 2, ssim: 6}[metric]
+    args = (None,) * n_positional
+    with pytest.raises(TypeError, match="positional argument"):
+        metric(a, b, *args, m)
+    # The keyword form is what callers must use, and it works.
+    assert np.isfinite(float(metric(a, b, mask=m, data_range=1.0)))
+
+
+def test_pcc_mask_is_keyword_only() -> None:
+    """``pcc`` also refuses a positional mask."""
+    from cubic.metrics.pcc import pcc
+
+    rng = np.random.default_rng(6)
+    a = rng.random((8, 8))
+    b = a + 0.1 * rng.random((8, 8))
+    m = np.zeros((8, 8), dtype=bool)
+    m[2:6, 2:6] = True
+    with pytest.raises(TypeError, match="positional argument"):
+        pcc(a, b, m)
+    assert np.isfinite(pcc(a, b, mask=m))
+
+
+@pytest.mark.parametrize("conflicting", [{"data_range": 1.0}, {"normalize": "min_max"}])
+def test_nrmse_rejects_denominator_conflicts(
+    test_images: tuple[np.ndarray, np.ndarray], conflicting: dict
+) -> None:
+    """``data_range`` used to silently win over ``normalization``.
+
+    ``normalize="min_max"`` is the same hole one step removed: it sets
+    ``data_range=1.0`` internally, which then short-circuits past
+    ``normalization``.
+    """
+    img1, img2 = test_images
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        nrmse(img1, img2, normalization="min-max", **conflicting)
+
+
+def test_nrmse_rejects_normalization_with_scale_invariant(
+    test_images: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """``scale_invariant`` injects ``data_range``, so ``normalization`` conflicts.
+
+    ``nrmse(a, b, normalization="min-max", scale_invariant=True)`` used to
+    return the plain scale-invariant result, silently ignoring the
+    requested normalization.
+    """
+    img1, img2 = test_images
+    with pytest.raises(ValueError, match="incompatible with normalization"):
+        nrmse(img1, img2, normalization="min-max", scale_invariant=True)
+
+
+def test_nrmse_normalization_alone_still_works(
+    test_images: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """``normalization`` on its own is forwarded to skimage."""
+    img1, img2 = test_images
+    assert nrmse(img1, img2, normalization="min-max") == pytest.approx(
+        skimage_metrics.normalized_root_mse(img1, img2, normalization="min-max")
+    )
+
+
+@pytest.mark.parametrize("metric", [nrmse, psnr, ssim])
+def test_scale_invariant_rejects_constant_image_true(metric) -> None:
+    """A constant ``image_true`` divides by a zero std instead of returning nan."""
+    rng = np.random.default_rng(7)
+    const = np.full((8, 8), 2.0)
+    other = rng.random((8, 8))
+    with pytest.raises(ValueError, match="image_true std"):
+        metric(const, other, scale_invariant=True)
+
+
+@pytest.mark.parametrize("metric", [nrmse, psnr, ssim])
+def test_scale_invariant_rejects_constant_image_test(metric) -> None:
+    """A constant ``image_test`` gives a zero-energy ``alpha`` denominator."""
+    rng = np.random.default_rng(8)
+    const = np.full((8, 8), 2.0)
+    other = rng.random((8, 8))
+    with pytest.raises(ValueError, match="image_test variance"):
+        metric(other, const, scale_invariant=True)
+
+
+def test_scale_invariant_rejects_constant_masked_region() -> None:
+    """A mask selecting a constant region is rejected too."""
+    rng = np.random.default_rng(9)
+    a = rng.random((8, 8))
+    b = rng.random((8, 8))
+    a[2:6, 2:6] = 3.0  # constant inside the mask, varying outside
+    mask = np.zeros((8, 8), dtype=bool)
+    mask[2:6, 2:6] = True
+    with pytest.raises(ValueError, match="masked image_true std"):
+        psnr(a, b, mask=mask, scale_invariant=True)
+
+
+def test_normalize_min_max_on_constant_input() -> None:
+    """A constant input falls back to ``eps`` instead of dividing by zero.
+
+    ``_min_max_to_unit`` maps a constant image to all zeros, so the two
+    normalized inputs are identical: NRMSE is 0 and PSNR is infinite.
+    """
+    const = np.full((8, 8), 3.0)
+    assert float(nrmse(const, const, normalize="min_max")) == 0.0
+    assert float(psnr(const, const, normalize="min_max")) == float("inf")
+
+
+@pytest.mark.parametrize("metric", [nrmse, psnr])
+def test_normalize_min_max_constant_cupy_input(metric, gpu_available: bool) -> None:
+    """``_min_max_to_unit`` must not rebuild the range as a CuPy 0-d array.
+
+    ``type(rng)(eps)`` evaluates ``cupy.ndarray(1e-8)`` for a CuPy input,
+    whose first constructor argument is a *shape*, so a constant GPU array
+    raised ``TypeError: 'float' object cannot be interpreted as an integer``.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+
+    const = np.full((8, 8), 3.0)
+    gpu = metric(ascupy(const), ascupy(const), normalize="min_max")
+    cpu = metric(const, const, normalize="min_max")
+    assert float(gpu) == pytest.approx(float(cpu))
+
+
 @pytest.mark.parametrize("ndim", [2, 3])
 def test_ssim_masked_gpu_matches_cpu(ndim: int, gpu_available: bool) -> None:
     """Masked SSIM runs on GPU and matches the CPU result.
 
-    Regression for the masked path: ``morphology.square``/``cube`` receive
-    only an int, so the proxy returns a host footprint; cuCIM's ``erosion``
-    rejected a NumPy footprint paired with a GPU mask
-    (``ValueError: footprint must be either an ndarray or Sequence``).
-    The footprint is now moved onto the mask's device first.
+    Regression for the masked path: the footprint builder receives only a
+    shape (an int for the former ``square``/``cube``, a tuple for today's
+    ``footprint_rectangle``), so the proxy sees no array argument and
+    returns a host footprint; cuCIM's ``erosion`` rejected a NumPy
+    footprint paired with a GPU mask (``ValueError: footprint must be
+    either an ndarray or Sequence``). The footprint is now moved onto the
+    mask's device first.
     """
     if not gpu_available:
         pytest.skip("GPU not available")

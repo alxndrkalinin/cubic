@@ -2,7 +2,8 @@
 
 import inspect
 import warnings
-from collections.abc import Sequence
+import itertools
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 from skimage import morphology as _sk_morphology
@@ -13,9 +14,10 @@ try:
 except ImportError:  # cucim is an optional GPU-only dep
     _cu_morphology = None  # type: ignore[assignment]
 
-from ..cuda import asnumpy, to_device, get_device
+from ..cuda import asnumpy, to_device, get_device, to_same_device
+from ..scipy import ndimage as _ndimage
 from ..skimage import feature, filters, transform, morphology
-from ..image_utils import label, pad_image, distance_transform_edt
+from ..image_utils import label, pad_image, rescale_xy, distance_transform_edt
 from ._clear_border import clear_border
 
 
@@ -63,15 +65,11 @@ def downscale_and_filter(
         Filtered and downsampled image.
 
     """
-    from ..scipy import ndimage as _ndimage
-
     if filter_shape not in ("square", "circular"):
         raise ValueError("filter_shape must be 'square' or 'circular'.")
 
     if downscale_factor < 1.0:
         if downscale_xy_only:
-            from ..image_utils import rescale_xy
-
             image = rescale_xy(
                 image,
                 scale=downscale_factor,
@@ -117,6 +115,14 @@ def check_labeled_binary(image):
         raise TypeError(f"Image must be of integer type, got {image.dtype}.")
 
     unique_values = np.unique(image)
+    if unique_values.size and int(unique_values[0]) < 0:
+        # Negative ids are not labels, and downstream helpers index arrays by
+        # label value (``remove_touching_objects``) or call ``np.bincount``
+        # (``remove_large_objects``), both of which fail obscurely on them.
+        raise ValueError(
+            f"Label image must not contain negative values; got "
+            f"{int(unique_values[0])}."
+        )
     if len(unique_values) == 2:
         warnings.warn(
             "Only one label was provided in the image. Make sure to label components first."
@@ -154,9 +160,11 @@ def _remove_small_objects(label_img: np.ndarray, min_size: int) -> np.ndarray:
 def _remove_small_holes(mask: np.ndarray, area_threshold: int) -> np.ndarray:
     """Fill holes smaller than ``area_threshold`` across skimage/cucim API drift.
 
-    skimage 0.26 renamed ``area_threshold`` → ``max_size`` with identical
-    semantics (no off-by-one shift, unlike ``remove_small_objects``). cucim
-    still uses ``area_threshold``.
+    skimage 0.26 ``max_size=N`` fills holes of area ≤ N; old ``area_threshold=N``
+    filled area < N. Pass ``max_size=area_threshold - 1`` to preserve the old
+    semantics, exactly as ``_remove_small_objects`` does — without the shift the
+    CPU and GPU branches disagree on holes of area exactly ``area_threshold``.
+    cucim still uses ``area_threshold``.
     """
     if get_device(mask) == "GPU":
         if _cu_morphology is None:
@@ -166,7 +174,7 @@ def _remove_small_holes(mask: np.ndarray, area_threshold: int) -> np.ndarray:
             )
         return _cu_morphology.remove_small_holes(mask, area_threshold=area_threshold)
     if _SKIMAGE_USES_MAX_SIZE:
-        return _sk_morphology.remove_small_holes(mask, max_size=area_threshold)  # type: ignore[call-arg]
+        return _sk_morphology.remove_small_holes(mask, max_size=area_threshold - 1)  # type: ignore[call-arg]
     return _sk_morphology.remove_small_holes(mask, area_threshold=area_threshold)
 
 
@@ -180,7 +188,7 @@ def cleanup_segmentation(
     """Clean up segmented image by removing small objects, clearing borders, and closing holes."""
     check_labeled_binary(label_img)
 
-    # first 3 transforms preserve labels
+    # the min/max-size filters and border clearing preserve label ids
     if min_obj_size is not None:
         label_img = _remove_small_objects(label_img, min_size=min_obj_size)
 
@@ -190,26 +198,51 @@ def cleanup_segmentation(
     if border_buffer_size is not None:
         label_img = clear_xy_borders(label_img, buffer_size=border_buffer_size)
 
-    # returns boolean array
+    # per-label hole filling runs on the full-size mask, not a bbox crop: a crop
+    # would break up the exterior background, whose area then falls below
+    # ``max_hole_size`` for small objects and gets filled in as label
     if max_hole_size is not None:
-        for label_id in np.unique(label_img)[1:]:
+        label_img = label_img.copy()
+        for label_id in _label_ids(label_img):
             mask = label_img == label_id
             filled_mask = _remove_small_holes(mask, area_threshold=max_hole_size)
             label_img[filled_mask] = label_id
 
-    return label(label_img).astype(np.uint16)
+    label_img = label(label_img)
+    # uint16 keeps the historical dtype; widen when the label count would wrap
+    n_labels = int(label_img.max())
+    dtype = (
+        np.uint16
+        if n_labels <= np.iinfo(np.uint16).max
+        else np.min_scalar_type(n_labels)
+    )
+    return label_img.astype(dtype)
+
+
+def _label_ids(label_image: np.ndarray) -> np.ndarray:
+    """Return the sorted non-zero label ids of ``label_image``.
+
+    ``np.unique(...)[1:]`` is wrong when the image has no background pixel at
+    all — index 0 is then a real label and gets silently skipped.
+    """
+    ids = np.unique(label_image)
+    return ids[ids != 0]
 
 
 def find_objects(label_image, max_label=None):
-    """Find objects in a labeled nD array.
+    """Find the bounding-box slices of every object in a labeled nD array.
+
+    Delegates to :mod:`scipy.ndimage` / :mod:`cupyx.scipy.ndimage` through the
+    :mod:`cubic.scipy` proxy, which is device-agnostic and orders of magnitude
+    faster than a per-label scan of the whole image.
 
     Parameters
     ----------
-    label_image : cupy.ndarray
+    label_image : np.ndarray
         nD array containing objects defined by different labels. Labels with
         value 0 are ignored.
     max_label : int, optional
-        Maximum label to be searched for in `input`. If max_label is not
+        Maximum label to be searched for in `label_image`. If max_label is not
         specified, the positions of all objects up to the highest label are returned.
 
     Returns
@@ -217,42 +250,45 @@ def find_objects(label_image, max_label=None):
     object_slices : list of tuples
         A list of tuples, with each tuple containing N slices (with N the
         dimension of the input array). Slices correspond to the minimal
-        parallelepiped that contains the object. If a number is missing,
-        None is returned instead of a slice. The label `l` corresponds to
-        the index `l-1` in the returned list.
+        parallelepiped that contains the object. Labels absent from the image
+        get ``None`` instead of a tuple. The label `l` corresponds to the index
+        `l-1` in the returned list.
 
     """
-    if max_label is None:
-        max_label = int(np.max(label_image))
+    if not np.issubdtype(label_image.dtype, np.integer):
+        raise TypeError(
+            f"label_image must be of integer type, got {label_image.dtype}."
+        )
+    if max_label is not None and max_label < 0:
+        raise ValueError(f"max_label must be >= 0, got {max_label}.")
+    # scipy overloads 0 as "all labels", but here it means "search up to label
+    # 0", i.e. none. Answer that directly rather than letting it be silently
+    # reinterpreted as the opposite.
+    if max_label == 0:
+        return []
+    return _ndimage.find_objects(label_image, 0 if max_label is None else max_label)
 
-    object_slices = [None] * max_label
 
-    for label_idx in range(1, max_label + 1):
-        mask = label_image == label_idx
-        if not mask.any():
-            continue
+def _iter_label_boxes(
+    label_image: np.ndarray,
+) -> Iterator[tuple[int, tuple[slice, ...]]]:
+    """Yield ``(label_id, bbox_slices)`` for every label present in the image.
 
-        slices = []
-        for dim in range(mask.ndim):
-            axis_indices = np.any(
-                mask,
-                axis=tuple(range(mask.ndim))[:dim] + tuple(range(mask.ndim))[dim + 1 :],
-            )
-            if not axis_indices.any():
-                slices.append(None)
-                continue
-            min_idx = int(np.where(axis_indices)[0].min())
-            max_idx = int(np.where(axis_indices)[0].max()) + 1
-            slices.append(slice(min_idx, max_idx))
-
-        object_slices[label_idx - 1] = tuple(slices)
-
-    return object_slices
+    Lets a per-object filter crop to each object's bounding box instead of
+    scanning the whole image once per label.
+    """
+    for label_id, slices in enumerate(find_objects(label_image), start=1):
+        if slices is not None:
+            yield label_id, slices
 
 
 def remove_large_objects(label_image: np.ndarray, max_size: int = 100000) -> np.ndarray:
-    """Remove objects with volume above specified threshold."""
+    """Remove objects with volume above specified threshold.
+
+    The input is left untouched; the filtered labels are returned as a copy.
+    """
     check_labeled_binary(label_image)
+    label_image = label_image.copy()
     label_volumes = np.bincount(label_image.ravel())
     too_large = label_volumes > max_size
     too_large_mask = too_large[label_image]
@@ -267,17 +303,18 @@ def remove_small_objects(label_image: np.ndarray, min_size: int = 500) -> np.nda
 
 
 def clear_xy_borders(label_image: np.ndarray, buffer_size: int = 0) -> np.ndarray:
-    """Remove masks that touch XY borders."""
+    """Remove masks that touch XY borders.
+
+    Label ids are preserved (border clearing only zeroes pixels, so no relabel
+    is needed) for both 2D and 3D inputs.
+    """
     check_labeled_binary(label_image)
     if label_image.ndim == 2:
         return clear_border(label_image, buffer_size=buffer_size)
-    label_image = pad_image(
-        label_image,
-        (buffer_size + 1, buffer_size + 1),
-        mode="constant",
-    )
+    # pad Z so the top/bottom planes are not treated as borders
+    label_image = pad_image(label_image, buffer_size + 1, axes=0, mode="constant")
     label_image = clear_border(label_image, buffer_size=buffer_size)
-    return label(label_image[buffer_size + 1 : -(buffer_size + 1), :, :])
+    return label_image[buffer_size + 1 : -(buffer_size + 1), :, :]
 
 
 def remove_touching_objects(
@@ -285,49 +322,71 @@ def remove_touching_objects(
 ) -> np.ndarray:
     """Find labelled masks that touch each other and remove them.
 
+    Two labels count as touching when they are within a ``(3,) * ndim``
+    neighbourhood of each other (8-connectivity in 2D, 26-connectivity in 3D).
+    All adjacent pairs are derived in a single pass from shifted comparisons of
+    the label image, instead of dilating each object over the whole volume; the
+    input is left untouched and the filtered labels are returned as a copy.
+
     ``border_value`` is accepted for backwards compatibility but no longer
-    used: neighbouring labels are read directly from each object's dilated
-    outline. The previous additive-offset trick misclassified any label id
-    greater than ``border_value`` (Cellpose routinely emits hundreds of
-    labels), which silently deleted non-touching objects.
+    used: neighbouring labels are read directly from the label image. The
+    previous additive-offset trick misclassified any label id greater than
+    ``border_value`` (Cellpose routinely emits hundreds of labels), which
+    silently deleted non-touching objects.
     """
     check_labeled_binary(label_image)
+    label_image = label_image.copy()
 
-    exclude_masks: set[int] = set()
-    for mask_idx in np.unique(label_image)[1:]:
-        if int(mask_idx) in exclude_masks:
+    max_label = int(label_image.max())
+    if max_label == 0:
+        return label_image
+
+    touching = np.zeros(max_label + 1, dtype=bool)
+    touching = to_same_device(touching, label_image)  # type: ignore[arg-type]
+    shape = label_image.shape
+    # loop-invariant: label_image is not written until after the loop, so the
+    # background mask is built once instead of twice per offset
+    nonzero = label_image != 0
+    # half of the (3,) * ndim offsets suffices: offset d and -d yield the same
+    # pairs, and both members of every pair are flagged
+    for offset in itertools.product((-1, 0, 1), repeat=label_image.ndim):
+        if offset <= (0,) * label_image.ndim:
             continue
-        binary_mask = label_image == mask_idx
-        dilated_mask = morphology.binary_dilation(binary_mask, morphology.cube(3))
-        mask_outline = dilated_mask & ~binary_mask
+        here = tuple(
+            slice(max(o, 0), s + min(o, 0)) for o, s in zip(offset, shape, strict=True)
+        )
+        there = tuple(
+            slice(max(-o, 0), s + min(-o, 0))
+            for o, s in zip(offset, shape, strict=True)
+        )
+        a = label_image[here]
+        b = label_image[there]
+        adjacent = (a != b) & nonzero[here] & nonzero[there]
+        touching[a[adjacent]] = True
+        touching[b[adjacent]] = True
 
-        neighbor_ids = np.unique(label_image[mask_outline])
-        neighbor_ids = neighbor_ids[neighbor_ids != 0]
-        if neighbor_ids.size > 0:
-            exclude_masks.add(int(mask_idx))
-            exclude_masks.update(int(n) for n in neighbor_ids)
-
-    for exclude_mask in exclude_masks:
-        label_image[label_image == exclude_mask] = 0
-
+    label_image[touching[label_image]] = 0
     return label_image
 
 
-def remove_thin_objects(label_image, min_z=2):
-    """Remove objects thinner than a specified minimum value in Z."""
-    unique_labels = [
-        regionlabel for regionlabel in np.unique(label_image) if regionlabel != 0
-    ]
-    for regionlabel in unique_labels:
-        mask = label_image == regionlabel
+def remove_thin_objects(label_image: np.ndarray, min_z: int = 2) -> np.ndarray:
+    """Remove objects thinner than a specified minimum value in Z.
 
-        maskz = np.any(mask, axis=(1, 2))
-        z1 = np.argmax(maskz)
-        z2 = len(maskz) - np.argmax(maskz[::-1])
-        size_z = abs(z2 - z1)
+    Objects spanning fewer than ``min_z`` Z planes are removed; one spanning
+    exactly ``min_z`` planes is kept. The input is left untouched; the filtered
+    labels are returned as a copy.
+    """
+    if label_image.ndim != 3:
+        raise ValueError(
+            f"remove_thin_objects operates on Z extents and needs a 3D (ZYX) "
+            f"label image, got {label_image.ndim}D."
+        )
+    label_image = label_image.copy()
 
-        if size_z <= min_z:
-            label_image[mask] = 0
+    for label_id, slices in _iter_label_boxes(label_image):
+        if slices[0].stop - slices[0].start < min_z:
+            region = label_image[slices]
+            region[region == label_id] = 0
 
     return label_image
 
@@ -377,8 +436,6 @@ def segment_watershed(
         Label image on the same device as the input.
 
     """
-    from ..cuda import to_same_device
-
     device = get_device(image)
 
     # Distance-based watershed (no markers provided)
@@ -392,7 +449,9 @@ def segment_watershed(
         seed_mask[tuple(asnumpy(coords).T)] = True
         seed_mask = to_device(seed_mask, device)
         if dilate_seeds:
-            seed_mask = morphology.binary_dilation(
+            # ``dilation`` replaces the deprecated ``binary_dilation`` (removed in
+            # skimage 0.28); identical here because ``ball(1)`` is symmetric
+            seed_mask = morphology.dilation(
                 seed_mask, to_same_device(morphology.ball(1), seed_mask)
             )
         markers = label(seed_mask)
@@ -404,9 +463,7 @@ def segment_watershed(
     if mask is not None:
         distance = distance_transform_edt(asnumpy(mask))
         assert isinstance(distance, np.ndarray)
-        ws_image = -distance
-        ws_image = ws_image - ws_image.min()
-        labels = watershed(ws_image, markers=asnumpy(markers), mask=asnumpy(mask))
+        labels = watershed(-distance, markers=asnumpy(markers), mask=asnumpy(mask))
         return to_device(labels, device)
 
     # Marker-based watershed without mask (image as landscape and mask)
@@ -415,20 +472,11 @@ def segment_watershed(
     return to_device(labels, device)
 
 
-def _binary_fill_holes(image):
-    """Fill holes in binary objects."""
-    if get_device(image) == "GPU":
-        from cupyx.scipy.ndimage import binary_fill_holes
-    elif get_device(image) == "CPU":
-        from scipy.ndimage import binary_fill_holes
-    else:
-        raise ValueError("Unknown device.")
-
-    return binary_fill_holes(image)
-
-
 def fill_label_holes(lbl_img, **binary_fill_holes_kwargs):
     """Fill small holes in label image.
+
+    Extra keyword arguments (e.g. ``structure``) are forwarded to
+    ``scipy.ndimage.binary_fill_holes`` / its cupyx counterpart.
 
     Inspired by: https://github.com/stardist/stardist/blob/master/stardist/utils.py
     """
@@ -450,9 +498,9 @@ def fill_label_holes(lbl_img, **binary_fill_holes_kwargs):
         interior = [(s.start > 0, s.stop < sz) for s, sz in zip(sl, lbl_img.shape)]
         shrink_slice = shrink(interior)
         grown_mask = lbl_img[grow(sl, interior)] == i
-        mask_filled = _binary_fill_holes(grown_mask, **binary_fill_holes_kwargs)[
-            shrink_slice
-        ]
+        mask_filled = _ndimage.binary_fill_holes(
+            grown_mask, **binary_fill_holes_kwargs
+        )[shrink_slice]
         lbl_img_filled[sl][mask_filled] = i
 
     return lbl_img_filled
@@ -466,12 +514,17 @@ def fill_holes_slicer(
 ):
     """Fill holes in slices of binary or labeled objects.
 
+    Runs on CPU or GPU arrays; the input is left untouched and the filled labels
+    are returned as a copy. Like :func:`cleanup_segmentation`'s hole filling,
+    each label is processed on the full-size mask rather than a bbox crop, which
+    would break up the exterior background and fill it in as label.
+
     Inspired by: https://github.com/True-North-Intelligent-Algorithms/tnia-python/blob/main/tnia/morphology/fill_holes.py
     """
-    img = np.asarray(image)
+    img = image.copy()
     axes = range(img.ndim) if axes is None else axes
 
-    for label_id in np.unique(img)[1:]:
+    for label_id in _label_ids(img):
         binary = img == label_id
 
         for _ in range(num_iterations):

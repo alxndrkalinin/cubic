@@ -3,32 +3,15 @@
 Ported from juglab/microssim@8bccb17d ``ri_factor/ri_factor.py``. Upstream
 solves the 1-D optimum of ``mean_n S_n(alpha)`` with ``scipy.optimize.minimize``;
 this module replaces that with a dependency-free bracket-then-bisection root
-finder on the analytical derivative ``f(alpha) = mean_n dS_n/dalpha``.
+finder on the analytical derivative ``f(alpha) = mean_n dS_n/dalpha``. The
+per-pixel algebra lives in :func:`_terms`, :func:`_compute_S_mean` and
+:func:`_compute_dS_mean`.
 
-Definitions (per-pixel, with ``e = SSIMElements``):
-
-* ``A1(alpha) = 2*alpha*ux*uy + C1``
-* ``A2(alpha) = 2*alpha*vxy + C2``
-* ``B1(alpha) = ux**2 + alpha**2 * uy**2 + C1``
-* ``B2(alpha) = vx + alpha**2 * vy + C2``
-* ``S_n(alpha) = (A1 * A2) / (B1 * B2)``
-
-Analytical derivative (per-pixel):
-
-* ``dA1/dalpha = 2*ux*uy``
-* ``dA2/dalpha = 2*vxy``
-* ``dB1/dalpha = 2*alpha*uy**2``
-* ``dB2/dalpha = 2*alpha*vy``
-* ``dN/dalpha = (2*ux*uy)*A2 + A1*(2*vxy)``
-* ``dD/dalpha = (2*alpha*uy**2)*B2 + B1*(2*alpha*vy)``
-* ``dS_n/dalpha = (dN*D - N*dD) / D**2``
-
-``f(alpha)`` is the mean of ``dS_n/dalpha`` over all flattened element pixels.
-MicroSSIM normalization places the optimum near ``alpha = 1``; we bracket by
-doubling outwards from ``alpha = 1`` (default range ``1e-6 <= alpha <= 1e6``;
-both bounds are configurable via the ``alpha_min`` / ``alpha_max`` kwargs) and
-refine with bisection terminated on both ``|f(mid)| < 1e-10`` AND
-``|hi - lo| < 1e-8``.
+MicroSSIM normalization places the optimum near ``alpha = 1``, so the bracket
+expands outward from ``alpha = 1`` by doubling / halving within the default
+window ``1e-6 <= alpha <= 1e6`` (both bounds configurable via the
+``alpha_min`` / ``alpha_max`` kwargs). Bisection then refines until both
+``|f(mid)| < 1e-10`` AND ``|hi - lo| < 1e-8`` hold.
 """
 
 from __future__ import annotations
@@ -41,7 +24,6 @@ from .ssim_elements import SSIMElements, compute_ssim_elements
 # MicroSSIM's normalization regime (alpha ~ 1 by construction); the
 # conjunctive termination guards both flat-region stalls (pure |f| tol)
 # and tiny-slope spinning (pure x tol).
-_ALPHA_INIT = 1.0
 ALPHA_MIN_DEFAULT = 1e-6
 ALPHA_MAX_DEFAULT = 1e6
 _F_TOL = 1e-10
@@ -51,17 +33,55 @@ _ASCENT_SLACK = 1e-12
 _MAX_BISECT_ITERS = 200
 
 
-def _validate_alpha_bounds(alpha_min: float, alpha_max: float) -> None:
+def validate_alpha_bounds(alpha_min: float, alpha_max: float) -> None:
     """Validate that ``(alpha_min, alpha_max)`` brackets ``alpha = 1`` strictly.
 
     The bracket starts at ``alpha = 1`` and expands by halving leftward /
     doubling rightward, so any ``alpha_min`` not in ``(0, 1)`` or any
     ``alpha_max`` not in ``(1, +inf)`` produces a degenerate window.
+
+    Raises
+    ------
+    ValueError
+        If ``alpha_min`` is not a finite float in ``(0, 1)`` or
+        ``alpha_max`` is not a finite float ``> 1``.
     """
     if not (np.isfinite(alpha_min) and 0.0 < alpha_min < 1.0):
         raise ValueError(f"alpha_min must be a finite float in (0, 1); got {alpha_min}")
     if not (np.isfinite(alpha_max) and alpha_max > 1.0):
         raise ValueError(f"alpha_max must be a finite float > 1; got {alpha_max}")
+
+
+def _terms(
+    alpha: float, elements: SSIMElements
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the per-pixel SSIM numerator / denominator terms at ``alpha``.
+
+    ``S(alpha) = (A1 * A2) / (B1 * B2)`` with
+
+    * ``A1 = 2*alpha*ux*uy + C1``
+    * ``A2 = 2*alpha*vxy + C2``
+    * ``B1 = ux**2 + alpha**2 * uy**2 + C1``
+    * ``B2 = vx + alpha**2 * vy + C2``
+
+    Parameters
+    ----------
+    alpha : float
+        Scalar multiplier applied to the prediction.
+    elements : SSIMElements
+        Precomputed SSIM elements.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        ``(A1, A2, B1, B2)``, each shaped like the element arrays.
+    """
+    alpha_sq = alpha * alpha
+    A1 = 2.0 * alpha * elements.ux * elements.uy + elements.C1
+    A2 = 2.0 * alpha * elements.vxy + elements.C2
+    B1 = elements.ux * elements.ux + alpha_sq * elements.uy * elements.uy + elements.C1
+    B2 = elements.vx + alpha_sq * elements.vy + elements.C2
+    return A1, A2, B1, B2
 
 
 def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:
@@ -72,61 +92,44 @@ def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:
     alpha : float
         Scalar multiplier applied to the prediction.
     elements : SSIMElements
-        Precomputed SSIM elements (flattened element arrays accepted).
+        Precomputed SSIM elements. Any layout is accepted (2-D map, 3-D
+        batched map, or a pre-pooled 1-D array) — ``.mean()`` reduces over
+        every element pixel regardless.
 
     Returns
     -------
     float
         Mean of ``S_n(alpha) = (A1*A2) / (B1*B2)`` over all element pixels.
     """
-    ux = elements.ux
-    uy = elements.uy
-    vxy = elements.vxy
-    vx = elements.vx
-    vy = elements.vy
-    C1 = elements.C1
-    C2 = elements.C2
-
-    A1 = 2.0 * alpha * ux * uy + C1
-    A2 = 2.0 * alpha * vxy + C2
-    B1 = ux * ux + (alpha * alpha) * uy * uy + C1
-    B2 = vx + (alpha * alpha) * vy + C2
+    A1, A2, B1, B2 = _terms(alpha, elements)
     return float(((A1 * A2) / (B1 * B2)).mean())
 
 
 def _compute_dS_mean(alpha: float, elements: SSIMElements) -> float:
     """Mean per-pixel derivative ``dS/dalpha`` at a given ``alpha``.
 
+    The analytical quotient rule on ``S = N / D = (A1*A2) / (B1*B2)`` with
+    ``dA1 = 2*ux*uy``, ``dA2 = 2*vxy``, ``dB1 = 2*alpha*uy**2`` and
+    ``dB2 = 2*alpha*vy``.
+
     Parameters
     ----------
     alpha : float
         Scalar multiplier applied to the prediction.
     elements : SSIMElements
-        Precomputed SSIM elements (flattened element arrays accepted).
+        Precomputed SSIM elements; any layout (see :func:`_compute_S_mean`).
 
     Returns
     -------
     float
-        Mean of ``dS_n/dalpha`` over all element pixels, computed via the
-        analytical quotient rule on ``(A1*A2)/(B1*B2)``.
+        Mean of ``dS_n/dalpha`` over all element pixels.
     """
-    ux = elements.ux
-    uy = elements.uy
-    vxy = elements.vxy
-    vx = elements.vx
-    vy = elements.vy
-    C1 = elements.C1
-    C2 = elements.C2
+    A1, A2, B1, B2 = _terms(alpha, elements)
 
-    A1 = 2.0 * alpha * ux * uy + C1
-    A2 = 2.0 * alpha * vxy + C2
-    B1 = ux * ux + (alpha * alpha) * uy * uy + C1
-    B2 = vx + (alpha * alpha) * vy + C2
-
-    dA1 = 2.0 * ux * uy
-    dA2 = 2.0 * vxy
-    dB1 = 2.0 * alpha * uy * uy
-    dB2 = 2.0 * alpha * vy
+    dA1 = 2.0 * elements.ux * elements.uy
+    dA2 = 2.0 * elements.vxy
+    dB1 = 2.0 * alpha * elements.uy * elements.uy
+    dB2 = 2.0 * alpha * elements.vy
 
     N = A1 * A2
     D = B1 * B2
@@ -137,38 +140,9 @@ def _compute_dS_mean(alpha: float, elements: SSIMElements) -> float:
     return float(dS.mean())
 
 
-def _flatten_elements(elements: SSIMElements) -> SSIMElements:
-    """Return a copy of ``elements`` with all element arrays flattened.
-
-    Flattening lets the derivative / SSIM evaluators take a single mean over
-    all element pixels regardless of how the caller laid them out (2-D map,
-    3-D batched map, or pre-concatenated 1-D pool from
-    :func:`get_global_ri_factor`).
-
-    Parameters
-    ----------
-    elements : SSIMElements
-        Source elements.
-
-    Returns
-    -------
-    SSIMElements
-        Same scalars, with ``ux, uy, vxy, vx, vy`` reshaped to 1-D.
-    """
-    return SSIMElements(
-        ux=elements.ux.ravel(),
-        uy=elements.uy.ravel(),
-        vxy=elements.vxy.ravel(),
-        vx=elements.vx.ravel(),
-        vy=elements.vy.ravel(),
-        C1=elements.C1,
-        C2=elements.C2,
-    )
-
-
 def _bracket_root(
     elements: SSIMElements, f1: float, alpha_min: float, alpha_max: float
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float]:
     """Find ``(lo, hi)`` with opposite-sign ``f`` values by expanding from 1.
 
     On entry ``f1 = f(1)`` is already known to be non-zero (the caller
@@ -179,7 +153,7 @@ def _bracket_root(
     Parameters
     ----------
     elements : SSIMElements
-        Flattened SSIM elements (variances / covariance).
+        SSIM elements (variances / covariance); any layout.
     f1 : float
         Value of ``f(1)``; sign decides direction.
     alpha_min : float
@@ -191,9 +165,13 @@ def _bracket_root(
 
     Returns
     -------
-    lo, hi, f_lo, f_hi : float
-        Bracket endpoints and their ``f`` values, with
-        ``f_lo * f_hi <= 0``.
+    lo, hi, f_lo : float
+        Bracket endpoints and ``f(lo)``. ``f(lo)`` is strictly positive and
+        ``f(hi)`` is strictly negative, so the caller's bisection can pick
+        the half retaining the root from ``f_lo`` alone. When a probe lands
+        *exactly* on the root, the degenerate bracket ``lo == hi`` is
+        returned with ``f_lo = 0.0``, which makes bisection terminate on
+        its first check.
 
     Raises
     ------
@@ -202,12 +180,14 @@ def _bracket_root(
     """
     if f1 > 0.0:
         # f(1) > 0: root is to the right of 1 — expand by doubling.
-        lo, f_lo = _ALPHA_INIT, f1
-        alpha = _ALPHA_INIT * 2.0
+        lo, f_lo = 1.0, f1
+        alpha = 2.0
         while alpha <= alpha_max:
             f_alpha = _compute_dS_mean(alpha, elements)
-            if f_alpha == 0.0 or (f_alpha < 0.0):
-                return lo, alpha, f_lo, f_alpha
+            if f_alpha == 0.0:
+                return alpha, alpha, 0.0
+            if f_alpha < 0.0:
+                return lo, alpha, f_lo
             lo, f_lo = alpha, f_alpha
             alpha *= 2.0
         # Powers-of-2 schedule could miss a root in (lo, alpha_max] when
@@ -216,29 +196,35 @@ def _bracket_root(
         # giving up so the full requested interval is actually covered.
         if lo < alpha_max:
             f_cap = _compute_dS_mean(alpha_max, elements)
-            if f_cap <= 0.0:
-                return lo, alpha_max, f_lo, f_cap
+            if f_cap == 0.0:
+                return alpha_max, alpha_max, 0.0
+            if f_cap < 0.0:
+                return lo, alpha_max, f_lo
         raise RuntimeError(
             "RI factor failed to bracket on the right; input may violate "
             f"fit assumptions or alpha_max={alpha_max} is too small. "
             f"ux shape={elements.ux.shape}"
         )
     # f(1) < 0: root is to the left of 1 — expand by halving.
-    hi, f_hi = _ALPHA_INIT, f1
-    alpha = _ALPHA_INIT * 0.5
+    hi = 1.0
+    alpha = 0.5
     while alpha >= alpha_min:
         f_alpha = _compute_dS_mean(alpha, elements)
-        if f_alpha == 0.0 or (f_alpha > 0.0):
-            return alpha, hi, f_alpha, f_hi
-        hi, f_hi = alpha, f_alpha
+        if f_alpha == 0.0:
+            return alpha, alpha, 0.0
+        if f_alpha > 0.0:
+            return alpha, hi, f_alpha
+        hi = alpha
         alpha *= 0.5
     # Mirror of the right-side fix: probe alpha_min itself before giving
     # up so a root in [alpha_min, hi) isn't missed by the powers-of-2
     # schedule.
     if hi > alpha_min:
         f_floor = _compute_dS_mean(alpha_min, elements)
-        if f_floor >= 0.0:
-            return alpha_min, hi, f_floor, f_hi
+        if f_floor == 0.0:
+            return alpha_min, alpha_min, 0.0
+        if f_floor > 0.0:
+            return alpha_min, hi, f_floor
     raise RuntimeError(
         "RI factor failed to bracket on the left; input may violate "
         f"fit assumptions or alpha_min={alpha_min} is too large. "
@@ -264,10 +250,11 @@ def get_ri_factor(
     ----------
     elements : SSIMElements
         Per-pixel SSIM elements. Element arrays may be 2-D, 3-D batched, or
-        pre-flattened; they are reshaped to 1-D internally so the mean is
-        taken over all pixels. ``C1`` and ``C2`` are taken from the
-        ``elements`` object (callers using :func:`get_global_ri_factor` get
-        the last-slice values, matching upstream).
+        pre-flattened; the objective reduces with ``.mean()`` over every
+        element pixel, so layout is irrelevant. ``C1`` and ``C2`` are taken
+        from the ``elements`` object (callers using
+        :func:`get_global_ri_factor` get the last-slice values, matching
+        upstream).
     alpha_min : float, default=:data:`ALPHA_MIN_DEFAULT` (``1e-6``)
         Lower bracket cap for the halving expansion. Used when ``pred`` is
         scaled larger than ``gt`` so the optimum sits below ``1``. The
@@ -301,47 +288,54 @@ def get_ri_factor(
     ValueError
         If ``alpha_min`` is outside ``(0, 1)`` or ``alpha_max`` is outside
         ``(1, +inf)``. The bracket starts at ``alpha = 1`` and expands
-        outward, so any cap on the wrong side of 1 is degenerate.
+        outward, so any cap on the wrong side of 1 is degenerate. Also
+        raised if the returned iterate violates the ascent invariant
+        (see Notes).
 
     Notes
     -----
     Termination: bisection stops as soon as both ``|f(mid)| < 1e-10`` AND
-    ``|hi - lo| < 1e-8`` hold. After the iterate ``alpha*`` is returned, the
-    invariant ``mean(S(alpha*)) >= mean(S(1)) - 1e-12`` is asserted (with
-    slack to allow ``alpha = 1`` itself being the optimum).
+    ``|hi - lo| < 1e-8`` hold. Before ``alpha*`` is returned, the invariant
+    ``mean(S(alpha*)) >= mean(S(1)) - 1e-12`` is checked and a violation
+    raises ``ValueError`` (the slack allows ``alpha = 1`` itself being the
+    optimum). ``ValueError`` rather than ``assert`` because asserts are
+    stripped under ``python -O``.
     """
-    _validate_alpha_bounds(alpha_min, alpha_max)
-    flat = _flatten_elements(elements)
+    validate_alpha_bounds(alpha_min, alpha_max)
 
-    f1 = _compute_dS_mean(_ALPHA_INIT, flat)
+    f1 = _compute_dS_mean(1.0, elements)
     if abs(f1) < _INIT_F_TOL:
-        return float(_ALPHA_INIT)
+        return 1.0
 
-    lo, hi, f_lo, f_hi = _bracket_root(flat, f1, alpha_min, alpha_max)
+    lo, hi, f_lo = _bracket_root(elements, f1, alpha_min, alpha_max)
 
     # Bisection refinement. The conjunction of |f| and x tolerances guards
     # both stalling in flat regions and spinning on near-zero slope.
     mid = 0.5 * (lo + hi)
-    f_mid = _compute_dS_mean(mid, flat)
+    f_mid = _compute_dS_mean(mid, elements)
     for _ in range(_MAX_BISECT_ITERS):
         if abs(f_mid) < _F_TOL and abs(hi - lo) < _X_TOL:
             break
-        # Sign decides which half retains the root.
-        if f_lo * f_mid <= 0.0:
-            hi, f_hi = mid, f_mid
+        # Sign decides which half retains the root. Compare signs directly
+        # rather than testing the product ``f_lo * f_mid <= 0``: the product
+        # underflows to +0.0 when both factors are tiny, which would take
+        # the wrong branch.
+        if (f_lo > 0.0) != (f_mid > 0.0):
+            hi = mid
         else:
             lo, f_lo = mid, f_mid
         mid = 0.5 * (lo + hi)
-        f_mid = _compute_dS_mean(mid, flat)
+        f_mid = _compute_dS_mean(mid, elements)
 
     alpha_star = float(mid)
 
-    s_star = _compute_S_mean(alpha_star, flat)
-    s_one = _compute_S_mean(_ALPHA_INIT, flat)
-    assert s_star >= s_one - _ASCENT_SLACK, (
-        f"RI bisection produced a non-ascent: S(alpha*={alpha_star})={s_star} "
-        f"< S(1)={s_one} - {_ASCENT_SLACK}"
-    )
+    s_star = _compute_S_mean(alpha_star, elements)
+    s_one = _compute_S_mean(1.0, elements)
+    if s_star < s_one - _ASCENT_SLACK:
+        raise ValueError(
+            f"RI bisection produced a non-ascent: S(alpha*={alpha_star})={s_star} "
+            f"< S(1)={s_one} - {_ASCENT_SLACK}"
+        )
 
     return alpha_star
 
@@ -396,7 +390,7 @@ def get_global_ri_factor(
     """
     # Validate bracket bounds up-front so a bad value fails before the
     # potentially-expensive per-slice compute_ssim_elements loop.
-    _validate_alpha_bounds(alpha_min, alpha_max)
+    validate_alpha_bounds(alpha_min, alpha_max)
     if gt.shape != pred.shape:
         raise ValueError(
             f"Ground-truth and prediction arrays must have the same shape "

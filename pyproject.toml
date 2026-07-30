@@ -14,7 +14,9 @@ authors = [
 ]
 dependencies = [
     "numpy>=1.20.0",
-    "scikit-image>=0.16.1",
+    # >=0.25 for morphology.footprint_rectangle, which replaces square/cube
+    # (removed in 0.27) and is the only variant cuCIM provides.
+    "scikit-image>=0.25",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -42,6 +44,7 @@ cellpose = [
 ]
 mesh = [
     "trimesh>=3.3.0",
+    "rtree>=1.0",  # trimesh curvature: mesh.face_adjacency_tree
 ]
 plot = [
     "matplotlib>=3.5",
@@ -78,7 +81,13 @@ python_version = "3.10"
 exclude = ["examples/scripts/*.py"]
 
 [tool.ruff.lint]
-select = ["D", "I"]
+# "F" (pyflakes) catches unused imports/variables, which previously accumulated
+# unnoticed. Example notebooks are authored content, so they only get the
+# import-order and docstring rules.
+select = ["D", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**/*.ipynb" = ["F401", "F541"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"

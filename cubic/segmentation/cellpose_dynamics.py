@@ -30,6 +30,16 @@ except ImportError:  # pragma: no cover
     _CELLPOSE_AVAILABLE = False
 
 
+def _require_cellpose() -> None:
+    """Raise a clear error when cellpose is missing (mirrors cellpose_sam_gpu)."""
+    if not _CELLPOSE_AVAILABLE:
+        raise ImportError(
+            "cellpose>=4 is required for the GPU-resident mask computation "
+            "(its pure-torch `max_pool_nd` kernels are reused as-is). "
+            "Install with `pip install cubic[cellpose]`."
+        )
+
+
 def _cp():
     """Return the cupy module (raises if unavailable)."""
     cp = CUDAManager().get_cp()
@@ -53,6 +63,8 @@ def _filter_small(masks: Any, min_size: int) -> Any:
     """Drop labels with pixel count < ``min_size`` then relabel (cupy)."""
     cp = _cp()
     uniq, counts = cp.unique(masks, return_counts=True)
+    # ``[1:]`` drops the background entry; mirrors upstream cellpose, which
+    # likewise assumes label 0 is present in a mask array
     small = uniq[1:][counts[1:] < min_size]
     if int(small.size) > 0:
         masks = cp.where(cp.isin(masks, small), 0, masks)
@@ -108,10 +120,6 @@ def _steps_interp(dP: Any, inds: tuple, niter: int, device: Any) -> Any:
     pt = pt[..., order].squeeze()
     pt = pt.unsqueeze(0) if pt.ndim == 1 else pt
     return pt.T
-
-
-def _follow_flows(dP: Any, inds: tuple, niter: int, device: Any) -> Any:
-    return _steps_interp(dP, inds, niter, device=device)
 
 
 def _get_masks(
@@ -216,8 +224,7 @@ def _get_masks(
     bigc = uniq[counts > big]
     if int(bigc.size) > 0 and (int(bigc.size) > 1 or int(bigc[0]) != 0):
         M0 = cp.where(cp.isin(M0, bigc), 0, M0)
-    M0 = _relabel_sequential(M0).reshape(tuple(shape0))
-    return M0
+    return _relabel_sequential(M0)
 
 
 # --------------------------------------------------------------------------- #
@@ -279,8 +286,11 @@ def _mask_centers_2d(masks: Any, idx: Any) -> tuple[Any, float]:
     cyf[idx] = cy
     cxf[idx] = cx
     dist = (yy - cyf[masks]) ** 2 + (xx - cxf[masks]) ** 2
+    # divergence from upstream ``get_centers``, kept deliberately: cellpose
+    # rounds the centroid first and only snaps when the rounded point falls
+    # outside the mask, while this snaps to the pixel nearest the float centroid
     pos = cnd.minimum_position(dist, masks, idx)
-    centers = cp.asarray([[int(p[0]), int(p[1])] for p in pos], dtype=cp.int64)
+    centers = cp.asarray(pos, dtype=cp.int64)
     ext = float(
         (
             cp.asarray(cnd.maximum(yy, masks, idx))
@@ -404,12 +414,18 @@ def _fill_holes_and_size_filter(masks: Any, min_size: int = 15) -> Any:
         masks = _filter_small(masks, min_size)
 
     slices = cnd.find_objects(masks)
+    # ``j`` counts only the labels actually present, so gaps in the input ids are
+    # compacted away exactly as upstream ``fill_holes_and_remove_small_masks``
+    # does; with ``min_size <= 0`` no relabel follows, and gapped ids would make
+    # ``_stitch3D``'s IoU rows NaN
+    j = 0
     for i, slc in enumerate(slices):
         if slc is not None:
             # assign back through the slice view (np.where dispatches to cupy);
             # avoids chained-indexing ``masks[slc][filled] = ...``
             filled = cnd.binary_fill_holes(masks[slc] == (i + 1))
-            masks[slc] = np.where(filled, i + 1, masks[slc])
+            masks[slc] = np.where(filled, j + 1, masks[slc])
+            j += 1
 
     if min_size > 0:
         masks = _filter_small(masks, min_size)
@@ -427,7 +443,9 @@ def _stitch3D(masks: Any, stitch_threshold: float = 0.25) -> Any:
     mmax = int(masks[0].max())
     empty = 0
     for i in range(len(masks) - 1):
-        iou = _intersection_over_union(masks[i + 1], masks[i])[1:, 1:]
+        # ``_intersection_over_union`` already drops the background row/column,
+        # so upstream cellpose's extra ``[1:, 1:]`` would discard label 1 twice
+        iou = _intersection_over_union(masks[i + 1], masks[i])
         if int(iou.size) == 0 and empty == 0:
             mmax = int(masks[i + 1].max())
         elif int(iou.size) == 0 and empty != 0:
@@ -467,15 +485,12 @@ def _compute_masks_single(
 ) -> Any:
     """Mirror ``dynamics.compute_masks`` (no size filter; that lives in resize step)."""
     cp = _cp()
-    if int((cellprob > cellprob_threshold).sum()) == 0:
-        return cp.zeros(cellprob.shape, dtype=cp.uint16)
-    inds = cp.nonzero(cellprob > cellprob_threshold)
+    is_cell = cellprob > cellprob_threshold
+    inds = cp.nonzero(is_cell)
     if int(inds[0].size) == 0:
         return cp.zeros(cellprob.shape, dtype=cp.uint16)
 
-    p_final = _follow_flows(
-        dP * (cellprob > cellprob_threshold) / 5.0, inds, niter, device
-    )
+    p_final = _steps_interp(dP * is_cell / 5.0, inds, niter, device=device)
     p_final = p_final.int()
     mask = _get_masks(p_final, inds, dP.shape[1:], max_size_fraction=max_size_fraction)
     del p_final
@@ -553,9 +568,10 @@ def compute_masks(
     ``dP`` and ``cellprob`` are CuPy arrays on the GPU; the returned mask stays
     on the GPU (the caller does the single device→host transfer).
     """
+    _require_cellpose()
     cp = _cp()
     niter = 200 if niter is None else niter
-    Lz, Ly, Lx = shape[:3]
+    _, Ly, Lx = shape[:3]
     if do_3D:
         diff = int((np.array(dP.shape[-3:]) != np.array(shape[:3])).sum())
         masks = _resize_and_compute_masks(

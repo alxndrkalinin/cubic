@@ -11,6 +11,7 @@ from .skimage_metrics import scale_invariant
 def pcc(
     image_true: np.ndarray,
     image_test: np.ndarray,
+    *,
     mask: np.ndarray | None = None,
     **_unused_kwargs,
 ) -> float:
@@ -25,7 +26,9 @@ def pcc(
         Images to compare. Must have the same shape.
     mask : np.ndarray, optional
         Boolean mask selecting voxels to include in the correlation. If
-        ``None``, all voxels are used.
+        ``None``, all voxels are used. Keyword-only, so that
+        ``scale_invariant=True`` cannot miss it in ``*args`` and
+        normalize over the whole image instead of the masked region.
 
     Returns
     -------

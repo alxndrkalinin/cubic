@@ -1,4 +1,4 @@
-"""Expose preprocessing functions."""
+"""Expose segmentation functions."""
 
 from .cellpose import cellpose_eval, cellpose_segment
 from .segment_utils import (
