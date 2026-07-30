@@ -99,6 +99,34 @@ def _nonzero_or_raise(value: Any, what: str) -> float:
     return scalar
 
 
+def _apply_normalize(
+    a: np.ndarray,
+    b: np.ndarray,
+    normalize: str | None,
+    data_range: float | None,
+) -> tuple[np.ndarray, np.ndarray, float | None]:
+    """Apply per-input ``normalize`` and the ``data_range`` it implies.
+
+    ``nrmse``, ``psnr`` and ``ssim`` all accept the same ``normalize`` option, so
+    they share one implementation rather than three copies. Keeping it in one
+    place is what stops them drifting apart the way ``ssim`` did while it had no
+    ``normalize`` parameter at all and silently ignored the keyword.
+    """
+    if normalize is None:
+        return a, b, data_range
+    if normalize != "min_max":
+        raise ValueError(
+            f"normalize={normalize!r} not supported; use 'min_max' or None"
+        )
+    # Each input is rescaled to [0, 1], so its dynamic range is 1 by
+    # construction; an explicit data_range still wins.
+    return (
+        _min_max_to_unit(a),
+        _min_max_to_unit(b),
+        1.0 if data_range is None else data_range,
+    )
+
+
 def scale_invariant(fn: Callable) -> Callable:
     """Decorate a function to make it scale invariant."""
 
@@ -220,15 +248,9 @@ def nrmse(
                     "Pass exactly one."
                 )
 
-    if normalize is not None:
-        if normalize != "min_max":
-            raise ValueError(
-                f"normalize={normalize!r} not supported; use 'min_max' or None"
-            )
-        image_true = _min_max_to_unit(image_true)
-        image_test = _min_max_to_unit(image_test)
-        if data_range is None:
-            data_range = 1.0
+    image_true, image_test, data_range = _apply_normalize(
+        image_true, image_test, normalize, data_range
+    )
 
     x = image_true[mask] if mask is not None else image_true
     y = image_test[mask] if mask is not None else image_test
@@ -267,15 +289,9 @@ def psnr(
     mask : np.ndarray, optional
         Boolean mask restricting the comparison region. Keyword-only.
     """
-    if normalize is not None:
-        if normalize != "min_max":
-            raise ValueError(
-                f"normalize={normalize!r} not supported; use 'min_max' or None"
-            )
-        image_true = _min_max_to_unit(image_true)
-        image_test = _min_max_to_unit(image_test)
-        if data_range is None:
-            data_range = 1.0
+    image_true, image_test, data_range = _apply_normalize(
+        image_true, image_test, normalize, data_range
+    )
 
     x = image_true[mask] if mask is not None else image_true
     y = image_test[mask] if mask is not None else image_test
@@ -359,15 +375,7 @@ def ssim(
             "**kwargs and silently ignores the rest."
         )
 
-    if normalize is not None:
-        if normalize != "min_max":
-            raise ValueError(
-                f"normalize={normalize!r} not supported; use 'min_max' or None"
-            )
-        im1 = _min_max_to_unit(im1)
-        im2 = _min_max_to_unit(im2)
-        if data_range is None:
-            data_range = 1.0
+    im1, im2, data_range = _apply_normalize(im1, im2, normalize, data_range)
 
     if spatial_dims is not None:
         if spatial_dims not in (2, 3):

@@ -1381,8 +1381,10 @@ def fsc_resolution(
     # Axial band limit, captured *before* any resampling: interpolating Z
     # refines the grid but not the information, so the floor stays here.
     # spacing=None means index units, where one voxel is the unit of length.
-    _original = _normalize_spacing(spacing, image1.ndim)
-    axial_floor = axial_floor_factor * (1.0 if _original is None else _original[0])
+    spacing_list = _normalize_spacing(spacing, image1.ndim)
+    axial_floor = axial_floor_factor * (
+        1.0 if spacing_list is None else spacing_list[0]
+    )
 
     # --- Isotropic resampling (optional) ---
     # None keeps the geometric axial projection; resampling swaps in the Koho
@@ -1390,16 +1392,15 @@ def fsc_resolution(
     resampled_anisotropy: float | None = None
 
     if resample_isotropic:
-        if spacing is None:
-            raise ValueError("resample_isotropic=True requires spacing to be provided")
-        spacing_list = _normalize_spacing(spacing, image1.ndim)
+        # ``_normalize_spacing`` returns None exactly when *spacing* is None, so
+        # this one check also narrows the type for the call below.
         if spacing_list is None:
-            raise RuntimeError("_normalize_spacing returned None with non-None spacing")
+            raise ValueError("resample_isotropic=True requires spacing to be provided")
         image1, image2, spacing_list, resampled_anisotropy = (
             _resample_isotropic_for_fsc(
                 image1,
                 image2,
-                spacing_list,  # type: ignore[arg-type]
+                spacing_list,
                 resample_order,
             )
         )
