@@ -697,6 +697,15 @@ def test_global_ri_factor_empty_stack_raises() -> None:
         get_global_ri_factor(empty, empty)
 
 
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (0, 5, 5)])
+def test_ri_factor_empty_elements_raises(shape: tuple[int, ...]) -> None:
+    """Empty element arrays raise ``ValueError`` instead of dividing by zero."""
+    z = np.zeros(shape)
+    e = SSIMElements(ux=z, uy=z, vxy=z, vx=z, vy=z, C1=1e-4, C2=9e-4)
+    with pytest.raises(ValueError, match="at least one pixel"):
+        get_ri_factor(e)
+
+
 def _gpu_peak_above_base(fn) -> tuple[object, int]:
     """Run ``fn()`` and return its result and the CuPy pool peak above entry."""
     import cupy as cp

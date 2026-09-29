@@ -360,7 +360,7 @@ def get_ri_factor(
         ``(1, +inf)``. The bracket starts at ``alpha = 1`` and expands
         outward, so any cap on the wrong side of 1 is degenerate. Also
         raised if the returned iterate violates the ascent invariant
-        (see Notes).
+        (see Notes), or if the element arrays are empty.
 
     Notes
     -----
@@ -372,6 +372,8 @@ def get_ri_factor(
     stripped under ``python -O``.
     """
     validate_alpha_bounds(alpha_min, alpha_max)
+    if elements.ux.size == 0:
+        raise ValueError("elements must contain at least one pixel.")
 
     f1 = _compute_dS_mean(1.0, elements)
     if abs(f1) < _INIT_F_TOL:
