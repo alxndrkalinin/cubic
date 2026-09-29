@@ -664,6 +664,21 @@ def test_chunked_objective_matches_full_map(monkeypatch, chunk: int) -> None:
             ), name
 
 
+def test_chunked_objective_accepts_0d_elements() -> None:
+    """Scalar (0-D) element arrays reduce as one chunk instead of indexing axis 0."""
+    e = SSIMElements(
+        ux=np.asarray(0.5),
+        uy=np.asarray(0.4),
+        vxy=np.asarray(0.01),
+        vx=np.asarray(0.02),
+        vy=np.asarray(0.015),
+        C1=1e-4,
+        C2=9e-4,
+    )
+    assert _compute_S_mean(1.2, e) == pytest.approx(float(ri._S_map(1.2, e)))
+    assert _compute_dS_mean(1.2, e) == pytest.approx(float(ri._dS_map(1.2, e)))
+
+
 def test_global_ri_factor_chunked_matches_unchunked(monkeypatch) -> None:
     """Forcing many chunks leaves the fitted alpha unchanged."""
     rng = np.random.default_rng(51)

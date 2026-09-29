@@ -109,8 +109,11 @@ def _iter_chunks(elements: SSIMElements) -> Iterator[SSIMElements]:
 
     Splits along axis 0; an index along axis 0 that alone exceeds a chunk
     (a large slice or image row) is split recursively, so the bound holds
-    for any layout without copying.
+    for any layout without copying. 0-D elements are yielded as one chunk.
     """
+    if elements.ux.ndim == 0:
+        yield elements
+        return
     n = elements.ux.shape[0]
     row = elements.ux.size // n
     if row > _CHUNK_ELEMS:
