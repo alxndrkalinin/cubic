@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from cubic.cuda import ascupy
 from cubic.metrics.microssim import ri_factor as ri
 from cubic.metrics.microssim.ri_factor import (
     get_ri_factor,
@@ -757,7 +758,6 @@ def test_global_ri_factor_gpu_peak_memory(monkeypatch, gpu_available: bool) -> N
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-    from cubic.cuda import ascupy
 
     n, h, w = 16, 256, 256
     rng = np.random.default_rng(52)
@@ -782,7 +782,6 @@ def test_ri_factor_gpu_single_large_slice_is_chunked(
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-    from cubic.cuda import ascupy
 
     rng = np.random.default_rng(53)
     gt = rng.random((1024, 1024), dtype=np.float32)
