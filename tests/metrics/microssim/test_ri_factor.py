@@ -664,6 +664,26 @@ def test_chunked_objective_matches_full_map(monkeypatch, chunk: int) -> None:
             ), name
 
 
+def test_chunked_objective_accumulates_float32_in_float64(monkeypatch) -> None:
+    """float32 chunk sums accumulate in float64, matching a float64 mean.
+
+    The per-pixel maps stay float32; only the reduction is upcast, so the
+    chunked mean agrees with the float64 mean of the same float32 map far
+    below float32 rounding (~1e-7).
+    """
+    rng = np.random.default_rng(51)
+    gt = rng.random((4, 128, 128), dtype=np.float32)
+    pred = (0.8 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(gt, pred, data_range=float(gt.max() - gt.min()))
+    assert e.ux.dtype == np.float32
+    monkeypatch.setattr(ri, "_CHUNK_ELEMS", 4096)
+    for alpha in (0.5, 1.0, 1.7):
+        want_S = ri._S_map(alpha, e).astype(np.float64).mean()
+        want_dS = ri._dS_map(alpha, e).astype(np.float64).mean()
+        assert _compute_S_mean(alpha, e) == pytest.approx(want_S, rel=1e-12)
+        assert _compute_dS_mean(alpha, e) == pytest.approx(want_dS, rel=1e-10)
+
+
 def test_chunked_objective_accepts_0d_elements() -> None:
     """Scalar (0-D) element arrays reduce as one chunk instead of indexing axis 0."""
     e = SSIMElements(
