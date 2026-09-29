@@ -56,6 +56,19 @@ def _sample_values(image: np.ndarray) -> np.ndarray:
     return sample[np.isfinite(sample)]
 
 
+def _non_integer_fraction(sample: np.ndarray) -> float:
+    """Fraction of *sample* whose distance to the nearest integer exceeds tol.
+
+    One definition for both integer tests. ``_FLOAT_NON_INTEGER_FRAC_THRESHOLD``
+    is a *per-pixel* tolerance, so it belongs inside the comparison; comparing a
+    mean deviation against it, as the thinning check used to, borrows the
+    constant for a different statistic and lets the two drift apart.
+    """
+    return float(
+        np.mean(np.abs(sample - np.rint(sample)) > _FLOAT_NON_INTEGER_FRAC_THRESHOLD)
+    )
+
+
 def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
     """Warn when ``poisson_thinning`` is handed data that looks like counts.
 
@@ -73,9 +86,7 @@ def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
     sample = _sample_values(image)
     if not sample.size or float(np.min(sample)) < 0.0:
         return
-    if float(np.mean(np.abs(sample - np.rint(sample)))) >= (
-        _FLOAT_NON_INTEGER_FRAC_THRESHOLD
-    ):
+    if _non_integer_fraction(sample) > _FLOAT_NON_INTEGER_WARN_FRACTION:
         return
 
     warnings.warn(
@@ -848,11 +859,7 @@ def binomial_split(
         # Warn if float input with default calibration (likely forgot gain/offset)
         if np.issubdtype(image.dtype, np.floating):
             sample = _sample_values(image)
-            frac_fraction = float(
-                np.mean(
-                    np.abs(sample - np.rint(sample)) > _FLOAT_NON_INTEGER_FRAC_THRESHOLD
-                )
-            )
+            frac_fraction = _non_integer_fraction(sample)
             if (
                 frac_fraction > _FLOAT_NON_INTEGER_WARN_FRACTION
                 and gain == 1.0

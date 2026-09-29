@@ -307,14 +307,9 @@ def test_calibration_factor() -> None:
 def test_calibration_factor_never_refines_the_raw_crossing() -> None:
     """The correction may only coarsen: the factor is clamped at 1.0.
 
-    The paper fits ``f(r) = d_min(ref) / d_min(co1)``, a flat 1.813 for
-    ``r <~ 0.7``, falling through 1.0 near ``r = 0.925`` to 0.549 at ``r = 1``.
-    Unclamped, that sub-1.0 branch refines the reported resolution by up to 45%
-    below the halves' sampling limit. The clamp blocks it, so cubic deliberately
-    departs from the published curve past ``r ~ 0.925`` — justified because a
-    crossing there is at the split halves' Nyquist, outside the method's validity
-    (Rieger et al. 2024 require ``d_min >= 4 * d_px``), not because the region is
-    unfitted: Koho's Suppl. Fig. 3 does carry points out to ``r ~ 1.0``.
+    See the ``_calibration_factor`` docstring for why cubic departs from the
+    published curve past ``r ~ 0.925``; restating the derivation here would mean
+    correcting these numbers in two places.
     """
     for freq in np.linspace(0.0, 1.0, 201):
         factor = _calibration_factor(float(freq))
