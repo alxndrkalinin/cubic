@@ -9,7 +9,7 @@
 # - **SFSC** (Sectored Fourier Shell Correlation) — correlation-based, requires image splitting
 # - **DCR** (Decorrelation Analysis) — single-image, parameter-free
 #
-# We compare results against miplib's own SFSC notebook, which prints `FWHM (Z: 3.8876 µm, XY: 0.5987 µm)` for this stack; Koho et al. (2019) Fig. 4b rounds that to `PSF_WFHM = 0.6 × 3.9 µm`. This is a PSF FWHM derived from Koho's own SFSC measurement, not an independent ground truth, so treat it as a consistency check rather than a reference value.
+# We compare results against miplib's own SFSC notebook, which prints `FWHM (Z: 3.8876 µm, XY: 0.5987 µm)` for this stack; Koho et al. (2019) Fig. 4b rounds that to `PSF_WFHM = 0.6 × 3.9 µm` (the figure label reads `WFHM` [sic]; the body text uses FWHM). This is a PSF FWHM derived from Koho's own SFSC measurement, not an independent ground truth, so treat it as a consistency check rather than a reference value.
 #
 # **References:**
 # - Koho et al. (2019) "Fourier ring correlation simplifies image restoration in fluorescence microscopy", *Nature Communications* 10:3103.
