@@ -127,9 +127,18 @@ def _chunked_mean(
     alpha: float,
     elements: SSIMElements,
 ) -> float:
-    """Mean of the per-pixel map ``fn(alpha, elements)``, evaluated in chunks."""
-    total = sum(float(fn(alpha, chunk).sum()) for chunk in _iter_chunks(elements))
-    return total / elements.ux.size
+    """Mean of the per-pixel map ``fn(alpha, elements)``, evaluated in chunks.
+
+    Chunk sums accumulate in float64 on the elements' device, so each call
+    synchronizes with the host once rather than once per chunk. The chunk is
+    upcast before reducing: CuPy's ``sum(dtype=float64)`` on float32 input
+    measured ~13x slower than ``astype(float64).sum()``.
+    """
+    total = sum(
+        fn(alpha, chunk).astype(np.float64, copy=False).sum()
+        for chunk in _iter_chunks(elements)
+    )
+    return float(total) / elements.ux.size
 
 
 def _S_map(alpha: float, elements: SSIMElements) -> np.ndarray:
