@@ -507,11 +507,15 @@ def get_global_ri_factor(
     # both copies at once (10 element-sized arrays instead of 5).
     e_i = slice_elements(0)
     pooled = _map_arrays(e_i, lambda a: np.empty_like(a, shape=(n,) + a.shape))
-    for i in range(n):
-        if i:
-            e_i = slice_elements(i)
+
+    def store(i: int, e: SSIMElements) -> None:
         for f in _ELEMENT_FIELDS:
-            getattr(pooled, f)[i] = getattr(e_i, f)
+            getattr(pooled, f)[i] = getattr(e, f)
+
+    store(0, e_i)
+    for i in range(1, n):
+        e_i = slice_elements(i)
+        store(i, e_i)
     # C1, C2 come from the last slice, as upstream (ri_factor.py:123-131).
     pooled = dataclasses.replace(pooled, C1=e_i.C1, C2=e_i.C2)
     return get_ri_factor(pooled, alpha_min=alpha_min, alpha_max=alpha_max)
