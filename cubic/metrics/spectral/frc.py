@@ -1225,8 +1225,19 @@ def _fsc_extract_resolution(
         # no information, so the volume's real axial band limit stays at the
         # *original* Z Nyquist while the grid now runs to the XY one; this factor
         # converts back. That is a different job from the geometric projection
-        # above, and on the pollen stack of Koho et al. Fig. 4b it is the one
-        # that reproduces the published 3.91 um (projecting instead gave 2.02).
+        # above. The reference target is miplib's own SFSC notebook, which prints
+        # Z 3.8876 um / XY 0.5987 um for this stack (Fig. 4b rounds that to
+        # 0.6 x 3.9 um). It is Koho's own SFSC output rather than an independent
+        # measurement, but it is reproducible. Matching the notebook's settings
+        # (resample_order=0, bin_delta=10, one-bit, curve_fit_type='spline') this
+        # branch gives Z 3.872 um / XY 0.578 um -- within 0.4% and 3.5%. At
+        # cubic's defaults (bin_delta=1, 'smooth-spline') the same call gives
+        # Z 4.38 um, so the gap once attributed to this formula is bin width and
+        # curve fit, not the axial correction. The geometric projection gives
+        # 2.02 um. Cropping to miplib's 500^3 cube is NOT reproduced here: it
+        # moves Z to 4.16 um (+7.1%). NOTE: miplib (analysis.py:197)
+        # applies the factor to EVERY sector unconditionally and has no
+        # geometric-projection branch at all.
         z_resolution = z_measured * (
             1.0 + (resampled_anisotropy - 1.0) * abs(float(np.cos(np.deg2rad(z_angle))))
         )

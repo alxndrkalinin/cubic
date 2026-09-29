@@ -106,9 +106,17 @@ to isotropic voxels adds no information, so the real axial band limit stays at
 the original Z Nyquist while the grid now runs to the XY one. The Koho et al.
 (2019) eq. (5) factor `1 + (z_spacing/xy_spacing - 1)·|cos(theta)|` converts back,
 and is used in place of the geometric projection (the two address different
-errors and are not combined). This is the path that reproduces the paper: on
-their Fig. 4b pollen stack it gives XY 0.586 µm / Z 4.38 µm against a published
-0.59 / 3.91.
+errors and are not combined). The reference implementation's own notebook,
+`miplib/notebooks/One Image Sectioned FSC and 3D Wiener filtering.ipynb`, prints
+`FWHM (Z: 3.8875587137876315 um, XY: 0.5986743538754852 um)` for this stack;
+that is what Fig. 4b rounds to `PSF_WFHM = 0.6 × 3.9 µm`. It is a PSF FWHM
+derived from Koho's own SFSC output, so it is *not* an independent measurement
+of the sample — but it is a reproducible target for the implementation.
+Matching the notebook's `bin_delta=10` (it passes `--bin-delta=10`), cubic gives
+XY 0.553 µm / Z 3.818 µm, i.e. Z within 1.8%; at `bin_delta=1` the same call
+gives XY 0.587 / Z 4.383, so most of the apparent axial disagreement is the bin
+width, not the axial formula. The `0.59 / 3.91` pair cited here previously
+appears neither in the paper nor in the notebook.
 
 `spacing=None` is the same frequency grid as `spacing=1.0` — cycles per pixel —
 so resolutions come back in pixels.
