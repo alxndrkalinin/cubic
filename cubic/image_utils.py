@@ -40,6 +40,22 @@ _CLIPPED_READOUT_WARN_FRACTION = 0.1  # warn if >10% of pixels clipped to 0
 _SAMPLE_MAX_VALUES = 2_000_000  # cap the integer test on large volumes
 
 
+def _sample_values(image: np.ndarray) -> np.ndarray:
+    """Return a strided subsample of *image* as a flat float64 host array.
+
+    Strides the leading axis *before* flattening. A cropped view is not
+    contiguous, so reshaping it first copies the whole array -- 114 ms for a
+    108 MB crop -- which defeats the point of capping the sample.
+    """
+    step = 1
+    if image.size > _SAMPLE_MAX_VALUES and image.shape[0] > 1:
+        per_plane = max(image.size // image.shape[0], 1)
+        step = max(1, -(-image.size // _SAMPLE_MAX_VALUES)) if per_plane else 1
+        step = min(step, image.shape[0])
+    sample = asnumpy(image[::step]).astype(np.float64).reshape(-1)
+    return sample[np.isfinite(sample)]
+
+
 def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
     """Warn when ``poisson_thinning`` is handed data that looks like counts.
 
@@ -54,11 +70,7 @@ def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
     if counts_mode != "poisson_thinning":
         return
 
-    flat = image.reshape(-1)
-    if flat.size > _SAMPLE_MAX_VALUES:
-        flat = flat[:: -(-flat.size // _SAMPLE_MAX_VALUES)]
-    sample = asnumpy(flat).astype(np.float64)
-    sample = sample[np.isfinite(sample)]
+    sample = _sample_values(image)
     if not sample.size or float(np.min(sample)) < 0.0:
         return
     if float(np.mean(np.abs(sample - np.rint(sample)))) >= (
@@ -835,9 +847,11 @@ def binomial_split(
         # --- counts mode ---
         # Warn if float input with default calibration (likely forgot gain/offset)
         if np.issubdtype(image.dtype, np.floating):
-            frac_part = np.abs(image - np.rint(image))
+            sample = _sample_values(image)
             frac_fraction = float(
-                np.mean(frac_part > _FLOAT_NON_INTEGER_FRAC_THRESHOLD)
+                np.mean(
+                    np.abs(sample - np.rint(sample)) > _FLOAT_NON_INTEGER_FRAC_THRESHOLD
+                )
             )
             if (
                 frac_fraction > _FLOAT_NON_INTEGER_WARN_FRACTION
