@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from cubic.cuda import ascupy
 from cubic.metrics.microssim import ri_factor as ri
 from cubic.metrics.microssim.ri_factor import (
     get_ri_factor,
@@ -633,22 +634,10 @@ def test_alpha_min_cap_probed_when_loop_undershoots() -> None:
 
 def _chunk_layouts(e: SSIMElements) -> dict[str, SSIMElements]:
     """Return ``e`` as a 3-D batch, a single 2-D map, and a 1-D pooled array."""
-
-    def remap(fn) -> SSIMElements:
-        return SSIMElements(
-            ux=fn(e.ux),
-            uy=fn(e.uy),
-            vxy=fn(e.vxy),
-            vx=fn(e.vx),
-            vy=fn(e.vy),
-            C1=e.C1,
-            C2=e.C2,
-        )
-
     return {
         "3d": e,
-        "2d": remap(lambda a: a[0]),
-        "1d": remap(lambda a: np.ascontiguousarray(a).ravel()),
+        "2d": ri._map_arrays(e, lambda a: a[0]),
+        "1d": ri._map_arrays(e, lambda a: a.ravel()),
     }
 
 
@@ -656,8 +645,8 @@ def _chunk_layouts(e: SSIMElements) -> dict[str, SSIMElements]:
 def test_chunked_objective_matches_full_map(monkeypatch, chunk: int) -> None:
     """Chunked ``S`` / ``dS`` means equal the whole-map means in every layout.
 
-    ``chunk=1`` forces one row per chunk (rows larger than the chunk), ``37``
-    does not divide the row count, and ``1000`` spans several rows.
+    ``chunk=1`` and ``37`` are smaller than one image row, so rows split
+    recursively (``37`` also does not divide a row); ``1000`` spans rows.
     """
     rng = np.random.default_rng(50)
     gt = rng.random((4, 40, 40))
@@ -676,6 +665,41 @@ def test_chunked_objective_matches_full_map(monkeypatch, chunk: int) -> None:
             ), name
 
 
+def test_chunked_objective_accumulates_float32_in_float64(monkeypatch) -> None:
+    """float32 chunk sums accumulate in float64, matching a float64 mean.
+
+    The per-pixel maps stay float32; only the reduction is upcast, so the
+    chunked mean agrees with the float64 mean of the same float32 map far
+    below float32 rounding (~1e-7).
+    """
+    rng = np.random.default_rng(51)
+    gt = rng.random((4, 128, 128), dtype=np.float32)
+    pred = (0.8 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(gt, pred, data_range=float(gt.max() - gt.min()))
+    assert e.ux.dtype == np.float32
+    monkeypatch.setattr(ri, "_CHUNK_ELEMS", 4096)
+    for alpha in (0.5, 1.0, 1.7):
+        want_S = ri._S_map(alpha, e).astype(np.float64).mean()
+        want_dS = ri._dS_map(alpha, e).astype(np.float64).mean()
+        assert _compute_S_mean(alpha, e) == pytest.approx(want_S, rel=1e-12)
+        assert _compute_dS_mean(alpha, e) == pytest.approx(want_dS, rel=1e-10)
+
+
+def test_chunked_objective_accepts_0d_elements() -> None:
+    """Scalar (0-D) element arrays reduce as one chunk instead of indexing axis 0."""
+    e = SSIMElements(
+        ux=np.asarray(0.5),
+        uy=np.asarray(0.4),
+        vxy=np.asarray(0.01),
+        vx=np.asarray(0.02),
+        vy=np.asarray(0.015),
+        C1=1e-4,
+        C2=9e-4,
+    )
+    assert _compute_S_mean(1.2, e) == pytest.approx(float(ri._S_map(1.2, e)))
+    assert _compute_dS_mean(1.2, e) == pytest.approx(float(ri._dS_map(1.2, e)))
+
+
 def test_global_ri_factor_chunked_matches_unchunked(monkeypatch) -> None:
     """Forcing many chunks leaves the fitted alpha unchanged."""
     rng = np.random.default_rng(51)
@@ -687,14 +711,25 @@ def test_global_ri_factor_chunked_matches_unchunked(monkeypatch) -> None:
     assert alpha_chunked == pytest.approx(alpha_full, rel=1e-9)
 
 
-def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
-    """GPU fit peak stays under 12 pooled-element arrays above the input.
+def test_global_ri_factor_empty_stack_raises() -> None:
+    """A zero-slice stack raises ``ValueError`` before any element compute."""
+    empty = np.zeros((0, 16, 16))
+    with pytest.raises(ValueError, match="at least one slice"):
+        get_global_ri_factor(empty, empty)
 
-    Pooling via per-slice lists + ``concatenate`` and unchunked objective
-    evaluation peaked at ~27 element-sized arrays (MEASURED on 640x960
-    float32 stacks), which OOMed 48 GB GPUs on 576 slices.
-    """
-    cp = pytest.importorskip("cupy")
+
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (0, 5, 5)])
+def test_ri_factor_empty_elements_raises(shape: tuple[int, ...]) -> None:
+    """Empty element arrays raise ``ValueError`` instead of dividing by zero."""
+    z = np.zeros(shape)
+    e = SSIMElements(ux=z, uy=z, vxy=z, vx=z, vy=z, C1=1e-4, C2=9e-4)
+    with pytest.raises(ValueError, match="at least one pixel"):
+        get_ri_factor(e)
+
+
+def _gpu_peak_above_base(fn) -> tuple[object, int]:
+    """Run ``fn()`` and return its result and the CuPy pool peak above entry."""
+    import cupy as cp
     from cupy.cuda import memory_hook
 
     class PeakHook(memory_hook.MemoryHook):
@@ -702,10 +737,27 @@ def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
 
         def __init__(self, pool) -> None:
             self.pool = pool
-            self.peak = 0
+            self.peak = pool.used_bytes()
 
         def malloc_postprocess(self, **kwargs) -> None:
             self.peak = max(self.peak, self.pool.used_bytes())
+
+    pool = cp.get_default_memory_pool()
+    base = pool.used_bytes()
+    with PeakHook(pool) as hook:
+        result = fn()
+    return result, hook.peak - base
+
+
+def test_global_ri_factor_gpu_peak_memory(monkeypatch, gpu_available: bool) -> None:
+    """GPU fit peak stays under 9 pooled-element arrays above the input.
+
+    Pooling via per-slice lists + ``concatenate`` and unchunked objective
+    evaluation peaked at ~27 element-sized arrays (MEASURED on 640x960
+    float32 stacks), which OOMed 48 GB GPUs on 576 slices.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
 
     n, h, w = 16, 256, 256
     rng = np.random.default_rng(52)
@@ -713,12 +765,32 @@ def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
     pred = (0.7 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
     # Force the chunked path on a test-sized input.
     monkeypatch.setattr(ri, "_CHUNK_ELEMS", 1 << 16)
-    pool = cp.get_default_memory_pool()
-    gt_cp, pred_cp = cp.asarray(gt), cp.asarray(pred)
-    base = pool.used_bytes()
-    hook = PeakHook(pool)
-    with hook:
-        alpha = get_global_ri_factor(gt_cp, pred_cp)
-    element_bytes = n * (h - 6) * (w - 6) * 4
+    gt_cp, pred_cp = ascupy(gt), ascupy(pred)
+    alpha, peak = _gpu_peak_above_base(lambda: get_global_ri_factor(gt_cp, pred_cp))
     assert np.isfinite(alpha)
-    assert (hook.peak - base) / element_bytes < 12
+    assert peak / (n * (h - 6) * (w - 6) * 4) < 9
+
+
+def test_ri_factor_gpu_single_large_slice_is_chunked(
+    monkeypatch, gpu_available: bool
+) -> None:
+    """A single slice larger than a chunk is split, not reduced whole.
+
+    Chunking only along axis 0 left a ``(1, h, w)`` pool as one chunk, which
+    built ~15 element-sized temporaries (MEASURED); splitting inside the
+    slice bounds them to ~15 chunk-sized ones.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+
+    rng = np.random.default_rng(53)
+    gt = rng.random((1024, 1024), dtype=np.float32)
+    pred = (0.7 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(
+        ascupy(gt), ascupy(pred), data_range=float(gt.max() - gt.min())
+    )
+    pooled = ri._map_arrays(e, lambda a: a[None].copy())
+    monkeypatch.setattr(ri, "_CHUNK_ELEMS", 1 << 16)
+    alpha, peak = _gpu_peak_above_base(lambda: get_ri_factor(pooled))
+    assert np.isfinite(alpha)
+    assert peak / (pooled.ux.size * 4) < 3
