@@ -476,6 +476,8 @@ def get_global_ri_factor(
         )
 
     n = gt.shape[0]
+    if n == 0:
+        raise ValueError("gt and pred must contain at least one slice.")
 
     def slice_elements(i: int) -> SSIMElements:
         dr = float(gt[i].max() - gt[i].min())

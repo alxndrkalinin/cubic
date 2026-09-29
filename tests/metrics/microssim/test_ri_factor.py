@@ -675,6 +675,13 @@ def test_global_ri_factor_chunked_matches_unchunked(monkeypatch) -> None:
     assert alpha_chunked == pytest.approx(alpha_full, rel=1e-9)
 
 
+def test_global_ri_factor_empty_stack_raises() -> None:
+    """A zero-slice stack raises ``ValueError`` before any element compute."""
+    empty = np.zeros((0, 16, 16))
+    with pytest.raises(ValueError, match="at least one slice"):
+        get_global_ri_factor(empty, empty)
+
+
 def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
     """GPU fit peak stays under 12 pooled-element arrays above the input.
 
