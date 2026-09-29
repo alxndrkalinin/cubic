@@ -129,6 +129,7 @@ def preprocess_images(
     gain: float = 1.0,
     offset: float = 0.0,
     readout_noise_rms: float = 0.0,
+    check_noise_model: bool = True,
     rng: np.random.Generator | int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Preprocess input images with all modifications (padding, windowing, splitting)."""
@@ -160,6 +161,7 @@ def preprocess_images(
                 gain=gain,
                 offset=offset,
                 readout_noise_rms=readout_noise_rms,
+                check_noise_model=check_noise_model,
                 rng=rng,
             )
         else:
@@ -404,6 +406,7 @@ def _calculate_frc_single_pass(
     gain: float,
     offset: float,
     readout_noise_rms: float,
+    check_noise_model: bool,
     rng: np.random.Generator | int | None,
 ) -> tuple[FourierCorrelationDataCollection, float]:
     """Run a single FRC pass (split + FFT + radial binning).
@@ -435,6 +438,7 @@ def _calculate_frc_single_pass(
         gain=gain,
         offset=offset,
         readout_noise_rms=readout_noise_rms,
+        check_noise_model=check_noise_model,
         rng=rng,
     )
 
@@ -563,7 +567,7 @@ def calculate_frc(
         all_curves: list[np.ndarray] = []
         all_resolutions: list[float] = []
 
-        for rep_rng in rngs:
+        for repeat_index, rep_rng in enumerate(rngs):
             frc_data, spacing_eff = _calculate_frc_single_pass(
                 image1,
                 None,
@@ -579,6 +583,9 @@ def calculate_frc(
                 gain=gain,
                 offset=offset,
                 readout_noise_rms=readout_noise_rms,
+                # Every repeat splits the same image, so the checks would warn
+                # identically n_repeats times at full cost.
+                check_noise_model=repeat_index == 0,
                 rng=rep_rng,
             )
 
@@ -655,6 +662,7 @@ def calculate_frc(
         gain=gain,
         offset=offset,
         readout_noise_rms=readout_noise_rms,
+        check_noise_model=True,
         rng=rng,
     )
 

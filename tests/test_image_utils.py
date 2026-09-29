@@ -1,9 +1,12 @@
 """Tests for ``image_utils`` helper functions."""
 
+import warnings
+
 import numpy as np
 import pytest
 
 from cubic.cuda import ascupy, asnumpy
+from cubic.scipy import ndimage
 from cubic.image_utils import (
     clahe,
     label,
@@ -28,6 +31,7 @@ from cubic.image_utils import (
     get_xy_block_coords,
     pad_to_matching_shape,
     distance_transform_edt,
+    _axis_bandwidth_fractions,
     reverse_checkerboard_split,
     select_max_contrast_slices,
 )
@@ -610,3 +614,87 @@ class TestBinomialSplit:
         assert img1.shape == img.shape
         assert img1.ndim == 3
         np.testing.assert_array_equal(img1 + img2, np.rint(img).astype(np.float32))
+
+
+class TestBinomialSplitNoiseModelWarnings:
+    """Veto-only checks that ``binomial_split`` warns when its assumptions fail.
+
+    These are asymmetric by construction: they can show data is not independent
+    Poisson counts, never that it is. ``test_silent_on_clean_counts`` pins the
+    no-false-positive side, since a check that fires on everything would be
+    useless as a warning.
+    """
+
+    @staticmethod
+    def _counts(shape: tuple[int, ...], seed: int = 0) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        smooth = ndimage.gaussian_filter(rng.normal(size=shape), 3.0)
+        smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+        return rng.poisson(smooth * 200.0).astype(np.float32)
+
+    @classmethod
+    def _upsampled_z(cls, factor: int = 3, order: int = 1) -> np.ndarray:
+        """Build counts with Z interpolated up, as isotropic FSC resampling does."""
+        img = cls._counts((48, 64, 64))
+        return ndimage.zoom(img, (factor, 1, 1), order=order).astype(np.float32)
+
+    def test_silent_on_clean_counts(self) -> None:
+        """Genuine Poisson counts must not trip any of the checks."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            binomial_split(self._counts((128, 128)), rng=0)
+        assert [str(w.message) for w in caught] == []
+
+    def test_warns_on_interpolated_axis(self) -> None:
+        """An upsampled axis is band-limited and must be reported by index."""
+        with pytest.warns(UserWarning, match="band-limited well below Nyquist"):
+            binomial_split(self._upsampled_z(), rng=0)
+
+    def test_interpolated_axis_is_identified(self) -> None:
+        """Only the resampled axis is named, not the untouched ones."""
+        img = self._upsampled_z()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            binomial_split(img, rng=0)
+        band = [str(w.message) for w in caught if "band-limited" in str(w.message)]
+        assert len(band) == 1
+        assert "axis 0" in band[0]
+        assert "axis 1" not in band[0] and "axis 2" not in band[0]
+
+    def test_warns_on_additive_gaussian_noise(self) -> None:
+        """Variance that does not track the mean is not Poisson."""
+        rng = np.random.default_rng(3)
+        smooth = ndimage.gaussian_filter(rng.normal(size=(128, 128)), 3.0)
+        smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min()) * 200.0
+        img = (smooth + rng.normal(0.0, 14.0, smooth.shape)).astype(np.float32)
+        with pytest.warns(UserWarning, match="barely tracks intensity"):
+            binomial_split(img, counts_mode="poisson_thinning", rng=0)
+
+    def test_warns_on_thinning_integer_counts(self) -> None:
+        """Thinning integer counts leaves a correlation floor; steer to 'counts'."""
+        with pytest.warns(UserWarning, match="counts_mode='counts' for count data"):
+            binomial_split(
+                self._counts((128, 128)), counts_mode="poisson_thinning", rng=0
+            )
+
+    def test_bandwidth_tracks_upsampling_factor(self) -> None:
+        """Bandwidth of an axis upsampled by m collapses to roughly 1/m."""
+        assert min(_axis_bandwidth_fractions(self._counts((48, 64, 64)))) > 0.6
+        for factor in (2, 3):
+            for order in (1, 3):
+                fractions = _axis_bandwidth_fractions(
+                    self._upsampled_z(factor=factor, order=order)
+                )
+                assert fractions[0] < 0.6
+                assert fractions[0] == pytest.approx(1.0 / factor, abs=0.15)
+                assert min(fractions[1:]) > 0.6
+
+    def test_nearest_neighbour_upsampling_is_a_known_blind_spot(self) -> None:
+        """Pin the documented limitation: replication can evade the check.
+
+        Nearest-neighbour upsampling reintroduces spectral replicas rather than
+        leaving the top of the band empty, so it is not reliably detected. This
+        test exists so the gap is visible rather than discovered in the field.
+        """
+        fractions = _axis_bandwidth_fractions(self._upsampled_z(order=0))
+        assert fractions[0] > 0.6

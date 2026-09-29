@@ -18,6 +18,168 @@ _FLOAT_NON_INTEGER_WARN_FRACTION = 0.1  # warn if >10% of pixels are non-integer
 _NEGATIVE_ELECTRON_WARN_FRACTION = 0.05  # warn if >5% of pixels go negative
 _CLIPPED_READOUT_WARN_FRACTION = 0.1  # warn if >10% of pixels clipped to 0
 
+# Thresholds for binomial_split noise-model checks. These are VETO-ONLY: they can
+# show that data is not independent Poisson counts, never that it is. An 8-bit
+# render of a count image passes every one of them, so nothing here may be used
+# to *select* a split type -- only to warn about one the caller asked for.
+_BANDWIDTH_ENERGY_QUANTILE = 0.99  # fraction of spectral power to enclose
+_BANDWIDTH_WARN_FRACTION = 0.6  # warn below this fraction of Nyquist
+_BANDWIDTH_MAX_LINES = 64  # subsample other axes to bound the FFT cost
+_POISSON_SLOPE_WARN = 0.3  # warn below this normalized variance-vs-mean slope
+_POISSON_SLOPE_MIN_BINS = 4  # need this many intensity bins to fit a slope
+_POISSON_SLOPE_MAX_SAMPLES = 2_000_000  # cap the fit cost on large volumes
+
+
+def _axis_bandwidth_fractions(image: np.ndarray) -> list[float]:
+    """Per-axis fraction of Nyquist enclosing ``_BANDWIDTH_ENERGY_QUANTILE``.
+
+    Independent per-pixel noise spreads power all the way to Nyquist, so an
+    untouched axis returns ~0.85-1.0. Upsampling an axis by a factor ``m``
+    leaves the band above ``1/m`` empty, so an interpolated axis returns ~``1/m``
+    -- and only that axis, which matters because isotropic resampling for FSC
+    touches Z alone. Measured on the Koho pollen stack: 0.86/0.84/0.85 as
+    acquired, 0.20/0.77/0.79 after an order-1 resample in Z.
+
+    Two known blind spots. It does NOT detect deconvolution: Richardson-Lucy
+    amplifies high frequencies, and 25 iterations on the same stack reads
+    1.00/0.98/0.98, i.e. fuller-band than the raw data. And nearest-neighbour
+    upsampling is only caught sometimes, because replication reintroduces
+    spectral replicas instead of leaving the top of the band empty -- a
+    synthetic x3 replication reads 0.78 (missed) while the real pollen stack at
+    resample_order=0 reads 0.37 (caught). Smooth interpolation, which is the
+    default everywhere, collapses cleanly to ~1/m.
+    """
+    fractions = []
+    for axis, n_axis in enumerate(image.shape):
+        if n_axis < 4:
+            fractions.append(1.0)
+            continue
+        sub = image[
+            tuple(
+                slice(None)
+                if i == axis
+                else slice(None, None, max(1, n // _BANDWIDTH_MAX_LINES))
+                for i, n in enumerate(image.shape)
+            )
+        ]
+        sub = sub.astype(np.float64) - np.mean(sub)
+        power = np.abs(np.fft.rfft(sub, axis=axis)) ** 2
+        profile = power.mean(axis=tuple(i for i in range(sub.ndim) if i != axis))
+        total = float(np.sum(profile))
+        if total <= 0.0:
+            fractions.append(1.0)
+            continue
+        cumulative = asnumpy(np.cumsum(profile) / total)
+        idx = int(np.searchsorted(cumulative, _BANDWIDTH_ENERGY_QUANTILE))
+        fractions.append(idx / max(len(cumulative) - 1, 1))
+    return fractions
+
+
+def _poisson_variance_slope(image: np.ndarray) -> float:
+    """Fit local noise variance against local mean and return the slope.
+
+    For Poisson data variance tracks the mean, so the slope is ~1 whatever the
+    gain (the normalization divides it out). Additive Gaussian noise gives ~0.
+    Noise scale comes from a robust MAD of first differences along the last
+    axis, which rejects the image structure that a plain variance would absorb.
+
+    Returns ``nan`` when there are too few populated intensity bins to fit.
+    """
+    # Subsample whole lines before differencing: this estimates one global
+    # variance-vs-mean relation, so a few million samples is ample, and the
+    # per-bin medians below cost O(n log n). Without the cap a 315 MB volume
+    # took 174 s, which is not acceptable on a path that runs per split.
+    lines = image.reshape(-1, image.shape[-1])
+    max_lines = max(1, _POISSON_SLOPE_MAX_SAMPLES // image.shape[-1])
+    if lines.shape[0] > max_lines:
+        lines = lines[:: -(-lines.shape[0] // max_lines)]
+    lines = asnumpy(lines).astype(np.float64)
+
+    mean_level = ((lines[:, 1:] + lines[:, :-1]) / 2.0).ravel()
+    abs_diff = np.abs(np.diff(lines, axis=-1)).ravel()
+    lo, hi = np.percentile(mean_level, [2.0, 98.0])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return float("nan")
+    edges = np.linspace(lo, hi, 12)
+    xs, ys = [], []
+    for start, stop in zip(edges[:-1], edges[1:]):
+        sel = (mean_level >= start) & (mean_level < stop)
+        if int(sel.sum()) < 200:
+            continue
+        # MAD -> sigma for the difference, then /2 for the per-pixel variance
+        sigma = 1.4826 * float(np.median(abs_diff[sel]))
+        xs.append(0.5 * (start + stop))
+        ys.append(sigma**2 / 2.0)
+    if len(xs) < _POISSON_SLOPE_MIN_BINS:
+        return float("nan")
+    x_arr, y_arr = np.asarray(xs), np.asarray(ys)
+    if y_arr.mean() <= 0.0:
+        return float("nan")
+    design = np.vstack([x_arr, np.ones_like(x_arr)]).T
+    slope = float(np.linalg.lstsq(design, y_arr, rcond=None)[0][0])
+    return slope * float(x_arr.mean()) / float(y_arr.mean())
+
+
+def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
+    """Warn when the data contradicts what a binomial split assumes.
+
+    Every check warns rather than raises: a violated assumption makes the number
+    unreliable, not uncomputable, and the caller may be doing something
+    deliberate. See ``_axis_bandwidth_fractions`` for what these cannot catch.
+    """
+    fractions = _axis_bandwidth_fractions(image)
+    narrow = [
+        (axis, frac)
+        for axis, frac in enumerate(fractions)
+        if frac < _BANDWIDTH_WARN_FRACTION
+    ]
+    if narrow:
+        detail = ", ".join(f"axis {axis} at {frac:.2f}" for axis, frac in narrow)
+        warnings.warn(
+            f"Binomial split assumes independent per-pixel noise, but the "
+            f"spectrum is band-limited well below Nyquist ({detail}; a full-band "
+            "axis reads ~0.85-1.0). That is the signature of interpolation, so "
+            "this volume was most likely resampled, upscaled or smoothed before "
+            "splitting, which correlates neighbouring pixels and biases the "
+            "resolution. Split at the native sampling first, then resample each "
+            "half.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    slope = _poisson_variance_slope(image)
+    if np.isfinite(slope) and slope < _POISSON_SLOPE_WARN:
+        warnings.warn(
+            f"Noise variance barely tracks intensity (normalized slope "
+            f"{slope:.2f}; Poisson data gives ~1). The binomial split assumes "
+            "Poisson counts, so this estimate may not be a physical resolution. "
+            "Note the converse does not hold: passing this check does not prove "
+            "the data are counts.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    if counts_mode == "poisson_thinning":
+        finite = image[np.isfinite(image)]
+        looks_like_counts = bool(
+            finite.size
+            and np.min(finite) >= 0
+            and float(np.mean(np.abs(finite - np.rint(finite))))
+            < _FLOAT_NON_INTEGER_FRAC_THRESHOLD
+        )
+        if looks_like_counts:
+            warnings.warn(
+                "counts_mode='poisson_thinning' on non-negative integer data. "
+                "Thinning draws two independent Poisson variates from the same "
+                "rate, so the halves share the rate and the FRC keeps a "
+                "high-frequency correlation floor (~0.33 measured on simulated "
+                "counts) that can stop the curve ever crossing 1/7. Use "
+                "counts_mode='counts' for count data; thinning is the fallback "
+                "for float or deconvolved input.",
+                UserWarning,
+                stacklevel=3,
+            )
+
 
 # image operations assume ZYX channel order
 def image_stats(
@@ -701,6 +863,7 @@ def binomial_split(
     gain: float = 1.0,
     offset: float = 0.0,
     readout_noise_rms: float = 0.0,
+    check_noise_model: bool = True,
     rng: np.random.Generator | int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Split a single image into two noise-independent halves via binomial sampling.
@@ -726,6 +889,12 @@ def binomial_split(
         Conversion: ``electrons = (image - offset) / gain``.
     offset : float
         Camera offset (ADU). Subtracted before gain conversion. Default 0.0.
+    check_noise_model : bool
+        Run the veto-only checks that warn when the data contradicts the
+        independent-Poisson assumption (interpolated axis, variance that does
+        not track the mean, thinning of integer counts). Costs a few seconds on
+        a large volume, so callers that split the *same* image repeatedly
+        should leave it on for the first call only. Default True.
     readout_noise_rms : float
         Read-noise standard deviation in **electrons**. When > 0 in counts mode,
         applies the Rieger et al. Eq. 29 bias correction: σ² is added to the count
@@ -761,6 +930,9 @@ def binomial_split(
         raise ValueError(f"gain must be > 0, got {gain}")
     if readout_noise_rms < 0:
         raise ValueError(f"readout_noise_rms must be >= 0, got {readout_noise_rms}")
+
+    if check_noise_model:
+        _warn_on_noise_model(image, counts_mode)
 
     # Resolve RNG
     if isinstance(rng, int):
