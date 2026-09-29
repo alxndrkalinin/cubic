@@ -1601,47 +1601,76 @@ def test_sampling_limit_is_judged_per_direction() -> None:
     assert "axial resolution" in messages[0]
 
 
-def test_binomial_split_warns_when_resampling_precedes_it(
-    cells_volume: tuple[np.ndarray, list[float]],
-) -> None:
-    """Interpolating before a binomial split breaks its Poisson premise.
+def test_binomial_split_precedes_resampling() -> None:
+    """The halves must be split from raw counts, then interpolated separately.
 
-    ``resample_isotropic`` runs before the split, so the halves inherit correlated
-    noise and the estimate is biased fine — on the Koho pollen stack, axial
-    0.745 um against a published 3.91 um. Rieger et al. (2024) require splitting
-    "at the raw data level, before any reconstruction step".
+    Splitting an interpolated volume is incorrect (Rieger et al. 2024: split
+    "at the raw data level"): the halves draw on shared source samples, so they
+    are correlated and the estimate is biased fine. Applying the same linear
+    interpolation to each half afterwards keeps them independent.
+
+    MEASURED against two genuinely independent acquisitions of the same object:
+    splitting after resampling reported XY 47% too fine, splitting before it
+    +8%.
     """
-    volume, spacing = cells_volume
+    rng = np.random.default_rng(0)
+    obj = ndimage.gaussian_filter(rng.normal(size=(40, 128, 128)), (1.5, 3.0, 3.0))
+    obj = (obj - obj.min()) / (obj.max() - obj.min()) * 300.0
+    shared = dict(
+        spacing=[0.3, 0.1, 0.1],
+        bin_delta=2,
+        angle_delta=45,
+        backend="hist",
+        resolution_threshold="fixed",
+        threshold_value=0.143,
+        axial_floor_factor=0.0,
+        resample_isotropic=True,
+        resample_order=1,
+    )
 
-    with pytest.warns(UserWarning, match="breaks the independent-Poisson assumption"):
-        fsc_resolution(
-            volume,
-            spacing=spacing,
-            split_type="binomial",
-            resample_isotropic=True,
-            angle_delta=45,
-            backend="hist",
-            rng=0,
-        )
+    truth = fsc_resolution(
+        rng.poisson(obj).astype(np.float32),
+        rng.poisson(obj).astype(np.float32),
+        **shared,
+    )
+    single = fsc_resolution(
+        rng.poisson(obj).astype(np.float32),
+        split_type="binomial",
+        rng=0,
+        **shared,
+    )
+
+    # Splitting after interpolation used to land near 0.5x the true value.
+    assert single["xy"] / truth["xy"] > 0.8, (
+        f"XY {single['xy']:.4f} against two-image {truth['xy']:.4f}: biased "
+        "fine, which is what splitting an interpolated volume does"
+    )
+    assert 0.8 < single["z"] / truth["z"] < 1.25
 
 
-def test_binomial_split_without_resampling_does_not_warn(
-    cells_volume: tuple[np.ndarray, list[float]],
-) -> None:
-    """The correct binomial usage must not be flagged."""
-    volume, spacing = cells_volume
+def test_binomial_split_on_resampled_input_is_not_warned_about() -> None:
+    """The ordering is handled, so there is nothing left to warn about.
+
+    This used to emit "breaks the independent-Poisson assumption" and tell the
+    caller to turn resampling off; the split now simply runs first.
+    """
+    rng = np.random.default_rng(0)
+    obj = ndimage.gaussian_filter(rng.normal(size=(24, 64, 64)), 2.0)
+    obj = (obj - obj.min()) / (obj.max() - obj.min()) * 200.0
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         fsc_resolution(
-            volume,
-            spacing=spacing,
+            rng.poisson(obj).astype(np.float32),
+            spacing=[0.3, 0.1, 0.1],
             split_type="binomial",
-            resample_isotropic=False,
+            resample_isotropic=True,
             angle_delta=45,
             backend="hist",
+            axial_floor_factor=0.0,
             rng=0,
         )
+
     offenders = [
         str(w.message) for w in caught if "independent-Poisson" in str(w.message)
     ]

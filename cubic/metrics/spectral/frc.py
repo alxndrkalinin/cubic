@@ -1477,31 +1477,6 @@ def fsc_resolution(
             stacklevel=2,
         )
 
-    if use_binomial and resample_isotropic:
-        # Resampling runs before the split (below), so the halves inherit
-        # interpolated -- hence spatially correlated -- noise, and the binomial
-        # split's independent-Poisson premise no longer holds. Rieger et al. (2024)
-        # are explicit: split "at the raw data level, after gain and offset
-        # correction", and "splitting the outcome of an image reconstruction for
-        # computation of an FRC curve is incorrect. In this case the reconstruction
-        # process will introduce correlations and bias to the resolution estimate."
-        # Measured on the Koho pollen stack: axial 0.745 um against the 3.8876 um
-        # PSF FWHM miplib's notebook reports, because interpolating 181 -> 582 Z
-        # planes makes neighbouring planes near copies, so the axial
-        # correlation never decays.
-        warnings.warn(
-            "split_type='binomial' with resample_isotropic=True interpolates the "
-            "volume before splitting it, which correlates neighbouring noise and "
-            "breaks the independent-Poisson assumption the binomial split relies "
-            "on; the resolution will be biased fine, potentially several-fold "
-            "along the interpolated axis. Rieger et al. (2024) require splitting "
-            "at the raw data level, before any reconstruction step. Use "
-            "resample_isotropic=False, or split_type='checkerboard' if isotropic "
-            "resampling is required.",
-            UserWarning,
-            stacklevel=2,
-        )
-
     # Axial band limit, captured *before* any resampling: interpolating Z
     # refines the grid but not the information, so the floor stays here.
     # spacing=None means index units, where one voxel is the unit of length.
@@ -1514,6 +1489,27 @@ def fsc_resolution(
     # None keeps the geometric axial projection; resampling swaps in the Koho
     # eq. (5) correction instead (see _fsc_extract_resolution).
     resampled_anisotropy: float | None = None
+
+    # Splitting the output of an interpolation is incorrect: the halves inherit
+    # neighbouring noise from the same source samples, so they are no longer
+    # independent and the FSC never decays (nan on the Koho pollen stack).
+    # Rieger et al. (2024) require splitting "at the raw data level". Split the
+    # raw counts first, then apply the *same* interpolation to each half: a
+    # linear operator applied separately to independent inputs leaves them
+    # independent, so the premise survives and eq. (5) still applies.
+    presplit_binomial = use_binomial and resample_isotropic
+    if presplit_binomial:
+        image1, image2 = binomial_split(
+            image1,
+            p=0.5,
+            counts_mode=counts_mode,
+            gain=gain,
+            offset=offset,
+            readout_noise_rms=readout_noise_rms,
+            rng=rng,
+        )
+        single_image = False
+        use_binomial = False
 
     if resample_isotropic:
         # ``_normalize_spacing`` returns None exactly when *spacing* is None, so
