@@ -633,22 +633,10 @@ def test_alpha_min_cap_probed_when_loop_undershoots() -> None:
 
 def _chunk_layouts(e: SSIMElements) -> dict[str, SSIMElements]:
     """Return ``e`` as a 3-D batch, a single 2-D map, and a 1-D pooled array."""
-
-    def remap(fn) -> SSIMElements:
-        return SSIMElements(
-            ux=fn(e.ux),
-            uy=fn(e.uy),
-            vxy=fn(e.vxy),
-            vx=fn(e.vx),
-            vy=fn(e.vy),
-            C1=e.C1,
-            C2=e.C2,
-        )
-
     return {
         "3d": e,
-        "2d": remap(lambda a: a[0]),
-        "1d": remap(lambda a: np.ascontiguousarray(a).ravel()),
+        "2d": ri._map_arrays(e, lambda a: a[0]),
+        "1d": ri._map_arrays(e, lambda a: a.ravel()),
     }
 
 
