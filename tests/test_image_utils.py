@@ -31,7 +31,6 @@ from cubic.image_utils import (
     get_xy_block_coords,
     pad_to_matching_shape,
     distance_transform_edt,
-    _axis_bandwidth_fractions,
     reverse_checkerboard_split,
     select_max_contrast_slices,
 )
@@ -617,12 +616,12 @@ class TestBinomialSplit:
 
 
 class TestBinomialSplitNoiseModelWarnings:
-    """Veto-only checks that ``binomial_split`` warns when its assumptions fail.
+    """Veto-only check that ``binomial_split`` warns when its assumption fails.
 
-    These are asymmetric by construction: they can show data is not independent
-    Poisson counts, never that it is. ``test_silent_on_clean_counts`` pins the
-    no-false-positive side, since a check that fires on everything would be
-    useless as a warning.
+    Asymmetric by construction: it can show data is not independent Poisson
+    counts, never that it is. ``test_silent_on_clean_counts`` pins the
+    no-false-positive side -- the two statistical checks that once lived here
+    were removed precisely because they failed it on valid high-SNR data.
     """
 
     @staticmethod
@@ -632,43 +631,12 @@ class TestBinomialSplitNoiseModelWarnings:
         smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
         return rng.poisson(smooth * 200.0).astype(np.float32)
 
-    @classmethod
-    def _upsampled_z(cls, factor: int = 3, order: int = 1) -> np.ndarray:
-        """Build counts with Z interpolated up, as isotropic FSC resampling does."""
-        img = cls._counts((48, 64, 64))
-        return ndimage.zoom(img, (factor, 1, 1), order=order).astype(np.float32)
-
     def test_silent_on_clean_counts(self) -> None:
         """Genuine Poisson counts must not trip any of the checks."""
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             binomial_split(self._counts((128, 128)), rng=0)
         assert [str(w.message) for w in caught] == []
-
-    def test_warns_on_interpolated_axis(self) -> None:
-        """An upsampled axis is band-limited and must be reported by index."""
-        with pytest.warns(UserWarning, match="band-limited well below Nyquist"):
-            binomial_split(self._upsampled_z(), rng=0)
-
-    def test_interpolated_axis_is_identified(self) -> None:
-        """Only the resampled axis is named, not the untouched ones."""
-        img = self._upsampled_z()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            binomial_split(img, rng=0)
-        band = [str(w.message) for w in caught if "band-limited" in str(w.message)]
-        assert len(band) == 1
-        assert "axis 0" in band[0]
-        assert "axis 1" not in band[0] and "axis 2" not in band[0]
-
-    def test_warns_on_additive_gaussian_noise(self) -> None:
-        """Variance that does not track the mean is not Poisson."""
-        rng = np.random.default_rng(3)
-        smooth = ndimage.gaussian_filter(rng.normal(size=(128, 128)), 3.0)
-        smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min()) * 200.0
-        img = (smooth + rng.normal(0.0, 14.0, smooth.shape)).astype(np.float32)
-        with pytest.warns(UserWarning, match="barely tracks intensity"):
-            binomial_split(img, counts_mode="poisson_thinning", rng=0)
 
     def test_warns_on_thinning_integer_counts(self) -> None:
         """Thinning integer counts leaves a correlation floor; steer to 'counts'."""
@@ -677,24 +645,32 @@ class TestBinomialSplitNoiseModelWarnings:
                 self._counts((128, 128)), counts_mode="poisson_thinning", rng=0
             )
 
-    def test_bandwidth_tracks_upsampling_factor(self) -> None:
-        """Bandwidth of an axis upsampled by m collapses to roughly 1/m."""
-        assert min(_axis_bandwidth_fractions(self._counts((48, 64, 64)))) > 0.6
-        for factor in (2, 3):
-            for order in (1, 3):
-                fractions = _axis_bandwidth_fractions(
-                    self._upsampled_z(factor=factor, order=order)
-                )
-                assert fractions[0] < 0.6
-                assert fractions[0] == pytest.approx(1.0 / factor, abs=0.15)
-                assert min(fractions[1:]) > 0.6
+    def test_singleton_final_axis_does_not_raise(self) -> None:
+        """A valid image with a singleton last axis must still split.
 
-    def test_nearest_neighbour_upsampling_is_a_known_blind_spot(self) -> None:
-        """Pin the documented limitation: replication can evade the check.
-
-        Nearest-neighbour upsampling reintroduces spectral replicas rather than
-        leaving the top of the band empty, so it is not reliably detected. This
-        test exists so the gap is visible rather than discovered in the field.
+        Regression: the variance-vs-mean fit differences along the last axis,
+        which is empty when that axis has length 1.
         """
-        fractions = _axis_bandwidth_fractions(self._upsampled_z(order=0))
-        assert fractions[0] > 0.6
+        for shape in ((64, 1), (8, 16, 1)):
+            img = np.random.default_rng(0).poisson(50, size=shape).astype(np.float32)
+            img1, img2 = binomial_split(img, rng=0)
+            assert img1.shape == img.shape
+            np.testing.assert_array_equal(img1 + img2, np.rint(img).astype(np.float32))
+
+    def test_silent_on_high_snr_smooth_counts(self) -> None:
+        """High-SNR smooth Poisson data must not warn.
+
+        Regression for the removed checks: spectral bandwidth read
+        0.54/0.38/0.36 of Nyquist and the variance-vs-mean slope read 0.04 on
+        data like this, both tripping their thresholds on counts that are
+        perfectly valid for a binomial split.
+        """
+        rng = np.random.default_rng(0)
+        for dose in (200.0, 20_000.0, 200_000.0):
+            smooth = ndimage.gaussian_filter(rng.normal(size=(32, 64, 64)), 3.0)
+            smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+            img = rng.poisson(smooth * dose).astype(np.float32)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                binomial_split(img, rng=0)
+            assert [str(w.message) for w in caught] == [], f"warned at dose {dose}"
