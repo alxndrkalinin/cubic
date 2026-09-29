@@ -1,5 +1,6 @@
 """Tests for FRC and FSC resolution calculations."""
 
+import warnings
 from typing import Any
 from collections.abc import Sequence
 
@@ -306,13 +307,14 @@ def test_calibration_factor() -> None:
 def test_calibration_factor_never_refines_the_raw_crossing() -> None:
     """The correction may only coarsen: the factor is clamped at 1.0.
 
-    The paper fits ``d_min(ref) / d_min(co1)``, which is >= 1 because the
-    checkerboard split's diagonal shift puts the one-image crossing at a *higher*
-    radius than the two-image reference. Its fit is an exponential centred on
-    ``b = 0.98``, so unclamped it passes 1.0 near ``r = 0.925`` and reaches 1.82
-    at the band edge; dividing by that reported resolutions up to 45% below the
-    sampling limit. The paper's calibration points stop near ``r = 0.85``, so that
-    whole region is extrapolation.
+    The paper fits ``f(r) = d_min(ref) / d_min(co1)``, a flat 1.813 for
+    ``r <~ 0.7``, falling through 1.0 near ``r = 0.925`` to 0.549 at ``r = 1``.
+    Unclamped, that sub-1.0 branch refines the reported resolution by up to 45%
+    below the halves' sampling limit. The clamp blocks it, so cubic deliberately
+    departs from the published curve past ``r ~ 0.925`` — justified because a
+    crossing there is at the split halves' Nyquist, outside the method's validity
+    (Rieger et al. 2024 require ``d_min >= 4 * d_px``), not because the region is
+    unfitted: Koho's Suppl. Fig. 3 does carry points out to ``r ~ 1.0``.
     """
     for freq in np.linspace(0.0, 1.0, 201):
         factor = _calibration_factor(float(freq))
@@ -1522,3 +1524,84 @@ def test_sectioned_fsc_matches_between_devices() -> None:
 
     for key in ("xy", "z"):
         assert res_cpu[key] == pytest.approx(res_gpu[key], rel=1e-9, nan_ok=True)
+
+
+def _dataset_with_crossing_at(root: float) -> FourierCorrelationData:
+    """Build a minimal analysed dataset whose recorded crossing radius is *root*."""
+    data_set = FourierCorrelationData()
+    data_set.resolution["resolution-point"] = (0.143, root)
+    data_set.resolution["resolution"] = 1.0
+    data_set.resolution["spacing"] = 1.0
+    return data_set
+
+
+def test_band_edge_crossing_warns_that_the_split_is_out_of_validity() -> None:
+    """A crossing at the halves' sampling limit must say so.
+
+    The checkerboard halves sample a lattice twice as coarse per axis, so their
+    Nyquist is half the original (Verbeke et al. 2024, Suppl. Note 2). A crossing
+    at ``r >= 0.9`` therefore sits at the halves' own sampling limit, where the
+    reported value reflects sampling rather than resolution and is optimistic by up
+    to 2x — and where the calibration is clamped inert, so nothing compensates. The
+    astrocyte stack hit exactly this (``r = 0.924``) and reported 366 nm silently.
+    """
+    with pytest.warns(RuntimeWarning, match="halves' own sampling limit"):
+        _apply_cutoff_correction(_dataset_with_crossing_at(0.924))
+
+
+def test_mid_band_crossing_does_not_warn() -> None:
+    """The validity warning must stay quiet where the method does apply.
+
+    The pollen stack crosses at ``r = 0.482``, comfortably inside the halves'
+    Nyquist, and must not be flagged.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning here fails the test
+        _apply_cutoff_correction(_dataset_with_crossing_at(0.482))
+
+
+def test_binomial_split_warns_when_resampling_precedes_it(
+    cells_volume: tuple[np.ndarray, list[float]],
+) -> None:
+    """Interpolating before a binomial split breaks its Poisson premise.
+
+    ``resample_isotropic`` runs before the split, so the halves inherit correlated
+    noise and the estimate is biased fine — on the Koho pollen stack, axial
+    0.745 um against a published 3.91 um. Rieger et al. (2024) require splitting
+    "at the raw data level, before any reconstruction step".
+    """
+    volume, spacing = cells_volume
+
+    with pytest.warns(UserWarning, match="breaks the independent-Poisson assumption"):
+        fsc_resolution(
+            volume,
+            spacing=spacing,
+            split_type="binomial",
+            resample_isotropic=True,
+            angle_delta=45,
+            backend="hist",
+            rng=0,
+        )
+
+
+def test_binomial_split_without_resampling_does_not_warn(
+    cells_volume: tuple[np.ndarray, list[float]],
+) -> None:
+    """The correct binomial usage must not be flagged."""
+    volume, spacing = cells_volume
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fsc_resolution(
+            volume,
+            spacing=spacing,
+            split_type="binomial",
+            resample_isotropic=False,
+            angle_delta=45,
+            backend="hist",
+            rng=0,
+        )
+    offenders = [
+        str(w.message) for w in caught if "independent-Poisson" in str(w.message)
+    ]
+    assert not offenders, f"unexpected split-order warning: {offenders}"

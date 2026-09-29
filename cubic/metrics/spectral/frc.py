@@ -299,21 +299,39 @@ def _calibration_factor(freq_at_crossing: float) -> float:
     threshold by imaging the same field of view at different pixel sizes
     (Supplementary Note 2, Supplementary Fig. 3, Koho et al. 2019).
 
-    The value returned is the reciprocal of the curve the paper fits, which
-    approximates ``d_min(ref) / d_min(co1)``; callers divide the raw resolution by
-    it. That ratio cannot drop below 1: the frequency compression puts the
-    one-image crossing at a *higher* radius than the two-image reference, so the
-    correction can only ever make the resolution coarser. The fit is an
-    exponential centred on ``b = 0.98``, though, so it climbs past 1.0 at
-    ``r ~ 0.925`` and reaches 1.82 at the band edge — and dividing by that reports
-    a resolution up to 45% *below* the sampling limit, since the raw crossing was
-    at most Nyquist to begin with. The paper's calibration points stop around
-    ``r ~ 0.85`` (their coarsest pixel size, 113 nm), where the ratio is already
-    ~1.0, so everything past it is extrapolation. Clamping at 1.0 keeps the
-    correction on the side of the effect it models and makes the reported
-    resolution ``1 / (root * kmax * factor)`` bounded below by ``1 / kmax``, the
-    Nyquist period, for both directions. miplib divides by the same factor
-    unbounded, so its near-Nyquist crossings are reported too fine.
+    The paper fits ``f(r) = (a * exp(c * (r - b)) + d) ** -1``, approximating
+    ``d_min(ref) / d_min(co1)``, and multiplies the raw resolution by it. This
+    function returns the *bracket* — the reciprocal of ``f`` — and callers divide,
+    which is the same operation.
+
+    ``f`` is a flat **1.813** for every ``r <~ 0.7``: over the range where the
+    method is valid the calibration is a constant ~1.8x coarsening, not a
+    frequency-dependent correction. It falls through 1.0 at ``r ~ 0.925`` and
+    reaches 0.549 at ``r = 1``, where the paper intends the correction to make the
+    resolution *finer*. The ``min(..., 1.0)`` below deliberately blocks that
+    branch, so this is **not** the published behaviour past ``r ~ 0.925``.
+
+    That deviation is justified by validity, not by the fit: a crossing at
+    ``r > 0.9`` sits at the split halves' own sampling limit, where the
+    checkerboard method does not apply. Rieger et al. (2024) require
+    ``d_min >= 4 * d_px`` ("pixel density twice above the Nyquist limit"), and
+    Verbeke et al. (2024, Suppl. Note 2) show the halves' Nyquist is *half* the
+    original. Applying the paper's sub-1.0 branch there reports a resolution below
+    the halves' sampling limit. Clamping keeps ``1 / (root * kmax * factor)``
+    bounded below by ``1 / kmax``. miplib divides by the same factor unbounded, so
+    its near-Nyquist crossings are reported too fine.
+
+    Note also what the calibration is standing in for. Verbeke et al. (Suppl.
+    Notes 2-4) separate three distinct biases in a checkerboard split that this
+    single empirical curve absorbs together: an effective pixel size of **twice**
+    the original (resolution too fine by 2), a noise variance scaled by
+    ``2 ** dim`` (too coarse), and a half-pixel diagonal translation between the
+    halves that attenuates the correlation (too coarse). The last two partly
+    cancel the first, which is why the plateau is 1.813 rather than 2.0. The
+    paper's own calibration points span ``r ~ 0.45-1.0`` (pixel sizes 29-113 nm at
+    ``d_min(ref) = 242 nm``); the 80 nm and 113 nm points violate the
+    ``4 * d_px`` criterion, and 113 nm violates Koho's own ``2 * sqrt(2) * d_px``
+    one, so the curve's entire *decline* is fitted outside the valid regime.
 
     Parameters
     ----------
@@ -323,8 +341,8 @@ def _calibration_factor(freq_at_crossing: float) -> float:
     Returns
     -------
     float
-        Calibration factor in ``(0, 1]``. Divide raw resolution by this to get
-        the corrected value.
+        Value in ``(0, 1]`` to divide the raw resolution by. Equals
+        ``1 / f(r)`` clamped so the correction can only coarsen.
     """
 
     def calibration_func(x: float, a: float, b: float, c: float, d: float) -> float:
@@ -335,9 +353,36 @@ def _calibration_factor(freq_at_crossing: float) -> float:
     return min(calibration_func(freq_at_crossing, *params), 1.0)
 
 
+#: Normalized crossing radius past which the checkerboard split is out of its
+#: validity range. The split halves sample a lattice twice as coarse per axis, so
+#: their Nyquist is half the original (Verbeke et al. 2024, Suppl. Note 2) and a
+#: crossing this far out is at the halves' own sampling limit rather than at a
+#: resolution the data support. It is also where ``_calibration_factor`` saturates
+#: against its clamp, leaving the raw crossing uncorrected.
+_CHECKERBOARD_VALIDITY_RADIUS = 0.9
+
+
 def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
     """Apply cut-off correction for single image FRC."""
     point = result.resolution["resolution-point"][1]
+    if point >= _CHECKERBOARD_VALIDITY_RADIUS:
+        # stacklevel is deliberately shallow: this runs at different call depths
+        # for the 2D FRC, hist-FSC and deprecated mask-FSC paths, so no single
+        # value points at the user's line from all three. The message stands alone.
+        warnings.warn(
+            f"Single-image checkerboard crossing at normalized radius "
+            f"{point:.3f} >= {_CHECKERBOARD_VALIDITY_RADIUS}, i.e. at the split "
+            "halves' own sampling limit. The checkerboard method needs the "
+            "resolution well above that limit (Rieger et al. 2024 require "
+            "d_min >= 4 * pixel size; Koho et al. 2019 require "
+            "d_min >= 2*sqrt(2) * pixel size), so this value reflects sampling "
+            "rather than resolution and is likely optimistic by up to 2x. The "
+            "empirical calibration is also clamped inert here. Use "
+            "split_type='binomial', which does not subsample, or image with "
+            "smaller pixels.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     cut_off_correction = _calibration_factor(point)
     result.resolution["spacing"] /= cut_off_correction
     result.resolution["resolution"] /= cut_off_correction
@@ -1385,6 +1430,31 @@ def fsc_resolution(
         warnings.warn(
             f"counts_mode={counts_mode!r} ignored: only applies to "
             f"split_type='binomial' in single-image mode.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if use_binomial and resample_isotropic:
+        # Resampling runs before the split (below), so the halves inherit
+        # interpolated -- hence spatially correlated -- noise, and the binomial
+        # split's independent-Poisson premise no longer holds. Rieger et al. (2024)
+        # are explicit: split "at the raw data level, after gain and offset
+        # correction", and "splitting the outcome of an image reconstruction for
+        # computation of an FRC curve is incorrect. In this case the reconstruction
+        # process will introduce correlations and bias to the resolution estimate."
+        # Measured on the Koho pollen stack: axial 0.745 um against the 3.8876 um
+        # PSF FWHM miplib's notebook reports, because interpolating 181 -> 582 Z
+        # planes makes
+        # neighbouring planes near copies and the axial correlation never decays.
+        warnings.warn(
+            "split_type='binomial' with resample_isotropic=True interpolates the "
+            "volume before splitting it, which correlates neighbouring noise and "
+            "breaks the independent-Poisson assumption the binomial split relies "
+            "on; the resolution will be biased fine, potentially several-fold "
+            "along the interpolated axis. Rieger et al. (2024) require splitting "
+            "at the raw data level, before any reconstruction step. Use "
+            "resample_isotropic=False, or split_type='checkerboard' if isotropic "
+            "resampling is required.",
             UserWarning,
             stacklevel=2,
         )
