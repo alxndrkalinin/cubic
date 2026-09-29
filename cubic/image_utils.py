@@ -41,19 +41,26 @@ _SAMPLE_MAX_VALUES = 2_000_000  # cap the integer test on large volumes
 
 
 def _sample_values(image: np.ndarray) -> np.ndarray:
-    """Return a strided subsample of *image* as a flat float64 host array.
+    """Return a bounded, spatially spread subsample of *image* as flat float64.
 
-    Strides the leading axis *before* flattening. A cropped view is not
-    contiguous, so reshaping it first copies the whole array -- 114 ms for a
-    108 MB crop -- which defeats the point of capping the sample.
+    Strides *every* axis by the same factor rather than only the first. Striding
+    the leading axis alone collapses to a single plane whenever one plane holds
+    more than the cap -- a (4, 2048, 2048) stack was read as plane 0 only -- so
+    the answer depended on whatever that plane happened to contain. Basic slices
+    stay views even on a non-contiguous input, so nothing is copied until the
+    cast, which is the point: reshaping first copies a cropped view whole
+    (114 ms for 108 MB, against 27 ms this way).
     """
-    step = 1
-    if image.size > _SAMPLE_MAX_VALUES and image.shape[0] > 1:
-        per_plane = max(image.size // image.shape[0], 1)
-        step = max(1, -(-image.size // _SAMPLE_MAX_VALUES)) if per_plane else 1
-        step = min(step, image.shape[0])
-    sample = asnumpy(image[::step]).astype(np.float64).reshape(-1)
-    return sample[np.isfinite(sample)]
+    steps = [1] * image.ndim
+    if image.size > _SAMPLE_MAX_VALUES:
+        factor = int(np.ceil((image.size / _SAMPLE_MAX_VALUES) ** (1.0 / image.ndim)))
+        steps = [max(1, min(factor, dim)) for dim in image.shape]
+    sub = image[tuple(slice(None, None, step) for step in steps)]
+    flat = asnumpy(sub).astype(np.float64).reshape(-1)
+    if flat.size > _SAMPLE_MAX_VALUES:
+        # Per-axis striding leaves a remainder when the axes are very uneven.
+        flat = flat[:: -(-flat.size // _SAMPLE_MAX_VALUES)]
+    return flat[np.isfinite(flat)]
 
 
 def _non_integer_fraction(sample: np.ndarray) -> float:
@@ -86,7 +93,10 @@ def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
     sample = _sample_values(image)
     if not sample.size or float(np.min(sample)) < 0.0:
         return
-    if _non_integer_fraction(sample) > _FLOAT_NON_INTEGER_WARN_FRACTION:
+    if _non_integer_fraction(sample) > 0.0:
+        # Strictly all-integer, not "mostly": sparse float data is largely
+        # exact zeros, so any averaged statistic reads as integral and the
+        # warning fired on the float input thinning actually exists for.
         return
 
     warnings.warn(
@@ -102,6 +112,7 @@ def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
     )
 
 
+# image operations assume ZYX channel order
 def image_stats(
     img: np.ndarray,
     q: tuple[float, float] = (0.1, 99.9),
