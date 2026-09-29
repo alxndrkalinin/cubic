@@ -518,4 +518,7 @@ def get_global_ri_factor(
         store(i, e_i)
     # C1, C2 come from the last slice, as upstream (ri_factor.py:123-131).
     pooled = dataclasses.replace(pooled, C1=e_i.C1, C2=e_i.C2)
+    # Drop the last slice's arrays so they don't stay pooled on the device
+    # through the fit; only its C1 / C2 were needed.
+    del e_i
     return get_ri_factor(pooled, alpha_min=alpha_min, alpha_max=alpha_max)
