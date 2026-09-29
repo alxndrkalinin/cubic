@@ -113,7 +113,7 @@ that is what Fig. 4b rounds to `PSF_WFHM = 0.6 × 3.9 µm` (the paper's figure l
 derived from Koho's own SFSC output, so it is *not* an independent measurement
 of the sample — but it is a reproducible target for the implementation.
 Matching the notebook's settings (`resample_order=0`, `bin_delta=10`, one-bit
-threshold and `curve_fit_type="spline"`), cubic gives XY 0.578 µm / Z 3.872 µm
+threshold and `xy_curve_fit_type="spline"` / `z_curve_fit_type="spline"`), cubic gives XY 0.578 µm / Z 3.872 µm
 — within 3.5% and 0.4%. At cubic's own defaults (`bin_delta=1`,
 `"smooth-spline"`) the same call gives XY 0.587 / Z 4.383, so the apparent
 axial disagreement is bin width and curve-fit type, not the axial formula.

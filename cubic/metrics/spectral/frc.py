@@ -377,7 +377,8 @@ def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
             "d_min >= 4 * pixel size; Koho et al. 2019 require "
             "d_min >= 2*sqrt(2) * pixel size), so this value reflects sampling "
             "rather than resolution and is likely optimistic by up to 2x. The "
-            "empirical calibration is also clamped inert here. Use "
+            "empirical calibration still coarsens here, reaching its "
+            "1.0 clamp only near r = 0.93. Use "
             "split_type='binomial', which does not subsample, or image with "
             "smaller pixels.",
             RuntimeWarning,
@@ -1272,9 +1273,11 @@ def _fsc_extract_resolution(
         # converts back. That is a different job from the geometric projection
         # above. The reference target is miplib's own SFSC notebook, which prints
         # Z 3.8876 um / XY 0.5987 um for this stack (Fig. 4b rounds that to
-        # 0.6 x 3.9 um; the figure label really does read WFHM [sic]). It is Koho's own SFSC output rather than an independent
-        # measurement, but it is reproducible. Matching the notebook's settings
-        # (resample_order=0, bin_delta=10, one-bit, curve_fit_type='spline') this
+        # 0.6 x 3.9 um; the figure label really does read WFHM [sic]). It is
+        # Koho's own SFSC output rather than an independent measurement, but it
+        # is reproducible. Matching the notebook's settings (resample_order=0,
+        # bin_delta=10, one-bit, and both xy_/z_curve_fit_type set to 'spline')
+        # this
         # branch gives Z 3.872 um / XY 0.578 um -- within 0.4% and 3.5%. At
         # cubic's defaults (bin_delta=1, 'smooth-spline') the same call gives
         # Z 4.38 um, so the gap once attributed to this formula is bin width and
@@ -1444,8 +1447,8 @@ def fsc_resolution(
         # process will introduce correlations and bias to the resolution estimate."
         # Measured on the Koho pollen stack: axial 0.745 um against the 3.8876 um
         # PSF FWHM miplib's notebook reports, because interpolating 181 -> 582 Z
-        # planes makes
-        # neighbouring planes near copies and the axial correlation never decays.
+        # planes makes neighbouring planes near copies, so the axial
+        # correlation never decays.
         warnings.warn(
             "split_type='binomial' with resample_isotropic=True interpolates the "
             "volume before splitting it, which correlates neighbouring noise and "
