@@ -626,3 +626,99 @@ def test_alpha_min_cap_probed_when_loop_undershoots() -> None:
     alpha = get_ri_factor(elements, alpha_min=0.6)
     assert np.isfinite(alpha)
     assert 0.6 <= alpha <= 1.0, f"expected root in [0.6, 1.0]; got {alpha}"
+
+
+# -- Chunked objective -----------------------------------------------------
+
+
+def _chunk_layouts(e: SSIMElements) -> dict[str, SSIMElements]:
+    """Return ``e`` as a 3-D batch, a single 2-D map, and a 1-D pooled array."""
+
+    def remap(fn) -> SSIMElements:
+        return SSIMElements(
+            ux=fn(e.ux),
+            uy=fn(e.uy),
+            vxy=fn(e.vxy),
+            vx=fn(e.vx),
+            vy=fn(e.vy),
+            C1=e.C1,
+            C2=e.C2,
+        )
+
+    return {
+        "3d": e,
+        "2d": remap(lambda a: a[0]),
+        "1d": remap(lambda a: np.ascontiguousarray(a).ravel()),
+    }
+
+
+@pytest.mark.parametrize("chunk", [1, 37, 1000])
+def test_chunked_objective_matches_full_map(monkeypatch, chunk: int) -> None:
+    """Chunked ``S`` / ``dS`` means equal the whole-map means in every layout.
+
+    ``chunk=1`` forces one row per chunk (rows larger than the chunk), ``37``
+    does not divide the row count, and ``1000`` spans several rows.
+    """
+    rng = np.random.default_rng(50)
+    gt = rng.random((4, 40, 40))
+    pred = 0.8 * gt + 0.05 * rng.standard_normal(gt.shape)
+    e = compute_ssim_elements(gt, pred, data_range=float(gt.max() - gt.min()))
+    monkeypatch.setattr(ri, "_CHUNK_ELEMS", chunk)
+    for name, layout in _chunk_layouts(e).items():
+        for alpha in (0.5, 1.0, 1.7):
+            want_S = float(ri._S_map(alpha, layout).mean())
+            want_dS = float(ri._dS_map(alpha, layout).mean())
+            assert _compute_S_mean(alpha, layout) == pytest.approx(want_S, rel=1e-12), (
+                name
+            )
+            assert _compute_dS_mean(alpha, layout) == pytest.approx(
+                want_dS, rel=1e-10, abs=1e-15
+            ), name
+
+
+def test_global_ri_factor_chunked_matches_unchunked(monkeypatch) -> None:
+    """Forcing many chunks leaves the fitted alpha unchanged."""
+    rng = np.random.default_rng(51)
+    gt = rng.random((6, 48, 48))
+    pred = 1.3 * gt + 0.05 * rng.standard_normal(gt.shape)
+    alpha_full = get_global_ri_factor(gt, pred)
+    monkeypatch.setattr(ri, "_CHUNK_ELEMS", 500)
+    alpha_chunked = get_global_ri_factor(gt, pred)
+    assert alpha_chunked == pytest.approx(alpha_full, rel=1e-9)
+
+
+def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
+    """GPU fit peak stays under 12 pooled-element arrays above the input.
+
+    Pooling via per-slice lists + ``concatenate`` and unchunked objective
+    evaluation peaked at ~27 element-sized arrays (MEASURED on 640x960
+    float32 stacks), which OOMed 48 GB GPUs on 576 slices.
+    """
+    cp = pytest.importorskip("cupy")
+    from cupy.cuda import memory_hook
+
+    class PeakHook(memory_hook.MemoryHook):
+        name = "PeakHook"
+
+        def __init__(self, pool) -> None:
+            self.pool = pool
+            self.peak = 0
+
+        def malloc_postprocess(self, **kwargs) -> None:
+            self.peak = max(self.peak, self.pool.used_bytes())
+
+    n, h, w = 16, 256, 256
+    rng = np.random.default_rng(52)
+    gt = rng.random((n, h, w), dtype=np.float32)
+    pred = (0.7 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    # Force the chunked path on a test-sized input.
+    monkeypatch.setattr(ri, "_CHUNK_ELEMS", 1 << 16)
+    pool = cp.get_default_memory_pool()
+    gt_cp, pred_cp = cp.asarray(gt), cp.asarray(pred)
+    base = pool.used_bytes()
+    hook = PeakHook(pool)
+    with hook:
+        alpha = get_global_ri_factor(gt_cp, pred_cp)
+    element_bytes = n * (h - 6) * (w - 6) * 4
+    assert np.isfinite(alpha)
+    assert (hook.peak - base) / element_bytes < 12

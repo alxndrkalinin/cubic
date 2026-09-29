@@ -16,8 +16,11 @@ window ``1e-6 <= alpha <= 1e6`` (both bounds configurable via the
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+
 import numpy as np
 
+from ...cuda import get_array_module
 from .ssim_elements import SSIMElements, compute_ssim_elements
 
 # Bracket and bisection tunables. The bracket caps mirror upstream
@@ -31,6 +34,11 @@ _X_TOL = 1e-8
 _INIT_F_TOL = 1e-14
 _ASCENT_SLACK = 1e-12
 _MAX_BISECT_ITERS = 200
+# Element count per chunk when reducing the objective. Each evaluation builds
+# ~15 element-sized temporaries; chunking bounds them to ~15 * _CHUNK_ELEMS
+# values instead of ~15x the pooled element arrays (which OOMed a 48 GB GPU
+# on 576 slices of 640x960).
+_CHUNK_ELEMS = 1 << 22
 
 
 def validate_alpha_bounds(alpha_min: float, alpha_max: float) -> None:
@@ -84,6 +92,68 @@ def _terms(
     return A1, A2, B1, B2
 
 
+def _iter_chunks(elements: SSIMElements) -> Iterator[SSIMElements]:
+    """Yield views of ``elements`` split along axis 0 in bounded-size chunks.
+
+    Each chunk holds at most ``max(_CHUNK_ELEMS, row size)`` pixels, where a
+    row is one index along axis 0 (a slice of a 3-D stack, a row of a 2-D
+    map, or a single pixel of a 1-D pooled array).
+    """
+    n_rows = elements.ux.shape[0]
+    rows = max(1, _CHUNK_ELEMS * n_rows // elements.ux.size)
+    for start in range(0, n_rows, rows):
+        sl = slice(start, start + rows)
+        yield SSIMElements(
+            ux=elements.ux[sl],
+            uy=elements.uy[sl],
+            vxy=elements.vxy[sl],
+            vx=elements.vx[sl],
+            vy=elements.vy[sl],
+            C1=elements.C1,
+            C2=elements.C2,
+        )
+
+
+def _chunked_mean(
+    fn: Callable[[SSIMElements], np.ndarray], elements: SSIMElements
+) -> float:
+    """Mean of the per-pixel map ``fn(elements)`` without materializing it whole.
+
+    Inputs that fit in one chunk reduce with a single ``.mean()`` (identical
+    to the unchunked computation); larger inputs accumulate per-chunk sums in
+    float64 and divide by the total pixel count.
+    """
+    if elements.ux.ndim == 0 or elements.ux.size <= _CHUNK_ELEMS:
+        return float(fn(elements).mean())
+    total = 0.0
+    for chunk in _iter_chunks(elements):
+        total += float(fn(chunk).sum())
+    return total / elements.ux.size
+
+
+def _S_map(alpha: float, elements: SSIMElements) -> np.ndarray:
+    """Per-pixel ``S(alpha) = (A1*A2) / (B1*B2)``."""
+    A1, A2, B1, B2 = _terms(alpha, elements)
+    return (A1 * A2) / (B1 * B2)
+
+
+def _dS_map(alpha: float, elements: SSIMElements) -> np.ndarray:
+    """Per-pixel ``dS/dalpha`` by the quotient rule (see :func:`_compute_dS_mean`)."""
+    A1, A2, B1, B2 = _terms(alpha, elements)
+
+    dA1 = 2.0 * elements.ux * elements.uy
+    dA2 = 2.0 * elements.vxy
+    dB1 = 2.0 * alpha * elements.uy * elements.uy
+    dB2 = 2.0 * alpha * elements.vy
+
+    N = A1 * A2
+    D = B1 * B2
+    dN = dA1 * A2 + A1 * dA2
+    dD = dB1 * B2 + B1 * dB2
+
+    return (dN * D - N * dD) / (D * D)
+
+
 def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:
     """Mean per-pixel SSIM at a given ``alpha``.
 
@@ -93,16 +163,15 @@ def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:
         Scalar multiplier applied to the prediction.
     elements : SSIMElements
         Precomputed SSIM elements. Any layout is accepted (2-D map, 3-D
-        batched map, or a pre-pooled 1-D array) — ``.mean()`` reduces over
-        every element pixel regardless.
+        batched map, or a pre-pooled 1-D array) — the mean reduces over
+        every element pixel regardless, in chunks of ``_CHUNK_ELEMS``.
 
     Returns
     -------
     float
         Mean of ``S_n(alpha) = (A1*A2) / (B1*B2)`` over all element pixels.
     """
-    A1, A2, B1, B2 = _terms(alpha, elements)
-    return float(((A1 * A2) / (B1 * B2)).mean())
+    return _chunked_mean(lambda e: _S_map(alpha, e), elements)
 
 
 def _compute_dS_mean(alpha: float, elements: SSIMElements) -> float:
@@ -124,20 +193,7 @@ def _compute_dS_mean(alpha: float, elements: SSIMElements) -> float:
     float
         Mean of ``dS_n/dalpha`` over all element pixels.
     """
-    A1, A2, B1, B2 = _terms(alpha, elements)
-
-    dA1 = 2.0 * elements.ux * elements.uy
-    dA2 = 2.0 * elements.vxy
-    dB1 = 2.0 * alpha * elements.uy * elements.uy
-    dB2 = 2.0 * alpha * elements.vy
-
-    N = A1 * A2
-    D = B1 * B2
-    dN = dA1 * A2 + A1 * dA2
-    dD = dB1 * B2 + B1 * dB2
-
-    dS = (dN * D - N * dD) / (D * D)
-    return float(dS.mean())
+    return _chunked_mean(lambda e: _dS_map(alpha, e), elements)
 
 
 def _bracket_root(
@@ -353,9 +409,10 @@ def get_global_ri_factor(
     Mirrors upstream's per-slice element pooling
     (``ri_factor/ri_factor.py:84-132``): every slice contributes its own
     ``compute_ssim_elements`` call using its own ``data_range``; the
-    flattened ``ux, uy, vxy, vx, vy`` are concatenated and ``C1, C2`` are
-    taken from the **last** slice. The pooled elements are passed to
-    :func:`get_ri_factor`.
+    cropped ``ux, uy, vxy, vx, vy`` are pooled into ``(N, h, w)`` stacks
+    (upstream concatenates flattened copies; the pixel set is identical)
+    and ``C1, C2`` are taken from the **last** slice. The pooled elements
+    are passed to :func:`get_ri_factor`.
 
     Parameters
     ----------
@@ -421,31 +478,26 @@ def get_global_ri_factor(
             "get_global_ri_factor."
         )
 
-    ux_list: list[np.ndarray] = []
-    uy_list: list[np.ndarray] = []
-    vxy_list: list[np.ndarray] = []
-    vx_list: list[np.ndarray] = []
-    vy_list: list[np.ndarray] = []
+    # Write each slice's cropped elements straight into preallocated
+    # (N, h, w) buffers: pooling via per-slice lists + np.concatenate held
+    # both copies at once (10 element-sized arrays instead of 5).
+    n = gt.shape[0]
+    fields = ("ux", "uy", "vxy", "vx", "vy")
+    pooled_arrays: dict[str, np.ndarray] = {}
     C1_last = 0.0
     C2_last = 0.0
-    for i in range(gt.shape[0]):
+    for i in range(n):
         dr = float(gt[i].max() - gt[i].min())
         e_i = compute_ssim_elements(gt[i], pred[i], data_range=dr, **ssim_kwargs)  # type: ignore[arg-type]
-        ux_list.append(e_i.ux.ravel())
-        uy_list.append(e_i.uy.ravel())
-        vxy_list.append(e_i.vxy.ravel())
-        vx_list.append(e_i.vx.ravel())
-        vy_list.append(e_i.vy.ravel())
+        if i == 0:
+            xp = get_array_module(e_i.ux)
+            pooled_arrays = {
+                f: xp.empty((n,) + e_i.ux.shape, dtype=e_i.ux.dtype) for f in fields
+            }
+        for f in fields:
+            pooled_arrays[f][i] = getattr(e_i, f)
         C1_last = e_i.C1
         C2_last = e_i.C2
 
-    pooled = SSIMElements(
-        ux=np.concatenate(ux_list),
-        uy=np.concatenate(uy_list),
-        vxy=np.concatenate(vxy_list),
-        vx=np.concatenate(vx_list),
-        vy=np.concatenate(vy_list),
-        C1=C1_last,
-        C2=C2_last,
-    )
+    pooled = SSIMElements(**pooled_arrays, C1=C1_last, C2=C2_last)
     return get_ri_factor(pooled, alpha_min=alpha_min, alpha_max=alpha_max)
