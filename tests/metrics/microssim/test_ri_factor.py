@@ -682,14 +682,9 @@ def test_global_ri_factor_empty_stack_raises() -> None:
         get_global_ri_factor(empty, empty)
 
 
-def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
-    """GPU fit peak stays under 12 pooled-element arrays above the input.
-
-    Pooling via per-slice lists + ``concatenate`` and unchunked objective
-    evaluation peaked at ~27 element-sized arrays (MEASURED on 640x960
-    float32 stacks), which OOMed 48 GB GPUs on 576 slices.
-    """
-    cp = pytest.importorskip("cupy")
+def _gpu_peak_above_base(fn) -> tuple[object, int]:
+    """Run ``fn()`` and return its result and the CuPy pool peak above entry."""
+    import cupy as cp
     from cupy.cuda import memory_hook
 
     class PeakHook(memory_hook.MemoryHook):
@@ -697,10 +692,28 @@ def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
 
         def __init__(self, pool) -> None:
             self.pool = pool
-            self.peak = 0
+            self.peak = pool.used_bytes()
 
         def malloc_postprocess(self, **kwargs) -> None:
             self.peak = max(self.peak, self.pool.used_bytes())
+
+    pool = cp.get_default_memory_pool()
+    base = pool.used_bytes()
+    with PeakHook(pool) as hook:
+        result = fn()
+    return result, hook.peak - base
+
+
+def test_global_ri_factor_gpu_peak_memory(monkeypatch, gpu_available: bool) -> None:
+    """GPU fit peak stays under 9 pooled-element arrays above the input.
+
+    Pooling via per-slice lists + ``concatenate`` and unchunked objective
+    evaluation peaked at ~27 element-sized arrays (MEASURED on 640x960
+    float32 stacks), which OOMed 48 GB GPUs on 576 slices.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
 
     n, h, w = 16, 256, 256
     rng = np.random.default_rng(52)
@@ -708,12 +721,7 @@ def test_global_ri_factor_gpu_peak_memory(monkeypatch) -> None:
     pred = (0.7 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
     # Force the chunked path on a test-sized input.
     monkeypatch.setattr(ri, "_CHUNK_ELEMS", 1 << 16)
-    pool = cp.get_default_memory_pool()
-    gt_cp, pred_cp = cp.asarray(gt), cp.asarray(pred)
-    base = pool.used_bytes()
-    hook = PeakHook(pool)
-    with hook:
-        alpha = get_global_ri_factor(gt_cp, pred_cp)
-    element_bytes = n * (h - 6) * (w - 6) * 4
+    gt_cp, pred_cp = ascupy(gt), ascupy(pred)
+    alpha, peak = _gpu_peak_above_base(lambda: get_global_ri_factor(gt_cp, pred_cp))
     assert np.isfinite(alpha)
-    assert (hook.peak - base) / element_bytes < 12
+    assert peak / (n * (h - 6) * (w - 6) * 4) < 9
