@@ -9,6 +9,7 @@ import pytest
 from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
+from cubic.scipy import ndimage
 from cubic.skimage import filters
 from cubic.metrics.spectral import (
     calculate_frc,
@@ -24,6 +25,7 @@ from cubic.metrics.spectral.frc import (
     _normalization_spacing,
     _fsc_extract_resolution,
     _apply_cutoff_correction,
+    _warn_if_below_split_floor,
 )
 from cubic.metrics.spectral.radial import (
     _kmax_phys,
@@ -1530,29 +1532,73 @@ def _dataset_with_crossing_at(root: float) -> FourierCorrelationData:
     return data_set
 
 
-def test_band_edge_crossing_warns_that_the_split_is_out_of_validity() -> None:
-    """A crossing at the halves' sampling limit must say so.
+def test_resolution_below_the_halves_sampling_limit_warns() -> None:
+    """A checkerboard result finer than 2*sqrt(2) pixels must say so.
 
-    The checkerboard halves sample a lattice twice as coarse per axis, so their
-    Nyquist is half the original (Verbeke et al. 2024, Suppl. Note 2). A crossing
-    at ``r >= 0.9`` therefore sits at the halves' own sampling limit, where the
-    reported value reflects sampling rather than resolution and is optimistic by up
-    to 2x — and where the calibration is clamped inert, so nothing compensates. The
-    astrocyte stack hit exactly this (``r = 0.924``) and reported 366 nm silently.
+    Runs through the public API rather than poking the correction helper: the
+    limit is physical, so it can only be judged once the crossing has been
+    turned into a length using the pixel size for that direction.
     """
-    with pytest.warns(RuntimeWarning, match="halves' own sampling limit"):
-        _apply_cutoff_correction(_dataset_with_crossing_at(0.924))
+    rng = np.random.default_rng(0)
+    # Structure just above the pixel scale: the crossing lands near the band
+    # edge, so the reported value (2.12 px) falls below the 2.83 px limit.
+    # Pure white noise cannot be used -- it never crosses at all, giving nan.
+    smooth = ndimage.gaussian_filter(rng.normal(size=(256, 256)), 1.2)
+    smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+    img = rng.poisson(smooth * 2000.0).astype(np.float32)
+
+    with pytest.warns(RuntimeWarning, match="finer than 2.83 x the in-plane"):
+        frc_resolution(img, spacing=1.0, backend="hist")
 
 
-def test_mid_band_crossing_does_not_warn() -> None:
-    """The validity warning must stay quiet where the method does apply.
+def test_resolution_well_inside_the_limit_does_not_warn() -> None:
+    """The sampling-limit warning must stay quiet where the method applies."""
+    rng = np.random.default_rng(0)
+    # Smooth structure resolves well short of the band edge.
+    smooth = ndimage.gaussian_filter(rng.normal(size=(256, 256)), 6.0)
+    smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+    img = rng.poisson(smooth * 400.0).astype(np.float32)  # resolves at 7.2 px
 
-    The pollen stack crosses at ``r = 0.482``, comfortably inside the halves'
-    Nyquist, and must not be flagged.
-    """
     with warnings.catch_warnings():
-        warnings.simplefilter("error")  # any warning here fails the test
-        _apply_cutoff_correction(_dataset_with_crossing_at(0.482))
+        warnings.simplefilter("error", RuntimeWarning)
+        frc_resolution(img, spacing=1.0, backend="hist")
+
+
+def test_sampling_limit_warning_is_deduplicated() -> None:
+    """Repeated calls must collapse to one warning, not one per call.
+
+    The message previously interpolated the crossing radius, so every call
+    produced distinct text and Python's once-per-location filter never merged
+    them; ``grid_crop_resolution`` calls in here once per slice per crop.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        for i in range(50):
+            _warn_if_below_split_floor(1.0 + i * 1e-6, 1.0, "XY")
+
+    assert len(caught) == 1, f"expected 1 deduplicated warning, got {len(caught)}"
+
+
+def test_sampling_limit_is_judged_per_direction() -> None:
+    """XY and Z are judged against their own pixel size, not a shared radius.
+
+    On anisotropic data one normalized radius maps to different physical
+    resolutions per axis, so a single radius threshold necessarily gets one of
+    the two directions wrong.
+    """
+    z_px, xy_px = 1.0, 0.2
+    resolution = 1.0  # the SAME length, judged against two pixel sizes
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # 1.0 um is 5 XY pixels, comfortably above the 0.57 um XY floor.
+        _warn_if_below_split_floor(resolution, xy_px, "XY")
+        # The same 1.0 um is one Z pixel, below the 2.83 um axial floor.
+        _warn_if_below_split_floor(resolution, z_px, "axial")
+
+    messages = [str(w.message) for w in caught]
+    assert len(messages) == 1, messages
+    assert "axial resolution" in messages[0]
 
 
 def test_binomial_split_warns_when_resampling_precedes_it(
