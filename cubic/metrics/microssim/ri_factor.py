@@ -105,14 +105,19 @@ def _map_arrays(
 
 
 def _iter_chunks(elements: SSIMElements) -> Iterator[SSIMElements]:
-    """Yield views of ``elements`` split along axis 0 in bounded-size chunks.
+    """Yield views of ``elements`` holding at most ``_CHUNK_ELEMS`` pixels each.
 
-    Each chunk holds at most ``max(_CHUNK_ELEMS, row size)`` pixels, where a
-    row is one index along axis 0 (a slice of a 3-D stack, a row of a 2-D
-    map, or a single pixel of a 1-D pooled array).
+    Splits along axis 0; an index along axis 0 that alone exceeds a chunk
+    (a large slice or image row) is split recursively, so the bound holds
+    for any layout without copying.
     """
     n = elements.ux.shape[0]
-    step = max(1, _CHUNK_ELEMS * n // elements.ux.size)
+    row = elements.ux.size // n
+    if row > _CHUNK_ELEMS:
+        for i in range(n):
+            yield from _iter_chunks(_map_arrays(elements, itemgetter(i)))
+        return
+    step = _CHUNK_ELEMS // row
     for start in range(0, n, step):
         yield _map_arrays(elements, itemgetter(slice(start, start + step)))
 

@@ -644,8 +644,8 @@ def _chunk_layouts(e: SSIMElements) -> dict[str, SSIMElements]:
 def test_chunked_objective_matches_full_map(monkeypatch, chunk: int) -> None:
     """Chunked ``S`` / ``dS`` means equal the whole-map means in every layout.
 
-    ``chunk=1`` forces one row per chunk (rows larger than the chunk), ``37``
-    does not divide the row count, and ``1000`` spans several rows.
+    ``chunk=1`` and ``37`` are smaller than one image row, so rows split
+    recursively (``37`` also does not divide a row); ``1000`` spans rows.
     """
     rng = np.random.default_rng(50)
     gt = rng.random((4, 40, 40))
@@ -725,3 +725,29 @@ def test_global_ri_factor_gpu_peak_memory(monkeypatch, gpu_available: bool) -> N
     alpha, peak = _gpu_peak_above_base(lambda: get_global_ri_factor(gt_cp, pred_cp))
     assert np.isfinite(alpha)
     assert peak / (n * (h - 6) * (w - 6) * 4) < 9
+
+
+def test_ri_factor_gpu_single_large_slice_is_chunked(
+    monkeypatch, gpu_available: bool
+) -> None:
+    """A single slice larger than a chunk is split, not reduced whole.
+
+    Chunking only along axis 0 left a ``(1, h, w)`` pool as one chunk, which
+    built ~15 element-sized temporaries (MEASURED); splitting inside the
+    slice bounds them to ~15 chunk-sized ones.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+
+    rng = np.random.default_rng(53)
+    gt = rng.random((1024, 1024), dtype=np.float32)
+    pred = (0.7 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(
+        ascupy(gt), ascupy(pred), data_range=float(gt.max() - gt.min())
+    )
+    pooled = ri._map_arrays(e, lambda a: a[None].copy())
+    monkeypatch.setattr(ri, "_CHUNK_ELEMS", 1 << 16)
+    alpha, peak = _gpu_peak_above_base(lambda: get_ri_factor(pooled))
+    assert np.isfinite(alpha)
+    assert peak / (pooled.ux.size * 4) < 3
