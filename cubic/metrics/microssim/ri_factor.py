@@ -516,7 +516,8 @@ def get_global_ri_factor(
     for i in range(1, n):
         e_i = slice_elements(i)
         store(i, e_i)
-    # C1, C2 come from the last slice, as upstream (ri_factor.py:123-131).
+    # C1, C2 come from the last slice, as upstream
+    # (juglab/microssim ``ri_factor/ri_factor.py:123-131``).
     pooled = dataclasses.replace(pooled, C1=e_i.C1, C2=e_i.C2)
     # Drop the last slice's arrays so they don't stay pooled on the device
     # through the fit; only its C1 / C2 were needed.
