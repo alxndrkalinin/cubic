@@ -9,6 +9,7 @@ import pytest
 from skimage import data
 
 from cubic.cuda import CUDAManager, ascupy
+from cubic.scipy import ndimage
 from cubic.skimage import filters
 from cubic.metrics.spectral import (
     calculate_frc,
@@ -24,6 +25,7 @@ from cubic.metrics.spectral.frc import (
     _normalization_spacing,
     _fsc_extract_resolution,
     _apply_cutoff_correction,
+    _warn_if_below_split_floor,
 )
 from cubic.metrics.spectral.radial import (
     _kmax_phys,
@@ -1530,73 +1532,177 @@ def _dataset_with_crossing_at(root: float) -> FourierCorrelationData:
     return data_set
 
 
-def test_band_edge_crossing_warns_that_the_split_is_out_of_validity() -> None:
-    """A crossing at the halves' sampling limit must say so.
+def test_resolution_below_the_halves_sampling_limit_warns() -> None:
+    """A checkerboard result finer than 2*sqrt(2) pixels must say so.
 
-    The checkerboard halves sample a lattice twice as coarse per axis, so their
-    Nyquist is half the original (Verbeke et al. 2024, Suppl. Note 2). A crossing
-    at ``r >= 0.9`` therefore sits at the halves' own sampling limit, where the
-    reported value reflects sampling rather than resolution and is optimistic by up
-    to 2x — and where the calibration is clamped inert, so nothing compensates. The
-    astrocyte stack hit exactly this (``r = 0.924``) and reported 366 nm silently.
+    Runs through the public API rather than poking the correction helper: the
+    limit is physical, so it can only be judged once the crossing has been
+    turned into a length using the pixel size for that direction.
     """
-    with pytest.warns(RuntimeWarning, match="halves' own sampling limit"):
-        _apply_cutoff_correction(_dataset_with_crossing_at(0.924))
+    rng = np.random.default_rng(0)
+    # Structure just above the pixel scale: the crossing lands near the band
+    # edge, so the reported value (2.12 px) falls below the 2.83 px limit.
+    # Pure white noise cannot be used -- it never crosses at all, giving nan.
+    smooth = ndimage.gaussian_filter(rng.normal(size=(256, 256)), 1.2)
+    smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+    img = rng.poisson(smooth * 2000.0).astype(np.float32)
+
+    with pytest.warns(RuntimeWarning, match="finer than 2.83 x the in-plane"):
+        frc_resolution(img, spacing=1.0, backend="hist")
 
 
-def test_mid_band_crossing_does_not_warn() -> None:
-    """The validity warning must stay quiet where the method does apply.
+def test_resolution_well_inside_the_limit_does_not_warn() -> None:
+    """The sampling-limit warning must stay quiet where the method applies."""
+    rng = np.random.default_rng(0)
+    # Smooth structure resolves well short of the band edge.
+    smooth = ndimage.gaussian_filter(rng.normal(size=(256, 256)), 6.0)
+    smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+    img = rng.poisson(smooth * 400.0).astype(np.float32)  # resolves at 7.2 px
 
-    The pollen stack crosses at ``r = 0.482``, comfortably inside the halves'
-    Nyquist, and must not be flagged.
-    """
     with warnings.catch_warnings():
-        warnings.simplefilter("error")  # any warning here fails the test
-        _apply_cutoff_correction(_dataset_with_crossing_at(0.482))
+        warnings.simplefilter("error", RuntimeWarning)
+        frc_resolution(img, spacing=1.0, backend="hist")
 
 
-def test_binomial_split_warns_when_resampling_precedes_it(
-    cells_volume: tuple[np.ndarray, list[float]],
-) -> None:
-    """Interpolating before a binomial split breaks its Poisson premise.
+def test_sampling_limit_warning_is_deduplicated() -> None:
+    """Repeated calls must collapse to one warning, not one per call.
 
-    ``resample_isotropic`` runs before the split, so the halves inherit correlated
-    noise and the estimate is biased fine — on the Koho pollen stack, axial
-    0.745 um against a published 3.91 um. Rieger et al. (2024) require splitting
-    "at the raw data level, before any reconstruction step".
+    The message previously interpolated the crossing radius, so every call
+    produced distinct text and Python's once-per-location filter never merged
+    them; ``grid_crop_resolution`` calls in here once per slice per crop.
     """
-    volume, spacing = cells_volume
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        for i in range(50):
+            _warn_if_below_split_floor(1.0 + i * 1e-6, 1.0, "XY")
 
-    with pytest.warns(UserWarning, match="breaks the independent-Poisson assumption"):
-        fsc_resolution(
-            volume,
-            spacing=spacing,
-            split_type="binomial",
-            resample_isotropic=True,
-            angle_delta=45,
-            backend="hist",
-            rng=0,
-        )
+    assert len(caught) == 1, f"expected 1 deduplicated warning, got {len(caught)}"
 
 
-def test_binomial_split_without_resampling_does_not_warn(
-    cells_volume: tuple[np.ndarray, list[float]],
-) -> None:
-    """The correct binomial usage must not be flagged."""
-    volume, spacing = cells_volume
+def test_sampling_limit_is_judged_per_direction() -> None:
+    """XY and Z are judged against their own pixel size, not a shared radius.
+
+    On anisotropic data one normalized radius maps to different physical
+    resolutions per axis, so a single radius threshold necessarily gets one of
+    the two directions wrong.
+    """
+    z_px, xy_px = 1.0, 0.2
+    resolution = 1.0  # the SAME length, judged against two pixel sizes
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # 1.0 um is 5 XY pixels, comfortably above the 0.57 um XY floor.
+        _warn_if_below_split_floor(resolution, xy_px, "XY")
+        # The same 1.0 um is one Z pixel, below the 2.83 um axial floor.
+        _warn_if_below_split_floor(resolution, z_px, "axial")
+
+    messages = [str(w.message) for w in caught]
+    assert len(messages) == 1, messages
+    assert "axial resolution" in messages[0]
+
+
+def test_binomial_split_precedes_resampling() -> None:
+    """The halves must be split from raw counts, then interpolated separately.
+
+    Splitting an interpolated volume is incorrect (Rieger et al. 2024: split
+    "at the raw data level"): the halves draw on shared source samples, so they
+    are correlated and the estimate is biased fine. Applying the same linear
+    interpolation to each half afterwards keeps them independent.
+
+    MEASURED against two genuinely independent acquisitions of the same object:
+    splitting after resampling reported XY 47% too fine, splitting before it
+    +8%.
+    """
+    rng = np.random.default_rng(0)
+    obj = ndimage.gaussian_filter(rng.normal(size=(40, 128, 128)), (1.5, 3.0, 3.0))
+    obj = (obj - obj.min()) / (obj.max() - obj.min()) * 300.0
+    shared = dict(
+        spacing=[0.3, 0.1, 0.1],
+        bin_delta=2,
+        angle_delta=45,
+        backend="hist",
+        resolution_threshold="fixed",
+        threshold_value=0.143,
+        axial_floor_factor=0.0,
+        resample_isotropic=True,
+        resample_order=1,
+    )
+
+    truth = fsc_resolution(
+        rng.poisson(obj).astype(np.float32),
+        rng.poisson(obj).astype(np.float32),
+        **shared,
+    )
+    single = fsc_resolution(
+        rng.poisson(obj).astype(np.float32),
+        split_type="binomial",
+        rng=0,
+        **shared,
+    )
+
+    # Splitting after interpolation used to land near 0.5x the true value.
+    assert single["xy"] / truth["xy"] > 0.8, (
+        f"XY {single['xy']:.4f} against two-image {truth['xy']:.4f}: biased "
+        "fine, which is what splitting an interpolated volume does"
+    )
+    assert 0.8 < single["z"] / truth["z"] < 1.25
+
+
+def test_binomial_split_on_resampled_input_is_not_warned_about() -> None:
+    """The ordering is handled, so there is nothing left to warn about.
+
+    This used to emit "breaks the independent-Poisson assumption" and tell the
+    caller to turn resampling off; the split now simply runs first.
+    """
+    rng = np.random.default_rng(0)
+    obj = ndimage.gaussian_filter(rng.normal(size=(24, 64, 64)), 2.0)
+    obj = (obj - obj.min()) / (obj.max() - obj.min()) * 200.0
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         fsc_resolution(
-            volume,
-            spacing=spacing,
+            rng.poisson(obj).astype(np.float32),
+            spacing=[0.3, 0.1, 0.1],
             split_type="binomial",
-            resample_isotropic=False,
+            resample_isotropic=True,
             angle_delta=45,
             backend="hist",
+            axial_floor_factor=0.0,
             rng=0,
         )
+
     offenders = [
         str(w.message) for w in caught if "independent-Poisson" in str(w.message)
     ]
     assert not offenders, f"unexpected split-order warning: {offenders}"
+
+
+def test_binomial_repeats_run_when_resampling() -> None:
+    """n_repeats must still average when resampling is on.
+
+    Regression: pre-splitting hoisted the split out of the repeat loop and
+    cleared the binomial flag, so the loop was skipped entirely. n_repeats was
+    silently ignored and the per-repeat spread vanished from the result, which
+    is a change in the returned keys rather than a visible failure.
+    """
+    rng = np.random.default_rng(0)
+    obj = ndimage.gaussian_filter(rng.normal(size=(24, 64, 64)), 2.0)
+    obj = (obj - obj.min()) / (obj.max() - obj.min()) * 200.0
+    volume = rng.poisson(obj).astype(np.float32)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = fsc_resolution(
+            volume,
+            spacing=[0.3, 0.1, 0.1],
+            split_type="binomial",
+            resample_isotropic=True,
+            n_repeats=3,
+            bin_delta=2,
+            angle_delta=45,
+            backend="hist",
+            axial_floor_factor=0.0,
+            rng=0,
+        )
+
+    assert "xy_std" in result and "z_std" in result, sorted(result)

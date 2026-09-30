@@ -353,37 +353,61 @@ def _calibration_factor(freq_at_crossing: float) -> float:
     return min(calibration_func(freq_at_crossing, *params), 1.0)
 
 
-#: Normalized crossing radius past which the checkerboard split is out of its
-#: validity range. The split halves sample a lattice twice as coarse per axis, so
-#: their Nyquist is half the original (Verbeke et al. 2024, Suppl. Note 2) and a
-#: crossing this far out is at the halves' own sampling limit rather than at a
-#: resolution the data support. It is also where ``_calibration_factor`` saturates
-#: against its clamp, leaving the raw crossing uncorrected.
-_CHECKERBOARD_VALIDITY_RADIUS = 0.9
+#: Smallest resolution, as a multiple of the pixel size *along the direction
+#: measured*, that a single-image checkerboard split can support. The halves
+#: sample a lattice twice as coarse per axis, so their Nyquist is half the
+#: original (Verbeke et al. 2024, Suppl. Note 2). Koho et al. (2019) require
+#: ``d_min >= 2*sqrt(2) * d_px``; Rieger et al. (2024) require the stricter
+#: ``d_min >= 4 * d_px``. Warning at Koho's bound reports every value that
+#: breaks the method's own criterion without firing on merely-marginal ones.
+#:
+#: This replaced a fixed normalized-radius cutoff of 0.9, which was both looser
+#: than the criteria it cited and normalized by the wrong axis. The reported
+#: resolution is ``2 * d_px / (r * f(r))``, so Rieger's bound is already broken
+#: at ``r = 0.797`` and Koho's at ``r = 0.883``; at ``r = 0.9`` the value is
+#: 2.56 * d_px, well inside both. A radius also cannot express a per-direction
+#: limit: the frequency axis is normalized by one Nyquist for the whole volume,
+#: so on anisotropic data the same radius means different physical resolutions
+#: along XY and Z.
+_SPLIT_SAMPLING_FLOOR_FACTOR = 2.0 * np.sqrt(2.0)
+
+
+def _warn_if_below_split_floor(
+    resolution: float, pixel_size: float, direction: str
+) -> None:
+    """Warn when a checkerboard resolution is finer than its halves can support.
+
+    The message text is deliberately constant. Interpolating the measured value
+    into it would give every call site a distinct message, defeating Python's
+    once-per-location deduplication -- ``grid_crop_resolution`` calls straight
+    into here for every slice of every crop, so a sampling-limited volume would
+    print hundreds of near-identical warnings.
+    """
+    floor = _SPLIT_SAMPLING_FLOOR_FACTOR * pixel_size
+    if not np.isfinite(resolution) or resolution <= 0.0 or resolution >= floor:
+        return
+    warnings.warn(
+        f"Single-image checkerboard {direction} resolution is finer than "
+        f"{_SPLIT_SAMPLING_FLOOR_FACTOR:.2f} x the {direction} pixel size, the "
+        "limit the split halves can support: they sample a lattice twice as "
+        "coarse per axis, so this reflects sampling rather than resolution and "
+        "is likely optimistic by up to 2x (Koho et al. 2019 require "
+        "d_min >= 2*sqrt(2) * pixel size, Rieger et al. 2024 the stricter "
+        "d_min >= 4 * pixel size). Use split_type='binomial', which does not "
+        "subsample, or image with smaller pixels.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
-    """Apply cut-off correction for single image FRC."""
+    """Apply cut-off correction for single image FRC.
+
+    Validity is checked by :func:`_warn_if_below_split_floor` at the call sites
+    that know the pixel size for the direction measured, not here: a normalized
+    radius cannot be compared against a physical criterion.
+    """
     point = result.resolution["resolution-point"][1]
-    if point >= _CHECKERBOARD_VALIDITY_RADIUS:
-        # stacklevel is deliberately shallow: this runs at different call depths
-        # for the 2D FRC, hist-FSC and deprecated mask-FSC paths, so no single
-        # value points at the user's line from all three. The message stands alone.
-        warnings.warn(
-            f"Single-image checkerboard crossing at normalized radius "
-            f"{point:.3f} >= {_CHECKERBOARD_VALIDITY_RADIUS}, i.e. at the split "
-            "halves' own sampling limit. The checkerboard method needs the "
-            "resolution well above that limit (Rieger et al. 2024 require "
-            "d_min >= 4 * pixel size; Koho et al. 2019 require "
-            "d_min >= 2*sqrt(2) * pixel size), so this value reflects sampling "
-            "rather than resolution and is likely optimistic by up to 2x. The "
-            "empirical calibration still coarsens here, reaching its "
-            "1.0 clamp only near r = 0.93. Use "
-            "split_type='binomial', which does not subsample, or image with "
-            "smaller pixels.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     cut_off_correction = _calibration_factor(point)
     result.resolution["spacing"] /= cut_off_correction
     result.resolution["resolution"] /= cut_off_correction
@@ -675,6 +699,11 @@ def calculate_frc(
     # Apply cut-off correction (only for checkerboard single-image case)
     if single_image and split_type == "checkerboard":
         _apply_cutoff_correction(result)
+        # The frequency axis was normalized by spacing_eff, so that is the pixel
+        # size this crossing is expressed in, whatever the caller passed.
+        _warn_if_below_split_floor(
+            float(result.resolution["resolution"]), spacing_eff, "in-plane"
+        )
 
     return result
 
@@ -1039,6 +1068,38 @@ def _resample_isotropic_for_fsc(
     return image1, image2, spacing_iso, spacing_tuple[0] / iso_spacing
 
 
+def _binomial_halves_resampled(
+    image: np.ndarray,
+    spacing_list: list[float],
+    resample_order: int,
+    *,
+    counts_mode: Literal["counts", "poisson_thinning"],
+    gain: float,
+    offset: float,
+    readout_noise_rms: float,
+    rng: np.random.Generator | int | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split raw counts, then interpolate each half with the same operator.
+
+    Must run per repeat: every repeat needs its own draw, so the interpolation
+    cannot be hoisted out of the loop and shared.
+    """
+    half1, half2 = binomial_split(
+        image,
+        p=0.5,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        rng=rng,
+    )
+    resampled1, resampled2, _, _ = _resample_isotropic_for_fsc(
+        half1, half2, spacing_list, resample_order
+    )
+    assert resampled2 is not None  # half2 was passed in, so a pair comes back
+    return resampled1, resampled2
+
+
 def _fsc_hist_compute(
     image1: np.ndarray,
     image2: np.ndarray | None,
@@ -1148,6 +1209,7 @@ def _fsc_extract_resolution(
     threshold_value: float,
     resampled_anisotropy: float | None = None,
     axial_floor: float = 0.0,
+    pixel_sizes: tuple[float, float] | None = None,
     xy_curve_fit_type: str = "smooth-spline",
     z_curve_fit_type: str = "smooth-spline",
     apply_cutoff: bool = True,
@@ -1196,6 +1258,11 @@ def _fsc_extract_resolution(
         ``z_spacing / xy_spacing`` of the *original* volume, when the input was
         interpolated up to isotropic voxels. None (default) means the frequency
         grid carries true per-axis Nyquists, so Z is projected geometrically.
+    pixel_sizes : tuple of float, optional
+        ``(z, xy)`` pixel size of the array actually measured, used for the
+        per-direction sampling-limit warning. A single normalized radius cannot
+        serve both directions on anisotropic data, which is why this is passed
+        rather than derived from ``max_freq``.
     axial_floor : float, optional
         Smallest reportable axial resolution, in the same units as the result.
         A finer value is replaced by ``nan`` with a warning. 0.0 (default)
@@ -1306,6 +1373,11 @@ def _fsc_extract_resolution(
             stacklevel=3,
         )
         z_resolution = float("nan")
+
+    if single_image and apply_cutoff and pixel_sizes is not None:
+        z_px, xy_px = pixel_sizes
+        _warn_if_below_split_floor(xy_resolution, xy_px, "XY")
+        _warn_if_below_split_floor(z_resolution, z_px, "axial")
 
     return {"xy": xy_resolution, "z": z_resolution}
 
@@ -1437,31 +1509,6 @@ def fsc_resolution(
             stacklevel=2,
         )
 
-    if use_binomial and resample_isotropic:
-        # Resampling runs before the split (below), so the halves inherit
-        # interpolated -- hence spatially correlated -- noise, and the binomial
-        # split's independent-Poisson premise no longer holds. Rieger et al. (2024)
-        # are explicit: split "at the raw data level, after gain and offset
-        # correction", and "splitting the outcome of an image reconstruction for
-        # computation of an FRC curve is incorrect. In this case the reconstruction
-        # process will introduce correlations and bias to the resolution estimate."
-        # Measured on the Koho pollen stack: axial 0.745 um against the 3.8876 um
-        # PSF FWHM miplib's notebook reports, because interpolating 181 -> 582 Z
-        # planes makes neighbouring planes near copies, so the axial
-        # correlation never decays.
-        warnings.warn(
-            "split_type='binomial' with resample_isotropic=True interpolates the "
-            "volume before splitting it, which correlates neighbouring noise and "
-            "breaks the independent-Poisson assumption the binomial split relies "
-            "on; the resolution will be biased fine, potentially several-fold "
-            "along the interpolated axis. Rieger et al. (2024) require splitting "
-            "at the raw data level, before any reconstruction step. Use "
-            "resample_isotropic=False, or split_type='checkerboard' if isotropic "
-            "resampling is required.",
-            UserWarning,
-            stacklevel=2,
-        )
-
     # Axial band limit, captured *before* any resampling: interpolating Z
     # refines the grid but not the information, so the floor stays here.
     # spacing=None means index units, where one voxel is the unit of length.
@@ -1475,7 +1522,28 @@ def fsc_resolution(
     # eq. (5) correction instead (see _fsc_extract_resolution).
     resampled_anisotropy: float | None = None
 
-    if resample_isotropic:
+    # Splitting the output of an interpolation is incorrect: the halves inherit
+    # neighbouring noise from the same source samples, so they are no longer
+    # independent and the FSC never decays (nan on the Koho pollen stack).
+    # Rieger et al. (2024) require splitting "at the raw data level". Split the
+    # raw counts first, then apply the *same* interpolation to each half: a
+    # linear operator applied separately to independent inputs leaves them
+    # independent, so the premise survives and eq. (5) still applies.
+    presplit_binomial = use_binomial and resample_isotropic
+    raw_spacing_list = spacing_list
+    if presplit_binomial:
+        if raw_spacing_list is None:
+            raise ValueError("resample_isotropic=True requires spacing to be provided")
+        # The split has to happen inside the repeat loop, so resample there too.
+        # Only the metadata is needed here, and it depends on the Z extent and
+        # the spacing alone -- take it from a thin proxy rather than paying for
+        # a full resample whose voxels are then discarded.
+        _, _, spacing_list, resampled_anisotropy = _resample_isotropic_for_fsc(
+            image1[:, :2, :2], None, raw_spacing_list, resample_order
+        )
+        spacing = spacing_list
+
+    if resample_isotropic and not presplit_binomial:
         # ``_normalize_spacing`` returns None exactly when *spacing* is None, so
         # this one check also narrows the type for the call below.
         if spacing_list is None:
@@ -1541,6 +1609,12 @@ def fsc_resolution(
 
     # --- Hist backend ---
     spacing_list = _normalize_spacing(spacing, image1.ndim)
+    # Spacing of the array actually measured: reassigned above when resampling
+    # ran, so these are the post-resample voxel sizes the crossing refers to.
+    # spacing=None means index units, where one voxel is the unit of length.
+    measured_pixel_sizes = (
+        (1.0, 1.0) if spacing_list is None else (spacing_list[0], spacing_list[1])
+    )
 
     if use_binomial and n_repeats > 1:
         # --- Multi-repeat binomial FSC ---
@@ -1548,9 +1622,23 @@ def fsc_resolution(
         all_results: list[dict[str, float]] = []
 
         for rep_rng in rngs:
+            rep_image1, rep_image2 = image1, None
+            if presplit_binomial:
+                assert raw_spacing_list is not None  # checked above
+                rep_image1, rep_image2 = _binomial_halves_resampled(
+                    image1,
+                    raw_spacing_list,
+                    resample_order,
+                    counts_mode=counts_mode,
+                    gain=gain,
+                    offset=offset,
+                    readout_noise_rms=readout_noise_rms,
+                    rng=rep_rng,
+                )
+
             fsc_data, max_freq = _fsc_hist_compute(
-                image1,
-                None,
+                rep_image1,
+                rep_image2,
                 bin_delta=bin_delta,
                 angle_delta=angle_delta,
                 spacing_list=spacing_list,
@@ -1569,6 +1657,7 @@ def fsc_resolution(
 
             rep_res = _fsc_extract_resolution(
                 fsc_data,
+                pixel_sizes=measured_pixel_sizes,
                 max_freq=max_freq,
                 single_image=True,
                 resampled_anisotropy=resampled_anisotropy,
@@ -1594,9 +1683,23 @@ def fsc_resolution(
     if use_binomial and n_repeats == 1:
         logger.info(_BINOMIAL_SINGLE_REPEAT_MSG)
 
+    pass_image1, pass_image2 = image1, image2
+    if presplit_binomial:
+        assert raw_spacing_list is not None  # checked above
+        pass_image1, pass_image2 = _binomial_halves_resampled(
+            image1,
+            raw_spacing_list,
+            resample_order,
+            counts_mode=counts_mode,
+            gain=gain,
+            offset=offset,
+            readout_noise_rms=readout_noise_rms,
+            rng=rng,
+        )
+
     fsc_data, max_freq = _fsc_hist_compute(
-        image1,
-        image2,
+        pass_image1,
+        pass_image2,
         bin_delta=bin_delta,
         angle_delta=angle_delta,
         spacing_list=spacing_list,
@@ -1615,8 +1718,10 @@ def fsc_resolution(
 
     result = _fsc_extract_resolution(
         fsc_data,
+        pixel_sizes=measured_pixel_sizes,
         max_freq=max_freq,
-        single_image=single_image,
+        # A pre-split pair is two independent images by the time it gets here.
+        single_image=single_image and not presplit_binomial,
         resampled_anisotropy=resampled_anisotropy,
         axial_floor=axial_floor,
         resolution_threshold=resolution_threshold,
