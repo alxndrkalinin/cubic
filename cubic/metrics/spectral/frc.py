@@ -408,25 +408,6 @@ def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
     radius cannot be compared against a physical criterion.
     """
     point = result.resolution["resolution-point"][1]
-    if point >= _CHECKERBOARD_VALIDITY_RADIUS:
-        # stacklevel is deliberately shallow: this runs at different call depths
-        # for the 2D FRC, hist-FSC and deprecated mask-FSC paths, so no single
-        # value points at the user's line from all three. The message stands alone.
-        warnings.warn(
-            f"Single-image checkerboard crossing at normalized radius "
-            f"{point:.3f} >= {_CHECKERBOARD_VALIDITY_RADIUS}, i.e. at the split "
-            "halves' own sampling limit. The checkerboard method needs the "
-            "resolution well above that limit (Rieger et al. 2024 require "
-            "d_min >= 4 * pixel size; Koho et al. 2019 require "
-            "d_min >= 2*sqrt(2) * pixel size), so this value reflects sampling "
-            "rather than resolution and is likely optimistic by up to 2x. The "
-            "empirical calibration still coarsens here, reaching its "
-            "1.0 clamp only near r = 0.93. Use "
-            "split_type='binomial', which does not subsample, or image with "
-            "smaller pixels.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     cut_off_correction = _calibration_factor(point)
     result.resolution["spacing"] /= cut_off_correction
     result.resolution["resolution"] /= cut_off_correction
@@ -1524,31 +1505,6 @@ def fsc_resolution(
         warnings.warn(
             f"counts_mode={counts_mode!r} ignored: only applies to "
             f"split_type='binomial' in single-image mode.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-    if use_binomial and resample_isotropic:
-        # Resampling runs before the split (below), so the halves inherit
-        # interpolated -- hence spatially correlated -- noise, and the binomial
-        # split's independent-Poisson premise no longer holds. Rieger et al. (2024)
-        # are explicit: split "at the raw data level, after gain and offset
-        # correction", and "splitting the outcome of an image reconstruction for
-        # computation of an FRC curve is incorrect. In this case the reconstruction
-        # process will introduce correlations and bias to the resolution estimate."
-        # Measured on the Koho pollen stack: axial 0.745 um against the 3.8876 um
-        # PSF FWHM miplib's notebook reports, because interpolating 181 -> 582 Z
-        # planes makes neighbouring planes near copies, so the axial
-        # correlation never decays.
-        warnings.warn(
-            "split_type='binomial' with resample_isotropic=True interpolates the "
-            "volume before splitting it, which correlates neighbouring noise and "
-            "breaks the independent-Poisson assumption the binomial split relies "
-            "on; the resolution will be biased fine, potentially several-fold "
-            "along the interpolated axis. Rieger et al. (2024) require splitting "
-            "at the raw data level, before any reconstruction step. Use "
-            "resample_isotropic=False, or split_type='checkerboard' if isotropic "
-            "resampling is required.",
             UserWarning,
             stacklevel=2,
         )
