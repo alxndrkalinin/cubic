@@ -2,11 +2,11 @@
 # coding: utf-8
 
 # ## Checkerboard vs Binomial Image Splitting for FRC/FSC
-#
+# 
 # Single-image resolution estimation via FRC (2D) or FSC (3D) requires splitting a single
 # acquisition into two independent half-images. This notebook compares the two splitting
 # strategies available in `cubic`:
-#
+# 
 # | Property | Checkerboard (default) | Binomial (`split_type="binomial"`) |
 # |----------|----------------------|-----------------------------------|
 # | Output size | Stride-2 subsampled (half per dim) | Same as input |
@@ -14,16 +14,16 @@
 # | Averaging | Reverse-split | across `n_repeats` |
 # | Input requirement | Any image | Photon counts or Poisson rates |
 # | Uncertainty quantification | Fwd/rev averaging | Repeat M times → curve std |
-#
+# 
 # **Checkerboard** (Koho et al., 2019) assigns pixels to two half-images in a
 # checkerboard pattern, halving each dimension. It works on any image but requires
 # adequate spatial oversampling.
-#
+# 
 # **Binomial** (Rieger et al., 2024) splits each pixel's photon count
 # $n$ into $n_1 \sim \text{Binomial}(n, 0.5)$ and $n_2 = n - n_1$, preserving the
 # full image size. For non-count data, `counts_mode="poisson_thinning"` draws
 # independent Poisson samples from the pixel intensity as a rate parameter.
-#
+# 
 # **References:**
 # - Koho et al. "Fourier ring correlation simplifies image restoration in fluorescence microscopy." *Nat. Commun.* 10:3103, 2019.
 # - Rieger et al. "Single image Fourier ring correlation." *Optics Express* 32(12):21767, 2024.
@@ -74,20 +74,20 @@ fetch_data()
 
 
 # ## 2D FRC: Tubulin STED
-#
+# 
 # We load a STED image of tubulin filaments (57 nm pixel spacing) and compare
 # checkerboard vs binomial splitting for single-image FRC.
-#
+# 
 # This 8-bit image is not raw photon counts, so we compare two binomial modes:
 # - **counts** — treats (rounded) pixel values as integer photon counts and splits
 #   via $n_1 \sim \text{Binomial}(n, 0.5)$, $n_2 = n - n_1$. Best comparison with checkerboard.
 # - **poisson_thinning** — treats pixel values as Poisson rates and draws two
 #   independent halves. Measures noise-model self-consistency, not physical resolution.
-#
+# 
 # We scale the grayscale image to [0, 255] so that Poisson rates are large enough
 # for informative splits.
 # cubic warns whenever `poisson_thinning` is handed integer data, so that warning is expected below — running both modes on the same image is the point of this comparison.
-#
+# 
 
 # In[3]:
 
@@ -170,11 +170,11 @@ plt.tight_layout()
 
 
 # ### Uncertainty quantification with multi-repeat binomial
-#
+# 
 # Binomial splitting is stochastic — each run gives a slightly different FRC curve.
 # By setting `n_repeats > 1`, `calculate_frc` runs M independent splits and returns
 # the mean curve plus per-ring and per-resolution standard deviations.
-#
+# 
 # Note: checkerboard splitting with `average=True` (default) already averages
 # forward and reverse splits (2 passes), whereas binomial with `n_repeats=1` uses
 # a single random split. Multi-repeat binomial provides richer uncertainty
@@ -220,11 +220,11 @@ plt.tight_layout()
 
 
 # ## 3D FSC: Pollen Confocal
-#
+# 
 # We compare directional FSC (XY and Z resolution) using checkerboard vs binomial.
 # The pollen volume has anisotropic spacing (250 nm Z, 77.7 nm XY), so we enable
 # isotropic resampling.
-#
+# 
 # Since this ND2 data is not raw photon counts, we use `poisson_thinning` for the
 # binomial split. The checkerboard FSC should match the published reference value
 # of ~590 nm XY from Koho et al. 2019. The poisson_thinning result will differ —
@@ -310,24 +310,24 @@ print(f"  Z:  {fsc_repeat['z'] * 1000:.1f} ± {fsc_repeat['z_std'] * 1000:.1f} n
 
 
 # ## Summary
-#
+# 
 # **Why do the results differ?**
-#
+# 
 # - **Checkerboard vs binomial counts (~10–15% gap):** Checkerboard operates on
 #   half-size images with a diagonal subsampling calibration correction (Koho et al.
 #   2019 Supplementary Note 1). Binomial counts preserves full image size with no
 #   calibration needed. The ~10–15% difference is expected from these methodological
 #   differences. Checkerboard results match the Koho et al. published reference values.
-#
+# 
 # - **Poisson thinning vs checkerboard (large gap):** `poisson_thinning` draws two
 #   independent Poisson samples from the pixel intensity — it measures the
 #   reproducible bandwidth of a Poisson noise model, not the physical resolution of
 #   the imaging system. For high-signal images the FRC stays high at all frequencies,
 #   giving an optimistically low resolution estimate. This is a fundamentally
 #   different quantity from checkerboard or binomial-counts FRC.
-#
+# 
 # **When to use each method:**
-#
+# 
 # - **Checkerboard** (default): Works on any image, no calibration needed.
 #   Best for compatibility with existing FRC/FSC workflows and published reference values.
 # - **Binomial + counts**: For raw camera data with known gain/offset/readout noise.
