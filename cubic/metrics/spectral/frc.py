@@ -1598,9 +1598,27 @@ def fsc_resolution(
                 UserWarning,
                 stacklevel=2,
             )
+        mask_image1, mask_image2 = image1, image2
+        if presplit_binomial:
+            # Only the metadata was resampled above, so this branch would
+            # otherwise analyse the raw anisotropic volume while *spacing*
+            # already described isotropic voxels. Produce the halves the same
+            # way the hist backend does and hand them over as a pair, so the
+            # grid and the array agree and no further splitting happens.
+            assert raw_spacing_list is not None  # checked when presplit was set
+            mask_image1, mask_image2 = _binomial_halves_resampled(
+                image1,
+                raw_spacing_list,
+                resample_order,
+                counts_mode=counts_mode,
+                gain=gain,
+                offset=offset,
+                readout_noise_rms=readout_noise_rms,
+                rng=rng,
+            )
         fsc_result = calculate_sectioned_fsc(
-            image1,
-            image2,
+            mask_image1,
+            mask_image2,
             bin_delta=bin_delta,
             angle_delta=angle_delta,
             resolution_threshold=resolution_threshold,

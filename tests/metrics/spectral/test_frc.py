@@ -11,6 +11,7 @@ from skimage import data
 from cubic.cuda import CUDAManager, ascupy
 from cubic.scipy import ndimage
 from cubic.skimage import filters
+from cubic.metrics.spectral import frc as frc_module
 from cubic.metrics.spectral import (
     calculate_frc,
     frc_resolution,
@@ -1708,6 +1709,60 @@ def test_binomial_repeats_run_when_resampling() -> None:
         )
 
     assert "xy_std" in result and "z_std" in result, sorted(result)
+
+
+def test_mask_backend_analyses_the_resampled_presplit_pair() -> None:
+    """The mask backend must see the halves, not the raw anisotropic volume.
+
+    Pre-splitting resamples only the *metadata* up front, deferring the voxels
+    to the repeat loop of the hist backend. The mask backend returns before
+    that loop, so it used to analyse the original anisotropic array while
+    ``spacing`` already described isotropic voxels -- the requested resampling
+    silently skipped and the frequency grid mislabelled.
+    """
+    rng = np.random.default_rng(0)
+    obj = ndimage.gaussian_filter(rng.normal(size=(12, 48, 48)), 2.0)
+    obj = (obj - obj.min()) / (obj.max() - obj.min()) * 200.0
+    volume = rng.poisson(obj).astype(np.float32)
+
+    seen: dict[str, Any] = {}
+    real = frc_module.calculate_sectioned_fsc
+
+    def _spy(image1: np.ndarray, image2: np.ndarray | None = None, **kwargs: Any):
+        seen["shape"] = image1.shape
+        seen["paired"] = image2 is not None
+        seen["spacing"] = kwargs.get("spacing")
+        return real(image1, image2, **kwargs)
+
+    frc_module.calculate_sectioned_fsc = _spy  # type: ignore[assignment]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fsc_resolution(
+                volume,
+                spacing=[0.3, 0.1, 0.1],
+                split_type="binomial",
+                resample_isotropic=True,
+                angle_delta=45,
+                backend="mask",
+                axial_floor_factor=0.0,
+                rng=0,
+            )
+    finally:
+        frc_module.calculate_sectioned_fsc = real  # type: ignore[assignment]
+
+    # Z was 0.3 um against 0.1 um in-plane, so isotropic resampling triples the
+    # 12 planes; the raw volume would still show 12.
+    assert seen["shape"][0] > volume.shape[0], (
+        f"mask backend saw {seen['shape']}, the un-resampled input "
+        f"{volume.shape}, while spacing said {seen['spacing']}"
+    )
+    # Handed over as an already-split pair, so nothing splits it a second time.
+    assert seen["paired"], "halves must reach the mask backend as two images"
+    assert seen["spacing"] is not None
+    assert seen["spacing"][0] == pytest.approx(seen["spacing"][1]), (
+        f"spacing {seen['spacing']} should be isotropic to match the array"
+    )
 
 
 def test_sectioned_fsc_warns_below_the_split_floor() -> None:
