@@ -1068,6 +1068,38 @@ def _resample_isotropic_for_fsc(
     return image1, image2, spacing_iso, spacing_tuple[0] / iso_spacing
 
 
+def _binomial_halves_resampled(
+    image: np.ndarray,
+    spacing_list: list[float],
+    resample_order: int,
+    *,
+    counts_mode: Literal["counts", "poisson_thinning"],
+    gain: float,
+    offset: float,
+    readout_noise_rms: float,
+    rng: np.random.Generator | int | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split raw counts, then interpolate each half with the same operator.
+
+    Must run per repeat: every repeat needs its own draw, so the interpolation
+    cannot be hoisted out of the loop and shared.
+    """
+    half1, half2 = binomial_split(
+        image,
+        p=0.5,
+        counts_mode=counts_mode,
+        gain=gain,
+        offset=offset,
+        readout_noise_rms=readout_noise_rms,
+        rng=rng,
+    )
+    resampled1, resampled2, _, _ = _resample_isotropic_for_fsc(
+        half1, half2, spacing_list, resample_order
+    )
+    assert resampled2 is not None  # half2 was passed in, so a pair comes back
+    return resampled1, resampled2
+
+
 def _fsc_hist_compute(
     image1: np.ndarray,
     image2: np.ndarray | None,
@@ -1498,20 +1530,20 @@ def fsc_resolution(
     # linear operator applied separately to independent inputs leaves them
     # independent, so the premise survives and eq. (5) still applies.
     presplit_binomial = use_binomial and resample_isotropic
+    raw_spacing_list = spacing_list
     if presplit_binomial:
-        image1, image2 = binomial_split(
-            image1,
-            p=0.5,
-            counts_mode=counts_mode,
-            gain=gain,
-            offset=offset,
-            readout_noise_rms=readout_noise_rms,
-            rng=rng,
+        if raw_spacing_list is None:
+            raise ValueError("resample_isotropic=True requires spacing to be provided")
+        # The split has to happen inside the repeat loop, so resample there too.
+        # Only the metadata is needed here, and it depends on the Z extent and
+        # the spacing alone -- take it from a thin proxy rather than paying for
+        # a full resample whose voxels are then discarded.
+        _, _, spacing_list, resampled_anisotropy = _resample_isotropic_for_fsc(
+            image1[:, :2, :2], None, raw_spacing_list, resample_order
         )
-        single_image = False
-        use_binomial = False
+        spacing = spacing_list
 
-    if resample_isotropic:
+    if resample_isotropic and not presplit_binomial:
         # ``_normalize_spacing`` returns None exactly when *spacing* is None, so
         # this one check also narrows the type for the call below.
         if spacing_list is None:
@@ -1590,9 +1622,23 @@ def fsc_resolution(
         all_results: list[dict[str, float]] = []
 
         for rep_rng in rngs:
+            rep_image1, rep_image2 = image1, None
+            if presplit_binomial:
+                assert raw_spacing_list is not None  # checked above
+                rep_image1, rep_image2 = _binomial_halves_resampled(
+                    image1,
+                    raw_spacing_list,
+                    resample_order,
+                    counts_mode=counts_mode,
+                    gain=gain,
+                    offset=offset,
+                    readout_noise_rms=readout_noise_rms,
+                    rng=rep_rng,
+                )
+
             fsc_data, max_freq = _fsc_hist_compute(
-                image1,
-                None,
+                rep_image1,
+                rep_image2,
                 bin_delta=bin_delta,
                 angle_delta=angle_delta,
                 spacing_list=spacing_list,
@@ -1637,9 +1683,23 @@ def fsc_resolution(
     if use_binomial and n_repeats == 1:
         logger.info(_BINOMIAL_SINGLE_REPEAT_MSG)
 
+    pass_image1, pass_image2 = image1, image2
+    if presplit_binomial:
+        assert raw_spacing_list is not None  # checked above
+        pass_image1, pass_image2 = _binomial_halves_resampled(
+            image1,
+            raw_spacing_list,
+            resample_order,
+            counts_mode=counts_mode,
+            gain=gain,
+            offset=offset,
+            readout_noise_rms=readout_noise_rms,
+            rng=rng,
+        )
+
     fsc_data, max_freq = _fsc_hist_compute(
-        image1,
-        image2,
+        pass_image1,
+        pass_image2,
         bin_delta=bin_delta,
         angle_delta=angle_delta,
         spacing_list=spacing_list,
@@ -1660,7 +1720,8 @@ def fsc_resolution(
         fsc_data,
         pixel_sizes=measured_pixel_sizes,
         max_freq=max_freq,
-        single_image=single_image,
+        # A pre-split pair is two independent images by the time it gets here.
+        single_image=single_image and not presplit_binomial,
         resampled_anisotropy=resampled_anisotropy,
         axial_floor=axial_floor,
         resolution_threshold=resolution_threshold,

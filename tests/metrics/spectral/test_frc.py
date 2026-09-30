@@ -1675,3 +1675,34 @@ def test_binomial_split_on_resampled_input_is_not_warned_about() -> None:
         str(w.message) for w in caught if "independent-Poisson" in str(w.message)
     ]
     assert not offenders, f"unexpected split-order warning: {offenders}"
+
+
+def test_binomial_repeats_run_when_resampling() -> None:
+    """n_repeats must still average when resampling is on.
+
+    Regression: pre-splitting hoisted the split out of the repeat loop and
+    cleared the binomial flag, so the loop was skipped entirely. n_repeats was
+    silently ignored and the per-repeat spread vanished from the result, which
+    is a change in the returned keys rather than a visible failure.
+    """
+    rng = np.random.default_rng(0)
+    obj = ndimage.gaussian_filter(rng.normal(size=(24, 64, 64)), 2.0)
+    obj = (obj - obj.min()) / (obj.max() - obj.min()) * 200.0
+    volume = rng.poisson(obj).astype(np.float32)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = fsc_resolution(
+            volume,
+            spacing=[0.3, 0.1, 0.1],
+            split_type="binomial",
+            resample_isotropic=True,
+            n_repeats=3,
+            bin_delta=2,
+            angle_delta=45,
+            backend="hist",
+            axial_floor_factor=0.0,
+            rng=0,
+        )
+
+    assert "xy_std" in result and "z_std" in result, sorted(result)
