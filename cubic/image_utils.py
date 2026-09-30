@@ -18,6 +18,99 @@ _FLOAT_NON_INTEGER_WARN_FRACTION = 0.1  # warn if >10% of pixels are non-integer
 _NEGATIVE_ELECTRON_WARN_FRACTION = 0.05  # warn if >5% of pixels go negative
 _CLIPPED_READOUT_WARN_FRACTION = 0.1  # warn if >10% of pixels clipped to 0
 
+# binomial_split noise-model check. VETO-ONLY: it can show that data is not
+# independent Poisson counts, never that it is -- an 8-bit render of a count
+# image is indistinguishable from counts here -- so it may never be used to
+# *select* a split type, only to warn about one the caller asked for.
+#
+# Two statistical checks were tried here and removed, because both fired on
+# valid high-SNR Poisson data, which is exactly what the binomial split is for:
+#   - per-axis spectral bandwidth, to catch interpolated input: smooth structure
+#     holds nearly all the power, so the band looks narrow (0.54/0.38/0.36 of
+#     Nyquist at 20k photons, against 0.20 for a genuinely resampled axis -- too
+#     thin a margin to threshold).
+#   - variance-vs-mean slope, to catch non-Poisson input: finite differences
+#     pick up the signal gradient, which grows like the dose while shot noise
+#     grows like its square root, so the slope collapses (0.04 at 20k photons;
+#     second differences rescue only the smoothest cases).
+# Real stacks passed both (pollen 1.09, astrocyte 1.54) but synthetic fields
+# resembling plausible microscopy did not. Interpolation that cubic itself
+# performs is still caught exactly by the flag check in
+# metrics/spectral/frc.py::fsc_resolution.
+_SAMPLE_MAX_VALUES = 2_000_000  # cap the integer test on large volumes
+
+
+def _sample_values(image: np.ndarray) -> np.ndarray:
+    """Return a bounded, spatially spread subsample of *image* as flat float64.
+
+    Strides *every* axis by the same factor rather than only the first. Striding
+    the leading axis alone collapses to a single plane whenever one plane holds
+    more than the cap -- a (4, 2048, 2048) stack was read as plane 0 only -- so
+    the answer depended on whatever that plane happened to contain. Basic slices
+    stay views even on a non-contiguous input, so nothing is copied until the
+    cast, which is the point: reshaping first copies a cropped view whole
+    (114 ms for 108 MB, against 27 ms this way).
+    """
+    steps = [1] * image.ndim
+    if image.size > _SAMPLE_MAX_VALUES:
+        factor = int(np.ceil((image.size / _SAMPLE_MAX_VALUES) ** (1.0 / image.ndim)))
+        steps = [max(1, min(factor, dim)) for dim in image.shape]
+    sub = image[tuple(slice(None, None, step) for step in steps)]
+    flat = asnumpy(sub).astype(np.float64).reshape(-1)
+    if flat.size > _SAMPLE_MAX_VALUES:
+        # Per-axis striding leaves a remainder when the axes are very uneven.
+        flat = flat[:: -(-flat.size // _SAMPLE_MAX_VALUES)]
+    return flat[np.isfinite(flat)]
+
+
+def _non_integer_fraction(sample: np.ndarray) -> float:
+    """Fraction of *sample* whose distance to the nearest integer exceeds tol.
+
+    One definition for both integer tests. ``_FLOAT_NON_INTEGER_FRAC_THRESHOLD``
+    is a *per-pixel* tolerance, so it belongs inside the comparison; comparing a
+    mean deviation against it, as the thinning check used to, borrows the
+    constant for a different statistic and lets the two drift apart.
+    """
+    return float(
+        np.mean(np.abs(sample - np.rint(sample)) > _FLOAT_NON_INTEGER_FRAC_THRESHOLD)
+    )
+
+
+def _warn_on_noise_model(image: np.ndarray, counts_mode: str) -> None:
+    """Warn when ``poisson_thinning`` is handed data that looks like counts.
+
+    Warns rather than raises: the caller may be doing this deliberately, and a
+    violated assumption makes the number unreliable, not uncomputable.
+
+    This is a value-domain test rather than a statistical one, so it has no
+    false positives on valid input. See the note on the module constants above
+    for the inferential checks that were tried and removed, and for why neither
+    interpolated nor deconvolved input can be detected from the array alone.
+    """
+    if counts_mode != "poisson_thinning":
+        return
+
+    sample = _sample_values(image)
+    if not sample.size or float(np.min(sample)) < 0.0:
+        return
+    if _non_integer_fraction(sample) > 0.0:
+        # Strictly all-integer, not "mostly": sparse float data is largely
+        # exact zeros, so any averaged statistic reads as integral and the
+        # warning fired on the float input thinning actually exists for.
+        return
+
+    warnings.warn(
+        "counts_mode='poisson_thinning' on non-negative integer data. Thinning "
+        "draws two independent Poisson variates from the same rate, so the "
+        "halves share that rate and the FRC keeps a high-frequency correlation "
+        "floor (~0.33 measured on simulated counts) that can stop the curve "
+        "ever crossing 1/7, returning nan with no explanation. Use "
+        "counts_mode='counts' for count data; thinning is the fallback for "
+        "float or deconvolved input.",
+        UserWarning,
+        stacklevel=3,
+    )
+
 
 # image operations assume ZYX channel order
 def image_stats(
@@ -762,6 +855,8 @@ def binomial_split(
     if readout_noise_rms < 0:
         raise ValueError(f"readout_noise_rms must be >= 0, got {readout_noise_rms}")
 
+    _warn_on_noise_model(image, counts_mode)
+
     # Resolve RNG
     if isinstance(rng, int):
         np_rng = np.random.default_rng(rng)
@@ -774,10 +869,8 @@ def binomial_split(
         # --- counts mode ---
         # Warn if float input with default calibration (likely forgot gain/offset)
         if np.issubdtype(image.dtype, np.floating):
-            frac_part = np.abs(image - np.rint(image))
-            frac_fraction = float(
-                np.mean(frac_part > _FLOAT_NON_INTEGER_FRAC_THRESHOLD)
-            )
+            sample = _sample_values(image)
+            frac_fraction = _non_integer_fraction(sample)
             if (
                 frac_fraction > _FLOAT_NON_INTEGER_WARN_FRACTION
                 and gain == 1.0

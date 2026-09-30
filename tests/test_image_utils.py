@@ -1,10 +1,14 @@
 """Tests for ``image_utils`` helper functions."""
 
+import warnings
+
 import numpy as np
 import pytest
 
 from cubic.cuda import ascupy, asnumpy
+from cubic.scipy import ndimage
 from cubic.image_utils import (
+    _SAMPLE_MAX_VALUES,
     clahe,
     label,
     crop_bl,
@@ -19,6 +23,7 @@ from cubic.image_utils import (
     random_crop,
     rotate_image,
     tukey_window,
+    _sample_values,
     binomial_split,
     hamming_window,
     crop_to_divisor,
@@ -610,3 +615,100 @@ class TestBinomialSplit:
         assert img1.shape == img.shape
         assert img1.ndim == 3
         np.testing.assert_array_equal(img1 + img2, np.rint(img).astype(np.float32))
+
+
+class TestBinomialSplitNoiseModelWarnings:
+    """Veto-only check that ``binomial_split`` warns when its assumption fails.
+
+    Asymmetric by construction: it can show data is not independent Poisson
+    counts, never that it is. The no-false-positive tests deliberately run in
+    ``poisson_thinning`` mode, because the check returns immediately in counts
+    mode and a counts-mode test could never catch one. The two statistical
+    checks that once lived here were removed precisely because they failed
+    that side on valid high-SNR data.
+    """
+
+    @staticmethod
+    def _counts(shape: tuple[int, ...], seed: int = 0) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        smooth = ndimage.gaussian_filter(rng.normal(size=shape), 3.0)
+        smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+        return rng.poisson(smooth * 200.0).astype(np.float32)
+
+    def test_silent_on_clean_counts(self) -> None:
+        """Genuine Poisson counts must not trip any of the checks."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            binomial_split(self._counts((128, 128)), rng=0)
+        assert [str(w.message) for w in caught] == []
+
+    def test_warns_on_thinning_integer_counts(self) -> None:
+        """Thinning integer counts leaves a correlation floor; steer to 'counts'."""
+        with pytest.warns(UserWarning, match="counts_mode='counts' for count data"):
+            binomial_split(
+                self._counts((128, 128)), counts_mode="poisson_thinning", rng=0
+            )
+
+    def test_singleton_final_axis_does_not_raise(self) -> None:
+        """A valid image with a singleton last axis must still split.
+
+        Regression from the removed variance-vs-mean fit, which differenced
+        along the last axis and so indexed an empty array when that axis had
+        length 1.
+        """
+        for shape in ((64, 1), (8, 16, 1)):
+            img = np.random.default_rng(0).poisson(50, size=shape).astype(np.float32)
+            img1, img2 = binomial_split(img, rng=0)
+            assert img1.shape == img.shape
+            np.testing.assert_array_equal(img1 + img2, np.rint(img).astype(np.float32))
+
+    def test_silent_on_high_snr_smooth_counts(self) -> None:
+        """High-SNR smooth Poisson data must not warn.
+
+        Regression for the removed checks: spectral bandwidth read
+        0.54/0.38/0.36 of Nyquist and the variance-vs-mean slope read 0.04 on
+        data like this, both tripping their thresholds on counts that are
+        perfectly valid for a binomial split.
+        """
+        rng = np.random.default_rng(0)
+        for dose in (200.0, 20_000.0, 200_000.0):
+            smooth = ndimage.gaussian_filter(rng.normal(size=(32, 64, 64)), 3.0)
+            smooth = (smooth - smooth.min()) / (smooth.max() - smooth.min())
+            img = rng.poisson(smooth * dose).astype(np.float32)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                binomial_split(img, rng=0)
+                # thinning mode is where the surviving check actually runs
+                binomial_split(img / 3.0, counts_mode="poisson_thinning", rng=0)
+            assert [str(w.message) for w in caught] == [], f"warned at dose {dose}"
+
+    def test_silent_on_sparse_float_under_thinning(self) -> None:
+        """Mostly-zero float data is what thinning is for; it must not warn.
+
+        Deconvolved and background-subtracted images are sparse, so an averaged
+        integer statistic is dominated by the exact zeros and reads as integral.
+        The check therefore requires every sampled value to be integral.
+        """
+        rng = np.random.default_rng(0)
+        img = np.zeros((256, 256), dtype=np.float32)
+        mask = rng.random(img.shape) < 0.03
+        img[mask] = rng.uniform(0.1, 50.0, size=int(mask.sum()))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            binomial_split(img, counts_mode="poisson_thinning", rng=0)
+        assert [str(w.message) for w in caught] == []
+
+    def test_sampler_spreads_over_every_axis(self) -> None:
+        """The subsample must not collapse onto one plane, nor exceed the cap.
+
+        Regression: striding only the leading axis read a (4, 2048, 2048) stack
+        as plane 0 alone, so the verdict depended on that plane's contents, and
+        a single oversized plane escaped the cap entirely.
+        """
+        for shape in ((8, 300, 300), (4, 1024, 1024), (1, 2048, 2048)):
+            img = np.random.default_rng(0).uniform(1.0, 100.0, shape).astype(np.float32)
+            img[0] = 0.0
+            sample = _sample_values(img)
+            assert sample.size <= _SAMPLE_MAX_VALUES
+            if shape[0] > 1:
+                assert np.any(sample != 0.0), f"{shape} sampled plane 0 only"
