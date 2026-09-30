@@ -17,10 +17,12 @@ from cubic.metrics.spectral import (
     fsc_resolution,
     five_crop_resolution,
     grid_crop_resolution,
+    calculate_sectioned_fsc,
 )
 from cubic.metrics.spectral.frc import (
     _fsc_hist_compute,
     preprocess_images,
+    _sector_pixel_size,
     _calibration_factor,
     _normalization_spacing,
     _fsc_extract_resolution,
@@ -1706,3 +1708,41 @@ def test_binomial_repeats_run_when_resampling() -> None:
         )
 
     assert "xy_std" in result and "z_std" in result, sorted(result)
+
+
+def test_sectioned_fsc_warns_below_the_split_floor() -> None:
+    """``calculate_sectioned_fsc`` must judge its own sectors against the floor.
+
+    Moving the validity test out of ``_apply_cutoff_correction`` and into the
+    resolution extraction left this public entry point -- and the deprecated
+    mask backend that calls it -- silently accepting sampling-limited results
+    that warned before.
+    """
+    rng = np.random.default_rng(0)
+    # Structure near the pixel scale, so the in-plane sectors cross close to
+    # the band edge and report 2.47 px against the 2.83 px floor.
+    fine = ndimage.gaussian_filter(rng.normal(size=(64, 64, 64)), 1.0)
+    fine = (fine - fine.min()) / (fine.max() - fine.min())
+    volume = rng.poisson(fine * 2000.0).astype(np.float32)
+
+    with pytest.warns(RuntimeWarning, match="finer than 2.83 x the sector"):
+        calculate_sectioned_fsc(volume, angle_delta=45, spacing=[1.0, 1.0, 1.0])
+
+
+def test_sector_pixel_size_follows_the_measured_direction() -> None:
+    """Axial sectors are judged in Z, in-plane sectors in XY, on one grid.
+
+    A normalized radius cannot express this: the frequency axis is normalized
+    by one Nyquist for the whole volume, so the same radius means different
+    physical resolutions along Z and XY on anisotropic data.
+    """
+    spacing = [0.3, 0.1, 0.1]
+
+    assert _sector_pixel_size(0.0, spacing) == pytest.approx(0.3)
+    assert _sector_pixel_size(180.0, spacing) == pytest.approx(0.3)
+    assert _sector_pixel_size(90.0, spacing) == pytest.approx(0.1)
+    assert _sector_pixel_size(270.0, spacing) == pytest.approx(0.1)
+    # Intermediate sectors interpolate between the two, never outside them.
+    assert 0.1 < _sector_pixel_size(45.0, spacing) < 0.3
+    # spacing=None means index units.
+    assert _sector_pixel_size(37.0, None) == pytest.approx(1.0)

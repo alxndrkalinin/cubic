@@ -400,6 +400,22 @@ def _warn_if_below_split_floor(
     )
 
 
+def _sector_pixel_size(angle_deg: float, spacing: Sequence[float] | None) -> float:
+    """Voxel pitch along the direction a sectioned-FSC sector measures.
+
+    ``angle_deg`` is the sector's polar angle from the Z axis, so 0 and 180
+    degrees are axial and 90 and 270 in-plane. One step along that direction
+    covers ``sqrt((d_z cos)^2 + (d_xy sin)^2)``, which reduces to the axis
+    pitch at each of those four angles and interpolates between them for the
+    intermediate sectors. ``spacing=None`` means index units, one voxel per
+    unit of length in every direction.
+    """
+    if spacing is None:
+        return 1.0
+    theta = np.deg2rad(angle_deg)
+    return float(np.hypot(spacing[0] * np.cos(theta), spacing[1] * np.sin(theta)))
+
+
 def _apply_cutoff_correction(result: FourierCorrelationData) -> None:
     """Apply cut-off correction for single image FRC.
 
@@ -874,6 +890,15 @@ def calculate_sectioned_fsc(
     if single_image and split_type == "checkerboard":
         for angle, dataset in result:
             _apply_cutoff_correction(dataset)
+            # Judged here rather than inside the correction: this is the
+            # innermost place that knows both the corrected resolution and the
+            # voxel pitch of the direction it was measured along, so checking
+            # here covers direct callers and the deprecated mask backend alike.
+            _warn_if_below_split_floor(
+                dataset.resolution["resolution"],
+                _sector_pixel_size(float(angle), spacing),
+                "sector",
+            )
 
     return result
 
