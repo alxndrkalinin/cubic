@@ -92,13 +92,20 @@ def test_remove_small_objects_matches_skimage(
     rng = np.random.default_rng(1)
     mask = ndi.binary_opening(rng.random((6, 64, 64)) > 0.6)
     min_size = 4
-    max_size = min_size if inclusive else min_size - 1
-    if per_slice:
-        expected = np.stack(
-            [remove_small_objects(m, max_size=max_size, connectivity=1) for m in mask]
-        )
+    # Largest removed size; scikit-image < 0.26 only has the exclusive min_size.
+    largest = min_size if inclusive else min_size - 1
+    if _SKIMAGE_USES_MAX_SIZE:
+        size_kwargs = {"max_size": largest}
     else:
-        expected = remove_small_objects(mask, max_size=max_size, connectivity=1)
+        size_kwargs = {"min_size": largest + 1}
+
+    def reference(m: np.ndarray) -> np.ndarray:
+        return remove_small_objects(m, connectivity=1, **size_kwargs)
+
+    if per_slice:
+        expected = np.stack([reference(m) for m in mask])
+    else:
+        expected = reference(mask)
     out = remove_small_objects_aics(
         _to_device(mask, use_gpu, gpu_available),
         min_size,
