@@ -335,12 +335,12 @@ __device__ void frc_sums(const T* x, const T* y, const int* radial_id,
        i += (long)blockDim.x * gridDim.x) {
     int r = radial_id[i];
     if (r < 0) continue;
-    int bin = r;
+    long long bin = r;
     if (has_angle) {
       int a = angle_id[i];
       if (a < 0) continue;
-      bin = a * n_radial + r;
-      if (r >= n_radial) bin = nbins;
+      // 64-bit, so a large angle id cannot wrap past the bounds check below.
+      bin = (r >= n_radial) ? nbins : (long long)a * n_radial + r;
     }
     if (bin >= nbins) {  // reported, so the caller falls back to bincount
       atomicAdd(overflow, 1ULL);

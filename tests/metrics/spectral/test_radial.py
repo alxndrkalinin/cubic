@@ -306,3 +306,17 @@ def test_fused_spectral_sums_decline_host_ids(gpu_available: bool) -> None:
     gx, gy = ascupy(fx), ascupy(fy)
     assert rad._fused_frc_sums(gx, gy, rid, None, n_radial) is None
     assert rad._fused_frc_sums(gx, gy, ascupy(rid), aid, n_radial, n_angle) is None
+
+
+def test_fused_spectral_sums_decline_huge_angle_ids(gpu_available: bool) -> None:
+    """An angle id whose combined bin overflows 32 bits is declined, not wrapped."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+    from cubic.metrics.spectral import radial as rad
+
+    fx, fy, rid, aid, n_radial, n_angle = _spectra_and_ids(np.complex64)
+    huge = aid.copy()
+    huge[aid >= 0] = 2**31 // n_radial + 7  # a * n_radial wraps negative in int32
+    gx, gy, grid, gaid = (ascupy(a) for a in (fx, fy, rid, huge))
+    assert rad._fused_frc_sums(gx, gy, grid, gaid, n_radial, n_angle) is None
