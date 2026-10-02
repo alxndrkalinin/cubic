@@ -23,7 +23,6 @@ import itertools
 import numpy as np
 
 from ..cuda import asnumpy, get_array_module
-from ..scipy import ndimage as _ndimage
 
 
 def _unit_offsets(ndim: int) -> list[tuple[int, ...]]:
@@ -63,17 +62,52 @@ def _slices_for_offset(
     return tuple(center), tuple(neighbor)
 
 
-def _quantize(image: np.ndarray, levels: int, lo: float, hi: float) -> np.ndarray:
+def _quantize(
+    image: np.ndarray,
+    levels: int,
+    lo: float | np.ndarray,
+    hi: float | np.ndarray,
+) -> np.ndarray:
     """Quantize ``image`` into ``[0, levels - 1]`` over ``[lo, hi]``.
 
-    Stays on the input array's device (NumPy or CuPy). A constant range
-    (``hi <= lo``) maps every voxel to bin 0.
+    Stays on the input array's device (NumPy or CuPy). ``lo`` / ``hi`` are
+    scalars or per-voxel arrays. A constant range (``hi <= lo``) maps its
+    voxels to bin 0.
     """
     span = hi - lo
-    if span <= 0:
-        return np.zeros_like(image, dtype=np.int64)
-    scaled = (image - lo) / span * levels
+    if np.ndim(span) == 0:
+        if span <= 0:
+            return np.zeros_like(image, dtype=np.int64)
+        scaled = (image - lo) / span * levels
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scaled = np.where(span > 0, (image - lo) / span * levels, 0.0)
     return np.clip(np.floor(scaled), 0, levels - 1).astype(np.int64)
+
+
+def _validate_glcm_args(
+    image: np.ndarray, levels: int, distances: tuple[int, ...]
+) -> None:
+    """Raise unless ``image`` is 2D/3D, ``levels >= 2`` and ``distances`` are positive."""
+    if image.ndim not in (2, 3):
+        raise ValueError(
+            f"Only 2D (H, W) or 3D (D, H, W) images are supported; got ndim={image.ndim}"
+        )
+    if levels < 2:
+        raise ValueError(f"levels must be >= 2; got {levels}")
+    if not distances or any(distance < 1 for distance in distances):
+        raise ValueError(
+            f"distances must be a non-empty sequence of positive integers; got {distances}"
+        )
+
+
+def _glcm_offsets(ndim: int, distances: tuple[int, ...]) -> list[tuple[int, ...]]:
+    """Every half-space unit direction scaled by every distance."""
+    return [
+        tuple(distance * axis for axis in unit)
+        for distance in distances
+        for unit in _unit_offsets(ndim)
+    ]
 
 
 def _direction_matrices(
@@ -249,10 +283,7 @@ def glcm_features(
         non-positive value, the masked region is empty when ``value_range`` is
         derived from the image, or no direction contains a voxel pair.
     """
-    if image.ndim not in (2, 3):
-        raise ValueError(
-            f"Only 2D (H, W) or 3D (D, H, W) images are supported; got ndim={image.ndim}"
-        )
+    _validate_glcm_args(image, levels, distances)
     if mask is not None:
         if mask.shape != image.shape:
             raise ValueError(
@@ -263,12 +294,6 @@ def glcm_features(
             # AND and the subsequent ``center[valid]`` into integer fancy
             # indexing, which returns wrong-but-plausible features, not an error.
             raise ValueError(f"mask must be a boolean array; got dtype {mask.dtype}")
-    if levels < 2:
-        raise ValueError(f"levels must be >= 2; got {levels}")
-    if not distances or any(distance < 1 for distance in distances):
-        raise ValueError(
-            f"distances must be a non-empty sequence of positive integers; got {distances}"
-        )
 
     if value_range is None:
         region = image[mask] if mask is not None else image
@@ -280,12 +305,7 @@ def glcm_features(
         lo, hi = float(value_range[0]), float(value_range[1])
 
     quant = _quantize(image, levels, lo, hi)
-    unit_offsets = _unit_offsets(image.ndim)
-    offsets = [
-        tuple(distance * axis for axis in unit)
-        for distance in distances
-        for unit in unit_offsets
-    ]
+    offsets = _glcm_offsets(image.ndim, distances)
 
     # Direction-independent level-index ramps, computed once and reused for
     # every direction's property reduction.
@@ -385,7 +405,10 @@ def glcm_features_by_label(
     voxels carry its label, and each region averages its properties over its
     own non-empty directions. Instead of one call per region, every direction
     accumulates the co-occurrences of all regions in a single ``bincount``,
-    so the cost no longer grows with the number of regions.
+    so the cost no longer grows with the number of regions. With per-region
+    ranges on a float32 image the range width is rounded in float32, not in
+    Python float as :func:`glcm_features` does, so a voxel on a level
+    boundary can land one level apart.
 
     Parameters
     ----------
@@ -413,74 +436,59 @@ def glcm_features_by_label(
         an integer array, ``levels`` is below 2, or ``distances`` is empty or
         contains a non-positive value.
     """
-    if image.ndim not in (2, 3):
-        raise ValueError(
-            f"Only 2D (H, W) or 3D (D, H, W) images are supported; got ndim={image.ndim}"
-        )
+    _validate_glcm_args(image, levels, distances)
     if labels.shape != image.shape:
         raise ValueError(
             f"labels shape {labels.shape} must match image shape {image.shape}"
         )
     if not np.issubdtype(labels.dtype, np.integer):
         raise ValueError(f"labels must be an integer array; got dtype {labels.dtype}")
-    if levels < 2:
-        raise ValueError(f"levels must be >= 2; got {levels}")
-    if not distances or any(distance < 1 for distance in distances):
-        raise ValueError(
-            f"distances must be a non-empty sequence of positive integers; got {distances}"
-        )
 
     present = np.unique(labels)
     present = present[present != 0]
     label_ids = asnumpy(present)
     n_labels = int(label_ids.size)
-    names = _PROP_NAMES
     if n_labels == 0:
-        return {"label": label_ids, **{p: np.empty(0) for p in names}}
+        return {"label": label_ids, **{p: np.empty(0) for p in _PROP_NAMES}}
     # Compact labels 1..n_labels in ascending label order; 0 stays background.
     xp = get_array_module(labels)
-    index = xp.arange(1, n_labels + 1)
     lookup = xp.zeros(int(label_ids[-1]) + 1, dtype=np.int64)
-    lookup[present] = index
+    lookup[present] = xp.arange(1, n_labels + 1)
     compact = lookup[labels]
     del lookup
 
     if value_range is None:
-        # Per-region (min, max), looked up per voxel; background maps to 0.
-        lo = xp.asarray(_ndimage.minimum(image, labels=compact, index=index))
-        hi = xp.asarray(_ndimage.maximum(image, labels=compact, index=index))
-        lo = np.concatenate([np.zeros_like(lo[:1]), lo])[compact]
-        hi = np.concatenate([np.zeros_like(hi[:1]), hi])[compact]
-        span = hi - lo
-        with np.errstate(divide="ignore", invalid="ignore"):
-            scaled = np.where(span > 0, (image - lo) / span * levels, 0.0)
-        quant = np.clip(np.floor(scaled), 0, levels - 1).astype(np.int64)
-        del lo, hi, span, scaled
+        # Per-region (min, max) by scatter, looked up per voxel. Slot 0 collects
+        # the background and is never read for a labeled voxel.
+        lo = np.full_like(image, image.max().item(), shape=(n_labels + 1,))
+        hi = np.full_like(image, image.min().item(), shape=(n_labels + 1,))
+        np.minimum.at(lo, compact, image)
+        np.maximum.at(hi, compact, image)
+        quant = _quantize(image, levels, lo[compact], hi[compact])
+        del lo, hi
     else:
         quant = _quantize(image, levels, float(value_range[0]), float(value_range[1]))
 
-    offsets = [
-        tuple(distance * axis for axis in unit)
-        for distance in distances
-        for unit in _unit_offsets(image.ndim)
-    ]
+    offsets = _glcm_offsets(image.ndim, distances)
     n_dir = len(offsets)
     n_pairs = levels * levels
     n_bins = n_labels * n_dir * n_pairs
-    counts = None
+    counts = xp.zeros(n_bins, dtype=np.int64)
     for direction, off in enumerate(offsets):
         center_sl, neighbor_sl = _slices_for_offset(off, image.shape)
         lab_c = compact[center_sl]
         same = (lab_c > 0) & (lab_c == compact[neighbor_sl])
-        # Bin (label, direction, i, j); compact labels start at 1.
-        index = ((lab_c[same] - 1) * n_dir + direction) * n_pairs
-        if index.size == 0:
+        # Bin (label, direction, i, j); compact labels start at 1. Compacting
+        # to the in-region pairs first measured faster than binning every pair
+        # with a sentinel bin (0.131 vs 0.174 s on 13 cells of 48x640x960,
+        # A40), since most voxels are background.
+        bins = ((lab_c[same] - 1) * n_dir + direction) * n_pairs
+        if bins.size == 0:  # cupy.bincount rejects empty input
             continue
-        index += quant[center_sl][same] * levels + quant[neighbor_sl][same]
-        partial = np.bincount(index, minlength=n_bins)
-        counts = partial if counts is None else counts + partial
-    host = np.zeros(n_bins) if counts is None else asnumpy(counts)
-    matrices = host.reshape(n_labels, n_dir, levels, levels).astype(np.float64)
+        bins += quant[center_sl][same] * levels + quant[neighbor_sl][same]
+        counts += np.bincount(bins, minlength=n_bins)
+    matrices = asnumpy(counts).reshape(n_labels, n_dir, levels, levels)
+    matrices = matrices.astype(np.float64)
 
     nonempty = matrices.sum(axis=(2, 3)) > 0
     if symmetric:
@@ -493,7 +501,7 @@ def glcm_features_by_label(
     n_nonempty = nonempty.sum(axis=1)
     out: dict[str, np.ndarray] = {"label": label_ids}
     with np.errstate(divide="ignore", invalid="ignore"):
-        for name in names:
+        for name in _PROP_NAMES:
             total = np.where(nonempty, props[name], 0.0).sum(axis=1)
             out[name] = np.where(n_nonempty > 0, total / n_nonempty, np.nan)
     return out
