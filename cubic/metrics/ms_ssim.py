@@ -16,7 +16,8 @@ Reference: ``torchmetrics/functional/image/ssim.py`` ``_ssim_update`` and
 
 from __future__ import annotations
 
-from typing import cast
+import inspect
+from typing import Any, cast
 
 import numpy as np
 
@@ -295,6 +296,14 @@ def ms_ssim(
             )
         )
     )
+
+
+# ``ms_ssim``'s keyword defaults, for callers of :func:`_ms_ssim_per_image`.
+_MS_SSIM_DEFAULTS: dict[str, Any] = {
+    name: param.default
+    for name, param in inspect.signature(ms_ssim).parameters.items()
+    if param.default is not inspect.Parameter.empty
+}
 
 
 def _validate_ms_ssim_shape(

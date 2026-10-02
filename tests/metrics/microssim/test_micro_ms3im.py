@@ -292,3 +292,19 @@ def test_score_stack_validates_input() -> None:
         sim.score_stack(gt, pred[:1])
     with pytest.raises(ValueError, match=">="):
         sim.score_stack(gt[:, :100], pred[:, :100])
+    with pytest.raises(TypeError, match="data_range"):
+        sim.score_stack(gt, pred, data_range=1.0)
+    with pytest.raises(TypeError, match="bogus"):
+        sim.score_stack(gt, pred, bogus=1)
+
+
+def test_score_stack_forwards_ms_ssim_kwargs() -> None:
+    """MS-SSIM keywords reach the batched path as they reach ``score``."""
+    gt, pred = _seeded_data(n=2)
+    sim = MicroMS3IM().fit(gt, pred)
+    kwargs = {"sigma": 1.0, "betas": (0.5, 0.5)}
+    got = sim.score_stack(gt, pred, **kwargs)
+    for i in range(2):
+        want = sim.score(gt[i], pred[i], **kwargs)
+        assert want != pytest.approx(sim.score(gt[i], pred[i]), rel=1e-6)
+        assert got[i] == pytest.approx(want, rel=1e-12)

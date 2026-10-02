@@ -204,16 +204,20 @@ class MicroSSIM:
             If ``fit()`` has not been called, gt/pred shapes differ, or
             ``gt.ndim != 2``.
         """
-        if not self._initialized:
-            raise ValueError("MicroSSIM was not initialized, call `fit()` first.")
-        if gt.shape != pred.shape:
-            raise ValueError("Groundtruth and prediction must have the same shape.")
+        self._check_pair(gt, pred)
         if gt.ndim != 2:
             raise ValueError("Only 2D images are supported.")
 
         gt_norm, pred_scaled = self._normalize_pair(gt, pred)
         data_range = float(gt_norm.max() - gt_norm.min())
         return gt_norm, pred_scaled, data_range
+
+    def _check_pair(self, gt: np.ndarray, pred: np.ndarray) -> None:
+        """Raise unless the instance is fitted and ``gt``, ``pred`` share a shape."""
+        if not self._initialized:
+            raise ValueError("MicroSSIM was not initialized, call `fit()` first.")
+        if gt.shape != pred.shape:
+            raise ValueError("Groundtruth and prediction must have the same shape.")
 
     def _normalize_pair(
         self, gt: np.ndarray, pred: np.ndarray

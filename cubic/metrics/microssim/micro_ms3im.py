@@ -16,7 +16,7 @@ import numpy as np
 
 from ...cuda import asnumpy
 from ..ms_ssim import (
-    DEFAULT_BETAS,
+    _MS_SSIM_DEFAULTS,
     ms_ssim,
     _ms_ssim_per_image,
     _validate_ms_ssim_shape,
@@ -83,12 +83,7 @@ class MicroMS3IM(MicroSSIM):
         pred: np.ndarray,
         *,
         degenerate: float = np.nan,
-        betas: tuple[float, ...] = DEFAULT_BETAS,
-        kernel_size: int = 11,
-        sigma: float = 1.5,
-        K1: float = 0.01,
-        K2: float = 0.03,
-        normalize: str = "relu",
+        **ms_ssim_kwargs: Any,
     ) -> np.ndarray:
         """Score every slice of a ``(N, H, W)`` stack in batched passes.
 
@@ -105,8 +100,9 @@ class MicroMS3IM(MicroSSIM):
         degenerate : float, default=nan
             Score of a slice whose normalized ground truth is constant or
             non-finite.
-        betas, kernel_size, sigma, K1, K2, normalize
-            As in :func:`cubic.metrics.ms_ssim`.
+        **ms_ssim_kwargs
+            Forwarded to the MS-SSIM computation, as in :meth:`score` (e.g.
+            ``kernel_size``, ``sigma``, ``betas``).
 
         Returns
         -------
@@ -118,14 +114,20 @@ class MicroMS3IM(MicroSSIM):
         ValueError
             If ``fit()`` has not been called, the shapes differ, the stacks are
             not 3-D, or the slices are too small for ``len(betas)`` scales.
+        TypeError
+            If ``ms_ssim_kwargs`` names a parameter :func:`ms_ssim` lacks, or
+            ``data_range``, which is computed per slice.
         """
-        if not self._initialized:
-            raise ValueError("MicroSSIM was not initialized, call `fit()` first.")
-        if gt.shape != pred.shape:
-            raise ValueError("Groundtruth and prediction must have the same shape.")
+        self._check_pair(gt, pred)
         if gt.ndim != 3:
             raise ValueError(f"Expected a (N, H, W) stack; got ndim={gt.ndim}.")
-        _validate_ms_ssim_shape(gt.shape, len(betas), kernel_size, sigma)
+        unknown = set(ms_ssim_kwargs) - set(_MS_SSIM_DEFAULTS)
+        if unknown:
+            raise TypeError(f"Unexpected MS-SSIM arguments: {sorted(unknown)}")
+        params = {**_MS_SSIM_DEFAULTS, **ms_ssim_kwargs}
+        _validate_ms_ssim_shape(
+            gt.shape, len(params["betas"]), params["kernel_size"], params["sigma"]
+        )
         n, h, w = gt.shape
         scores = np.full(n, degenerate, dtype=np.float64)
         step = max(1, _STACK_BATCH_PIXELS // (h * w))
@@ -141,15 +143,7 @@ class MicroMS3IM(MicroSSIM):
                 data_range = data_range[valid]
             # Argument order as in :meth:`score` (prediction first).
             batch_scores = _ms_ssim_per_image(
-                pred_scaled,
-                gt_norm,
-                data_range=data_range,
-                betas=betas,
-                kernel_size=kernel_size,
-                sigma=sigma,
-                K1=K1,
-                K2=K2,
-                normalize=normalize,
+                pred_scaled, gt_norm, data_range=data_range, **params
             )
             scores[start : start + len(valid)][valid] = asnumpy(
                 cast(np.ndarray, batch_scores)
