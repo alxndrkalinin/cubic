@@ -402,5 +402,4 @@ def test_workflow_matches_aicssegmentation(
     module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
     img = _filaments((6, 48, 64), seed=5)
     expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
-    out = workflow(img, size_filter_inclusive=_SKIMAGE_USES_MAX_SIZE)
-    np.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(workflow(img), expected)

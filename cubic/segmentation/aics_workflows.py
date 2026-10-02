@@ -23,6 +23,7 @@ from scipy.ndimage import generate_binary_structure
 
 from ..cuda import CUDAManager, asnumpy, get_device, get_array_module
 from ..scipy import ndimage as _ndimage
+from .segment_utils import _SKIMAGE_USES_MAX_SIZE
 
 # Relative distance from a float32 rounding midpoint below which ITK's serially
 # accumulated K could round differently from a pairwise sum. The two sums were
@@ -719,8 +720,15 @@ def remove_small_objects_aics(
     return keep[labels]
 
 
+def _resolve_inclusive(size_filter_inclusive: bool | None) -> bool:
+    """``None`` follows the installed scikit-image, as the reference would."""
+    if size_filter_inclusive is None:
+        return _SKIMAGE_USES_MAX_SIZE
+    return size_filter_inclusive
+
+
 def workflow_sec61b(
-    image: np.ndarray, *, size_filter_inclusive: bool = True
+    image: np.ndarray, *, size_filter_inclusive: bool | None = None
 ) -> np.ndarray:
     """SEC61B (endoplasmic reticulum) classic segmentation of one z-stack.
 
@@ -731,17 +739,18 @@ def workflow_sec61b(
     ----------
     image : np.ndarray
         3D image ``(Z, Y, X)``; NumPy or CuPy.
-    size_filter_inclusive : bool
-        Small-object semantics of the reference run: ``True`` (default)
-        reproduces ``aicssegmentation`` under scikit-image >= 0.26, ``False``
-        under older releases. See :func:`remove_small_objects_aics`.
+    size_filter_inclusive : bool | None
+        Small-object semantics of the reference run: ``True`` reproduces
+        ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
+        releases, ``None`` (default) follows the installed scikit-image. See
+        :func:`remove_small_objects_aics`.
 
     Returns
     -------
     np.ndarray
         Boolean mask on the input's device.
     """
-    inclusive = size_filter_inclusive
+    inclusive = _resolve_inclusive(size_filter_inclusive)
     norm = intensity_normalization(image.astype(np.float32, copy=False), (2.5, 7.5))
     smooth = gradient_anisotropic_diffusion(norm)
     del norm
@@ -753,7 +762,7 @@ def workflow_sec61b(
 
 
 def workflow_tomm20(
-    image: np.ndarray, *, size_filter_inclusive: bool = True
+    image: np.ndarray, *, size_filter_inclusive: bool | None = None
 ) -> np.ndarray:
     """TOMM20 (mitochondria) classic segmentation of one z-stack.
 
@@ -764,10 +773,11 @@ def workflow_tomm20(
     ----------
     image : np.ndarray
         3D image ``(Z, Y, X)``; NumPy or CuPy.
-    size_filter_inclusive : bool
-        Small-object semantics of the reference run: ``True`` (default)
-        reproduces ``aicssegmentation`` under scikit-image >= 0.26, ``False``
-        under older releases. See :func:`remove_small_objects_aics`.
+    size_filter_inclusive : bool | None
+        Small-object semantics of the reference run: ``True`` reproduces
+        ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
+        releases, ``None`` (default) follows the installed scikit-image. See
+        :func:`remove_small_objects_aics`.
 
     Returns
     -------
@@ -778,4 +788,6 @@ def workflow_tomm20(
     smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
     del norm
     bw = vesselness_slice_by_slice(smooth, sigmas=[1.5]) > 0.16
-    return remove_small_objects_aics(bw, 10, inclusive=size_filter_inclusive)
+    return remove_small_objects_aics(
+        bw, 10, inclusive=_resolve_inclusive(size_filter_inclusive)
+    )
