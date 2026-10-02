@@ -405,10 +405,10 @@ def glcm_features_by_label(
     voxels carry its label, and each region averages its properties over its
     own non-empty directions. Instead of one call per region, every direction
     accumulates the co-occurrences of all regions in a single ``bincount``,
-    so the cost no longer grows with the number of regions. With per-region
-    ranges on a float32 image the range width is rounded in float32, not in
-    Python float as :func:`glcm_features` does, so a voxel on a level
-    boundary can land one level apart.
+    so the cost no longer grows with the number of regions. Per-region
+    ranges quantize in float64, while :func:`glcm_features` quantizes a
+    float32 image in float32, so a voxel on a level boundary can land one level
+    apart there.
 
     Parameters
     ----------
@@ -459,14 +459,17 @@ def glcm_features_by_label(
     compact[labels == 0] = 0
 
     if value_range is None:
-        # Per-region (min, max) by scatter, looked up per voxel. Slot 0 collects
-        # the background and is never read for a labeled voxel.
-        lo = np.full_like(image, image.max().item(), shape=(n_labels + 1,))
-        hi = np.full_like(image, image.min().item(), shape=(n_labels + 1,))
-        np.minimum.at(lo, compact, image)
-        np.maximum.at(hi, compact, image)
-        quant = _quantize(image, levels, lo[compact], hi[compact])
-        del lo, hi
+        # Per-region (min, max) by scatter, in float64 like glcm_features' Python
+        # floats: integer ranges cannot overflow, every dtype is one CuPy
+        # ``ufunc.at`` supports, and a NaN only poisons its own region. Slot 0
+        # collects the background and is never read for a labeled voxel.
+        values = image.astype(np.float64, copy=False)
+        lo = xp.full(n_labels + 1, np.inf)
+        hi = xp.full(n_labels + 1, -np.inf)
+        np.minimum.at(lo, compact, values)
+        np.maximum.at(hi, compact, values)
+        quant = _quantize(values, levels, lo[compact], hi[compact])
+        del values, lo, hi
     else:
         quant = _quantize(image, levels, float(value_range[0]), float(value_range[1]))
 

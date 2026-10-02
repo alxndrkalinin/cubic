@@ -336,6 +336,55 @@ def test_glcm_by_label_rejects_mixed_devices(gpu_available: bool) -> None:
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.int16, bool])
+def test_glcm_by_label_integer_and_bool_images(
+    use_gpu: bool, dtype: type, gpu_available: bool
+) -> None:
+    """Per-region ranges work for every dtype ``glcm_features`` accepts.
+
+    int16 ranges wider than 32767 used to overflow (every region scored 0),
+    bool raised on subtraction, and CuPy's ``ufunc.at`` rejected uint8/uint16/
+    int16 on the GPU.
+    """
+    _, labels = _labeled_volume(3)
+    rng = np.random.default_rng(11)
+    if dtype is bool:
+        image = rng.random(labels.shape) > 0.5
+    else:
+        info = np.iinfo(dtype)
+        image = rng.integers(info.min, info.max, labels.shape, endpoint=True)
+        image = image.astype(dtype)
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels = ascupy(image), ascupy(labels)
+    out = glcm_features_by_label(image, labels, levels=16)
+    for k, lab in enumerate(out["label"][:4]):
+        ref = glcm_features(image, mask=labels == int(lab), levels=16)
+        assert ref["contrast"] > 0
+        for prop in _EXPECTED_PROPS:
+            assert out[prop][k] == pytest.approx(ref[prop], rel=1e-9, abs=1e-12)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_glcm_by_label_background_nan_leaves_regions_intact(
+    use_gpu: bool, gpu_available: bool
+) -> None:
+    """A NaN outside every region does not reach any region's range."""
+    image, labels = _labeled_volume(2)
+    image[labels == 0] = np.nan
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels = ascupy(image), ascupy(labels)
+    out = glcm_features_by_label(image, labels, levels=16)
+    for k, lab in enumerate(out["label"][:3]):
+        ref = glcm_features(image, mask=labels == int(lab), levels=16)
+        assert out["contrast"][k] == pytest.approx(ref["contrast"], rel=1e-12)
+        assert out["contrast"][k] > 0
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
 def test_glcm_by_label_sparse_and_negative_ids(
     use_gpu: bool, gpu_available: bool
 ) -> None:
