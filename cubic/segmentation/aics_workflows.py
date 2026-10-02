@@ -589,10 +589,11 @@ def _vesselness_2d_response(eigen: np.ndarray, width: int) -> np.ndarray:
 
     The minimum eigenvalue is taken over each whole plane, as in the reference;
     the response is elementwise, so only the kept columns are computed. On GPU
-    one kernel evaluates it with glibc's ``powf`` algorithm, which the NumPy
-    reference calls on x86-64 AVX2 hosts.
+    one kernel evaluates a 3D float32 stack with glibc's ``powf`` algorithm,
+    which the NumPy reference calls on x86-64 AVX2 hosts; other dtypes use the
+    array operations on either device.
     """
-    if get_device(eigen) == "GPU":
+    if get_device(eigen) == "GPU" and eigen.ndim == 3 and eigen.dtype == np.float32:
         return _vesselness_2d_response_cuda(eigen, width)
     plane_min = eigen.min(axis=(eigen.ndim - 2, eigen.ndim - 1), keepdims=True)
     eigen = eigen[..., :width]
@@ -609,8 +610,6 @@ def _vesselness_2d_response(eigen: np.ndarray, width: int) -> np.ndarray:
 
 def _vesselness_2d_response_cuda(eigen: np.ndarray, width: int) -> np.ndarray:
     """Kernel form of :func:`_vesselness_2d_response` for 3D float32 CuPy stacks."""
-    if eigen.ndim != 3 or eigen.dtype != np.float32:
-        raise ValueError("expected a 3D float32 eigenvalue stack")
     xp = get_array_module(eigen)
     device = _cupy_device(eigen)
     with device:

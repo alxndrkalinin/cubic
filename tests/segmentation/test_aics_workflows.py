@@ -140,6 +140,20 @@ def test_vesselness_matches_reference(use_gpu: bool, gpu_available: bool) -> Non
     np.testing.assert_array_equal(asnumpy(out) > 0.15, expected > 0.15)
 
 
+def test_vesselness_float64_gpu_matches_cpu(gpu_available: bool) -> None:
+    """Float64 input skips the float32 kernel and takes the array path on GPU."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    img = intensity_normalization(_filaments((5, 40, 56)), (2.5, 7.5)).astype(
+        np.float64
+    )
+    cpu = vesselness_slice_by_slice(img, [1.0])
+    gpu = vesselness_slice_by_slice(ascupy(img), [1.0])
+    assert gpu.dtype == np.float64
+    # CuPy's float64 pow is not glibc's, so the two agree to rounding, not bitwise.
+    np.testing.assert_allclose(asnumpy(gpu), cpu, rtol=1e-12, atol=1e-14)
+
+
 # glibc 2.28 powf(x, 3.0f) bit patterns (x86-64 FMA variant, as NumPy's float32
 # power returns them on AVX2 hosts): the first eight are inputs where both CUDA's
 # powf and a float64 cube round differently; then 0, subnormal, underflow, exact,
