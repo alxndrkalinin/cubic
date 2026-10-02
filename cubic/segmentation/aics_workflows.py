@@ -9,8 +9,8 @@ same call runs on NumPy or CuPy input.
 Each primitive reproduces its reference's arithmetic, dtype, operation order
 and boundary handling (see the per-function notes). For float32 input the
 masks were bitwise equal to ``aicssegmentation`` on every volume measured
-(240 A549 ER volumes, 10 more across ER and mitochondria) on an x86-64 AVX2
-host without AVX-512, where NumPy's float32 power returns glibc's FMA
+(250 light-sheet ER and mitochondria z-stacks of 48x640x960 voxels, acquired
+and predicted) on an x86-64 AVX2 host without AVX-512, where NumPy's float32 power returns glibc's FMA
 ``powf``.
 
 The reference itself is not bitwise across CPUs. On AVX-512 hosts NumPy's
@@ -42,8 +42,8 @@ from .segment_utils import _SKIMAGE_USES_MAX_SIZE
 # serial float64 sum of n terms is (n - 1) * 2**-53 relative: about 1e-8 for
 # such a volume's 3 x 48 x 640 x 960 squared derivatives. An interval that wide
 # holds a float32 midpoint for a sixth to a third of all K values. Replaying
-# those would mean 2-3 host replays of 1-3 s each per 10-iteration volume,
-# against 0.37 s for the whole GPU workflow. An input whose serial sum drifts
+# those would mean 2-3 host replays per 10-iteration volume, each several
+# times slower than the whole GPU workflow. An input whose serial sum drifts
 # past the margin can therefore round K differently from ITK.
 _K_SERIAL_MARGIN = 1e-9
 
@@ -501,7 +501,8 @@ _RESPONSE_CUDA_SOURCE = r"""
 // glibc 2.28 powf(x, 3.0f) for finite x >= 0: sysdeps/ieee754/flt-32/e_powf.c with
 // its log2/exp2 tables, as built into the x86-64 FMA ifunc variant (__powf_fma,
 // -mfma: every single-use a*b+c contracted). NumPy's float32 power calls it on
-// AVX2 hosts, and CUDA's powf rounds differently in ~6% of real inputs.
+// AVX2 hosts, and CUDA's powf rounds differently for ~6% of the inputs in such
+// volumes.
 __constant__ double POWF_INVC[16] = {
   0x1.661ec79f8f3bep+0, 0x1.571ed4aaf883dp+0, 0x1.49539f0f010bp+0, 0x1.3c995b0b80385p+0,
   0x1.30d190c8864a5p+0, 0x1.25e227b0b8eap+0, 0x1.1bb4a4a1a343fp+0, 0x1.12358f08ae5bap+0,

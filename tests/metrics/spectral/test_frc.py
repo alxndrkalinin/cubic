@@ -1612,7 +1612,7 @@ def test_binomial_split_precedes_resampling() -> None:
     are correlated and the estimate is biased fine. Applying the same linear
     interpolation to each half afterwards keeps them independent.
 
-    MEASURED against two genuinely independent acquisitions of the same object:
+    Measured against two genuinely independent acquisitions of the same object:
     splitting after resampling reported XY 47% too fine, splitting before it
     +8%.
     """

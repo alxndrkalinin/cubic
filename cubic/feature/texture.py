@@ -504,8 +504,8 @@ def glcm_features_by_label(
             lab_c = compact[center_sl]
             # Compact labels start at 1. Compacting to the in-region pairs first
             # measured faster than binning every pair with a sentinel bin
-            # (0.131 vs 0.174 s on 13 cells of 48x640x960, A40): most voxels
-            # are background.
+            # (25% less time on a 48x640x960 volume with 13 labeled cells):
+            # most voxels are background.
             same = (lab_c > start) & (lab_c <= stop) & (lab_c == compact[neighbor_sl])
             bins = (lab_c[same] - 1 - start) * n_pairs
             if bins.size == 0:  # cupy.bincount rejects empty input

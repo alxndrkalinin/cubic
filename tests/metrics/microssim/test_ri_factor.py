@@ -794,7 +794,7 @@ def test_global_ri_factor_gpu_peak_memory(monkeypatch, gpu_available: bool) -> N
     """GPU fit peak stays under 9 pooled-element arrays above the input.
 
     Pooling via per-slice lists + ``concatenate`` and unchunked objective
-    evaluation peaked at ~27 element-sized arrays (MEASURED on 640x960
+    evaluation peaked at ~27 element-sized arrays (measured on 640x960
     float32 stacks), which OOMed 48 GB GPUs on 576 slices.
     """
     if not gpu_available:
@@ -818,7 +818,7 @@ def test_ri_factor_gpu_single_large_slice_is_chunked(
     """A single slice larger than a chunk is split, not reduced whole.
 
     Chunking only along axis 0 left a ``(1, h, w)`` pool as one chunk, which
-    built ~15 element-sized temporaries (MEASURED); splitting inside the
+    built ~15 element-sized temporaries (measured); splitting inside the
     slice bounds them to ~15 chunk-sized ones.
     """
     if not gpu_available:

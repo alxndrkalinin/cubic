@@ -199,7 +199,7 @@ def _fused_mean(name: str, alpha: float, elements: SSIMElements) -> float:
     )
     # Reduce each leading-axis row in its own block, then sum the rows: a
     # reduction to one scalar runs on a single block and was ~1.6x slower than
-    # the array path on 576 slices of 634x954 (MEASURED, A40). Reducing over
+    # the array path on a stack of 576 slices of 634x954. Reducing over
     # the trailing axes reads strided (cropped) element views without a copy.
     arrays = [getattr(elements, f) for f in _ELEMENT_FIELDS]
     axis = tuple(range(1, elements.ux.ndim)) or None
