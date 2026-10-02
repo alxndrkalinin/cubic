@@ -263,3 +263,33 @@ def test_fused_spectral_sums_decline_unsupported_input(gpu_available: bool) -> N
     assert rad._fused_frc_sums(gx, gy, grid, grid, n_radial, too_many) is None
     assert rad._fused_frc_sums(gx, gy.ravel()[:-1], grid, None, n_radial) is None
     assert rad._fused_frc_sums(gx, gy, grid, None, n_radial) is not None
+
+
+def test_fused_spectral_sums_out_of_range_ids_match_array_path(
+    gpu_available: bool,
+) -> None:
+    """Ids past ``nbins`` fall back to the array path instead of spilling over.
+
+    The kernel used to add them into the neighbouring sum's shared-memory
+    slots: 813 of 1000 voxels counted and a (10,) result where the array path
+    returns (12,) with all 1000.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy, asnumpy
+
+    rng = np.random.default_rng(10)
+    F = (rng.standard_normal(1000) + 1j * rng.standard_normal(1000)).astype(
+        np.complex64
+    )
+    ids = rng.integers(0, 12, 1000).astype(np.int32)
+    want = reduce_power(F, ids, nbins=10)
+    got = reduce_power(ascupy(F), ascupy(ids), nbins=10)
+    assert want[1].shape == (12,) and want[1].sum() == 1000
+    np.testing.assert_array_equal(asnumpy(got[1]), want[1])
+    np.testing.assert_allclose(asnumpy(got[0]), want[0], rtol=1e-5)
+    fx, fy, rid, aid, n_radial, n_angle = _spectra_and_ids(np.complex64)
+    want = reduce_frc_sums(fx, fy, rid, n_radial - 1)
+    got = reduce_frc_sums(ascupy(fx), ascupy(fy), ascupy(rid), n_radial - 1)
+    for w, g in zip(want, got):
+        np.testing.assert_allclose(asnumpy(g), w, rtol=1e-5)

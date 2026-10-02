@@ -320,7 +320,8 @@ template <typename T>
 __device__ void frc_sums(const T* x, const T* y, const int* radial_id,
                          const int* angle_id, int has_y, int has_angle, long n,
                          int n_radial, int nbins, double* sx2, double* sy2,
-                         double* sxy, unsigned long long* count) {
+                         double* sxy, unsigned long long* count,
+                         unsigned long long* overflow) {
   extern __shared__ __align__(8) unsigned char smem[];
   double* bx = (double*)smem;
   double* by = bx + nbins;
@@ -339,6 +340,11 @@ __device__ void frc_sums(const T* x, const T* y, const int* radial_id,
       int a = angle_id[i];
       if (a < 0) continue;
       bin = a * n_radial + r;
+      if (r >= n_radial) bin = nbins;
+    }
+    if (bin >= nbins) {  // reported, so the caller falls back to bincount
+      atomicAdd(overflow, 1ULL);
+      continue;
     }
     T xr = x[2 * i], xi = x[2 * i + 1];
     atomicAdd(&bx[bin], (double)(xr * xr + xi * xi));
@@ -365,9 +371,9 @@ __device__ void frc_sums(const T* x, const T* y, const int* radial_id,
   extern "C" __global__ void NAME(                                             \
       const T* x, const T* y, const int* radial_id, const int* angle_id,       \
       int has_y, int has_angle, long n, int n_radial, int nbins, double* sums, \
-      unsigned long long* count) {                                             \
+      unsigned long long* count, unsigned long long* overflow) {               \
     frc_sums<T>(x, y, radial_id, angle_id, has_y, has_angle, n, n_radial,      \
-                nbins, sums, sums + nbins, sums + 2 * nbins, count);           \
+                nbins, sums, sums + nbins, sums + 2 * nbins, count, overflow); \
   }
 FRC_SUMS_ENTRY(frc_sums_float, float)
 FRC_SUMS_ENTRY(frc_sums_double, double)
@@ -442,6 +448,7 @@ def _fused_frc_sums(
         aid = rid if angle_id is None else cp.ascontiguousarray(angle_id)
         sums = cp.zeros((3, nbins), dtype=np.float64)
         count = cp.zeros(nbins, dtype=np.uint64)
+        overflow = cp.zeros(1, dtype=np.uint64)
         n = FX.size
         sms = device.attributes["MultiProcessorCount"]
         blocks = max(1, min(-(-n // _FRC_SUMS_THREADS), 8 * sms))
@@ -460,9 +467,13 @@ def _fused_frc_sums(
                 np.int32(nbins),
                 sums,
                 count,
+                overflow,
             ),
             shared_mem=shared,
         )
+        if int(overflow[0]):
+            # An id beyond n_radial / n_angle: the array path extends or raises.
+            return None
     # Counts never reach 2**63, so the uint64 buffer reads as int64 in place.
     return sums[0], sums[1], sums[2], count.view(np.int64)
 
