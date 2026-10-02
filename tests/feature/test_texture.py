@@ -384,6 +384,22 @@ def test_glcm_by_label_background_nan_leaves_regions_intact(
         assert out["contrast"][k] > 0
 
 
+def test_glcm_by_label_chunks_the_property_stage(monkeypatch) -> None:
+    """Chunking labels in the property stage changes values only by rounding.
+
+    NumPy reduces differently shaped batches in a different order (~4e-16).
+    """
+    import cubic.feature.texture as tx
+
+    image, labels = _labeled_volume(3)
+    whole = glcm_features_by_label(image, labels, levels=8)
+    monkeypatch.setattr(tx, "_PROP_CHUNK_BINS", 1)
+    chunked = glcm_features_by_label(image, labels, levels=8)
+    np.testing.assert_array_equal(chunked["label"], whole["label"])
+    for key in _EXPECTED_PROPS:
+        np.testing.assert_allclose(chunked[key], whole[key], rtol=1e-12)
+
+
 @pytest.mark.parametrize("use_gpu", [False, True])
 def test_glcm_by_label_sparse_and_negative_ids(
     use_gpu: bool, gpu_available: bool

@@ -405,7 +405,8 @@ def glcm_features_by_label(
     voxels carry its label, and each region averages its properties over its
     own non-empty directions. Instead of one call per region, every direction
     accumulates the co-occurrences of all regions in a single ``bincount``,
-    so the cost no longer grows with the number of regions. Per-region
+    so the image is traversed once per direction, not once per region. The
+    histogram holds ``n_labels * n_directions * levels**2`` counts. Per-region
     ranges quantize in float64, while :func:`glcm_features` quantizes a
     float32 image in float32, so a voxel on a level boundary can land one level
     apart there.
@@ -476,34 +477,60 @@ def glcm_features_by_label(
     offsets = _glcm_offsets(image.ndim, distances)
     n_dir = len(offsets)
     n_pairs = levels * levels
-    n_bins = n_labels * n_dir * n_pairs
-    counts = xp.zeros(n_bins, dtype=np.int64)
+    n_label_bins = n_labels * n_pairs
+    # Bin (direction, label, i, j): each direction counts into its own slice, so
+    # a bincount spans n_labels * levels**2 bins, not all directions' bins.
+    counts = xp.zeros((n_dir, n_label_bins), dtype=np.int64)
     for direction, off in enumerate(offsets):
         center_sl, neighbor_sl = _slices_for_offset(off, image.shape)
         lab_c = compact[center_sl]
         same = (lab_c > 0) & (lab_c == compact[neighbor_sl])
-        # Bin (label, direction, i, j); compact labels start at 1. Compacting
-        # to the in-region pairs first measured faster than binning every pair
-        # with a sentinel bin (0.131 vs 0.174 s on 13 cells of 48x640x960,
-        # A40), since most voxels are background.
-        bins = ((lab_c[same] - 1) * n_dir + direction) * n_pairs
+        # Compact labels start at 1. Compacting to the in-region pairs first
+        # measured faster than binning every pair with a sentinel bin (0.131 vs
+        # 0.174 s on 13 cells of 48x640x960, A40): most voxels are background.
+        bins = (lab_c[same] - 1) * n_pairs
         if bins.size == 0:  # cupy.bincount rejects empty input
             continue
         bins += quant[center_sl][same] * levels + quant[neighbor_sl][same]
-        counts += np.bincount(bins, minlength=n_bins)
-    matrices = asnumpy(counts).reshape(n_labels, n_dir, levels, levels)
-    matrices = matrices.astype(np.float64)
+        counts[direction] += np.bincount(bins, minlength=n_label_bins)
+    host = asnumpy(counts).reshape(n_dir, n_labels, levels, levels)
+    del counts
 
+    out: dict[str, np.ndarray] = {"label": label_ids}
+    columns: dict[str, list[np.ndarray]] = {name: [] for name in _PROP_NAMES}
+    # The float64 property stage holds ~10 temporaries of its input's size, so
+    # it runs over bounded label chunks.
+    step = max(1, _PROP_CHUNK_BINS // (n_dir * n_pairs))
+    for start in range(0, n_labels, step):
+        chunk = host[:, start : start + step].transpose(1, 0, 2, 3)
+        for name, values in _direction_mean_props(chunk, symmetric, normed).items():
+            columns[name].append(values)
+    for name in _PROP_NAMES:
+        out[name] = np.concatenate(columns[name])
+    return out
+
+
+# Co-occurrence bins per chunk of the per-label property stage (~16 MB each).
+_PROP_CHUNK_BINS = 1 << 21
+
+
+def _direction_mean_props(
+    counts: np.ndarray, symmetric: bool, normed: bool
+) -> dict[str, np.ndarray]:
+    """Haralick properties of ``(labels, directions, L, L)`` co-occurrence counts.
+
+    Averaged over each label's non-empty directions; NaN for a label with none.
+    """
+    matrices = counts.astype(np.float64)
     nonempty = matrices.sum(axis=(2, 3)) > 0
     if symmetric:
         matrices = matrices + matrices.transpose(0, 1, 3, 2)
     if normed:
         totals = matrices.sum(axis=(2, 3), keepdims=True)
         matrices = np.divide(matrices, totals, out=matrices, where=totals > 0)
-
     props = _haralick_props_batched(matrices)
     n_nonempty = nonempty.sum(axis=1)
-    out: dict[str, np.ndarray] = {"label": label_ids}
+    out = {}
     with np.errstate(divide="ignore", invalid="ignore"):
         for name in _PROP_NAMES:
             total = np.where(nonempty, props[name], 0.0).sum(axis=1)
