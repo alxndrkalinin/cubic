@@ -469,15 +469,15 @@ def _hessian_2d_eigen_max(image: np.ndarray, sigma: float) -> np.ndarray:
     return np.where(np.abs(low) > np.abs(high), low, high)
 
 
-def _vesselness_2d_response(eigen: np.ndarray, tau: float, width: int) -> np.ndarray:
-    """Jerman 2D filament response over the first ``width`` columns.
+def _vesselness_2d_response(eigen: np.ndarray, width: int) -> np.ndarray:
+    """Jerman 2D filament response (tau = 1) over the first ``width`` columns.
 
     The minimum eigenvalue is taken over each whole plane, as in the reference;
     the response is elementwise, so only the kept columns are computed.
     """
     plane_min = eigen.min(axis=(eigen.ndim - 2, eigen.ndim - 1), keepdims=True)
     eigen = eigen[..., :width]
-    lambda3 = np.where((eigen < 0) & (eigen >= tau * plane_min), tau * plane_min, eigen)
+    lambda3 = np.where((eigen < 0) & (eigen >= plane_min), plane_min, eigen)
     diff = np.abs(lambda3 - eigen)
     numerator = 27 * (np.square(eigen) * diff)
     denominator = np.power(2 * np.abs(eigen) + diff, 3)
@@ -488,15 +488,14 @@ def _vesselness_2d_response(eigen: np.ndarray, tau: float, width: int) -> np.nda
     return np.where(np.isinf(response), eigen.dtype.type(0), response)
 
 
-def vesselness_slice_by_slice(
-    image: np.ndarray, sigmas: list[float], tau: float = 1.0
-) -> np.ndarray:
+def vesselness_slice_by_slice(image: np.ndarray, sigmas: list[float]) -> np.ndarray:
     """Multi-scale 2D filament filter on each z-plane of a 3D image.
 
     Port of ``aicssegmentation.core.vessel.vesselnessSliceBySlice`` for
     bright-on-dark structures. As in the reference, each plane is filtered
-    side by side with the z maximum-intensity projection, and the last three
-    columns are zeroed. All planes are filtered in one batched call.
+    side by side with the z maximum-intensity projection, the last three
+    columns are zeroed, and the response uses ``tau = 1`` (the reference
+    ignores its ``tau`` argument). All planes are filtered in one batched call.
 
     Parameters
     ----------
@@ -504,8 +503,6 @@ def vesselness_slice_by_slice(
         3D float image ``(Z, Y, X)``.
     sigmas : list[float]
         Gaussian scales; the response is the maximum over scales.
-    tau : float
-        Response uniformity parameter in ``[0.5, 1]``.
 
     Returns
     -------
@@ -526,7 +523,7 @@ def vesselness_slice_by_slice(
     del mip
     response = None
     for sigma in sigmas:
-        r = _vesselness_2d_response(_hessian_2d_eigen_max(stacked, sigma), tau, kept)
+        r = _vesselness_2d_response(_hessian_2d_eigen_max(stacked, sigma), kept)
         response = r if response is None else np.maximum(response, r)
     assert response is not None  # sigmas is non-empty
     return np.pad(response.astype(np.float64), ((0, 0), (0, 0), (0, 3)))
@@ -608,7 +605,7 @@ def workflow_sec61b(
     norm = intensity_normalization(image.astype(np.float32, copy=False), (2.5, 7.5))
     smooth = gradient_anisotropic_diffusion(norm)
     del norm
-    bw = vesselness_slice_by_slice(smooth, sigmas=[1.0], tau=1.0) > 0.15
+    bw = vesselness_slice_by_slice(smooth, sigmas=[1.0]) > 0.15
     del smooth
     bw = remove_small_objects_aics(bw, 15, inclusive=inclusive)
     bw = remove_small_objects_aics(bw, 3, per_slice=True, inclusive=inclusive)
@@ -640,5 +637,5 @@ def workflow_tomm20(
     norm = intensity_normalization(image.astype(np.float32, copy=False), (3.5, 15.0))
     smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
     del norm
-    bw = vesselness_slice_by_slice(smooth, sigmas=[1.5], tau=1.0) > 0.16
+    bw = vesselness_slice_by_slice(smooth, sigmas=[1.5]) > 0.16
     return remove_small_objects_aics(bw, 10, inclusive=size_filter_inclusive)
