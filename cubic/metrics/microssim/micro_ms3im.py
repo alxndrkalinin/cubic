@@ -14,7 +14,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from ...cuda import asnumpy
+from ...cuda import asnumpy, check_same_device
 from ..ms_ssim import (
     _MS_SSIM_DEFAULTS,
     ms_ssim,
@@ -112,13 +112,15 @@ class MicroMS3IM(MicroSSIM):
         Raises
         ------
         ValueError
-            If ``fit()`` has not been called, the shapes differ, the stacks are
-            not 3-D, or the slices are too small for ``len(betas)`` scales.
+            If ``fit()`` has not been called, the shapes differ, ``gt`` and
+            ``pred`` are on different devices, the stacks are not 3-D, or the
+            slices are too small for ``len(betas)`` scales.
         TypeError
             If ``ms_ssim_kwargs`` names a parameter :func:`ms_ssim` lacks, or
             ``data_range``, which is computed per slice.
         """
         self._check_pair(gt, pred)
+        check_same_device(gt, pred)
         if gt.ndim != 3:
             raise ValueError(f"Expected a (N, H, W) stack; got ndim={gt.ndim}.")
         unknown = set(ms_ssim_kwargs) - set(_MS_SSIM_DEFAULTS)

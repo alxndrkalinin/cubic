@@ -298,6 +298,18 @@ def test_score_stack_validates_input() -> None:
         sim.score_stack(gt, pred, bogus=1)
 
 
+def test_score_stack_rejects_mixed_devices(gpu_available: bool) -> None:
+    """GPU gt with host pred raises the library's ValueError, as ``score`` does."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+
+    gt, pred = _seeded_data(n=2)
+    sim = MicroMS3IM().fit(gt, pred)
+    with pytest.raises(ValueError, match="same device"):
+        sim.score_stack(ascupy(gt), pred)
+
+
 def test_score_stack_forwards_ms_ssim_kwargs() -> None:
     """MS-SSIM keywords reach the batched path as they reach ``score``."""
     gt, pred = _seeded_data(n=2)
