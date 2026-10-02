@@ -738,7 +738,9 @@ def workflow_sec61b(
     Parameters
     ----------
     image : np.ndarray
-        3D image ``(Z, Y, X)``; NumPy or CuPy.
+        3D image ``(Z, Y, X)``; NumPy or CuPy. Converted to float32 first; the
+        bitwise match with the reference holds for float32 input (the
+        reference normalizes other dtypes in their own precision).
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
@@ -772,7 +774,9 @@ def workflow_tomm20(
     Parameters
     ----------
     image : np.ndarray
-        3D image ``(Z, Y, X)``; NumPy or CuPy.
+        3D image ``(Z, Y, X)``; NumPy or CuPy. Converted to float32 first; the
+        bitwise match with the reference holds for float32 input (the
+        reference normalizes other dtypes in their own precision).
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
