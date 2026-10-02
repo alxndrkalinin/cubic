@@ -427,10 +427,13 @@ def _fused_frc_sums(
     # A CuPy array here (checked above); NumPy types .device as the string "cpu".
     device_id = int(cast(Any, FX).device.id)
     name, real = _FRC_SUMS_TYPES[FX.dtype]
+    cp = get_array_module(FX)  # CuPy: FX is on the GPU
+    # Shared-memory atomicAdd on double needs compute capability 6.0.
+    if int(cp.cuda.Device(device_id).compute_capability) < 60:
+        return None
     kernel, limit = _frc_sums_kernel(name, device_id)
     if nbins == 0 or shared > limit:
         return None
-    cp = get_array_module(FX)  # CuPy: FX is on the GPU
     with cp.cuda.Device(device_id) as device:
         x = cp.ascontiguousarray(FX).ravel().view(real)
         # Absent inputs pass a placeholder pointer; the flags keep it unread.
