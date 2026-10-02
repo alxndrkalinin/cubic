@@ -15,12 +15,36 @@ result on both devices.
 """
 
 import functools
+from typing import Any
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure
 
 from ..cuda import CUDAManager, asnumpy, get_device, get_array_module
 from ..scipy import ndimage as _ndimage
+
+
+@functools.cache
+def _cuda_functions(
+    source: str, names: tuple[str, ...], device_id: int
+) -> tuple[Any, ...]:
+    """Compile ``source`` once per device and return its kernels.
+
+    ``--fmad=false`` keeps every multiply and add separately rounded, as in the
+    scalar C/C++ references; contractions the reference does perform are
+    spelled out as explicit ``fma`` calls.
+    """
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        raise RuntimeError("CuPy is required for the CUDA kernels")
+    with cp.cuda.Device(device_id):
+        module = cp.RawModule(code=source, options=("--fmad=false",))
+        return tuple(module.get_function(name) for name in names)
+
+
+def _launch_config(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
+    """Grid-stride launch configuration for ``size`` elements."""
+    return (min((size + threads - 1) // threads, 65535 * 8),), (threads,)
 
 
 def intensity_normalization(
@@ -287,41 +311,34 @@ extern "C" __global__ void gad_apply(
 """
 
 
-@functools.cache
-def _diffusion_kernels():
-    """Compile the diffusion kernels once per process.
-
-    ``--fmad=false`` keeps each multiply and add separately rounded, as in ITK's
-    scalar C++ loop.
-    """
-    cp = CUDAManager().get_cp()
-    module = cp.RawModule(code=_DIFFUSION_CUDA_SOURCE, options=("--fmad=false",))
-    names = ("gad_gradient", "gad_flux", "gad_apply")
-    return tuple(module.get_function(name) for name in names)
-
-
 def _diffusion_step_cuda(
     u: np.ndarray, scale: list[float], conductance: float, time_step: float
 ) -> bool:
     """Kernel form of :func:`_diffusion_step_xp` for C-contiguous 3D CuPy arrays."""
     xp = get_array_module(u)
-    gradient_kernel, flux_kernel, apply_kernel = _diffusion_kernels()
     nz, ny, nx = (np.int64(n) for n in u.shape)
     # ITK dimension order (x, y, z) = array axes reversed.
     sx, sy, sz = (np.float64(scale[axis]) for axis in (2, 1, 0))
-    threads = 256
-    launch = ((min(int(u.size + threads - 1) // threads, 65535 * 8),), (threads,))
-    derivatives = xp.empty((3, *u.shape), dtype=np.float64)
-    grad_sq = xp.empty(u.shape, dtype=np.float64)
-    gradient_kernel(*launch, (u, derivatives, grad_sq, nz, ny, nx, sx, sy, sz))
-    k = _conductance_k(grad_sq, conductance)
-    del grad_sq
-    if k == 0.0:
-        return False
-    flux = xp.empty((3, *u.shape), dtype=np.float64)
-    flux_kernel(*launch, (u, derivatives, flux, nz, ny, nx, np.float64(k), sx, sy, sz))
-    del derivatives
-    apply_kernel(*launch, (flux, u, nz, ny, nx, np.float64(time_step)))
+    launch = _launch_config(u.size)
+    with u.device:
+        gradient_kernel, flux_kernel, apply_kernel = _cuda_functions(
+            _DIFFUSION_CUDA_SOURCE,
+            ("gad_gradient", "gad_flux", "gad_apply"),
+            u.device.id,
+        )
+        derivatives = xp.empty((3, *u.shape), dtype=np.float64)
+        grad_sq = xp.empty(u.shape, dtype=np.float64)
+        gradient_kernel(*launch, (u, derivatives, grad_sq, nz, ny, nx, sx, sy, sz))
+        k = _conductance_k(grad_sq, conductance)
+        del grad_sq
+        if k == 0.0:
+            return False
+        flux = xp.empty((3, *u.shape), dtype=np.float64)
+        flux_kernel(
+            *launch, (u, derivatives, flux, nz, ny, nx, np.float64(k), sx, sy, sz)
+        )
+        del derivatives
+        apply_kernel(*launch, (flux, u, nz, ny, nx, np.float64(time_step)))
     return True
 
 
