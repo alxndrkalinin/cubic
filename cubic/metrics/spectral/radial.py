@@ -422,22 +422,31 @@ def _fused_frc_sums(
 
     Bins are ``angle_id * n_radial + radial_id`` (``radial_id`` alone without
     angles), and ids below 0 are skipped. ``None`` means the caller should
-    take the array path: host arrays, other dtypes, mismatched sizes, or a
-    binning too large for the device's shared memory.
+    take the array path: an input that is not on ``FX``'s GPU, other dtypes,
+    mismatched sizes, ids beyond the binning, a device below compute capability
+    6.0, or a binning too large for the device's shared memory.
     """
     if get_device(FX) != "GPU" or FX.dtype not in _FRC_SUMS_TYPES:
         return None
-    if FY is not None and (FY.dtype != FX.dtype or FY.size != FX.size):
+    # A CuPy array here (checked above); NumPy types .device as the string "cpu".
+    device_id = int(cast(Any, FX).device.id)
+
+    def on_fx_device(a: np.ndarray) -> bool:
+        # The raw kernel runs on FX's device; host arrays or another GPU's
+        # memory would be copied silently or read across devices.
+        return get_device(a) == "GPU" and int(cast(Any, a).device.id) == device_id
+
+    if FY is not None and (
+        FY.dtype != FX.dtype or FY.size != FX.size or not on_fx_device(FY)
+    ):
         return None
     ids = [radial_id] if angle_id is None else [radial_id, angle_id]
     if any(
-        a.dtype != np.int32 or a.size != FX.size or get_device(a) != "GPU" for a in ids
+        a.dtype != np.int32 or a.size != FX.size or not on_fx_device(a) for a in ids
     ):
         return None
     nbins = n_angle * n_radial
     shared = nbins * _FRC_SUMS_BYTES_PER_BIN
-    # A CuPy array here (checked above); NumPy types .device as the string "cpu".
-    device_id = int(cast(Any, FX).device.id)
     name, real = _FRC_SUMS_TYPES[FX.dtype]
     compiled = _frc_sums_kernel(name, device_id)
     if compiled is None:

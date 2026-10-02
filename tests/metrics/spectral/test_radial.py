@@ -262,6 +262,7 @@ def test_fused_spectral_sums_decline_unsupported_input(gpu_available: bool) -> N
     too_many = limit // rad._FRC_SUMS_BYTES_PER_BIN // n_radial + 1
     assert rad._fused_frc_sums(gx, gy, grid, grid, n_radial, too_many) is None
     assert rad._fused_frc_sums(gx, gy.ravel()[:-1], grid, None, n_radial) is None
+    assert rad._fused_frc_sums(gx, fy, grid, None, n_radial) is None  # host FY
     assert rad._fused_frc_sums(gx, gy, grid, None, n_radial) is not None
 
 
