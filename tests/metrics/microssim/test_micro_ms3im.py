@@ -228,3 +228,67 @@ def test_xp_dispatch():
     score_cp = m3_cp.score(gt_cp[0], pred_cp[0])
 
     assert abs(float(score_np) - float(score_cp)) < 1e-4
+
+
+# --- score_stack() ----------------------------------------------------------
+
+
+def _stack_with_constant_slices() -> tuple[np.ndarray, np.ndarray]:
+    """Five slices; slices 1 and 4 have a constant ground truth."""
+    gt, pred = _seeded_data(n=5)
+    gt[1] = 7.0
+    gt[4] = 3.0
+    return gt, pred
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("batch_pixels", [1 << 24, 2 * _H * _W, 1])
+def test_score_stack_matches_per_slice_score(
+    monkeypatch, use_gpu: bool, batch_pixels: int, gpu_available: bool
+) -> None:
+    """Batched scores equal per-slice ``score``; degenerate slices get the fill.
+
+    ``2 * H * W`` puts both constant slices in batches with valid ones, and
+    ``1`` scores one slice per batch, so batch 4 has no valid slice at all.
+    """
+    import cubic.metrics.microssim.micro_ms3im as m3
+
+    gt, pred = _stack_with_constant_slices()
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        from cubic.cuda import ascupy
+
+        gt, pred = ascupy(gt), ascupy(pred)
+    sim = MicroMS3IM().fit(gt[[0, 2, 3]], pred[[0, 2, 3]])
+    monkeypatch.setattr(m3, "_STACK_BATCH_PIXELS", batch_pixels)
+    got = sim.score_stack(gt, pred, degenerate=-1.0)
+    assert isinstance(got, np.ndarray) and got.shape == (5,)
+    for i in (1, 4):
+        with pytest.raises(ValueError, match="data_range"):
+            sim.score(gt[i], pred[i])
+        assert got[i] == -1.0
+    for i in (0, 2, 3):
+        assert got[i] == pytest.approx(sim.score(gt[i], pred[i]), rel=1e-12)
+
+
+def test_score_stack_default_degenerate_is_nan() -> None:
+    """Without ``degenerate``, constant-GT slices score NaN and the rest stay finite."""
+    gt, pred = _stack_with_constant_slices()
+    sim = MicroMS3IM().fit(gt[[0, 2]], pred[[0, 2]])
+    got = sim.score_stack(gt, pred)
+    assert np.isnan(got[[1, 4]]).all() and np.isfinite(got[[0, 2, 3]]).all()
+
+
+def test_score_stack_validates_input() -> None:
+    """Unfitted, 2-D, mismatched and too-small stacks raise ``ValueError``."""
+    gt, pred = _seeded_data(n=2)
+    with pytest.raises(ValueError, match="not initialized"):
+        MicroMS3IM().score_stack(gt, pred)
+    sim = MicroMS3IM().fit(gt, pred)
+    with pytest.raises(ValueError, match="ndim=2"):
+        sim.score_stack(gt[0], pred[0])
+    with pytest.raises(ValueError, match="same shape"):
+        sim.score_stack(gt, pred[:1])
+    with pytest.raises(ValueError, match=">="):
+        sim.score_stack(gt[:, :100], pred[:, :100])

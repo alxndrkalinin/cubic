@@ -16,6 +16,8 @@ Reference: ``torchmetrics/functional/image/ssim.py`` ``_ssim_update`` and
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 
 import cubic.skimage as _sk
@@ -68,8 +70,8 @@ def _ssim_scale_component(
     image1: np.ndarray,
     image2: np.ndarray,
     *,
-    c1: float,
-    c2: float,
+    c1: float | np.ndarray,
+    c2: float | np.ndarray,
     kernel_size: int,
     sigma: float,
     full_ssim: bool,
@@ -110,9 +112,10 @@ def _ssim_scale_component(
     image1, image2 : numpy.ndarray
         Same-shape, same-device float images. Shape ``(H, W)`` or
         ``(N, H, W)``.
-    c1, c2 : float
+    c1, c2 : float or numpy.ndarray
         SSIM stability constants ``(K1 * data_range) ** 2`` and
-        ``(K2 * data_range) ** 2``.
+        ``(K2 * data_range) ** 2``; ``(N, 1, 1)`` arrays give each image of
+        an ``(N, H, W)`` batch its own.
     kernel_size : int
         Gaussian kernel side; must be odd-positive. Sets the reflect-pad
         width ``(kernel_size - 1) // 2`` *and* the Gaussian radius — see
@@ -273,34 +276,78 @@ def ms_ssim(
             f"Shape mismatch between image1 and image2: "
             f"{image1.shape} vs {image2.shape}"
         )
-    if image1.ndim not in (2, 3):
+    if not (np.isfinite(data_range) and data_range > 0):
+        raise ValueError(f"data_range must be finite and positive; got {data_range}")
+    _validate_ms_ssim_shape(image1.shape, len(betas), kernel_size, sigma)
+
+    return float(
+        np.mean(
+            _ms_ssim_per_image(
+                image1,
+                image2,
+                data_range=data_range,
+                betas=betas,
+                kernel_size=kernel_size,
+                sigma=sigma,
+                K1=K1,
+                K2=K2,
+                normalize=normalize,
+            )
+        )
+    )
+
+
+def _validate_ms_ssim_shape(
+    shape: tuple[int, ...], n_scales: int, kernel_size: int, sigma: float
+) -> None:
+    """Raise unless ``shape`` and the filter parameters suit MS-SSIM."""
+    if len(shape) not in (2, 3):
         raise ValueError(
-            f"Only (H, W) or (N, H, W) input is supported; got ndim={image1.ndim}"
+            f"Only (H, W) or (N, H, W) input is supported; got ndim={len(shape)}"
         )
     if kernel_size < 1 or kernel_size % 2 == 0:
         raise ValueError(f"kernel_size must be odd and positive; got {kernel_size}")
     if not (np.isfinite(sigma) and sigma > 0):
         raise ValueError(f"sigma must be finite and positive; got {sigma}")
-    if not (np.isfinite(data_range) and data_range > 0):
-        raise ValueError(f"data_range must be finite and positive; got {data_range}")
-
-    n_scales = len(betas)
     min_spatial = 2 ** (n_scales - 1) * kernel_size
-    if min(image1.shape[-2:]) < min_spatial:
+    if min(shape[-2:]) < min_spatial:
         raise ValueError(
             f"Spatial dims must be >= {min_spatial} for {n_scales}-scale "
             f"MS-SSIM with kernel_size={kernel_size}; "
-            f"got spatial shape {image1.shape[-2:]}"
+            f"got spatial shape {shape[-2:]}"
         )
 
+
+def _ms_ssim_per_image(
+    image1: np.ndarray,
+    image2: np.ndarray,
+    *,
+    data_range: float | np.ndarray,
+    betas: tuple[float, ...],
+    kernel_size: int,
+    sigma: float,
+    K1: float,
+    K2: float,
+    normalize: str,
+) -> np.ndarray | float:
+    """MS-SSIM of each image; the caller has validated the inputs.
+
+    ``data_range`` is a scalar, or for ``(N, H, W)`` input an ``(N,)`` array
+    on the images' device that gives each image its own stability constants.
+    Returns a scalar for ``(H, W)`` input and an ``(N,)`` array otherwise.
+    """
     # Integer input would wrap on ``image * image`` and would additionally be
     # rescaled by skimage's ``img_as_float``, silently desyncing the maps from
     # the caller's ``data_range``. Cast once, up front.
     image1 = image1.astype(np.float64, copy=False)
     image2 = image2.astype(np.float64, copy=False)
 
+    if np.ndim(data_range) == 1:
+        # One constant per image, broadcast over its two spatial axes.
+        data_range = cast(np.ndarray, data_range).astype(np.float64)[:, None, None]
     c1 = (K1 * data_range) ** 2
     c2 = (K2 * data_range) ** 2
+    n_scales = len(betas)
 
     # Per-image accumulators (scalar for (H, W), shape (N,) for (N, H, W)).
     ms_per_image: np.ndarray | float = 1.0
@@ -324,4 +371,4 @@ def ms_ssim(
             image1 = _avgpool2(image1)
             image2 = _avgpool2(image2)
 
-    return float(np.mean(ms_per_image))
+    return ms_per_image

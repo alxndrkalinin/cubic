@@ -10,12 +10,22 @@ which is numerically faithful to ``torchmetrics``'s
 from __future__ import annotations
 
 import warnings
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
-from ..ms_ssim import ms_ssim
+from ...cuda import asnumpy
+from ..ms_ssim import (
+    DEFAULT_BETAS,
+    ms_ssim,
+    _ms_ssim_per_image,
+    _validate_ms_ssim_shape,
+)
 from .micro_ssim import MicroSSIM
+
+# Pixels scored per batch in :meth:`MicroMS3IM.score_stack`. Each batch holds
+# ~15 float64 temporaries of its size, ~2 GB at this bound.
+_STACK_BATCH_PIXELS = 1 << 24
 
 
 class MicroMS3IM(MicroSSIM):
@@ -66,6 +76,85 @@ class MicroMS3IM(MicroSSIM):
         # the argument order (micro_ms3im.py:200). SSIM is symmetric in its
         # two image arguments, so order doesn't affect the score.
         return ms_ssim(pred_scaled, gt_norm, data_range=data_range, **ms_ssim_kwargs)
+
+    def score_stack(
+        self,
+        gt: np.ndarray,
+        pred: np.ndarray,
+        *,
+        degenerate: float = np.nan,
+        betas: tuple[float, ...] = DEFAULT_BETAS,
+        kernel_size: int = 11,
+        sigma: float = 1.5,
+        K1: float = 0.01,
+        K2: float = 0.03,
+        normalize: str = "relu",
+    ) -> np.ndarray:
+        """Score every slice of a ``(N, H, W)`` stack in batched passes.
+
+        Each slice gets the score :meth:`score` gives it alone, with its own
+        normalized ground-truth data range. Batching only changes the order of
+        floating-point reductions, and the scores agree to about 1e-15. A slice
+        whose ground-truth range is not finite and positive, which makes
+        :meth:`score` raise, scores ``degenerate`` instead.
+
+        Parameters
+        ----------
+        gt, pred : np.ndarray
+            ``(N, H, W)`` ground-truth and prediction stacks of matching shape.
+        degenerate : float, default=nan
+            Score of a slice whose normalized ground truth is constant or
+            non-finite.
+        betas, kernel_size, sigma, K1, K2, normalize
+            As in :func:`cubic.metrics.ms_ssim`.
+
+        Returns
+        -------
+        np.ndarray
+            ``(N,)`` float64 scores, on the host.
+
+        Raises
+        ------
+        ValueError
+            If ``fit()`` has not been called, the shapes differ, the stacks are
+            not 3-D, or the slices are too small for ``len(betas)`` scales.
+        """
+        if not self._initialized:
+            raise ValueError("MicroSSIM was not initialized, call `fit()` first.")
+        if gt.shape != pred.shape:
+            raise ValueError("Groundtruth and prediction must have the same shape.")
+        if gt.ndim != 3:
+            raise ValueError(f"Expected a (N, H, W) stack; got ndim={gt.ndim}.")
+        _validate_ms_ssim_shape(gt.shape, len(betas), kernel_size, sigma)
+        n, h, w = gt.shape
+        scores = np.full(n, degenerate, dtype=np.float64)
+        step = max(1, _STACK_BATCH_PIXELS // (h * w))
+        for start in range(0, n, step):
+            batch = slice(start, start + step)
+            gt_norm, pred_scaled = self._normalize_pair(gt[batch], pred[batch])
+            data_range = gt_norm.max(axis=(1, 2)) - gt_norm.min(axis=(1, 2))
+            valid = asnumpy(np.isfinite(data_range) & (data_range > 0))
+            if not valid.any():
+                continue
+            if not valid.all():
+                gt_norm, pred_scaled = gt_norm[valid], pred_scaled[valid]
+                data_range = data_range[valid]
+            # Argument order as in :meth:`score` (prediction first).
+            batch_scores = _ms_ssim_per_image(
+                pred_scaled,
+                gt_norm,
+                data_range=data_range,
+                betas=betas,
+                kernel_size=kernel_size,
+                sigma=sigma,
+                K1=K1,
+                K2=K2,
+                normalize=normalize,
+            )
+            scores[start : start + len(valid)][valid] = asnumpy(
+                cast(np.ndarray, batch_scores)
+            )
+        return scores
 
 
 def micro_multiscale_structural_similarity(
