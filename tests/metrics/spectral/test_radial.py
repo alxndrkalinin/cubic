@@ -188,6 +188,16 @@ def test_validate_angle_delta() -> None:
         _validate_angle_delta(90, min_sectors=2)
 
 
+def _require_fused_kernel() -> None:
+    """Skip unless this GPU runs the fused bin-sum kernel (compute capability >= 6.0)."""
+    from cubic.cuda import ascupy
+    from cubic.metrics.spectral import radial as rad
+
+    device_id = ascupy(np.zeros(1)).device.id
+    if rad._frc_sums_kernel("frc_sums_float", device_id) is None:
+        pytest.skip("GPU below compute capability 6.0 takes the bincount path")
+
+
 def _spectra_and_ids(dtype: type, shape=(6, 40, 52)):
     """Two seeded spectra plus radial / angular ids with some -1 entries."""
     rng = np.random.default_rng(9)
@@ -213,6 +223,7 @@ def test_fused_spectral_sums_match_array_path(
     """
     if not gpu_available:
         pytest.skip("GPU not available")
+    _require_fused_kernel()
     from cubic.cuda import ascupy, asnumpy
     from cubic.metrics.spectral import radial as rad
 
@@ -254,6 +265,7 @@ def test_fused_spectral_sums_decline_unsupported_input(gpu_available: bool) -> N
     assert rad._fused_frc_sums(fx, fy, rid, None, n_radial) is None
     if not gpu_available:
         pytest.skip("GPU not available")
+    _require_fused_kernel()
     from cubic.cuda import ascupy
 
     gx, gy, grid = ascupy(fx), ascupy(fy), ascupy(rid)
