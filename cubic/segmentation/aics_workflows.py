@@ -167,12 +167,12 @@ def _diffusion_step_xp(
     if k == 0.0:
         # ITK sets both conductances to zero, so the update vanishes.
         return False
-    delta = np.zeros(center.shape, dtype=np.float64)
+    delta = np.zeros_like(center, dtype=np.float64)
     for i in axes:
         forward = sub(shifted({i: 1}), center) * scale[i]
         backward = sub(center, shifted({i: -1})) * scale[i]
-        accum = np.zeros(center.shape, dtype=np.float64)
-        accum_d = np.zeros(center.shape, dtype=np.float64)
+        accum = np.zeros_like(center, dtype=np.float64)
+        accum_d = np.zeros_like(center, dtype=np.float64)
         for j in axes:
             if j == i:
                 continue

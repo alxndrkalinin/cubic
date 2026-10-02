@@ -203,6 +203,16 @@ def test_diffusion_kernel_matches_array_path(gpu_available: bool) -> None:
     np.testing.assert_array_equal(asnumpy(gpu), cpu)
 
 
+def test_diffusion_2d_gpu_matches_cpu(gpu_available: bool) -> None:
+    """2D CuPy input runs the array path on the device and matches NumPy."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    img = intensity_normalization(_filaments((1, 40, 52))[0], (2.5, 7.5))
+    gpu = gradient_anisotropic_diffusion(ascupy(img))
+    assert get_device(gpu) == "GPU"
+    np.testing.assert_array_equal(asnumpy(gpu), gradient_anisotropic_diffusion(img))
+
+
 def test_diffusion_kernel_handles_non_contiguous_input(gpu_available: bool) -> None:
     """A strided view is copied to C order before the kernel indexes it."""
     if not gpu_available:
