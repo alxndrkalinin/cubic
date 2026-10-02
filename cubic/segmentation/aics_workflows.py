@@ -7,11 +7,17 @@ vesselness filter; here every step is a whole-volume array operation, so the
 same call runs on NumPy or CuPy input.
 
 Each primitive reproduces its reference's arithmetic, dtype, operation order
-and boundary handling (see the per-function notes), so for float32 input the
-masks are bitwise equal to ``aicssegmentation`` run on an x86-64 host whose
-glibc selects the FMA ``powf`` (any AVX2 + FMA CPU). The reference itself is
-not bitwise across CPUs: on AVX-512 hosts NumPy's ``np.power`` in its
-vesselness rounds differently, which moves 1-3 voxels per volume.
+and boundary handling (see the per-function notes). For float32 input the
+masks were bitwise equal to ``aicssegmentation`` on every volume measured
+(240 A549 ER volumes, 10 more across ER and mitochondria) on an x86-64 AVX2
+host without AVX-512, where NumPy's float32 power returns glibc's FMA
+``powf``.
+
+The reference itself is not bitwise across CPUs. On AVX-512 hosts NumPy's
+float32 ``np.power`` in its vesselness rounds differently, which moves 1-3
+voxels per volume. The CPU path calls the same ``np.power``, so it follows the
+host. The GPU kernel always reproduces glibc's ``powf``, so it matches the
+AVX2 result.
 """
 
 import functools
