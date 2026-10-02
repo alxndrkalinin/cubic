@@ -92,9 +92,13 @@ def test_remove_small_objects_matches_skimage(
     use_gpu: bool, inclusive: bool, per_slice: bool, gpu_available: bool
 ) -> None:
     """Sizes strictly below (or, inclusive, at most) ``min_size`` are dropped."""
-    rng = np.random.default_rng(1)
-    mask = ndi.binary_opening(rng.random((6, 64, 64)) > 0.6)
     min_size = 4
+    # Isolated rows of min_size - 1, min_size and min_size + 1 voxels on one plane,
+    # so volume and per-slice components coincide and both rules hit the boundary.
+    mask = np.zeros((3, 8, 20), dtype=bool)
+    for row, size in zip((1, 3, 5), (min_size - 1, min_size, min_size + 1)):
+        mask[1, row, 2 : 2 + size] = True
+    kept = (min_size + 1) + (0 if inclusive else min_size)
     # Largest removed size; scikit-image < 0.26 only has the exclusive min_size.
     largest = min_size if inclusive else min_size - 1
     if _SKIMAGE_USES_MAX_SIZE:
@@ -116,6 +120,7 @@ def test_remove_small_objects_matches_skimage(
         inclusive=inclusive,
     )
     assert get_device(out) == ("GPU" if use_gpu else "CPU")
+    assert int(expected.sum()) == kept
     np.testing.assert_array_equal(asnumpy(out), expected)
 
 
