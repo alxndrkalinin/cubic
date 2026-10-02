@@ -9,11 +9,13 @@ from scipy.stats import norm
 from skimage.morphology import remove_small_objects
 
 from cubic.cuda import ascupy, asnumpy, get_device
-from cubic.segmentation import workflow_sec61b, workflow_tomm20
+from cubic.segmentation import aics_workflows, workflow_sec61b, workflow_tomm20
 from cubic.segmentation.segment_utils import _SKIMAGE_USES_MAX_SIZE
 from cubic.segmentation.aics_workflows import (
     _gaussian_nearest,
     _hessian_2d_eigen_max,
+    _itk_boundary_regions,
+    _near_float32_midpoint,
     intensity_normalization,
     remove_small_objects_aics,
     vesselness_slice_by_slice,
@@ -137,6 +139,40 @@ def test_vesselness_matches_reference(use_gpu: bool, gpu_available: bool) -> Non
     np.testing.assert_array_equal(asnumpy(out) > 0.15, expected > 0.15)
 
 
+def test_itk_boundary_regions_partition_the_volume() -> None:
+    """Interior first, then x/y/z faces; every voxel exactly once."""
+    for shape in [(4, 5, 6), (1, 3, 2), (2, 2, 2), (3, 7)]:
+        regions = _itk_boundary_regions(shape)
+        count = np.zeros(shape, dtype=int)
+        for r in regions:
+            count[r] += 1
+        assert (count == 1).all(), shape
+        assert all(sl == slice(1, n - 1) for sl, n in zip(regions[0], shape) if n > 2)
+
+
+def test_near_float32_midpoint() -> None:
+    """Only values within the margin of a float32 rounding midpoint are flagged."""
+    one = 1.0
+    midpoint = (one + float(np.nextafter(np.float32(1), np.float32(2)))) / 2
+    assert _near_float32_midpoint(midpoint, 1e-9)
+    assert _near_float32_midpoint(midpoint * (1 + 1e-11), 1e-9)
+    assert not _near_float32_midpoint(one, 1e-9)
+    assert not _near_float32_midpoint(0.0, 1e-9)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_diffusion_serial_k_fallback_matches_fast_path(
+    use_gpu: bool, gpu_available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forcing ITK's serial K accumulation every iteration changes nothing here."""
+    img = intensity_normalization(_filaments((6, 40, 52)), (2.5, 7.5))
+    dev = _to_device(img, use_gpu, gpu_available)
+    fast = asnumpy(gradient_anisotropic_diffusion(dev))
+    monkeypatch.setattr(aics_workflows, "_K_SERIAL_MARGIN", np.inf)
+    serial = asnumpy(gradient_anisotropic_diffusion(dev))
+    np.testing.assert_array_equal(serial, fast)
+
+
 def test_hessian_eigen_gpu_matches_cpu(gpu_available: bool) -> None:
     """The closed-form eigenvalue is computed identically on both devices."""
     if not gpu_available:
@@ -243,6 +279,21 @@ def test_diffusion_matches_itk() -> None:
     filt.Update()
     expected = itk.GetArrayFromImage(filt.GetOutput())
     np.testing.assert_array_equal(gradient_anisotropic_diffusion(img), expected)
+
+
+def test_diffusion_serial_k_matches_itk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The replayed ITK summation order itself is bitwise ITK."""
+    itk = pytest.importorskip("itk")
+    img = intensity_normalization(_filaments((6, 40, 52)), (2.5, 7.5))
+    filt = itk.GradientAnisotropicDiffusionImageFilter.New(itk.GetImageFromArray(img))
+    filt.SetNumberOfIterations(10)
+    filt.SetTimeStep(0.0625)
+    filt.SetConductanceParameter(1.2)
+    filt.Update()
+    monkeypatch.setattr(aics_workflows, "_K_SERIAL_MARGIN", np.inf)
+    np.testing.assert_array_equal(
+        gradient_anisotropic_diffusion(img), itk.GetArrayFromImage(filt.GetOutput())
+    )
 
 
 @pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])

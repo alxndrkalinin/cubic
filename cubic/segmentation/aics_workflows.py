@@ -16,12 +16,18 @@ result on both devices.
 
 import functools
 from typing import Any
+from collections.abc import Sequence
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure
 
 from ..cuda import CUDAManager, asnumpy, get_device, get_array_module
 from ..scipy import ndimage as _ndimage
+
+# Relative distance from a float32 rounding midpoint below which ITK's serially
+# accumulated K could round differently from a pairwise sum. The two sums were
+# measured 1.3e-11 to 1.5e-11 apart on 48x640x960 volumes.
+_K_SERIAL_MARGIN = 1e-9
 
 
 @functools.cache
@@ -187,7 +193,7 @@ def _diffusion_step_xp(
     grad_sq = dx[axes[0]] * dx[axes[0]]
     for i in axes[1:]:
         grad_sq = grad_sq + dx[i] * dx[i]
-    k = _conductance_k(grad_sq, conductance)
+    k = _conductance_k(grad_sq, [dx[i] for i in axes], conductance)
     if k == 0.0:
         # ITK sets both conductances to zero, so the update vanishes.
         return False
@@ -212,13 +218,80 @@ def _diffusion_step_xp(
     return True
 
 
-def _conductance_k(grad_sq: np.ndarray, conductance: float) -> float:
+def _conductance_k(
+    grad_sq: np.ndarray, derivatives: Sequence[np.ndarray], conductance: float
+) -> float:
     """ITK's ``K = -2 * conductance**2 * mean(|grad u|^2)``, stored as float32.
 
-    ITK keeps ``m_K`` in the pixel type, so the float64 product is rounded.
+    ITK keeps ``m_K`` in the pixel type, so the float64 product is rounded, and
+    it accumulates the squared derivatives serially in float64. A pairwise sum
+    of ``grad_sq`` lands within ~1e-11 of that serial sum, which rounds to the
+    same float32 unless K sits next to a rounding midpoint; only then is ITK's
+    exact summation order replayed on the host from ``derivatives`` (central
+    derivatives in ITK dimension order).
     """
-    k = float(grad_sq.mean()) * conductance * conductance * -2.0
+    n = grad_sq.size
+    k = float(grad_sq.sum()) / n * conductance * conductance * -2.0
+    if _near_float32_midpoint(k, _K_SERIAL_MARGIN):
+        total = _itk_serial_sum_of_squares([asnumpy(d) for d in derivatives])
+        k = total / n * conductance * conductance * -2.0
     return float(np.float32(k))
+
+
+def _near_float32_midpoint(value: float, margin: float) -> bool:
+    """Whether ``value`` lies within ``margin * |value|`` of a float32 midpoint."""
+    if value == 0.0 or not np.isfinite(value):
+        return False
+    nearest = np.float32(value)
+    for direction in (-np.inf, np.inf):
+        neighbour = np.nextafter(nearest, np.float32(direction))
+        midpoint = (float(nearest) + float(neighbour)) / 2.0
+        if abs(value - midpoint) <= margin * abs(value):
+            return True
+    return False
+
+
+def _itk_boundary_regions(shape: tuple[int, ...]) -> list[tuple[slice, ...]]:
+    """Regions in the order ITK's ``ImageBoundaryFacesCalculator`` visits them.
+
+    For a radius-1 neighbourhood: the interior first, then for each ITK
+    dimension (x, y, z = array axes reversed) its lower and upper one-voxel
+    faces, each restricted to the part not covered by earlier faces.
+    """
+    ndim = len(shape)
+    start = [0] * ndim
+    size = list(shape)
+    faces = []
+
+    def region(axis: int, face_start: int, face_size: int) -> tuple[slice, ...]:
+        return tuple(
+            slice(face_start, face_start + face_size)
+            if a == axis
+            else slice(start[a], start[a] + size[a])
+            for a in range(ndim)
+        )
+
+    for d in range(ndim):
+        axis = ndim - 1 - d
+        low = min(1, size[axis])
+        faces.append(region(axis, start[axis], low))
+        start[axis] += low
+        size[axis] -= low
+        high = min(1, size[axis])
+        faces.append(region(axis, start[axis] + size[axis] - high, high))
+        size[axis] -= high
+    interior = tuple(slice(start[a], start[a] + size[a]) for a in range(ndim))
+    return [interior, *faces]
+
+
+def _itk_serial_sum_of_squares(derivatives: Sequence[np.ndarray]) -> float:
+    """``sum(d**2)`` accumulated in ITK's order: regions, raster order, then dims."""
+    squares = np.stack([d * d for d in derivatives], axis=-1)
+    terms = np.concatenate(
+        [squares[r].ravel() for r in _itk_boundary_regions(squares.shape[:-1])]
+    )
+    del squares
+    return float(np.add.accumulate(terms, out=terms)[-1])
 
 
 # Each face flux F_i(c) = fwd * exp((fwd^2 + accum) / K) through (c, c + e_i) is
@@ -329,7 +402,7 @@ def _diffusion_step_cuda(
         derivatives = xp.empty((3, *u.shape), dtype=np.float64)
         grad_sq = xp.empty(u.shape, dtype=np.float64)
         gradient_kernel(*launch, (u, derivatives, grad_sq, nz, ny, nx, sx, sy, sz))
-        k = _conductance_k(grad_sq, conductance)
+        k = _conductance_k(grad_sq, list(derivatives), conductance)
         del grad_sq
         if k == 0.0:
             return False
