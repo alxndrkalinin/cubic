@@ -10,6 +10,7 @@ from .segment_utils import (
     remove_small_objects,
     remove_touching_objects,
 )
+from .aics_workflows import workflow_sec61b, workflow_tomm20
 from .cellpose_sam_gpu import segment_cpsam, segment_cellpose
 
 __all__ = [
@@ -24,4 +25,6 @@ __all__ = [
     "cleanup_segmentation",
     "remove_thin_objects",
     "fill_label_holes",
+    "workflow_sec61b",
+    "workflow_tomm20",
 ]
