@@ -389,21 +389,25 @@ _FRC_SUMS_TYPES = {
 
 
 @lru_cache(maxsize=None)
-def _frc_sums_kernel(name: str, device_id: int) -> tuple[Any, int]:
+def _frc_sums_kernel(name: str, device_id: int) -> tuple[Any, int, int] | None:
     """Compile one :data:`_FRC_SUMS_SOURCE` entry point on one device.
 
-    Returns the kernel and the shared memory per block it may use: the
-    device's opt-in maximum, enabled on the kernel, rather than the 48 KB
-    default, so finer binnings still fit.
+    Returns the kernel, the shared memory per block it may use (the device's
+    opt-in maximum, enabled on the kernel, rather than the 48 KB default) and
+    the multiprocessor count; ``None`` below compute capability 6.0, which
+    lacks the shared-memory ``atomicAdd`` on double.
     """
     cp = CUDAManager().get_cp()
     if cp is None:
         raise RuntimeError("CuPy is required for the fused spectral sums.")
     with cp.cuda.Device(device_id) as device:
+        if int(device.compute_capability) < 60:
+            return None
+        attributes = device.attributes
         kernel = cp.RawKernel(_FRC_SUMS_SOURCE, name, options=("--fmad=false",))
-        limit = int(device.attributes["MaxSharedMemoryPerBlockOptin"])
+        limit = int(attributes["MaxSharedMemoryPerBlockOptin"])
         kernel.max_dynamic_shared_size_bytes = limit
-    return kernel, limit
+    return kernel, limit, int(attributes["MultiProcessorCount"])
 
 
 def _fused_frc_sums(
@@ -435,14 +439,14 @@ def _fused_frc_sums(
     # A CuPy array here (checked above); NumPy types .device as the string "cpu".
     device_id = int(cast(Any, FX).device.id)
     name, real = _FRC_SUMS_TYPES[FX.dtype]
-    cp = get_array_module(FX)  # CuPy: FX is on the GPU
-    # Shared-memory atomicAdd on double needs compute capability 6.0.
-    if int(cp.cuda.Device(device_id).compute_capability) < 60:
+    compiled = _frc_sums_kernel(name, device_id)
+    if compiled is None:
         return None
-    kernel, limit = _frc_sums_kernel(name, device_id)
+    kernel, limit, sms = compiled
     if nbins == 0 or shared > limit:
         return None
-    with cp.cuda.Device(device_id) as device:
+    cp = get_array_module(FX)  # CuPy: FX is on the GPU
+    with cp.cuda.Device(device_id):
         x = cp.ascontiguousarray(FX).ravel().view(real)
         # Absent inputs pass a placeholder pointer; the flags keep it unread.
         y = x if FY is None else cp.ascontiguousarray(FY).ravel().view(real)
@@ -452,7 +456,6 @@ def _fused_frc_sums(
         count = cp.zeros(nbins, dtype=np.uint64)
         overflow = cp.zeros(1, dtype=np.uint64)
         n = FX.size
-        sms = device.attributes["MultiProcessorCount"]
         blocks = max(1, min(-(-n // _FRC_SUMS_THREADS), 8 * sms))
         kernel(
             (blocks,),
