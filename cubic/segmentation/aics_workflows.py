@@ -6,13 +6,15 @@ gradient anisotropic diffusion and a per-slice Python loop for the 2D
 vesselness filter; here every step is a whole-volume array operation, so the
 same call runs on NumPy or CuPy input.
 
-Each primitive follows its reference's arithmetic, dtype and boundary handling
-(see the per-function notes), so a mask from these workflows differs from the
-reference only where floating-point rounding moves a voxel across a threshold.
+Each primitive reproduces its reference's arithmetic, dtype, operation order
+and boundary handling (see the per-function notes), so the masks are bitwise
+equal to ``aicssegmentation`` run on the same inputs. The reference itself is
+not bitwise across CPUs: ``np.power`` in its vesselness rounds differently on
+AVX-512 hosts, which moves 1-3 voxels per volume; these ports follow the AVX2
+result on both devices.
 """
 
 import functools
-from itertools import combinations_with_replacement
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure
@@ -58,19 +60,26 @@ def intensity_normalization(
         raise ValueError("image contains non-finite values")
     dtype = image.dtype.type
     flat = asnumpy(image).ravel()
-    mean = flat.mean()
-    std = np.sqrt(((flat - mean) ** 2).mean())
-    stretch_min = max(mean - dtype(scaling_param[0]) * std, flat.min())
-    stretch_max = min(mean + dtype(scaling_param[1]) * std, flat.max())
-    del flat
+    mean, lowest, highest = flat.mean(), flat.min(), flat.max()
+    # A device array arrives as a fresh host copy, so square it in place.
+    on_cpu = get_device(image) == "CPU"
+    sq = flat - mean if on_cpu else np.subtract(flat, mean, out=flat)
+    np.multiply(sq, sq, out=sq)
+    std = np.sqrt(sq.mean())
+    del flat, sq
+    stretch_min = max(mean - dtype(scaling_param[0]) * std, lowest)
+    stretch_max = min(mean + dtype(scaling_param[1]) * std, highest)
     if stretch_min > stretch_max:
         raise ValueError(
             f"scaling_param {scaling_param!r} gives an empty range "
             f"[{stretch_min}, {stretch_max}]"
         )
     eps = dtype(1e-8)
-    clipped = np.clip(image, stretch_min, stretch_max)
-    return (clipped - stretch_min + eps) / (stretch_max - stretch_min + eps)
+    out = np.clip(image, stretch_min, stretch_max)
+    out -= stretch_min
+    out += eps
+    out /= stretch_max - stretch_min + eps
+    return out
 
 
 def gradient_anisotropic_diffusion(
@@ -321,9 +330,13 @@ def _gaussian_nearest(image: np.ndarray, sigmas: list[float]) -> np.ndarray:
 
     SciPy filters a float32 image one axis at a time, accumulating each pass in
     float64 and storing it as float32. cupyx accumulates float32 input in
-    float32, so each pass runs on a float64 copy here to keep both devices on
-    SciPy's arithmetic. Axes with ``sigma == 0`` are skipped, as in SciPy.
+    float32, so on GPU each pass runs on a float64 copy to stay on SciPy's
+    arithmetic. Axes with ``sigma == 0`` are skipped, as in SciPy.
     """
+    if get_device(image) == "CPU":
+        return _ndimage.gaussian_filter(
+            image, sigma=sigmas, mode="nearest", truncate=3.0
+        )
     out = image
     for axis, sigma in enumerate(sigmas):
         if sigma > 1e-15:
@@ -341,19 +354,24 @@ def _hessian_2d_eigen_max(image: np.ndarray, sigma: float) -> np.ndarray:
     ``np.gradient`` twice, ``sigma**2`` scaling. Leading axes are a batch of
     independent planes.
     """
-    plane_axes = (image.ndim - 2, image.ndim - 1)
-    sigmas = [0.0] * (image.ndim - 2) + [sigma, sigma]
-    smoothed = _gaussian_nearest(image, sigmas)
-    gradients = np.gradient(smoothed, axis=plane_axes)
-    h = {
-        (a, b): np.gradient(gradients[a], axis=plane_axes[b])
-        for a, b in combinations_with_replacement(range(2), 2)
-    }
+    y_axis, x_axis = image.ndim - 2, image.ndim - 1
+    smoothed = _gaussian_nearest(image, [0.0] * (image.ndim - 2) + [sigma, sigma])
+    grad_y, grad_x = np.gradient(smoothed, axis=(y_axis, x_axis))
+    del smoothed
+    hessian = [
+        np.gradient(grad_y, axis=y_axis),
+        np.gradient(grad_y, axis=x_axis),
+        np.gradient(grad_x, axis=x_axis),
+    ]
+    del grad_y, grad_x
     if sigma > 0:
-        h = {key: (sigma**2) * value for key, value in h.items()}
-    a, b, c = (h[0, 0].astype(np.float64), h[0, 1], h[1, 1].astype(np.float64))
+        for h in hessian:
+            h *= sigma**2
+    a, b, c = (h.astype(np.float64) for h in hessian)
+    del hessian
     half_trace = (a + c) / 2.0
-    radius = np.sqrt(((a - c) / 2.0) ** 2 + b.astype(np.float64) ** 2)
+    radius = np.sqrt(((a - c) / 2.0) ** 2 + b**2)
+    del a, b, c
     low = (half_trace - radius).astype(image.dtype)
     high = (half_trace + radius).astype(image.dtype)
     # Ascending |lambda| with a stable tie-break, as ``sortbyabs`` on eigvalsh
@@ -361,10 +379,14 @@ def _hessian_2d_eigen_max(image: np.ndarray, sigma: float) -> np.ndarray:
     return np.where(np.abs(low) > np.abs(high), low, high)
 
 
-def _vesselness_2d_response(eigen: np.ndarray, tau: float) -> np.ndarray:
-    """Jerman 2D filament response; the minimum eigenvalue is taken per plane."""
-    plane_axes = (eigen.ndim - 2, eigen.ndim - 1)
-    plane_min = eigen.min(axis=plane_axes, keepdims=True)
+def _vesselness_2d_response(eigen: np.ndarray, tau: float, width: int) -> np.ndarray:
+    """Jerman 2D filament response over the first ``width`` columns.
+
+    The minimum eigenvalue is taken over each whole plane, as in the reference;
+    the response is elementwise, so only the kept columns are computed.
+    """
+    plane_min = eigen.min(axis=(eigen.ndim - 2, eigen.ndim - 1), keepdims=True)
+    eigen = eigen[..., :width]
     lambda3 = np.where((eigen < 0) & (eigen >= tau * plane_min), tau * plane_min, eigen)
     diff = np.abs(lambda3 - eigen)
     numerator = 27 * (np.square(eigen) * diff)
@@ -406,17 +428,18 @@ def vesselness_slice_by_slice(
         raise ValueError("sigmas must contain at least one scale")
     if any(s < 0 for s in sigmas):
         raise ValueError("Sigma values less than zero are not valid")
-    width = image.shape[2]
+    if image.shape[2] <= 3:
+        raise ValueError(f"image must be wider than 3 columns, got {image.shape[2]}")
+    kept = image.shape[2] - 3
     mip = np.broadcast_to(image.max(axis=0), image.shape)
     stacked = np.concatenate([image, mip], axis=2)
-    response = _vesselness_2d_response(_hessian_2d_eigen_max(stacked, sigmas[0]), tau)
-    for sigma in sigmas[1:]:
-        r = _vesselness_2d_response(_hessian_2d_eigen_max(stacked, sigma), tau)
-        response = np.maximum(response, r)
-    xp = get_array_module(image)
-    out = xp.zeros(image.shape, dtype=np.float64)
-    out[:, :, : width - 3] = response[:, :, : width - 3]
-    return out
+    del mip
+    response = None
+    for sigma in sigmas:
+        r = _vesselness_2d_response(_hessian_2d_eigen_max(stacked, sigma), tau, kept)
+        response = r if response is None else np.maximum(response, r)
+    assert response is not None  # sigmas is non-empty
+    return np.pad(response.astype(np.float64), ((0, 0), (0, 0), (0, 3)))
 
 
 def remove_small_objects_aics(
@@ -429,7 +452,10 @@ def remove_small_objects_aics(
     """Drop face-connected components below ``min_size`` voxels.
 
     Matches ``skimage.morphology.remove_small_objects(mask, min_size=min_size,
-    connectivity=1)`` as the ``aicssegmentation`` workflows call it.
+    connectivity=1)`` as the ``aicssegmentation`` workflows call it. Unlike
+    :func:`cubic.segmentation.remove_small_objects`, which keeps the pre-0.26
+    ``size >= min_size`` rule for label images through cuCIM, this takes
+    binary masks, needs only cupyx on GPU, and can filter per z-plane.
 
     Parameters
     ----------
@@ -452,7 +478,7 @@ def remove_small_objects_aics(
     np.ndarray
         Boolean mask on the input's device.
     """
-    mask = mask.astype(bool)
+    mask = mask.astype(bool, copy=False)
     structure = generate_binary_structure(mask.ndim, 1)
     if per_slice:
         if mask.ndim != 3:
@@ -488,13 +514,15 @@ def workflow_sec61b(
     np.ndarray
         Boolean mask on the input's device.
     """
-    rso = functools.partial(remove_small_objects_aics, inclusive=size_filter_inclusive)
-    norm = intensity_normalization(image.astype(np.float32), (2.5, 7.5))
+    inclusive = size_filter_inclusive
+    norm = intensity_normalization(image.astype(np.float32, copy=False), (2.5, 7.5))
     smooth = gradient_anisotropic_diffusion(norm)
+    del norm
     bw = vesselness_slice_by_slice(smooth, sigmas=[1.0], tau=1.0) > 0.15
-    bw = rso(bw, 15)
-    bw = rso(bw, 3, per_slice=True)
-    return rso(bw, 15)
+    del smooth
+    bw = remove_small_objects_aics(bw, 15, inclusive=inclusive)
+    bw = remove_small_objects_aics(bw, 3, per_slice=True, inclusive=inclusive)
+    return remove_small_objects_aics(bw, 15, inclusive=inclusive)
 
 
 def workflow_tomm20(
@@ -519,7 +547,8 @@ def workflow_tomm20(
     np.ndarray
         Boolean mask on the input's device.
     """
-    norm = intensity_normalization(image.astype(np.float32), (3.5, 15.0))
+    norm = intensity_normalization(image.astype(np.float32, copy=False), (3.5, 15.0))
     smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
+    del norm
     bw = vesselness_slice_by_slice(smooth, sigmas=[1.5], tau=1.0) > 0.16
     return remove_small_objects_aics(bw, 10, inclusive=size_filter_inclusive)

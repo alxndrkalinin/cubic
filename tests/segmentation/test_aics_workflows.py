@@ -10,6 +10,7 @@ from skimage.morphology import remove_small_objects
 
 from cubic.cuda import ascupy, asnumpy, get_device
 from cubic.segmentation import workflow_sec61b, workflow_tomm20
+from cubic.segmentation.segment_utils import _SKIMAGE_USES_MAX_SIZE
 from cubic.segmentation.aics_workflows import (
     _gaussian_nearest,
     _hessian_2d_eigen_max,
@@ -206,6 +207,12 @@ def test_diffusion_kernel_handles_non_contiguous_input(gpu_available: bool) -> N
     np.testing.assert_array_equal(asnumpy(gpu), cpu)
 
 
+def test_vesselness_rejects_too_narrow_image() -> None:
+    """The reference zeroes the last three columns, so it needs more than three."""
+    with pytest.raises(ValueError, match="wider than 3"):
+        vesselness_slice_by_slice(np.ones((2, 8, 3), dtype=np.float32), [1.0])
+
+
 def test_diffusion_matches_itk() -> None:
     """Bitwise agreement with ``itk.GradientAnisotropicDiffusionImageFilter``."""
     itk = pytest.importorskip("itk")
@@ -235,23 +242,19 @@ def test_workflow_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    ("workflow", "reference_name"),
+    ("workflow", "module_name", "func_name"),
     [
-        (workflow_sec61b, "seg_sec61b.Workflow_sec61b"),
-        (workflow_tomm20, "seg_tomm20.Workflow_tomm20"),
+        (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
+        (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
     ],
 )
-def test_workflow_matches_aicssegmentation(workflow, reference_name: str) -> None:
+def test_workflow_matches_aicssegmentation(
+    workflow, module_name: str, func_name: str
+) -> None:
     """Masks equal ``aicssegmentation``'s under the installed scikit-image."""
     pytest.importorskip("itk")
-    wrapper = pytest.importorskip("aicssegmentation.structure_wrapper")
-    module_name, func_name = reference_name.split(".")
-    module = getattr(__import__(wrapper.__name__, fromlist=[module_name]), module_name)
+    module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
     img = _filaments((6, 48, 64), seed=5)
     expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
-    import skimage
-
-    inclusive = tuple(int(v) for v in skimage.__version__.split(".")[:2]) >= (0, 26)
-    np.testing.assert_array_equal(
-        workflow(img, size_filter_inclusive=inclusive), expected
-    )
+    out = workflow(img, size_filter_inclusive=_SKIMAGE_USES_MAX_SIZE)
+    np.testing.assert_array_equal(out, expected)
