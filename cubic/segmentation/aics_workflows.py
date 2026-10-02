@@ -18,6 +18,10 @@ float32 ``np.power`` in its vesselness rounds differently, which moves 1-3
 voxels per volume. The CPU path calls the same ``np.power``, so it follows the
 host. The GPU kernel always reproduces glibc's ``powf``, so it matches the
 AVX2 result.
+
+The match is measured, not guaranteed for every input. The diffusion's
+conductance ``K`` replays ITK's serial summation only near a float32 rounding
+midpoint (see ``_K_SERIAL_MARGIN``).
 """
 
 import functools
@@ -33,7 +37,14 @@ from .segment_utils import _SKIMAGE_USES_MAX_SIZE
 
 # Relative distance from a float32 rounding midpoint below which ITK's serially
 # accumulated K could round differently from a pairwise sum. The two sums were
-# measured 1.3e-11 to 1.5e-11 apart on 48x640x960 volumes.
+# measured 1.3e-11 to 1.5e-11 apart on 48x640x960 volumes, so this margin is a
+# measured heuristic with ~70x headroom, not a bound. The worst-case error of a
+# serial float64 sum of n terms is (n - 1) * 2**-53 relative: about 1e-8 for
+# such a volume's 3 x 48 x 640 x 960 squared derivatives. An interval that wide
+# holds a float32 midpoint for a sixth to a third of all K values. Replaying
+# those would mean 2-3 host replays of 1-3 s each per 10-iteration volume,
+# against 0.37 s for the whole GPU workflow. An input whose serial sum drifts
+# past the margin can therefore round K differently from ITK.
 _K_SERIAL_MARGIN = 1e-9
 
 
