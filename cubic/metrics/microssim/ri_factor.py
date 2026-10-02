@@ -17,6 +17,7 @@ window ``1e-6 <= alpha <= 1e6`` (both bounds configurable via the
 
 from __future__ import annotations
 
+import functools
 import dataclasses
 from typing import Any
 from operator import itemgetter
@@ -24,6 +25,7 @@ from collections.abc import Callable, Iterator
 
 import numpy as np
 
+from ...cuda import CUDAManager, get_device
 from .ssim_elements import SSIMElements, compute_ssim_elements
 
 # Bracket and bisection tunables. The bracket caps mirror upstream
@@ -125,6 +127,85 @@ def _iter_chunks(elements: SSIMElements) -> Iterator[SSIMElements]:
         yield _map_arrays(elements, itemgetter(slice(start, start + step)))
 
 
+# Per-pixel S and dS/dalpha, one fused pass on the GPU. Each line is one NumPy
+# operation of :func:`_terms` / :func:`_dS_map` in the same order and dtype, and
+# ``--fmad=false`` keeps every product separately rounded, so the per-pixel values
+# equal the array path's; only the float64 summation order differs.
+_OBJECTIVE_PREAMBLE = r"""
+template <typename T>
+__device__ void ri_terms(T ux, T uy, T vxy, T vx, T vy, T two_a, T a_sq, T c1, T c2,
+                         T& A1, T& A2, T& B1, T& B2) {
+  A1 = two_a * ux * uy + c1;
+  A2 = two_a * vxy + c2;
+  B1 = ux * ux + a_sq * uy * uy + c1;
+  B2 = vx + a_sq * vy + c2;
+}
+
+template <typename T>
+__device__ T ri_s(T ux, T uy, T vxy, T vx, T vy, T two_a, T a_sq, T c1, T c2) {
+  T A1, A2, B1, B2;
+  ri_terms(ux, uy, vxy, vx, vy, two_a, a_sq, c1, c2, A1, A2, B1, B2);
+  return (A1 * A2) / (B1 * B2);
+}
+
+template <typename T>
+__device__ T ri_ds(T ux, T uy, T vxy, T vx, T vy, T two_a, T a_sq, T c1, T c2) {
+  T A1, A2, B1, B2;
+  ri_terms(ux, uy, vxy, vx, vy, two_a, a_sq, c1, c2, A1, A2, B1, B2);
+  T dA1 = (T)2.0 * ux * uy;
+  T dA2 = (T)2.0 * vxy;
+  T dB1 = two_a * uy * uy;
+  T dB2 = two_a * vy;
+  T N = A1 * A2;
+  T D = B1 * B2;
+  T dN = dA1 * A2 + A1 * dA2;
+  T dD = dB1 * B2 + B1 * dB2;
+  return (dN * D - N * dD) / (D * D);
+}
+"""
+
+
+@functools.cache
+def _objective_kernel(name: str) -> Any:
+    """CuPy reduction of ``ri_s`` or ``ri_ds`` summed in float64."""
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        raise RuntimeError("CuPy is required for the fused GPU objective.")
+    return cp.ReductionKernel(
+        "T ux, T uy, T vxy, T vx, T vy, T two_a, T a_sq, T c1, T c2",
+        "float64 total",
+        f"(double){name}(ux, uy, vxy, vx, vy, two_a, a_sq, c1, c2)",
+        "a + b",
+        "total = a",
+        "0",
+        f"microssim_{name}_sum",
+        preamble=_OBJECTIVE_PREAMBLE,
+        options=("--fmad=false",),
+    )
+
+
+def _fused_mean(name: str, alpha: float, elements: SSIMElements) -> float:
+    """GPU form of :func:`_chunked_mean` for :func:`_S_map` / :func:`_dS_map`.
+
+    The scalars are cast to the element dtype as NumPy casts a Python float
+    against a float32 array, after the same Python-float products.
+    """
+    dtype = elements.ux.dtype.type
+    scalars = (
+        dtype(2.0 * alpha),
+        dtype(alpha * alpha),
+        dtype(elements.C1),
+        dtype(elements.C2),
+    )
+    # Reduce each leading-axis row in its own block, then sum the rows: a
+    # reduction to one scalar runs on a single block and was ~1.6x slower than
+    # the array path on 576 slices of 634x954 (MEASURED, A40).
+    rows = elements.ux.shape[0] if elements.ux.ndim > 1 else 1
+    arrays = [getattr(elements, f).reshape(rows, -1) for f in _ELEMENT_FIELDS]
+    totals = _objective_kernel(name)(*arrays, *scalars, axis=1)
+    return float(totals.sum()) / elements.ux.size
+
+
 def _chunked_mean(
     fn: Callable[[float, SSIMElements], np.ndarray],
     alpha: float,
@@ -135,8 +216,17 @@ def _chunked_mean(
     Chunk sums accumulate in float64 on the elements' device, so each call
     synchronizes with the host once rather than once per chunk. The chunk is
     upcast before reducing: CuPy's ``sum(dtype=float64)`` on float32 input
-    measured ~13x slower than ``astype(float64).sum()``.
+    measured ~13x slower than ``astype(float64).sum()``. Float32/float64
+    elements on the GPU skip the temporaries altogether: one fused reduction
+    reads each element array once per call.
     """
+    if (
+        elements.ux.ndim > 0
+        and get_device(elements.ux) == "GPU"
+        and elements.ux.dtype in (np.float32, np.float64)
+        and fn in _FUSED_NAMES
+    ):
+        return _fused_mean(_FUSED_NAMES[fn], alpha, elements)
     total = sum(
         fn(alpha, chunk).astype(np.float64, copy=False).sum()
         for chunk in _iter_chunks(elements)
@@ -165,6 +255,13 @@ def _dS_map(alpha: float, elements: SSIMElements) -> np.ndarray:
     dD = dB1 * B2 + B1 * dB2
 
     return (dN * D - N * dD) / (D * D)
+
+
+# Maps with a fused GPU reduction (see :func:`_chunked_mean`).
+_FUSED_NAMES: dict[Callable[[float, SSIMElements], np.ndarray], str] = {
+    _S_map: "ri_s",
+    _dS_map: "ri_ds",
+}
 
 
 def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:

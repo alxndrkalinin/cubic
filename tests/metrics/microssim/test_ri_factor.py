@@ -794,3 +794,52 @@ def test_ri_factor_gpu_single_large_slice_is_chunked(
     alpha, peak = _gpu_peak_above_base(lambda: get_ri_factor(pooled))
     assert np.isfinite(alpha)
     assert peak / (pooled.ux.size * 4) < 3
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_fused_gpu_objective_matches_array_maps(
+    monkeypatch, dtype: type, gpu_available: bool
+) -> None:
+    """The fused GPU reduction sums the array path's per-pixel maps.
+
+    Its kernel repeats the NumPy operation order with FMA contraction off, so
+    only the float64 summation order differs from summing the CuPy maps.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(54)
+    gt = rng.random((5, 64, 72)).astype(dtype)
+    pred = (0.8 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(dtype)
+    e = compute_ssim_elements(
+        ascupy(gt), ascupy(pred), data_range=float(gt.max() - gt.min())
+    )
+    assert e.ux.dtype == dtype
+    fused = ri._fused_mean
+    calls: list[str] = []
+    monkeypatch.setattr(
+        ri, "_fused_mean", lambda name, *args: calls.append(name) or fused(name, *args)
+    )
+    for name, layout in _chunk_layouts(e).items():
+        for alpha in (0.5, 1.0, 1.7):
+            want_S = float(ri._S_map(alpha, layout).astype(np.float64).mean())
+            want_dS = float(ri._dS_map(alpha, layout).astype(np.float64).mean())
+            assert _compute_S_mean(alpha, layout) == pytest.approx(want_S, rel=1e-13), (
+                name
+            )
+            assert _compute_dS_mean(alpha, layout) == pytest.approx(
+                want_dS, rel=1e-11, abs=1e-15
+            ), name
+    assert calls.count("ri_s") == calls.count("ri_ds") == 9
+
+
+def test_global_ri_factor_gpu_matches_cpu(gpu_available: bool) -> None:
+    """The fused GPU fit lands on the CPU alpha within the bisection tolerance."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(55)
+    gt = rng.random((6, 96, 80), dtype=np.float32)
+    pred = (1.6 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    cpu = get_global_ri_factor(gt, pred)
+    gpu = get_global_ri_factor(ascupy(gt), ascupy(pred))
+    assert cpu != pytest.approx(1.0, abs=0.05)
+    assert gpu == pytest.approx(cpu, abs=2 * ri._X_TOL)
