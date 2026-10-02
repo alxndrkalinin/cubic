@@ -326,6 +326,15 @@ def test_glcm_by_label_matches_per_region_calls(
     assert out["correlation"][3] == 1.0
 
 
+def test_glcm_by_label_rejects_mixed_devices(gpu_available: bool) -> None:
+    """A host label image with a GPU image raises a clear ValueError."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    image, labels = _labeled_volume(2)
+    with pytest.raises(ValueError, match="same device"):
+        glcm_features_by_label(ascupy(image), labels)
+
+
 @pytest.mark.parametrize("use_gpu", [False, True])
 def test_glcm_by_label_sparse_and_negative_ids(
     use_gpu: bool, gpu_available: bool

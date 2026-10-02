@@ -22,7 +22,7 @@ import itertools
 
 import numpy as np
 
-from ..cuda import asnumpy, get_array_module
+from ..cuda import asnumpy, get_array_module, check_same_device
 
 
 def _unit_offsets(ndim: int) -> list[tuple[int, ...]]:
@@ -437,6 +437,7 @@ def glcm_features_by_label(
         contains a non-positive value.
     """
     _validate_glcm_args(image, levels, distances)
+    check_same_device(image, labels)
     if labels.shape != image.shape:
         raise ValueError(
             f"labels shape {labels.shape} must match image shape {image.shape}"
