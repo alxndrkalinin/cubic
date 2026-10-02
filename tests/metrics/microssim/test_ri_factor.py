@@ -213,6 +213,47 @@ def test_bisection_terminates_quickly() -> None:
     assert iters < 100, f"bisection took {iters} iterations"
 
 
+def test_bisection_stops_at_its_fixed_point(monkeypatch) -> None:
+    """float32 elements: same alpha as running to the cap, far fewer evaluations.
+
+    |f| stays above ``_F_TOL`` on float32 maps, so the loop without the
+    fixed-point exit spun to ``_MAX_BISECT_ITERS``; the replay below checks
+    that this input is such a case.
+    """
+    from cubic.metrics.microssim.ri_factor import _bracket_root  # local
+
+    rng = np.random.default_rng(56)
+    gt = rng.random((6, 64, 64), dtype=np.float32)
+    pred = (1.6 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(gt, pred, data_range=float(gt.max() - gt.min()))
+    assert e.ux.dtype == np.float32
+
+    # The loop as it was, run to the iteration cap.
+    lo, hi, f_lo = _bracket_root(e, _compute_dS_mean(1.0, e), 1e-6, 1e6)
+    mid = 0.5 * (lo + hi)
+    f_mid = _compute_dS_mean(mid, e)
+    converged = False
+    for _ in range(ri._MAX_BISECT_ITERS):
+        if abs(f_mid) < ri._F_TOL and abs(hi - lo) < ri._X_TOL:
+            converged = True
+            break
+        if (f_lo > 0.0) != (f_mid > 0.0):
+            hi = mid
+        else:
+            lo, f_lo = mid, f_mid
+        mid = 0.5 * (lo + hi)
+        f_mid = _compute_dS_mean(mid, e)
+    assert not converged
+
+    evals = []
+    inner = ri._compute_dS_mean
+    monkeypatch.setattr(
+        ri, "_compute_dS_mean", lambda a, el: evals.append(a) or inner(a, el)
+    )
+    assert get_ri_factor(e) == mid
+    assert len(evals) < 100
+
+
 # -- get_global_ri_factor ---------------------------------------------------
 
 

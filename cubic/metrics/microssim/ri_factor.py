@@ -493,7 +493,14 @@ def get_ri_factor(
             hi = mid
         else:
             lo, f_lo = mid, f_mid
-        mid = 0.5 * (lo + hi)
+        next_mid = 0.5 * (lo + hi)
+        if next_mid == mid:
+            # lo and hi are adjacent floats: every further iteration repeats
+            # this state, so stop with the same alpha. float32 elements leave
+            # |f| above _F_TOL here, and the loop used to run to
+            # _MAX_BISECT_ITERS (204 evaluations on 576 640x960 slices).
+            break
+        mid = next_mid
         f_mid = _compute_dS_mean(mid, elements)
 
     alpha_star = float(mid)
