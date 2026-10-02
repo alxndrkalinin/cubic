@@ -17,7 +17,7 @@ from itertools import combinations_with_replacement
 import numpy as np
 from scipy.ndimage import generate_binary_structure
 
-from ..cuda import asnumpy, get_device, get_array_module
+from ..cuda import CUDAManager, asnumpy, get_device, get_array_module
 from ..scipy import ndimage as _ndimage
 
 
@@ -114,20 +114,20 @@ def gradient_anisotropic_diffusion(
     scale = [1.0] * ndim if spacing is None else [1.0 / float(s) for s in spacing]
     if len(scale) != ndim:
         raise ValueError(f"spacing has {len(scale)} entries for a {ndim}D image")
-    u = image.astype(np.float32, copy=True)
+    u = image.astype(np.float32, order="C", copy=True)
     use_kernel = ndim == 3 and get_device(u) == "GPU"
     step = _diffusion_step_cuda if use_kernel else _diffusion_step_xp
     for _ in range(n_iter):
-        delta = step(u, scale, conductance)
-        if delta is not None:
-            u += (time_step * delta.astype(np.float64)).astype(np.float32)
+        # K == 0 leaves u unchanged, so every later iteration is a no-op too.
+        if not step(u, scale, conductance, time_step):
+            break
     return u
 
 
 def _diffusion_step_xp(
-    u: np.ndarray, scale: list[float], conductance: float
-) -> np.ndarray | None:
-    """One ITK diffusion update ``delta`` (float32), or ``None`` when ``K == 0``.
+    u: np.ndarray, scale: list[float], conductance: float, time_step: float
+) -> bool:
+    """Apply one ITK diffusion iteration to ``u`` in place; ``False`` if ``K == 0``.
 
     Array-operation form of ``GradientNDAnisotropicDiffusionFunction``: works
     on NumPy and CuPy arrays of any dimensionality.
@@ -157,7 +157,7 @@ def _diffusion_step_xp(
     k = _conductance_k(grad_sq, conductance)
     if k == 0.0:
         # ITK sets both conductances to zero, so the update vanishes.
-        return None
+        return False
     delta = np.zeros(center.shape, dtype=np.float64)
     for i in axes:
         forward = sub(shifted({i: 1}), center) * scale[i]
@@ -174,7 +174,9 @@ def _diffusion_step_xp(
         forward = forward * np.exp((forward * forward + accum) / k)
         backward = backward * np.exp((backward * backward + accum_d) / k)
         delta += forward - backward
-    return delta.astype(np.float32)
+    # ITK ApplyUpdate: u += float(dt * double(float(delta))).
+    u += (time_step * delta.astype(np.float32).astype(np.float64)).astype(np.float32)
+    return True
 
 
 def _conductance_k(grad_sq: np.ndarray, conductance: float) -> float:
@@ -186,16 +188,15 @@ def _conductance_k(grad_sq: np.ndarray, conductance: float) -> float:
     return float(np.float32(k))
 
 
+# Each face flux F_i(c) = fwd * exp((fwd^2 + accum) / K) through (c, c + e_i) is
+# computed once. In ITK's per-voxel ComputeUpdate, voxel c's backward term along i
+# repeats c - e_i's forward term on the same float32 operands (the cross-derivative
+# sum differs only by the commutative order of one addition), and it is exactly
+# +0.0 on the lower border. So delta(c) = sum_i [F_i(c) - F_i(c - e_i)] is bitwise
+# ITK's update at half the float64 exp/div work.
 _DIFFUSION_CUDA_SOURCE = r"""
-// Clamped (zero-flux Neumann) read of u at (z, y, x) + offset.
-__device__ __forceinline__ float at(
-    const float* u, long z, long y, long x, const int* o,
-    long nz, long ny, long nx) {
-  z += o[0]; y += o[1]; x += o[2];
-  z = z < 0 ? 0 : (z >= nz ? nz - 1 : z);
-  y = y < 0 ? 0 : (y >= ny ? ny - 1 : y);
-  x = x < 0 ? 0 : (x >= nx ? nx - 1 : x);
-  return u[(z * ny + y) * nx + x];
+__device__ __forceinline__ long clamp(long v, long n) {
+  return v < 0 ? 0 : (v >= n ? n - 1 : v);
 }
 
 // ITK subtracts float pixels in float, then widens the result to double.
@@ -203,76 +204,75 @@ __device__ __forceinline__ double sub(float a, float b) {
   return (double)(a - b);
 }
 
-// Offsets (dz, dy, dx) of a unit step along ITK dimension d (0=x, 1=y, 2=z),
-// optionally combined with a step along dimension e.
-__device__ __forceinline__ void step(int* o, int d, int sd, int e, int se) {
-  o[0] = 0; o[1] = 0; o[2] = 0;
-  o[2 - d] += sd;
-  if (e >= 0) o[2 - e] += se;
+// Linear index of the clamped (zero-flux Neumann) neighbour c + s * e_d along
+// ITK dimension d (0=x, 1=y, 2=z).
+__device__ __forceinline__ long neighbour(
+    long z, long y, long x, int d, int s, long nz, long ny, long nx) {
+  if (d == 0) x = clamp(x + s, nx);
+  if (d == 1) y = clamp(y + s, ny);
+  if (d == 2) z = clamp(z + s, nz);
+  return (z * ny + y) * nx + x;
 }
 
-extern "C" __global__ void gad_grad_sq(
-    const float* u, double* out, long nz, long ny, long nx,
+// D[j] = central derivative along ITK dimension j; g = |grad u|^2 in ITK order.
+extern "C" __global__ void gad_gradient(
+    const float* u, double* D, double* g, long nz, long ny, long nx,
     double s0, double s1, double s2) {
   const double sc[3] = {s0, s1, s2};
   long n = nz * ny * nx;
   for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
        idx += (long)blockDim.x * gridDim.x) {
     long x = idx % nx, y = (idx / nx) % ny, z = idx / (nx * ny);
-    int op[3], om[3];
     double acc = 0.0;
-    for (int i = 0; i < 3; ++i) {
-      step(op, i, 1, -1, 0); step(om, i, -1, -1, 0);
-      double v = sub(at(u, z, y, x, op, nz, ny, nx), at(u, z, y, x, om, nz, ny, nx)) / 2.0;
-      v *= sc[i];
+    for (int j = 0; j < 3; ++j) {
+      double v = sub(u[neighbour(z, y, x, j, 1, nz, ny, nx)],
+                     u[neighbour(z, y, x, j, -1, nz, ny, nx)]) / 2.0;
+      v *= sc[j];
+      D[j * n + idx] = v;
       acc += v * v;
     }
-    out[idx] = acc;
+    g[idx] = acc;
   }
 }
 
-// GradientNDAnisotropicDiffusionFunction::ComputeUpdate for one voxel.
-extern "C" __global__ void gad_update(
-    const float* u, float* out, long nz, long ny, long nx, double k,
-    double s0, double s1, double s2) {
+// F[i] = flux through the face (c, c + e_i).
+extern "C" __global__ void gad_flux(
+    const float* u, const double* D, double* F, long nz, long ny, long nx,
+    double k, double s0, double s1, double s2) {
   const double sc[3] = {s0, s1, s2};
-  const int zero[3] = {0, 0, 0};
   long n = nz * ny * nx;
   for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
        idx += (long)blockDim.x * gridDim.x) {
     long x = idx % nx, y = (idx / nx) % ny, z = idx / (nx * ny);
-    int a[3], b[3];
-    float c = at(u, z, y, x, zero, nz, ny, nx);
-    double dx[3];
     for (int i = 0; i < 3; ++i) {
-      step(a, i, 1, -1, 0); step(b, i, -1, -1, 0);
-      dx[i] = sub(at(u, z, y, x, a, nz, ny, nx), at(u, z, y, x, b, nz, ny, nx)) / 2.0;
-      dx[i] *= sc[i];
-    }
-    double delta = 0.0;
-    for (int i = 0; i < 3; ++i) {
-      step(a, i, 1, -1, 0); step(b, i, -1, -1, 0);
-      double fwd = sub(at(u, z, y, x, a, nz, ny, nx), c);
+      long nb = neighbour(z, y, x, i, 1, nz, ny, nx);
+      double fwd = sub(u[nb], u[idx]);
       fwd *= sc[i];
-      double bwd = sub(c, at(u, z, y, x, b, nz, ny, nx));
-      bwd *= sc[i];
-      double accum = 0.0, accum_d = 0.0;
+      double accum = 0.0;
       for (int j = 0; j < 3; ++j) {
         if (j == i) continue;
-        step(a, i, 1, j, 1); step(b, i, 1, j, -1);
-        double aug = sub(at(u, z, y, x, a, nz, ny, nx), at(u, z, y, x, b, nz, ny, nx)) / 2.0;
-        aug *= sc[j];
-        step(a, i, -1, j, 1); step(b, i, -1, j, -1);
-        double dim = sub(at(u, z, y, x, a, nz, ny, nx), at(u, z, y, x, b, nz, ny, nx)) / 2.0;
-        dim *= sc[j];
-        accum += 0.25 * ((dx[j] + aug) * (dx[j] + aug));
-        accum_d += 0.25 * ((dx[j] + dim) * (dx[j] + dim));
+        double t = D[j * n + idx] + D[j * n + nb];
+        accum += 0.25 * (t * t);
       }
-      fwd = fwd * exp((fwd * fwd + accum) / k);
-      bwd = bwd * exp((bwd * bwd + accum_d) / k);
-      delta += fwd - bwd;
+      F[i * n + idx] = fwd * exp((fwd * fwd + accum) / k);
     }
-    out[idx] = (float)delta;
+  }
+}
+
+// delta = sum_i [F_i(c) - F_i(c - e_i)], then ITK's ApplyUpdate in place.
+extern "C" __global__ void gad_apply(
+    const double* F, float* u, long nz, long ny, long nx, double dt) {
+  long n = nz * ny * nx;
+  const long stride[3] = {1, nx, nx * ny};
+  for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += (long)blockDim.x * gridDim.x) {
+    const long coord[3] = {idx % nx, (idx / nx) % ny, idx / (nx * ny)};
+    double delta = 0.0;
+    for (int i = 0; i < 3; ++i) {
+      double back = coord[i] > 0 ? F[i * n + idx - stride[i]] : 0.0;
+      delta += F[i * n + idx] - back;
+    }
+    u[idx] = u[idx] + (float)(dt * (double)(float)delta);
   }
 }
 """
@@ -280,38 +280,40 @@ extern "C" __global__ void gad_update(
 
 @functools.cache
 def _diffusion_kernels():
-    """Compile the fused diffusion kernels once per process.
+    """Compile the diffusion kernels once per process.
 
     ``--fmad=false`` keeps each multiply and add separately rounded, as in ITK's
     scalar C++ loop.
     """
-    import cupy as cp
-
+    cp = CUDAManager().get_cp()
     module = cp.RawModule(code=_DIFFUSION_CUDA_SOURCE, options=("--fmad=false",))
-    return module.get_function("gad_grad_sq"), module.get_function("gad_update")
+    names = ("gad_gradient", "gad_flux", "gad_apply")
+    return tuple(module.get_function(name) for name in names)
 
 
 def _diffusion_step_cuda(
-    u: np.ndarray, scale: list[float], conductance: float
-) -> np.ndarray | None:
-    """Fused-kernel equivalent of :func:`_diffusion_step_xp` for 3D CuPy arrays."""
+    u: np.ndarray, scale: list[float], conductance: float, time_step: float
+) -> bool:
+    """Kernel form of :func:`_diffusion_step_xp` for C-contiguous 3D CuPy arrays."""
     xp = get_array_module(u)
-    grad_sq_kernel, update_kernel = _diffusion_kernels()
-    u = xp.ascontiguousarray(u)
+    gradient_kernel, flux_kernel, apply_kernel = _diffusion_kernels()
     nz, ny, nx = (np.int64(n) for n in u.shape)
     # ITK dimension order (x, y, z) = array axes reversed.
     sx, sy, sz = (np.float64(scale[axis]) for axis in (2, 1, 0))
     threads = 256
-    blocks = (min(int(u.size + threads - 1) // threads, 65535 * 8),)
+    launch = ((min(int(u.size + threads - 1) // threads, 65535 * 8),), (threads,))
+    derivatives = xp.empty((3, *u.shape), dtype=np.float64)
     grad_sq = xp.empty(u.shape, dtype=np.float64)
-    grad_sq_kernel(blocks, (threads,), (u, grad_sq, nz, ny, nx, sx, sy, sz))
+    gradient_kernel(*launch, (u, derivatives, grad_sq, nz, ny, nx, sx, sy, sz))
     k = _conductance_k(grad_sq, conductance)
     del grad_sq
     if k == 0.0:
-        return None
-    delta = xp.empty(u.shape, dtype=np.float32)
-    update_kernel(blocks, (threads,), (u, delta, nz, ny, nx, np.float64(k), sx, sy, sz))
-    return delta
+        return False
+    flux = xp.empty((3, *u.shape), dtype=np.float64)
+    flux_kernel(*launch, (u, derivatives, flux, nz, ny, nx, np.float64(k), sx, sy, sz))
+    del derivatives
+    apply_kernel(*launch, (flux, u, nz, ny, nx, np.float64(time_step)))
+    return True
 
 
 def _gaussian_nearest(image: np.ndarray, sigmas: list[float]) -> np.ndarray:

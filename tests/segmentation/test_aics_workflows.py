@@ -195,6 +195,17 @@ def test_diffusion_kernel_matches_array_path(gpu_available: bool) -> None:
     np.testing.assert_array_equal(asnumpy(gpu), cpu)
 
 
+def test_diffusion_kernel_handles_non_contiguous_input(gpu_available: bool) -> None:
+    """A strided view is copied to C order before the kernel indexes it."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    img = intensity_normalization(_filaments((40, 24, 6)), (2.5, 7.5))
+    view = img.transpose(2, 1, 0)
+    cpu = gradient_anisotropic_diffusion(np.ascontiguousarray(view))
+    gpu = gradient_anisotropic_diffusion(ascupy(img).transpose(2, 1, 0))
+    np.testing.assert_array_equal(asnumpy(gpu), cpu)
+
+
 def test_diffusion_matches_itk() -> None:
     """Bitwise agreement with ``itk.GradientAnisotropicDiffusionImageFilter``."""
     itk = pytest.importorskip("itk")
