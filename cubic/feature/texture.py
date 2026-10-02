@@ -428,7 +428,8 @@ def glcm_features_by_label(
     dict of str to np.ndarray
         ``label`` (the sorted non-zero labels present) and one host float64
         array per property, aligned with ``label``. A region without a voxel
-        pair in any direction, where :func:`glcm_features` raises, is NaN.
+        pair in any direction, or with a non-finite voxel, is NaN where
+        :func:`glcm_features` raises. Non-finite background voxels are ignored.
 
     Raises
     ------
@@ -458,6 +459,16 @@ def glcm_features_by_label(
     xp = get_array_module(labels)
     compact = np.searchsorted(present, labels) + 1
     compact[labels == 0] = 0
+    if np.issubdtype(image.dtype, np.floating):
+        # A region with a NaN or inf voxel has no valid quantization: count it
+        # as background, which leaves it without pairs and so NaN. A non-finite
+        # voxel in the background is never read.
+        nonfinite = ~np.isfinite(image)
+        if nonfinite.any():
+            invalid = np.bincount(compact[nonfinite], minlength=n_labels + 1) > 0
+            invalid[0] = False
+            compact[invalid[compact]] = 0
+        del nonfinite
 
     if value_range is None:
         # Per-region (min, max) by scatter, in float64 like glcm_features' Python

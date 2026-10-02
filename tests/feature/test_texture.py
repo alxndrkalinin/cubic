@@ -367,6 +367,34 @@ def test_glcm_by_label_integer_and_bool_images(
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("value_range", [None, (0.0, 1.0)])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_glcm_by_label_nonfinite_region_is_nan(
+    use_gpu: bool, value_range, bad: float, gpu_available: bool
+) -> None:
+    """A region holding a NaN or inf voxel gets a NaN row; the others are intact.
+
+    It used to return the constant-region row on CPU (contrast 0, ASM 1) and
+    raise in ``bincount`` on GPU.
+    """
+    image, labels = _labeled_volume(2)
+    image[5, 10] = bad  # inside label 3
+    assert labels[5, 10] == 3
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels = ascupy(image), ascupy(labels)
+    kwargs = {"levels": 16, "value_range": value_range}
+    out = glcm_features_by_label(image, labels, **kwargs)
+    np.testing.assert_array_equal(out["label"], [3, 7, 12, 20, 31])
+    assert all(np.isnan(out[p][0]) for p in _EXPECTED_PROPS)
+    for k, lab in enumerate(out["label"][1:4], start=1):
+        ref = glcm_features(image, mask=labels == int(lab), **kwargs)
+        for prop in _EXPECTED_PROPS:
+            assert out[prop][k] == pytest.approx(ref[prop], rel=1e-12, abs=1e-12)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
 def test_glcm_by_label_background_nan_leaves_regions_intact(
     use_gpu: bool, gpu_available: bool
 ) -> None:
