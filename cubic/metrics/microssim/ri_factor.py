@@ -199,11 +199,21 @@ def _fused_mean(name: str, alpha: float, elements: SSIMElements) -> float:
     )
     # Reduce each leading-axis row in its own block, then sum the rows: a
     # reduction to one scalar runs on a single block and was ~1.6x slower than
-    # the array path on 576 slices of 634x954 (MEASURED, A40).
-    rows = elements.ux.shape[0] if elements.ux.ndim > 1 else 1
-    arrays = [getattr(elements, f).reshape(rows, -1) for f in _ELEMENT_FIELDS]
-    totals = _objective_kernel(name)(*arrays, *scalars, axis=1)
+    # the array path on 576 slices of 634x954 (MEASURED, A40). Reducing over
+    # the trailing axes reads strided (cropped) element views without a copy.
+    arrays = [getattr(elements, f) for f in _ELEMENT_FIELDS]
+    axis = tuple(range(1, elements.ux.ndim)) or None
+    totals = _objective_kernel(name)(*arrays, *scalars, axis=axis)
     return float(totals.sum()) / elements.ux.size
+
+
+def _fused_eligible(elements: SSIMElements) -> bool:
+    """Whether :func:`_fused_mean` handles ``elements`` (float GPU arrays)."""
+    return (
+        elements.ux.ndim > 0
+        and get_device(elements.ux) == "GPU"
+        and elements.ux.dtype in (np.float32, np.float64)
+    )
 
 
 def _chunked_mean(
@@ -216,17 +226,8 @@ def _chunked_mean(
     Chunk sums accumulate in float64 on the elements' device, so each call
     synchronizes with the host once rather than once per chunk. The chunk is
     upcast before reducing: CuPy's ``sum(dtype=float64)`` on float32 input
-    measured ~13x slower than ``astype(float64).sum()``. Float32/float64
-    elements on the GPU skip the temporaries altogether: one fused reduction
-    reads each element array once per call.
+    measured ~13x slower than ``astype(float64).sum()``.
     """
-    if (
-        elements.ux.ndim > 0
-        and get_device(elements.ux) == "GPU"
-        and elements.ux.dtype in (np.float32, np.float64)
-        and fn in _FUSED_NAMES
-    ):
-        return _fused_mean(_FUSED_NAMES[fn], alpha, elements)
     total = sum(
         fn(alpha, chunk).astype(np.float64, copy=False).sum()
         for chunk in _iter_chunks(elements)
@@ -257,13 +258,6 @@ def _dS_map(alpha: float, elements: SSIMElements) -> np.ndarray:
     return (dN * D - N * dD) / (D * D)
 
 
-# Maps with a fused GPU reduction (see :func:`_chunked_mean`).
-_FUSED_NAMES: dict[Callable[[float, SSIMElements], np.ndarray], str] = {
-    _S_map: "ri_s",
-    _dS_map: "ri_ds",
-}
-
-
 def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:
     """Mean per-pixel SSIM at a given ``alpha``.
 
@@ -282,6 +276,8 @@ def _compute_S_mean(alpha: float, elements: SSIMElements) -> float:
     float
         Mean of ``S_n(alpha) = (A1*A2) / (B1*B2)`` over all element pixels.
     """
+    if _fused_eligible(elements):
+        return _fused_mean("ri_s", alpha, elements)
     return _chunked_mean(_S_map, alpha, elements)
 
 
@@ -304,6 +300,8 @@ def _compute_dS_mean(alpha: float, elements: SSIMElements) -> float:
     float
         Mean of ``dS_n/dalpha`` over all element pixels.
     """
+    if _fused_eligible(elements):
+        return _fused_mean("ri_ds", alpha, elements)
     return _chunked_mean(_dS_map, alpha, elements)
 
 
@@ -496,9 +494,8 @@ def get_ri_factor(
         next_mid = 0.5 * (lo + hi)
         if next_mid == mid:
             # lo and hi are adjacent floats: every further iteration repeats
-            # this state, so stop with the same alpha. float32 elements leave
-            # |f| above _F_TOL here, and the loop used to run to
-            # _MAX_BISECT_ITERS (204 evaluations on 576 640x960 slices).
+            # this state, so stop with the same alpha (float32 elements never
+            # bring |f| below _F_TOL).
             break
         mid = next_mid
         f_mid = _compute_dS_mean(mid, elements)
