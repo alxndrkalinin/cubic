@@ -7,11 +7,11 @@ vesselness filter; here every step is a whole-volume array operation, so the
 same call runs on NumPy or CuPy input.
 
 Each primitive reproduces its reference's arithmetic, dtype, operation order
-and boundary handling (see the per-function notes), so the masks are bitwise
-equal to ``aicssegmentation`` run on the same inputs. The reference itself is
-not bitwise across CPUs: ``np.power`` in its vesselness rounds differently on
-AVX-512 hosts, which moves 1-3 voxels per volume; these ports follow the AVX2
-result on both devices.
+and boundary handling (see the per-function notes), so for float32 input the
+masks are bitwise equal to ``aicssegmentation`` run on an x86-64 host whose
+glibc selects the FMA ``powf`` (any AVX2 + FMA CPU). The reference itself is
+not bitwise across CPUs: on AVX-512 hosts NumPy's ``np.power`` in its
+vesselness rounds differently, which moves 1-3 voxels per volume.
 """
 
 import functools
@@ -469,12 +469,120 @@ def _hessian_2d_eigen_max(image: np.ndarray, sigma: float) -> np.ndarray:
     return np.where(np.abs(low) > np.abs(high), low, high)
 
 
+_RESPONSE_CUDA_SOURCE = r"""
+// glibc 2.28 powf(x, 3.0f) for finite x >= 0: sysdeps/ieee754/flt-32/e_powf.c with
+// its log2/exp2 tables, as built into the x86-64 FMA ifunc variant (__powf_fma,
+// -mfma: every single-use a*b+c contracted). NumPy's float32 power calls it on
+// AVX2 hosts, and CUDA's powf rounds differently in ~6% of real inputs.
+__constant__ double POWF_INVC[16] = {
+  0x1.661ec79f8f3bep+0, 0x1.571ed4aaf883dp+0, 0x1.49539f0f010bp+0, 0x1.3c995b0b80385p+0,
+  0x1.30d190c8864a5p+0, 0x1.25e227b0b8eap+0, 0x1.1bb4a4a1a343fp+0, 0x1.12358f08ae5bap+0,
+  0x1.0953f419900a7p+0, 0x1p+0, 0x1.e608cfd9a47acp-1, 0x1.ca4b31f026aap-1,
+  0x1.b2036576afce6p-1, 0x1.9c2d163a1aa2dp-1, 0x1.886e6037841edp-1, 0x1.767dcf5534862p-1};
+__constant__ double POWF_LOGC[16] = {
+  -0x1.efec65b963019p-2, -0x1.b0b6832d4fca4p-2, -0x1.7418b0a1fb77bp-2, -0x1.39de91a6dcf7bp-2,
+  -0x1.01d9bf3f2b631p-2, -0x1.97c1d1b3b7afp-3, -0x1.2f9e393af3c9fp-3, -0x1.960cbbf788d5cp-4,
+  -0x1.a6f9db6475fcep-5, 0x0p+0, 0x1.338ca9f24f53dp-4, 0x1.476a9543891bap-3,
+  0x1.e840b4ac4e4d2p-3, 0x1.40645f0c6651cp-2, 0x1.88e9c2c1b9ff8p-2, 0x1.ce0a44eb17bccp-2};
+__constant__ double POWF_A[5] = {
+  0x1.27616c9496e0bp-2, -0x1.71969a075c67ap-2, 0x1.ec70a6ca7baddp-2,
+  -0x1.7154748bef6c8p-1, 0x1.71547652ab82bp0};
+__constant__ unsigned long long EXP2F_T[32] = {
+  0x3ff0000000000000ULL, 0x3fefd9b0d3158574ULL, 0x3fefb5586cf9890fULL, 0x3fef9301d0125b51ULL,
+  0x3fef72b83c7d517bULL, 0x3fef54873168b9aaULL, 0x3fef387a6e756238ULL, 0x3fef1e9df51fdee1ULL,
+  0x3fef06fe0a31b715ULL, 0x3feef1a7373aa9cbULL, 0x3feedea64c123422ULL, 0x3feece086061892dULL,
+  0x3feebfdad5362a27ULL, 0x3feeb42b569d4f82ULL, 0x3feeab07dd485429ULL, 0x3feea47eb03a5585ULL,
+  0x3feea09e667f3bcdULL, 0x3fee9f75e8ec5f74ULL, 0x3feea11473eb0187ULL, 0x3feea589994cce13ULL,
+  0x3feeace5422aa0dbULL, 0x3feeb737b0cdc5e5ULL, 0x3feec49182a3f090ULL, 0x3feed503b23e255dULL,
+  0x3feee89f995ad3adULL, 0x3feeff76f2fb5e47ULL, 0x3fef199bdd85529cULL, 0x3fef3720dcef9069ULL,
+  0x3fef5818dcfba487ULL, 0x3fef7c97337b9b5fULL, 0x3fefa4afa2a490daULL, 0x3fefd0765b6e4540ULL};
+__constant__ double EXP2F_C[3] = {
+  0x1.c6af84b912394p-5, 0x1.ebfce50fac4f3p-3, 0x1.62e42ff0c52d6p-1};
+
+__device__ float glibc_powf3(float x) {
+  unsigned int ix = __float_as_uint(x);
+  if (ix - 0x00800000u >= 0x7f800000u - 0x00800000u) {
+    if (2u * ix == 0u) return x * x;
+    if (ix < 0x00800000u) {  // normalize subnormal x
+      ix = __float_as_uint(x * 0x1p23f) & 0x7fffffffu;
+      ix -= 23u << 23;
+    }
+  }
+  // log2_inline
+  unsigned int tmp = ix - 0x3f330000u;
+  int i = (tmp >> 19) % 16;
+  unsigned int top = tmp & 0xff800000u;
+  unsigned int iz = ix - top;
+  int k = (int)top >> 23;
+  double z = (double)__uint_as_float(iz);
+  double r = fma(z, POWF_INVC[i], -1.0);
+  double y0 = POWF_LOGC[i] + (double)k;
+  double r2 = r * r;
+  double y = fma(POWF_A[0], r, POWF_A[1]);
+  double p = fma(POWF_A[2], r, POWF_A[3]);
+  double r4 = r2 * r2;
+  double q = fma(POWF_A[4], r, y0);
+  q = fma(p, r2, q);
+  y = fma(y, r4, q);
+  double ylogx = 3.0 * y;
+  unsigned long long bits = (unsigned long long)__double_as_longlong(ylogx);
+  unsigned long long limit = (unsigned long long)__double_as_longlong(126.0);
+  if (((bits >> 47) & 0xffffULL) >= (limit >> 47)) {
+    if (ylogx > 0x1.fffffffd1d571p+6) return __int_as_float(0x7f800000);
+    if (ylogx <= -150.0) return 0.0f;
+  }
+  // exp2_inline (TOINT_INTRINSICS == 0)
+  const double shift = 0x1.8p+52 / 32;
+  double kd = ylogx + shift;
+  unsigned long long ki = (unsigned long long)__double_as_longlong(kd);
+  kd -= shift;
+  double rr = ylogx - kd;
+  unsigned long long t = EXP2F_T[ki % 32] + (ki << 47);
+  double s = __longlong_as_double((long long)t);
+  double zz = fma(EXP2F_C[0], rr, EXP2F_C[1]);
+  double rr2 = rr * rr;
+  double yy = fma(EXP2F_C[2], rr, 1.0);
+  yy = fma(zz, rr2, yy);
+  yy = yy * s;
+  return (float)yy;
+}
+
+// aicssegmentation.core.vessel.compute_vesselness2D (tau = 1) on (nz, ny, nx_out)
+// columns of an (nz, ny, nx_in) eigenvalue stack with per-plane minima.
+extern "C" __global__ void vesselness_response(
+    const float* eigen, const float* plane_min, float* out,
+    long nz, long ny, long nx_in, long nx_out) {
+  long n = nz * ny * nx_out;
+  for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += (long)blockDim.x * gridDim.x) {
+    long x = idx % nx_out, y = (idx / nx_out) % ny, z = idx / (nx_out * ny);
+    float e = eigen[(z * ny + y) * nx_in + x];
+    float m = plane_min[z];
+    float lambda3 = (e < 0.0f && e >= m) ? m : e;
+    float diff = fabsf(lambda3 - e);
+    float numerator = 27.0f * ((e * e) * diff);
+    float denominator = glibc_powf3(2.0f * fabsf(e) + diff);
+    if (denominator == 0.0f) denominator = 1e-10f;
+    float response = numerator / denominator;
+    if (e < 0.5f * lambda3) response = 1.0f;
+    if (e >= 0.0f) response = 0.0f;
+    if (isinf(response)) response = 0.0f;
+    out[idx] = response;
+  }
+}
+"""
+
+
 def _vesselness_2d_response(eigen: np.ndarray, width: int) -> np.ndarray:
     """Jerman 2D filament response (tau = 1) over the first ``width`` columns.
 
     The minimum eigenvalue is taken over each whole plane, as in the reference;
-    the response is elementwise, so only the kept columns are computed.
+    the response is elementwise, so only the kept columns are computed. On GPU
+    one kernel evaluates it with glibc's ``powf`` algorithm, which the NumPy
+    reference calls on x86-64 AVX2 hosts.
     """
+    if get_device(eigen) == "GPU":
+        return _vesselness_2d_response_cuda(eigen, width)
     plane_min = eigen.min(axis=(eigen.ndim - 2, eigen.ndim - 1), keepdims=True)
     eigen = eigen[..., :width]
     lambda3 = np.where((eigen < 0) & (eigen >= plane_min), plane_min, eigen)
@@ -486,6 +594,34 @@ def _vesselness_2d_response(eigen: np.ndarray, width: int) -> np.ndarray:
     response = np.where(eigen < 0.5 * lambda3, eigen.dtype.type(1), response)
     response = np.where(eigen >= 0, eigen.dtype.type(0), response)
     return np.where(np.isinf(response), eigen.dtype.type(0), response)
+
+
+def _vesselness_2d_response_cuda(eigen: np.ndarray, width: int) -> np.ndarray:
+    """Kernel form of :func:`_vesselness_2d_response` for 3D float32 CuPy stacks."""
+    if eigen.ndim != 3 or eigen.dtype != np.float32:
+        raise ValueError("expected a 3D float32 eigenvalue stack")
+    xp = get_array_module(eigen)
+    with eigen.device:
+        (kernel,) = _cuda_functions(
+            _RESPONSE_CUDA_SOURCE, ("vesselness_response",), eigen.device.id
+        )
+        eigen = xp.ascontiguousarray(eigen)
+        plane_min = xp.ascontiguousarray(eigen.min(axis=(1, 2)))
+        nz, ny, nx_in = eigen.shape
+        out = xp.empty((nz, ny, width), dtype=np.float32)
+        kernel(
+            *_launch_config(out.size),
+            (
+                eigen,
+                plane_min,
+                out,
+                np.int64(nz),
+                np.int64(ny),
+                np.int64(nx_in),
+                np.int64(width),
+            ),
+        )
+    return out
 
 
 def vesselness_slice_by_slice(image: np.ndarray, sigmas: list[float]) -> np.ndarray:

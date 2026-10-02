@@ -16,6 +16,7 @@ from cubic.segmentation.aics_workflows import (
     _hessian_2d_eigen_max,
     _itk_boundary_regions,
     _near_float32_midpoint,
+    _vesselness_2d_response,
     intensity_normalization,
     remove_small_objects_aics,
     vesselness_slice_by_slice,
@@ -137,6 +138,83 @@ def test_vesselness_matches_reference(use_gpu: bool, gpu_available: bool) -> Non
     assert out.dtype == np.float64
     np.testing.assert_allclose(asnumpy(out), expected, rtol=1e-5, atol=1e-6)
     np.testing.assert_array_equal(asnumpy(out) > 0.15, expected > 0.15)
+
+
+# glibc 2.28 powf(x, 3.0f) bit patterns (x86-64 FMA variant, as NumPy's float32
+# power returns them on AVX2 hosts): the first eight are inputs where both CUDA's
+# powf and a float64 cube round differently; then 0, subnormal, underflow, exact,
+# and a large value.
+_GLIBC_CUBE_IN = [
+    0x3B88F19A,
+    0x3C48D56B,
+    0x3CE4B1AA,
+    0x3D7CA57D,
+    0x3D7968CF,
+    0x3D88FB77,
+    0x3B17F675,
+    0x3D84EA42,
+    0x0,
+    0x116C2,
+    0x1E3CE508,
+    0x3FC00000,
+    0x542E9F7C,
+]
+_GLIBC_CUBE_OUT = [
+    0x339CBFEE,
+    0x35F734D3,
+    0x37B68251,
+    0x3976120F,
+    0x396CBB9E,
+    0x399CE1CF,
+    0x32562FA4,
+    0x398F5194,
+    0x0,
+    0x0,
+    0x0,
+    0x40580000,
+    0x7DA28017,
+]
+
+
+def test_response_kernel_reproduces_glibc_powf(gpu_available: bool) -> None:
+    """The kernel's ``glibc_powf3`` returns glibc's bit patterns on any host."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    x = np.array(_GLIBC_CUBE_IN, dtype=np.uint32).view(np.float32)
+    expected = np.array(_GLIBC_CUBE_OUT, dtype=np.uint32)
+    import cupy as cp
+
+    module = cp.RawModule(
+        code=aics_workflows._RESPONSE_CUDA_SOURCE
+        + r"""
+extern "C" __global__ void cube(const float* x, float* y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = glibc_powf3(x[i]);
+}
+""",
+        options=("--fmad=false",),
+    )
+    xs = cp.asarray(x)
+    ys = cp.empty_like(xs)
+    module.get_function("cube")((1,), (32,), (xs, ys, np.int32(x.size)))
+    np.testing.assert_array_equal(asnumpy(ys).view(np.uint32), expected)
+
+
+def test_response_gpu_matches_numpy_reference(gpu_available: bool) -> None:
+    """GPU response equals the NumPy ops wherever np.power is glibc's powf."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    x = np.array(_GLIBC_CUBE_IN, dtype=np.uint32).view(np.float32)
+    if not np.array_equal(
+        np.power(x, np.float32(3)).view(np.uint32), np.array(_GLIBC_CUBE_OUT, np.uint32)
+    ):
+        pytest.skip("np.power is not glibc's FMA powf on this host (e.g. AVX-512)")
+    img = intensity_normalization(_filaments((5, 40, 56)), (2.5, 7.5))
+    stacked = np.concatenate([img, np.broadcast_to(img.max(axis=0), img.shape)], axis=2)
+    eigen = _hessian_2d_eigen_max(stacked, 1.0)
+    cpu = _vesselness_2d_response(eigen, 53)
+    gpu = _vesselness_2d_response(ascupy(eigen), 53)
+    np.testing.assert_array_equal(asnumpy(gpu), cpu)
 
 
 def test_itk_boundary_regions_partition_the_volume() -> None:
