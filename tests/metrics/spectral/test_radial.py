@@ -251,13 +251,14 @@ def test_fused_spectral_sums_decline_unsupported_input(gpu_available: bool) -> N
     from cubic.metrics.spectral import radial as rad
 
     fx, fy, rid, _, n_radial, _ = _spectra_and_ids(np.complex64)
-    assert rad._fused_frc_sums(fx, fy, rid, None, n_radial, n_radial) is None
+    assert rad._fused_frc_sums(fx, fy, rid, None, n_radial) is None
     if not gpu_available:
         pytest.skip("GPU not available")
     from cubic.cuda import ascupy
 
     gx, gy, grid = ascupy(fx), ascupy(fy), ascupy(rid)
-    assert rad._fused_frc_sums(gx.real, None, grid, None, n_radial, n_radial) is None
-    too_many = rad._FRC_SUMS_SHARED_BYTES // 32 + 1
-    assert rad._fused_frc_sums(gx, gy, grid, None, too_many, too_many) is None
-    assert rad._fused_frc_sums(gx, gy, grid, None, n_radial, n_radial) is not None
+    assert rad._fused_frc_sums(gx.real, None, grid, None, n_radial) is None
+    _, limit = rad._frc_sums_kernel("frc_sums_float", gx.device.id)
+    too_many = limit // rad._FRC_SUMS_BYTES_PER_BIN // n_radial + 1
+    assert rad._fused_frc_sums(gx, gy, grid, grid, n_radial, too_many) is None
+    assert rad._fused_frc_sums(gx, gy, grid, None, n_radial) is not None
