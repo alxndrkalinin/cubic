@@ -405,8 +405,8 @@ def glcm_features_by_label(
     voxels carry its label, and each region averages its properties over its
     own non-empty directions. Instead of one call per region, every direction
     accumulates the co-occurrences of all regions in a single ``bincount``,
-    so the image is traversed once per direction, not once per region. The
-    histogram holds ``n_labels * n_directions * levels**2`` counts. Per-region
+    so the image is traversed once per direction for each bounded chunk of
+    labels (one chunk for a typical FOV), not once per region. Per-region
     ranges quantize in float64, while :func:`glcm_features` quantizes a
     float32 image in float32, so a voxel on a level boundary can land one level
     apart there.
@@ -477,41 +477,44 @@ def glcm_features_by_label(
     offsets = _glcm_offsets(image.ndim, distances)
     n_dir = len(offsets)
     n_pairs = levels * levels
-    n_label_bins = n_labels * n_pairs
-    # Bin (direction, label, i, j): each direction counts into its own slice, so
-    # a bincount spans n_labels * levels**2 bins, not all directions' bins.
-    counts = xp.zeros((n_dir, n_label_bins), dtype=np.int64)
-    for direction, off in enumerate(offsets):
-        center_sl, neighbor_sl = _slices_for_offset(off, image.shape)
-        lab_c = compact[center_sl]
-        same = (lab_c > 0) & (lab_c == compact[neighbor_sl])
-        # Compact labels start at 1. Compacting to the in-region pairs first
-        # measured faster than binning every pair with a sentinel bin (0.131 vs
-        # 0.174 s on 13 cells of 48x640x960, A40): most voxels are background.
-        bins = (lab_c[same] - 1) * n_pairs
-        if bins.size == 0:  # cupy.bincount rejects empty input
-            continue
-        bins += quant[center_sl][same] * levels + quant[neighbor_sl][same]
-        counts[direction] += np.bincount(bins, minlength=n_label_bins)
-    host = asnumpy(counts).reshape(n_dir, n_labels, levels, levels)
-    del counts
-
-    out: dict[str, np.ndarray] = {"label": label_ids}
     columns: dict[str, list[np.ndarray]] = {name: [] for name in _PROP_NAMES}
-    # The float64 property stage holds ~10 temporaries of its input's size, so
-    # it runs over bounded label chunks.
-    step = max(1, _PROP_CHUNK_BINS // (n_dir * n_pairs))
+    # Labels go in chunks whose (direction, label, i, j) histogram stays under
+    # _LABEL_CHUNK_BINS, on the device and in the float64 property stage on the
+    # host; each chunk scans the image once per direction. A typical FOV
+    # (hundreds of cells, 3D, 32 levels) is one chunk.
+    step = max(1, _LABEL_CHUNK_BINS // (n_dir * n_pairs))
     for start in range(0, n_labels, step):
-        chunk = host[:, start : start + step].transpose(1, 0, 2, 3)
+        stop = min(start + step, n_labels)
+        n_chunk_bins = (stop - start) * n_pairs
+        # Each direction counts into its own slice of the chunk's histogram.
+        counts = xp.zeros((n_dir, n_chunk_bins), dtype=np.int64)
+        for direction, off in enumerate(offsets):
+            center_sl, neighbor_sl = _slices_for_offset(off, image.shape)
+            lab_c = compact[center_sl]
+            # Compact labels start at 1. Compacting to the in-region pairs first
+            # measured faster than binning every pair with a sentinel bin
+            # (0.131 vs 0.174 s on 13 cells of 48x640x960, A40): most voxels
+            # are background.
+            same = (lab_c > start) & (lab_c <= stop) & (lab_c == compact[neighbor_sl])
+            bins = (lab_c[same] - 1 - start) * n_pairs
+            if bins.size == 0:  # cupy.bincount rejects empty input
+                continue
+            bins += quant[center_sl][same] * levels + quant[neighbor_sl][same]
+            counts[direction] += np.bincount(bins, minlength=n_chunk_bins)
+        host = asnumpy(counts).reshape(n_dir, stop - start, levels, levels)
+        del counts
+        chunk = host.transpose(1, 0, 2, 3)
         for name, values in _direction_mean_props(chunk, symmetric, normed).items():
             columns[name].append(values)
+    out: dict[str, np.ndarray] = {"label": label_ids}
     for name in _PROP_NAMES:
         out[name] = np.concatenate(columns[name])
     return out
 
 
-# Co-occurrence bins per chunk of the per-label property stage (~16 MB each).
-_PROP_CHUNK_BINS = 1 << 21
+# Histogram bins per label chunk of glcm_features_by_label: 64 MB as int64 on the
+# device, and ~10 float64 temporaries of that size in the property stage.
+_LABEL_CHUNK_BINS = 1 << 23
 
 
 def _direction_mean_props(
