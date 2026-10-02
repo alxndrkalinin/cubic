@@ -884,3 +884,26 @@ def test_global_ri_factor_gpu_matches_cpu(gpu_available: bool) -> None:
     gpu = get_global_ri_factor(ascupy(gt), ascupy(pred))
     assert cpu != pytest.approx(1.0, abs=0.05)
     assert gpu == pytest.approx(cpu, abs=2 * ri._X_TOL)
+
+
+def test_mixed_dtype_gpu_elements_take_the_array_path(gpu_available: bool) -> None:
+    """Elements of mixed float dtypes skip the single-dtype fused kernel."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(57)
+    gt = rng.random((3, 40, 40), dtype=np.float32)
+    pred = (0.8 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(
+        ascupy(gt), ascupy(pred), data_range=float(gt.max() - gt.min())
+    )
+    mixed = SSIMElements(
+        ux=e.ux,
+        uy=e.uy,
+        vxy=e.vxy.astype(np.float64),
+        vx=e.vx.astype(np.float64),
+        vy=e.vy.astype(np.float64),
+        C1=e.C1,
+        C2=e.C2,
+    )
+    assert not ri._fused_eligible(mixed)
+    assert np.isfinite(_compute_dS_mean(1.3, mixed))

@@ -208,11 +208,17 @@ def _fused_mean(name: str, alpha: float, elements: SSIMElements) -> float:
 
 
 def _fused_eligible(elements: SSIMElements) -> bool:
-    """Whether :func:`_fused_mean` handles ``elements`` (float GPU arrays)."""
+    """Whether :func:`_fused_mean` handles ``elements``.
+
+    It needs float GPU arrays of one dtype, as its kernel types all five
+    inputs alike.
+    """
+    arrays = [getattr(elements, f) for f in _ELEMENT_FIELDS]
+    dtype = elements.ux.dtype
     return (
         elements.ux.ndim > 0
-        and get_device(elements.ux) == "GPU"
-        and elements.ux.dtype in (np.float32, np.float64)
+        and dtype in (np.float32, np.float64)
+        and all(a.dtype == dtype and get_device(a) == "GPU" for a in arrays)
     )
 
 
