@@ -97,18 +97,22 @@ def intensity_normalization(
     np.multiply(sq, sq, out=sq)
     std = np.sqrt(sq.mean())
     del flat, sq
-    stretch_min = max(mean - dtype(scaling_param[0]) * std, lowest)
-    stretch_max = min(mean + dtype(scaling_param[1]) * std, highest)
+    # The reference's scalar expressions verbatim, so the installed NumPy's
+    # promotion rules apply to both alike: float32 under NEP 50, float64 scalars
+    # (rounded to float32 where they meet the array) under NumPy 1.
+    stretch_min = max(mean - scaling_param[0] * std, lowest)
+    stretch_max = min(mean + scaling_param[1] * std, highest)
     if stretch_min > stretch_max:
         raise ValueError(
             f"scaling_param {scaling_param!r} gives an empty range "
             f"[{stretch_min}, {stretch_max}]"
         )
-    eps = dtype(1e-8)
-    out = np.clip(image, stretch_min, stretch_max)
-    out -= stretch_min
-    out += eps
-    out /= stretch_max - stretch_min + eps
+    denominator = stretch_max - stretch_min + 1e-8
+    low, high = dtype(stretch_min), dtype(stretch_max)
+    out = np.clip(image, low, high)
+    out -= low
+    out += dtype(1e-8)
+    out /= dtype(denominator)
     return out
 
 
