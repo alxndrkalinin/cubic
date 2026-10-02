@@ -451,11 +451,11 @@ def glcm_features_by_label(
     if n_labels == 0:
         return {"label": label_ids, **{p: np.empty(0) for p in _PROP_NAMES}}
     # Compact labels 1..n_labels in ascending label order; 0 stays background.
+    # A sorted search keeps memory proportional to the image, whatever the
+    # label values (sparse or negative ids included).
     xp = get_array_module(labels)
-    lookup = xp.zeros(int(label_ids[-1]) + 1, dtype=np.int64)
-    lookup[present] = xp.arange(1, n_labels + 1)
-    compact = lookup[labels]
-    del lookup
+    compact = np.searchsorted(present, labels) + 1
+    compact[labels == 0] = 0
 
     if value_range is None:
         # Per-region (min, max) by scatter, looked up per voxel. Slot 0 collects

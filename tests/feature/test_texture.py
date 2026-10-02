@@ -326,6 +326,31 @@ def test_glcm_by_label_matches_per_region_calls(
     assert out["correlation"][3] == 1.0
 
 
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_glcm_by_label_sparse_and_negative_ids(
+    use_gpu: bool, gpu_available: bool
+) -> None:
+    """Huge and negative label ids are regions like any other, at no memory cost."""
+    image, labels = _labeled_volume(2)
+    labels = labels.astype(np.int64)
+    ids = {3: -5, 7: 2**40 + 7, 12: 2**31, 20: -(2**35), 31: 1}
+    sparse = np.zeros_like(labels)
+    for old, new in ids.items():
+        sparse[labels == old] = new
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels, sparse = ascupy(image), ascupy(labels), ascupy(sparse)
+    ref = glcm_features_by_label(image, labels, levels=16)
+    out = glcm_features_by_label(image, sparse, levels=16)
+    np.testing.assert_array_equal(out["label"], sorted(ids.values()))
+    order = {new: k for k, new in enumerate(sorted(ids.values()))}
+    for k, old in enumerate(ref["label"]):
+        j = order[ids[int(old)]]
+        for prop in _EXPECTED_PROPS:
+            np.testing.assert_equal(out[prop][j], ref[prop][k])
+
+
 def test_glcm_by_label_empty_and_invalid_input() -> None:
     """No labels gives empty columns; bad input raises like ``glcm_features``."""
     image = np.random.default_rng(8).random((8, 9))
