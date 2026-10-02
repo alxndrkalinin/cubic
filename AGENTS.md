@@ -48,6 +48,7 @@ FRC (Fourier Ring Correlation), FSC (Fourier Shell Correlation), and DCR (Decorr
 ### Segmentation (`cubic/segmentation/`)
 
 - `cellpose.py` – Cellpose integration
+- `aics_workflows.py` – Allen Cell Structure Segmenter SEC61B/TOMM20 workflows (ITK anisotropic diffusion, slice-wise vesselness); masks measured bitwise equal to `aicssegmentation` on AVX2 hosts without AVX-512; the reference itself moves 1-3 voxels on AVX-512 hosts, where the CPU path follows the host and the GPU kernels keep the AVX2 result; CUDA kernels on GPU
 - `segment_utils.py` – Segmentation utilities
 - `_clear_border.py` – Border clearing operations
 
