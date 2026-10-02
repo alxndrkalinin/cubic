@@ -321,7 +321,7 @@ __device__ void frc_sums(const T* x, const T* y, const int* radial_id,
                          const int* angle_id, int has_y, int has_angle, long n,
                          int n_radial, int nbins, double* sx2, double* sy2,
                          double* sxy, unsigned long long* count) {
-  extern __shared__ unsigned char smem[];
+  extern __shared__ __align__(8) unsigned char smem[];
   double* bx = (double*)smem;
   double* by = bx + nbins;
   double* bxy = by + nbins;
