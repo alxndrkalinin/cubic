@@ -49,6 +49,11 @@ def _cuda_functions(
         return tuple(module.get_function(name) for name in names)
 
 
+def _cupy_device(array: np.ndarray) -> Any:
+    """CuPy device of ``array``; NumPy's stubs type ``.device`` as ``"cpu"``."""
+    return array.device
+
+
 def _launch_config(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
     """Grid-stride launch configuration for ``size`` elements."""
     return (min((size + threads - 1) // threads, 65535 * 8),), (threads,)
@@ -398,11 +403,12 @@ def _diffusion_step_cuda(
     # ITK dimension order (x, y, z) = array axes reversed.
     sx, sy, sz = (np.float64(scale[axis]) for axis in (2, 1, 0))
     launch = _launch_config(u.size)
-    with u.device:
+    device = _cupy_device(u)
+    with device:
         gradient_kernel, flux_kernel, apply_kernel = _cuda_functions(
             _DIFFUSION_CUDA_SOURCE,
             ("gad_gradient", "gad_flux", "gad_apply"),
-            u.device.id,
+            device.id,
         )
         derivatives = xp.empty((3, *u.shape), dtype=np.float64)
         grad_sq = xp.empty(u.shape, dtype=np.float64)
@@ -606,9 +612,10 @@ def _vesselness_2d_response_cuda(eigen: np.ndarray, width: int) -> np.ndarray:
     if eigen.ndim != 3 or eigen.dtype != np.float32:
         raise ValueError("expected a 3D float32 eigenvalue stack")
     xp = get_array_module(eigen)
-    with eigen.device:
+    device = _cupy_device(eigen)
+    with device:
         (kernel,) = _cuda_functions(
-            _RESPONSE_CUDA_SOURCE, ("vesselness_response",), eigen.device.id
+            _RESPONSE_CUDA_SOURCE, ("vesselness_response",), device.id
         )
         eigen = xp.ascontiguousarray(eigen)
         plane_min = xp.ascontiguousarray(eigen.min(axis=(1, 2)))
