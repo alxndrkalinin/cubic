@@ -426,7 +426,9 @@ def _fused_frc_sums(
     if FY is not None and (FY.dtype != FX.dtype or FY.size != FX.size):
         return None
     ids = [radial_id] if angle_id is None else [radial_id, angle_id]
-    if any(a.dtype != np.int32 or a.size != FX.size for a in ids):
+    if any(
+        a.dtype != np.int32 or a.size != FX.size or get_device(a) != "GPU" for a in ids
+    ):
         return None
     nbins = n_angle * n_radial
     shared = nbins * _FRC_SUMS_BYTES_PER_BIN

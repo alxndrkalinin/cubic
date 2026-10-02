@@ -293,3 +293,16 @@ def test_fused_spectral_sums_out_of_range_ids_match_array_path(
     got = reduce_frc_sums(ascupy(fx), ascupy(fy), ascupy(rid), n_radial - 1)
     for w, g in zip(want, got):
         np.testing.assert_allclose(asnumpy(g), w, rtol=1e-5)
+
+
+def test_fused_spectral_sums_decline_host_ids(gpu_available: bool) -> None:
+    """Host bin ids with a GPU spectrum are declined rather than copied."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+    from cubic.metrics.spectral import radial as rad
+
+    fx, fy, rid, aid, n_radial, n_angle = _spectra_and_ids(np.complex64)
+    gx, gy = ascupy(fx), ascupy(fy)
+    assert rad._fused_frc_sums(gx, gy, rid, None, n_radial) is None
+    assert rad._fused_frc_sums(gx, gy, ascupy(rid), aid, n_radial, n_angle) is None
