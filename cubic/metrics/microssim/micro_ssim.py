@@ -204,23 +204,34 @@ class MicroSSIM:
             If ``fit()`` has not been called, gt/pred shapes differ, or
             ``gt.ndim != 2``.
         """
+        self._check_pair(gt, pred)
+        if gt.ndim != 2:
+            raise ValueError("Only 2D images are supported.")
+
+        gt_norm, pred_scaled = self._normalize_pair(gt, pred)
+        data_range = float(gt_norm.max() - gt_norm.min())
+        return gt_norm, pred_scaled, data_range
+
+    def _check_pair(self, gt: np.ndarray, pred: np.ndarray) -> None:
+        """Raise unless the instance is fitted and ``gt``, ``pred`` share a shape."""
         if not self._initialized:
             raise ValueError("MicroSSIM was not initialized, call `fit()` first.")
         if gt.shape != pred.shape:
             raise ValueError("Groundtruth and prediction must have the same shape.")
-        if gt.ndim != 2:
-            raise ValueError("Only 2D images are supported.")
 
-        # After the _initialized check, params are guaranteed non-None;
-        # cast to silence mypy union narrowing.
+    def _normalize_pair(
+        self, gt: np.ndarray, pred: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply the fitted normalization and RI factor to a fitted instance's inputs."""
+        # The callers check _initialized, so the params are non-None; cast to
+        # silence mypy union narrowing.
         offset_gt = cast(float, self._offset_gt)
         offset_pred = cast(float, self._offset_pred)
         max_val = cast(float, self._max_val)
         ri_factor = cast(float, self._ri_factor)
         gt_norm = cast(np.ndarray, normalize_min_max(gt, offset_gt, max_val))
         pred_norm = cast(np.ndarray, normalize_min_max(pred, offset_pred, max_val))
-        data_range = float(gt_norm.max() - gt_norm.min())
-        return gt_norm, pred_norm * ri_factor, data_range
+        return gt_norm, pred_norm * ri_factor
 
     def score(
         self,

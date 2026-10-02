@@ -186,3 +186,150 @@ def test_validate_angle_delta() -> None:
             _validate_angle_delta(bad)
     with pytest.raises(ValueError, match="separate XY from Z"):
         _validate_angle_delta(90, min_sectors=2)
+
+
+def _require_fused_kernel() -> None:
+    """Skip unless this GPU runs the fused bin-sum kernel (compute capability >= 6.0)."""
+    from cubic.cuda import ascupy
+    from cubic.metrics.spectral import radial as rad
+
+    device_id = ascupy(np.zeros(1)).device.id
+    if rad._frc_sums_kernel("frc_sums_float", device_id) is None:
+        pytest.skip("GPU below compute capability 6.0 takes the bincount path")
+
+
+def _spectra_and_ids(dtype: type, shape=(6, 40, 52)):
+    """Two seeded spectra plus radial / angular ids with some -1 entries."""
+    rng = np.random.default_rng(9)
+    fx = np.fft.fftn(rng.standard_normal(shape)).astype(dtype)
+    fy = np.fft.fftn(rng.standard_normal(shape)).astype(dtype)
+    edges, radii = radial_edges(shape, 2, spacing=[0.3, 0.15, 0.15])
+    angle_edges = np.array([0.0, 30.0, 60.0, 90.0])
+    radial_id, angle_id = sectioned_bin_id(
+        shape, edges, angle_edges, spacing=[0.3, 0.15, 0.15], exclude_axis_angle=10.0
+    )
+    return fx, fy, radial_id, angle_id, len(radii), len(angle_edges) - 1
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+def test_fused_spectral_sums_match_array_path(
+    monkeypatch, dtype: type, gpu_available: bool
+) -> None:
+    """GPU fused sums equal the bincount path: plain, sectioned and power-only.
+
+    The per-voxel terms are the same float ops, so only float64 summation
+    order differs; ``reduce_power`` forms |F|^2 as re^2 + im^2 instead of
+    squaring |F|, which agrees to float rounding.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    _require_fused_kernel()
+    from cubic.cuda import ascupy, asnumpy
+    from cubic.metrics.spectral import radial as rad
+
+    fx, fy, rid, aid, n_radial, n_angle = _spectra_and_ids(dtype)
+    assert (rid < 0).any() and (aid < 0).any()
+    calls = []
+    fused = rad._fused_frc_sums
+
+    def spy(*args):
+        out = fused(*args)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(rad, "_fused_frc_sums", spy)
+    gx, gy, grid, gaid = (ascupy(a) for a in (fx, fy, rid, aid))
+    rel = 1e-5 if dtype == np.complex64 else 1e-12
+    want = rad.reduce_frc_sums(fx, fy, rid, n_radial)
+    got = rad.reduce_frc_sums(gx, gy, grid, n_radial)
+    for w, g in zip(want, got):
+        np.testing.assert_allclose(asnumpy(g), w, rtol=rel)
+    np.testing.assert_array_equal(asnumpy(got[3]), want[3])
+    want = rad.reduce_frc_sums_sectioned(fx, fy, rid, aid, n_radial, n_angle)
+    got = rad.reduce_frc_sums_sectioned(gx, gy, grid, gaid, n_radial, n_angle)
+    for w, g in zip(want, got):
+        assert g.shape == (n_angle, n_radial)
+        np.testing.assert_allclose(asnumpy(g), w, rtol=rel)
+    want = reduce_power(fx, rid, nbins=n_radial)
+    got = reduce_power(gx, grid, nbins=n_radial)
+    np.testing.assert_allclose(asnumpy(got[0]), want[0], rtol=rel)
+    np.testing.assert_array_equal(asnumpy(got[1]), want[1])
+    assert sum(calls) == 3  # the three GPU calls took the fused path
+
+
+def test_fused_spectral_sums_decline_unsupported_input(gpu_available: bool) -> None:
+    """Host arrays, real spectra and over-large binnings take the array path."""
+    from cubic.metrics.spectral import radial as rad
+
+    fx, fy, rid, _, n_radial, _ = _spectra_and_ids(np.complex64)
+    assert rad._fused_frc_sums(fx, fy, rid, None, n_radial) is None
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    _require_fused_kernel()
+    from cubic.cuda import ascupy
+
+    gx, gy, grid = ascupy(fx), ascupy(fy), ascupy(rid)
+    assert rad._fused_frc_sums(gx.real, None, grid, None, n_radial) is None
+    _, limit, _ = rad._frc_sums_kernel("frc_sums_float", gx.device.id)
+    too_many = limit // rad._FRC_SUMS_BYTES_PER_BIN // n_radial + 1
+    assert rad._fused_frc_sums(gx, gy, grid, grid, n_radial, too_many) is None
+    assert rad._fused_frc_sums(gx, gy.ravel()[:-1], grid, None, n_radial) is None
+    assert rad._fused_frc_sums(gx, fy, grid, None, n_radial) is None  # host FY
+    assert rad._fused_frc_sums(gx, gy, grid, None, n_radial) is not None
+
+
+def test_fused_spectral_sums_out_of_range_ids_match_array_path(
+    gpu_available: bool,
+) -> None:
+    """Ids past ``nbins`` fall back to the array path instead of spilling over.
+
+    The kernel used to add them into the neighbouring sum's shared-memory
+    slots: 813 of 1000 voxels counted and a (10,) result where the array path
+    returns (12,) with all 1000.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy, asnumpy
+
+    rng = np.random.default_rng(10)
+    F = (rng.standard_normal(1000) + 1j * rng.standard_normal(1000)).astype(
+        np.complex64
+    )
+    ids = rng.integers(0, 12, 1000).astype(np.int32)
+    want = reduce_power(F, ids, nbins=10)
+    got = reduce_power(ascupy(F), ascupy(ids), nbins=10)
+    assert want[1].shape == (12,) and want[1].sum() == 1000
+    np.testing.assert_array_equal(asnumpy(got[1]), want[1])
+    np.testing.assert_allclose(asnumpy(got[0]), want[0], rtol=1e-5)
+    fx, fy, rid, aid, n_radial, n_angle = _spectra_and_ids(np.complex64)
+    want = reduce_frc_sums(fx, fy, rid, n_radial - 1)
+    got = reduce_frc_sums(ascupy(fx), ascupy(fy), ascupy(rid), n_radial - 1)
+    for w, g in zip(want, got):
+        np.testing.assert_allclose(asnumpy(g), w, rtol=1e-5)
+
+
+def test_fused_spectral_sums_decline_host_ids(gpu_available: bool) -> None:
+    """Host bin ids with a GPU spectrum are declined rather than copied."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+    from cubic.metrics.spectral import radial as rad
+
+    fx, fy, rid, aid, n_radial, n_angle = _spectra_and_ids(np.complex64)
+    gx, gy = ascupy(fx), ascupy(fy)
+    assert rad._fused_frc_sums(gx, gy, rid, None, n_radial) is None
+    assert rad._fused_frc_sums(gx, gy, ascupy(rid), aid, n_radial, n_angle) is None
+
+
+def test_fused_spectral_sums_decline_huge_angle_ids(gpu_available: bool) -> None:
+    """An angle id whose combined bin overflows 32 bits is declined, not wrapped."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    from cubic.cuda import ascupy
+    from cubic.metrics.spectral import radial as rad
+
+    fx, fy, rid, aid, n_radial, n_angle = _spectra_and_ids(np.complex64)
+    huge = aid.copy()
+    huge[aid >= 0] = 2**31 // n_radial + 7  # a * n_radial wraps negative in int32
+    gx, gy, grid, gaid = (ascupy(a) for a in (fx, fy, rid, huge))
+    assert rad._fused_frc_sums(gx, gy, grid, gaid, n_radial, n_angle) is None

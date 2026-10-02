@@ -1,11 +1,12 @@
 """Radial binning utilities for histogram-based FRC/FSC."""
 
+from typing import Any, cast
 from functools import lru_cache
 from collections.abc import Sequence
 
 import numpy as np
 
-from cubic.cuda import get_array_module
+from cubic.cuda import CUDAManager, get_device, get_array_module
 
 
 def _normalize_spacing(
@@ -290,6 +291,12 @@ def reduce_power(F: np.ndarray, bin_id: np.ndarray, nbins: int | None = None):
             a curve shorter than ``radii`` whenever a trailing bin is empty,
             which callers then pair positionally with the bin centers.
     """
+    if nbins is not None:
+        # Complex GPU spectra: one fused pass. It forms |F|^2 as re^2 + im^2
+        # rather than squaring |F|, which agrees to float rounding.
+        fused = _fused_frc_sums(F, None, bin_id, None, nbins)
+        if fused is not None:
+            return fused[0], fused[3]
     valid = bin_id >= 0
     bins = bin_id[valid]
     if nbins is None:
@@ -299,6 +306,190 @@ def reduce_power(F: np.ndarray, bin_id: np.ndarray, nbins: int | None = None):
     S2 = np.bincount(bins, weights=a * a, minlength=nbins)
     N = np.bincount(bins, minlength=nbins)
     return S2, N
+
+
+# Per-bin sums of |X|^2, |Y|^2 and Re{X conj(Y)} plus counts, in one pass over
+# two complex spectra. Each block accumulates into shared-memory bins and flushes
+# once, instead of every voxel adding into the few global bins that a weighted
+# ``bincount`` contends on. The per-voxel terms are the array path's float ops in
+# the same order (``--fmad=false``), widened to double before accumulating, so
+# only the order of the float64 additions differs; ``bincount`` adds atomically
+# in an arbitrary order too.
+_FRC_SUMS_SOURCE = r"""
+template <typename T>
+__device__ void frc_sums(const T* x, const T* y, const int* radial_id,
+                         const int* angle_id, int has_y, int has_angle, long n,
+                         int n_radial, int nbins, double* sx2, double* sy2,
+                         double* sxy, unsigned long long* count,
+                         unsigned long long* overflow) {
+  extern __shared__ __align__(8) unsigned char smem[];
+  double* bx = (double*)smem;
+  double* by = bx + nbins;
+  double* bxy = by + nbins;
+  unsigned long long* bn = (unsigned long long*)(bxy + nbins);
+  for (int b = threadIdx.x; b < nbins; b += blockDim.x) {
+    bx[b] = 0.0; by[b] = 0.0; bxy[b] = 0.0; bn[b] = 0ULL;
+  }
+  __syncthreads();
+  for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (long)blockDim.x * gridDim.x) {
+    int r = radial_id[i];
+    if (r < 0) continue;
+    long long bin = r;
+    if (has_angle) {
+      int a = angle_id[i];
+      if (a < 0) continue;
+      // 64-bit, so a large angle id cannot wrap past the bounds check below.
+      bin = (r >= n_radial) ? nbins : (long long)a * n_radial + r;
+    }
+    if (bin >= nbins) {  // reported, so the caller falls back to bincount
+      atomicAdd(overflow, 1ULL);
+      continue;
+    }
+    T xr = x[2 * i], xi = x[2 * i + 1];
+    atomicAdd(&bx[bin], (double)(xr * xr + xi * xi));
+    if (has_y) {
+      T yr = y[2 * i], yi = y[2 * i + 1];
+      atomicAdd(&by[bin], (double)(yr * yr + yi * yi));
+      atomicAdd(&bxy[bin], (double)(xr * yr + xi * yi));
+    }
+    atomicAdd(&bn[bin], 1ULL);
+  }
+  __syncthreads();
+  for (int b = threadIdx.x; b < nbins; b += blockDim.x) {
+    if (bn[b] == 0ULL) continue;
+    atomicAdd(&sx2[b], bx[b]);
+    if (has_y) {
+      atomicAdd(&sy2[b], by[b]);
+      atomicAdd(&sxy[b], bxy[b]);
+    }
+    atomicAdd(&count[b], bn[b]);
+  }
+}
+
+#define FRC_SUMS_ENTRY(NAME, T)                                                \
+  extern "C" __global__ void NAME(                                             \
+      const T* x, const T* y, const int* radial_id, const int* angle_id,       \
+      int has_y, int has_angle, long n, int n_radial, int nbins, double* sums, \
+      unsigned long long* count, unsigned long long* overflow) {               \
+    frc_sums<T>(x, y, radial_id, angle_id, has_y, has_angle, n, n_radial,      \
+                nbins, sums, sums + nbins, sums + 2 * nbins, count, overflow); \
+  }
+FRC_SUMS_ENTRY(frc_sums_float, float)
+FRC_SUMS_ENTRY(frc_sums_double, double)
+"""
+# Shared memory per bin: three float64 sums and one uint64 count.
+_FRC_SUMS_BYTES_PER_BIN = 32
+_FRC_SUMS_THREADS = 256
+# Kernel name and real dtype per complex dtype.
+_FRC_SUMS_TYPES = {
+    np.dtype(np.complex64): ("frc_sums_float", np.float32),
+    np.dtype(np.complex128): ("frc_sums_double", np.float64),
+}
+
+
+@lru_cache(maxsize=None)
+def _frc_sums_kernel(name: str, device_id: int) -> tuple[Any, int, int] | None:
+    """Compile one :data:`_FRC_SUMS_SOURCE` entry point on one device.
+
+    Returns the kernel, the shared memory per block it may use (the device's
+    opt-in maximum, enabled on the kernel, rather than the 48 KB default) and
+    the multiprocessor count; ``None`` below compute capability 6.0, which
+    lacks the shared-memory ``atomicAdd`` on double.
+    """
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        raise RuntimeError("CuPy is required for the fused spectral sums.")
+    with cp.cuda.Device(device_id) as device:
+        if int(device.compute_capability) < 60:
+            return None
+        attributes = device.attributes
+        kernel = cp.RawKernel(_FRC_SUMS_SOURCE, name, options=("--fmad=false",))
+        limit = int(attributes["MaxSharedMemoryPerBlockOptin"])
+        kernel.max_dynamic_shared_size_bytes = limit
+    return kernel, limit, int(attributes["MultiProcessorCount"])
+
+
+def _fused_frc_sums(
+    FX: np.ndarray,
+    FY: np.ndarray | None,
+    radial_id: np.ndarray,
+    angle_id: np.ndarray | None,
+    n_radial: int,
+    n_angle: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """GPU per-bin sums for complex64/complex128 spectra, or ``None`` if unsupported.
+
+    Bins are ``angle_id * n_radial + radial_id`` (``radial_id`` alone without
+    angles), and ids below 0 are skipped. ``None`` means the caller should
+    take the array path: an input that is not on ``FX``'s GPU, other dtypes,
+    mismatched sizes, ids beyond the binning, a device below compute capability
+    6.0, or a binning too large for the device's shared memory.
+    """
+    if get_device(FX) != "GPU" or FX.dtype not in _FRC_SUMS_TYPES:
+        return None
+    # A CuPy array here (checked above); NumPy types .device as the string "cpu".
+    device_id = int(cast(Any, FX).device.id)
+
+    def on_fx_device(a: np.ndarray) -> bool:
+        # The raw kernel runs on FX's device; host arrays or another GPU's
+        # memory would be copied silently or read across devices.
+        return get_device(a) == "GPU" and int(cast(Any, a).device.id) == device_id
+
+    if FY is not None and (
+        FY.dtype != FX.dtype or FY.size != FX.size or not on_fx_device(FY)
+    ):
+        return None
+    ids = [radial_id] if angle_id is None else [radial_id, angle_id]
+    if any(
+        a.dtype != np.int32 or a.size != FX.size or not on_fx_device(a) for a in ids
+    ):
+        return None
+    nbins = n_angle * n_radial
+    shared = nbins * _FRC_SUMS_BYTES_PER_BIN
+    name, real = _FRC_SUMS_TYPES[FX.dtype]
+    compiled = _frc_sums_kernel(name, device_id)
+    if compiled is None:
+        return None
+    kernel, limit, sms = compiled
+    if nbins == 0 or shared > limit:
+        return None
+    cp = get_array_module(FX)  # CuPy: FX is on the GPU
+    with cp.cuda.Device(device_id):
+        x = cp.ascontiguousarray(FX).ravel().view(real)
+        # Absent inputs pass a placeholder pointer; the flags keep it unread.
+        y = x if FY is None else cp.ascontiguousarray(FY).ravel().view(real)
+        rid = cp.ascontiguousarray(radial_id)
+        aid = rid if angle_id is None else cp.ascontiguousarray(angle_id)
+        sums = cp.zeros((3, nbins), dtype=np.float64)
+        count = cp.zeros(nbins, dtype=np.uint64)
+        overflow = cp.zeros(1, dtype=np.uint64)
+        n = FX.size
+        blocks = max(1, min(-(-n // _FRC_SUMS_THREADS), 8 * sms))
+        kernel(
+            (blocks,),
+            (_FRC_SUMS_THREADS,),
+            (
+                x,
+                y,
+                rid,
+                aid,
+                np.int32(FY is not None),
+                np.int32(angle_id is not None),
+                np.int64(n),
+                np.int32(n_radial),
+                np.int32(nbins),
+                sums,
+                count,
+                overflow,
+            ),
+            shared_mem=shared,
+        )
+        if int(overflow[0]):
+            # An id beyond n_radial / n_angle: the array path extends or raises.
+            return None
+    # Counts never reach 2**63, so the uint64 buffer reads as int64 in place.
+    return sums[0], sums[1], sums[2], count.view(np.int64)
 
 
 def reduce_frc_sums(
@@ -315,8 +506,12 @@ def reduce_frc_sums(
     ``bin_id``, avoiding the repeated ``bin_id[valid]`` gathers and the
     duplicate count that separate power/cross reducers would each redo.
 
-    Device-aware: preserves device of input arrays.
+    Device-aware: preserves device of input arrays. Complex GPU spectra take
+    one fused pass (:func:`_fused_frc_sums`).
     """
+    fused = _fused_frc_sums(FX, FY, bin_id, None, nbins)
+    if fused is not None:
+        return fused
     valid = bin_id >= 0
     bins = bin_id[valid]
     X = FX.ravel()[valid]
@@ -520,9 +715,12 @@ def reduce_frc_sums_sectioned(
     Sx2, Sy2, Sxy, N : ndarray, each shape (n_angle, n_radial)
         Power sums, cross-spectrum sum ``Σ Re{X·conj(Y)}`` and voxel count.
     """
+    n_combined = n_angle * n_radial
+    fused = _fused_frc_sums(FX, FY, radial_id, angle_id, n_radial, n_angle)
+    if fused is not None:
+        return tuple(s.reshape(n_angle, n_radial) for s in fused)  # type: ignore[return-value]
     valid = (radial_id >= 0) & (angle_id >= 0)
     combined_id = angle_id[valid] * n_radial + radial_id[valid]
-    n_combined = n_angle * n_radial
     X = FX.ravel()[valid]
     Y = FY.ravel()[valid]
 

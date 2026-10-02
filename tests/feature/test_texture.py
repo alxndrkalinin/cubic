@@ -5,7 +5,7 @@ import pytest
 from skimage.feature import graycoprops, graycomatrix
 
 from cubic.cuda import ascupy, asnumpy
-from cubic.feature import glcm_features
+from cubic.feature import glcm_features, glcm_features_by_label
 from cubic.feature.texture import (
     _unit_offsets,
     _slices_for_offset,
@@ -277,3 +277,196 @@ def test_glcm_cpu_vs_gpu(use_gpu: bool, gpu_available: bool) -> None:
     else:
         for value in cpu.values():
             assert np.isfinite(value)
+
+
+def _labeled_volume(ndim: int) -> tuple[np.ndarray, np.ndarray]:
+    """Noisy image with non-consecutive labels: blobs, a 1-voxel and a flat region."""
+    rng = np.random.default_rng(7)
+    shape = (6, 40, 48)[-ndim:]
+    image = rng.random(shape)
+    labels = np.zeros(shape, dtype=np.int32)
+    labels[..., 2:12, 3:15] = 3
+    labels[..., 12:30, 5:20] = 7  # touches label 3: cross-label pairs must not count
+    labels[..., 5:35, 25:44] = 12
+    labels[..., 33:37, 2:6] = 20
+    image[..., 33:37, 2:6] = 0.25  # constant region: correlation guard
+    labels[(0,) * (ndim - 2) + (38, 46)] = 31  # one voxel: no pair
+    labels[..., 20:25, 28:33] = 0  # hole inside label 12
+    return image, labels
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("value_range", [None, (0.0, 1.0)])
+def test_glcm_by_label_matches_per_region_calls(
+    use_gpu: bool, ndim: int, value_range, gpu_available: bool
+) -> None:
+    """Each region equals ``glcm_features`` with that region's mask."""
+    image, labels = _labeled_volume(ndim)
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels = ascupy(image), ascupy(labels)
+    kwargs = {"levels": 16, "distances": (1, 2), "value_range": value_range}
+    out = glcm_features_by_label(image, labels, **kwargs)
+    np.testing.assert_array_equal(out["label"], [3, 7, 12, 20, 31])
+    for k, lab in enumerate(out["label"]):
+        mask = labels == int(lab)
+        if lab == 31:
+            with pytest.raises(ValueError, match="No voxel pair"):
+                glcm_features(image, mask=mask, **kwargs)
+            assert all(np.isnan(out[p][k]) for p in _EXPECTED_PROPS)
+            continue
+        ref = glcm_features(image, mask=mask, **kwargs)
+        for prop in _EXPECTED_PROPS:
+            assert out[prop][k] == pytest.approx(ref[prop], rel=1e-12, abs=1e-12), (
+                lab,
+                prop,
+            )
+    assert out["correlation"][3] == 1.0
+
+
+def test_glcm_by_label_rejects_mixed_devices(gpu_available: bool) -> None:
+    """A host label image with a GPU image raises a clear ValueError."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    image, labels = _labeled_volume(2)
+    with pytest.raises(ValueError, match="same device"):
+        glcm_features_by_label(ascupy(image), labels)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.int16, bool])
+def test_glcm_by_label_integer_and_bool_images(
+    use_gpu: bool, dtype: type, gpu_available: bool
+) -> None:
+    """Per-region ranges work for every dtype ``glcm_features`` accepts.
+
+    int16 ranges wider than 32767 used to overflow (every region scored 0),
+    bool raised on subtraction, and CuPy's ``ufunc.at`` rejected uint8/uint16/
+    int16 on the GPU.
+    """
+    _, labels = _labeled_volume(3)
+    rng = np.random.default_rng(11)
+    if dtype is bool:
+        image = rng.random(labels.shape) > 0.5
+    else:
+        info = np.iinfo(dtype)
+        image = rng.integers(info.min, info.max, labels.shape, endpoint=True)
+        image = image.astype(dtype)
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels = ascupy(image), ascupy(labels)
+    out = glcm_features_by_label(image, labels, levels=16)
+    for k, lab in enumerate(out["label"][:4]):
+        ref = glcm_features(image, mask=labels == int(lab), levels=16)
+        assert ref["contrast"] > 0
+        for prop in _EXPECTED_PROPS:
+            assert out[prop][k] == pytest.approx(ref[prop], rel=1e-9, abs=1e-12)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("value_range", [None, (0.0, 1.0)])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_glcm_by_label_nonfinite_region_is_nan(
+    use_gpu: bool, value_range, bad: float, gpu_available: bool
+) -> None:
+    """A region holding a NaN or inf voxel gets a NaN row; the others are intact.
+
+    It used to return the constant-region row on CPU (contrast 0, ASM 1) and
+    raise in ``bincount`` on GPU.
+    """
+    image, labels = _labeled_volume(2)
+    image[5, 10] = bad  # inside label 3
+    assert labels[5, 10] == 3
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels = ascupy(image), ascupy(labels)
+    kwargs = {"levels": 16, "value_range": value_range}
+    out = glcm_features_by_label(image, labels, **kwargs)
+    np.testing.assert_array_equal(out["label"], [3, 7, 12, 20, 31])
+    assert all(np.isnan(out[p][0]) for p in _EXPECTED_PROPS)
+    for k, lab in enumerate(out["label"][1:4], start=1):
+        ref = glcm_features(image, mask=labels == int(lab), **kwargs)
+        for prop in _EXPECTED_PROPS:
+            assert out[prop][k] == pytest.approx(ref[prop], rel=1e-12, abs=1e-12)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_glcm_by_label_background_nan_leaves_regions_intact(
+    use_gpu: bool, gpu_available: bool
+) -> None:
+    """A NaN outside every region does not reach any region's range."""
+    image, labels = _labeled_volume(2)
+    image[labels == 0] = np.nan
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels = ascupy(image), ascupy(labels)
+    out = glcm_features_by_label(image, labels, levels=16)
+    for k, lab in enumerate(out["label"][:3]):
+        ref = glcm_features(image, mask=labels == int(lab), levels=16)
+        assert out["contrast"][k] == pytest.approx(ref["contrast"], rel=1e-12)
+        assert out["contrast"][k] > 0
+
+
+def test_glcm_by_label_chunks_the_property_stage(monkeypatch) -> None:
+    """Processing one label per chunk changes values only by rounding.
+
+    NumPy reduces differently shaped batches in a different order (~4e-16).
+    """
+    import cubic.feature.texture as tx
+
+    image, labels = _labeled_volume(3)
+    whole = glcm_features_by_label(image, labels, levels=8)
+    monkeypatch.setattr(tx, "_LABEL_CHUNK_BINS", 1)
+    chunked = glcm_features_by_label(image, labels, levels=8)
+    np.testing.assert_array_equal(chunked["label"], whole["label"])
+    for key in _EXPECTED_PROPS:
+        np.testing.assert_allclose(chunked[key], whole[key], rtol=1e-12)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_glcm_by_label_sparse_and_negative_ids(
+    use_gpu: bool, gpu_available: bool
+) -> None:
+    """Huge and negative label ids are regions like any other, at no memory cost."""
+    image, labels = _labeled_volume(2)
+    labels = labels.astype(np.int64)
+    ids = {3: -5, 7: 2**40 + 7, 12: 2**31, 20: -(2**35), 31: 1}
+    sparse = np.zeros_like(labels)
+    for old, new in ids.items():
+        sparse[labels == old] = new
+    if use_gpu:
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        image, labels, sparse = ascupy(image), ascupy(labels), ascupy(sparse)
+    ref = glcm_features_by_label(image, labels, levels=16)
+    out = glcm_features_by_label(image, sparse, levels=16)
+    np.testing.assert_array_equal(out["label"], sorted(ids.values()))
+    order = {new: k for k, new in enumerate(sorted(ids.values()))}
+    for k, old in enumerate(ref["label"]):
+        j = order[ids[int(old)]]
+        for prop in _EXPECTED_PROPS:
+            np.testing.assert_equal(out[prop][j], ref[prop][k])
+
+
+def test_glcm_by_label_empty_and_invalid_input() -> None:
+    """No labels gives empty columns; bad input raises like ``glcm_features``."""
+    image = np.random.default_rng(8).random((8, 9))
+    out = glcm_features_by_label(image, np.zeros((8, 9), dtype=np.int64))
+    assert out["label"].size == 0
+    assert set(out) == _EXPECTED_PROPS | {"label"}
+    labels = np.ones((8, 9), dtype=np.int64)
+    with pytest.raises(ValueError, match="2D"):
+        glcm_features_by_label(image.ravel(), labels.ravel())
+    with pytest.raises(ValueError, match="shape"):
+        glcm_features_by_label(image, labels[:4])
+    with pytest.raises(ValueError, match="integer"):
+        glcm_features_by_label(image, labels.astype(bool))
+    with pytest.raises(ValueError, match="levels"):
+        glcm_features_by_label(image, labels, levels=1)
+    with pytest.raises(ValueError, match="distances"):
+        glcm_features_by_label(image, labels, distances=())

@@ -213,6 +213,47 @@ def test_bisection_terminates_quickly() -> None:
     assert iters < 100, f"bisection took {iters} iterations"
 
 
+def test_bisection_stops_at_its_fixed_point(monkeypatch) -> None:
+    """float32 elements: same alpha as running to the cap, far fewer evaluations.
+
+    |f| stays above ``_F_TOL`` on float32 maps, so the loop without the
+    fixed-point exit spun to ``_MAX_BISECT_ITERS``; the replay below checks
+    that this input is such a case.
+    """
+    from cubic.metrics.microssim.ri_factor import _bracket_root  # local
+
+    rng = np.random.default_rng(56)
+    gt = rng.random((6, 64, 64), dtype=np.float32)
+    pred = (1.6 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(gt, pred, data_range=float(gt.max() - gt.min()))
+    assert e.ux.dtype == np.float32
+
+    # The loop as it was, run to the iteration cap.
+    lo, hi, f_lo = _bracket_root(e, _compute_dS_mean(1.0, e), 1e-6, 1e6)
+    mid = 0.5 * (lo + hi)
+    f_mid = _compute_dS_mean(mid, e)
+    converged = False
+    for _ in range(ri._MAX_BISECT_ITERS):
+        if abs(f_mid) < ri._F_TOL and abs(hi - lo) < ri._X_TOL:
+            converged = True
+            break
+        if (f_lo > 0.0) != (f_mid > 0.0):
+            hi = mid
+        else:
+            lo, f_lo = mid, f_mid
+        mid = 0.5 * (lo + hi)
+        f_mid = _compute_dS_mean(mid, e)
+    assert not converged
+
+    evals = []
+    inner = ri._compute_dS_mean
+    monkeypatch.setattr(
+        ri, "_compute_dS_mean", lambda a, el: evals.append(a) or inner(a, el)
+    )
+    assert get_ri_factor(e) == mid
+    assert len(evals) < 100
+
+
 # -- get_global_ri_factor ---------------------------------------------------
 
 
@@ -794,3 +835,75 @@ def test_ri_factor_gpu_single_large_slice_is_chunked(
     alpha, peak = _gpu_peak_above_base(lambda: get_ri_factor(pooled))
     assert np.isfinite(alpha)
     assert peak / (pooled.ux.size * 4) < 3
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_fused_gpu_objective_matches_array_maps(
+    monkeypatch, dtype: type, gpu_available: bool
+) -> None:
+    """The fused GPU reduction sums the array path's per-pixel maps.
+
+    Its kernel repeats the NumPy operation order with FMA contraction off, so
+    only the float64 summation order differs from summing the CuPy maps.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(54)
+    gt = rng.random((5, 64, 72)).astype(dtype)
+    pred = (0.8 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(dtype)
+    e = compute_ssim_elements(
+        ascupy(gt), ascupy(pred), data_range=float(gt.max() - gt.min())
+    )
+    assert e.ux.dtype == dtype
+    fused = ri._fused_mean
+    calls: list[str] = []
+    monkeypatch.setattr(
+        ri, "_fused_mean", lambda name, *args: calls.append(name) or fused(name, *args)
+    )
+    for name, layout in _chunk_layouts(e).items():
+        for alpha in (0.5, 1.0, 1.7):
+            want_S = float(ri._S_map(alpha, layout).astype(np.float64).mean())
+            want_dS = float(ri._dS_map(alpha, layout).astype(np.float64).mean())
+            assert _compute_S_mean(alpha, layout) == pytest.approx(want_S, rel=1e-13), (
+                name
+            )
+            assert _compute_dS_mean(alpha, layout) == pytest.approx(
+                want_dS, rel=1e-11, abs=1e-15
+            ), name
+    assert calls.count("ri_s") == calls.count("ri_ds") == 9
+
+
+def test_global_ri_factor_gpu_matches_cpu(gpu_available: bool) -> None:
+    """The fused GPU fit lands on the CPU alpha within the bisection tolerance."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(55)
+    gt = rng.random((6, 96, 80), dtype=np.float32)
+    pred = (1.6 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    cpu = get_global_ri_factor(gt, pred)
+    gpu = get_global_ri_factor(ascupy(gt), ascupy(pred))
+    assert cpu != pytest.approx(1.0, abs=0.05)
+    assert gpu == pytest.approx(cpu, abs=2 * ri._X_TOL)
+
+
+def test_mixed_dtype_gpu_elements_take_the_array_path(gpu_available: bool) -> None:
+    """Elements of mixed float dtypes skip the single-dtype fused kernel."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(57)
+    gt = rng.random((3, 40, 40), dtype=np.float32)
+    pred = (0.8 * gt + 0.05 * rng.standard_normal(gt.shape)).astype(np.float32)
+    e = compute_ssim_elements(
+        ascupy(gt), ascupy(pred), data_range=float(gt.max() - gt.min())
+    )
+    mixed = SSIMElements(
+        ux=e.ux,
+        uy=e.uy,
+        vxy=e.vxy.astype(np.float64),
+        vx=e.vx.astype(np.float64),
+        vy=e.vy.astype(np.float64),
+        C1=e.C1,
+        C2=e.C2,
+    )
+    assert not ri._fused_eligible(mixed)
+    assert np.isfinite(_compute_dS_mean(1.3, mixed))
