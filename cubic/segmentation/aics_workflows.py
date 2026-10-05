@@ -762,7 +762,7 @@ def _resolve_inclusive(size_filter_inclusive: bool | None) -> bool:
 def workflow_sec61b(
     image: np.ndarray, *, size_filter_inclusive: bool | None = None
 ) -> np.ndarray:
-    """SEC61B (endoplasmic reticulum) classic segmentation of one z-stack.
+    """SEC61B (endoplasmic reticulum) classic segmentation of one z-stack or plane.
 
     Port of ``aicssegmentation.structure_wrapper.seg_sec61b.Workflow_sec61b``
     with its fixed parameters (no rescaling).
@@ -807,7 +807,7 @@ def workflow_sec61b(
 def workflow_tomm20(
     image: np.ndarray, *, size_filter_inclusive: bool | None = None
 ) -> np.ndarray:
-    """TOMM20 (mitochondria) classic segmentation of one z-stack.
+    """TOMM20 (mitochondria) classic segmentation of one z-stack or plane.
 
     Port of ``aicssegmentation.structure_wrapper.seg_tomm20.Workflow_tomm20``
     with its fixed parameters (no rescaling).
