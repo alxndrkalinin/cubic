@@ -406,6 +406,38 @@ def test_workflow_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
     np.testing.assert_array_equal(asnumpy(gpu), cpu)
 
 
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+def test_workflow_segments_a_plane_as_a_one_plane_volume(
+    workflow, use_gpu: bool, gpu_available: bool
+) -> None:
+    """A (Y, X) plane gives the mask of the same plane passed as a (1, Y, X) volume."""
+    plane = _filaments((6, 48, 64), seed=6)[3]
+    img = _to_device(plane, use_gpu, gpu_available)
+    mask = workflow(img)
+    assert mask.shape == plane.shape and mask.dtype == bool
+    assert get_device(mask) == get_device(img)
+    expected = asnumpy(workflow(img[None]))[0]
+    assert expected.any()
+    np.testing.assert_array_equal(asnumpy(mask), expected)
+
+
+@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+def test_workflow_plane_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
+    """The 2D mode returns the same mask on both devices."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    plane = _filaments((6, 48, 64), seed=7)[2]
+    np.testing.assert_array_equal(asnumpy(workflow(ascupy(plane))), workflow(plane))
+
+
+@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+def test_workflow_rejects_other_dimensionalities(workflow) -> None:
+    """Only (Y, X) planes and (Z, Y, X) volumes are accepted."""
+    with pytest.raises(ValueError, match="2D .* or 3D"):
+        workflow(np.zeros((2, 4, 8, 8), dtype=np.float32))
+
+
 @pytest.mark.parametrize(
     ("workflow", "module_name", "func_name"),
     [
@@ -422,3 +454,7 @@ def test_workflow_matches_aicssegmentation(
     img = _filaments((6, 48, 64), seed=5)
     expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(img), expected)
+    # The 2D mode equals the reference run on the one-plane volume.
+    plane = img[2:3]
+    expected = getattr(module, func_name)(plane.copy(), output_type="array") > 0
+    np.testing.assert_array_equal(workflow(plane[0]), expected[0])
