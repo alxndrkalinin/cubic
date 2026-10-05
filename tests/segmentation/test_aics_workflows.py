@@ -468,7 +468,21 @@ def test_workflow_matches_aicssegmentation(
     img = _filaments((6, 48, 64), seed=5)
     expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(img), expected)
-    # The 2D mode equals the reference run on the one-plane volume.
-    plane = img[2:3]
-    expected = getattr(module, func_name)(plane.copy(), output_type="array") > 0
-    np.testing.assert_array_equal(workflow(plane[0]), expected[0])
+
+
+@pytest.mark.parametrize(
+    ("workflow", "module_name", "func_name"),
+    [
+        (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
+        (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
+    ],
+)
+def test_workflow_plane_matches_aicssegmentation(
+    workflow, module_name: str, func_name: str
+) -> None:
+    """A plane's mask equals ``aicssegmentation`` run on the one-plane volume."""
+    pytest.importorskip("itk")
+    module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
+    plane = _filaments((6, 48, 64), seed=5)[2]
+    expected = getattr(module, func_name)(plane[None].copy(), output_type="array") > 0
+    np.testing.assert_array_equal(workflow(plane), expected[0])
