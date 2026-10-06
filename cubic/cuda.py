@@ -53,7 +53,10 @@ class CUDAManager:
         except ImportError:
             self.cp = self.cucim = None
             self.num_gpus = 0
-            warnings.warn("CuPy or CuCIM is not installed. Falling back to CPU.")
+            warnings.warn(
+                "CuPy or CuCIM is not installed. Falling back to CPU. For GPU "
+                "support, install cubic[cuda12] or cubic[cuda13]."
+            )
         except Exception:
             self.cp = self.cucim = None
             self.num_gpus = 0
