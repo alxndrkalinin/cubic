@@ -18,18 +18,31 @@ and other features.
 ### Dependencies
 * Python >=3.10
 * numpy/scipy/scikit-image
-* [optional] CUDA>=11.x, [CuPy](https://docs.cupy.dev/en/stable/install.html), [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file#install-cucim)
+* [optional] an NVIDIA driver supporting CUDA 12 or 13, [CuPy](https://docs.cupy.dev/en/stable/install.html), [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file#install-cucim)
 * [optional] Cellpose for segmentation
 
 ### Installation
-
-Install optional CUDA dependencies if GPU support is needed.
 
 Install from PyPI:
 
 ```bash
 pip install cubic
 ```
+
+For GPU support, pick the extra matching the highest CUDA major version your
+driver supports (the `CUDA Version` shown by `nvidia-smi`):
+
+```bash
+pip install 'cubic[cuda12]'  # CUDA 12.x
+pip install 'cubic[cuda13]'  # CUDA 13.x
+```
+
+These install CuPy and cuCIM together with the CUDA runtime libraries from
+PyPI, so only the NVIDIA driver is needed, not a CUDA Toolkit. The two extras
+are mutually exclusive. pip and uv cannot yet detect the CUDA version
+themselves; conda can, so `conda install -c rapidsai -c conda-forge cupy cucim`
+followed by `pip install cubic` is an alternative. Without CuPy and cuCIM,
+cubic runs on the CPU.
 
 Or install from source:
 
