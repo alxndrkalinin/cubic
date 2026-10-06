@@ -4,7 +4,8 @@ Ports of the ``aicssegmentation`` SEC61B (ER) and TOMM20 (mitochondria)
 workflows and the primitives they share. The CPU reference runs ITK's
 gradient anisotropic diffusion and a per-slice Python loop for the 2D
 vesselness filter; here every step is a whole-volume array operation, so the
-same call runs on NumPy or CuPy input.
+same call runs on NumPy or CuPy input. The workflows also accept a single 2D
+plane, segmented as a one-plane volume.
 
 Each primitive reproduces its reference's arithmetic, dtype, operation order
 and boundary handling (see the per-function notes). For float32 input the
@@ -744,6 +745,13 @@ def remove_small_objects_aics(
     return keep[labels]
 
 
+def _is_plane(image: np.ndarray) -> bool:
+    """Tell a 2D plane (``True``) from a volume (``False``); raise otherwise."""
+    if image.ndim not in (2, 3):
+        raise ValueError(f"image must be 2D (Y, X) or 3D (Z, Y, X), got {image.ndim}D")
+    return image.ndim == 2
+
+
 def _resolve_inclusive(size_filter_inclusive: bool | None) -> bool:
     """``None`` follows the installed scikit-image, as the reference would."""
     if size_filter_inclusive is None:
@@ -754,7 +762,7 @@ def _resolve_inclusive(size_filter_inclusive: bool | None) -> bool:
 def workflow_sec61b(
     image: np.ndarray, *, size_filter_inclusive: bool | None = None
 ) -> np.ndarray:
-    """SEC61B (endoplasmic reticulum) classic segmentation of one z-stack.
+    """SEC61B (endoplasmic reticulum) classic segmentation of one z-stack or plane.
 
     Port of ``aicssegmentation.structure_wrapper.seg_sec61b.Workflow_sec61b``
     with its fixed parameters (no rescaling).
@@ -762,9 +770,14 @@ def workflow_sec61b(
     Parameters
     ----------
     image : np.ndarray
-        3D image ``(Z, Y, X)``; NumPy or CuPy. Converted to float32 first; the
-        bitwise match with the reference holds for float32 input (the
-        reference normalizes other dtypes in their own precision).
+        3D image ``(Z, Y, X)``, or one 2D plane ``(Y, X)``; NumPy or CuPy.
+        Converted to float32 first; the bitwise match with the reference holds
+        for float32 input (the reference normalizes other dtypes in their own
+        precision). A 2D plane is segmented as a one-plane volume, so every
+        step sees only that plane: its own intensity statistics, no smoothing
+        or connectivity across z, and the plane itself as the z-projection the
+        vesselness filter sets its threshold from. The mask can therefore
+        differ from the same plane of a whole-volume segmentation.
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
@@ -774,8 +787,12 @@ def workflow_sec61b(
     Returns
     -------
     np.ndarray
-        Boolean mask on the input's device.
+        Boolean mask of the input's shape, on the input's device.
     """
+    if _is_plane(image):
+        return workflow_sec61b(
+            image[None], size_filter_inclusive=size_filter_inclusive
+        )[0]
     inclusive = _resolve_inclusive(size_filter_inclusive)
     norm = intensity_normalization(image.astype(np.float32, copy=False), (2.5, 7.5))
     smooth = gradient_anisotropic_diffusion(norm)
@@ -790,7 +807,7 @@ def workflow_sec61b(
 def workflow_tomm20(
     image: np.ndarray, *, size_filter_inclusive: bool | None = None
 ) -> np.ndarray:
-    """TOMM20 (mitochondria) classic segmentation of one z-stack.
+    """TOMM20 (mitochondria) classic segmentation of one z-stack or plane.
 
     Port of ``aicssegmentation.structure_wrapper.seg_tomm20.Workflow_tomm20``
     with its fixed parameters (no rescaling).
@@ -798,9 +815,14 @@ def workflow_tomm20(
     Parameters
     ----------
     image : np.ndarray
-        3D image ``(Z, Y, X)``; NumPy or CuPy. Converted to float32 first; the
-        bitwise match with the reference holds for float32 input (the
-        reference normalizes other dtypes in their own precision).
+        3D image ``(Z, Y, X)``, or one 2D plane ``(Y, X)``; NumPy or CuPy.
+        Converted to float32 first; the bitwise match with the reference holds
+        for float32 input (the reference normalizes other dtypes in their own
+        precision). A 2D plane is segmented as a one-plane volume, so every
+        step sees only that plane: its own intensity statistics, no smoothing
+        or connectivity across z, and the plane itself as the z-projection the
+        vesselness filter sets its threshold from. The mask can therefore
+        differ from the same plane of a whole-volume segmentation.
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
@@ -810,8 +832,12 @@ def workflow_tomm20(
     Returns
     -------
     np.ndarray
-        Boolean mask on the input's device.
+        Boolean mask of the input's shape, on the input's device.
     """
+    if _is_plane(image):
+        return workflow_tomm20(
+            image[None], size_filter_inclusive=size_filter_inclusive
+        )[0]
     norm = intensity_normalization(image.astype(np.float32, copy=False), (3.5, 15.0))
     smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
     del norm

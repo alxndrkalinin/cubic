@@ -406,6 +406,52 @@ def test_workflow_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
     np.testing.assert_array_equal(asnumpy(gpu), cpu)
 
 
+def _planar_workflow(workflow, plane: np.ndarray) -> np.ndarray:
+    """Compose the workflow's steps on a 2D plane, without a one-plane volume.
+
+    Runs the 2D array-path diffusion, a 2D Gaussian and 2D labeling, so it shares
+    none of the one-plane (Z=1) volume handling the workflows use for a plane:
+    the 3D CUDA kernels, ITK's 3D boundary-face replay or 3D connectivity.
+    """
+    inclusive = _SKIMAGE_USES_MAX_SIZE
+    if workflow is workflow_sec61b:
+        norm = intensity_normalization(plane, (2.5, 7.5))
+        smooth = gradient_anisotropic_diffusion(norm)
+        bw = vesselness_slice_by_slice(smooth[None], [1.0])[0] > 0.15
+        # A plane's per-z-plane pass is the plain 2D filter.
+        for min_size in (15, 3, 15):
+            bw = remove_small_objects_aics(bw, min_size, inclusive=inclusive)
+        return bw
+    norm = intensity_normalization(plane, (3.5, 15.0))
+    smooth = _gaussian_nearest(norm, [1.0, 1.0])
+    bw = vesselness_slice_by_slice(smooth[None], [1.5])[0] > 0.16
+    return remove_small_objects_aics(bw, 10, inclusive=inclusive)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+def test_workflow_plane_matches_planar_steps(
+    workflow, use_gpu: bool, gpu_available: bool
+) -> None:
+    """A (Y, X) plane is segmented as its steps run directly in 2D, on either device."""
+    # This plane leaves components just below each size threshold, which a plane
+    # filtered with connectivity across z would keep.
+    plane = _filaments((6, 48, 64), seed=4)[1]
+    mask = workflow(_to_device(plane, use_gpu, gpu_available))
+    assert mask.shape == plane.shape and mask.dtype == bool
+    assert get_device(mask) == ("GPU" if use_gpu else "CPU")
+    expected = _planar_workflow(workflow, plane)
+    assert expected.any()
+    np.testing.assert_array_equal(asnumpy(mask), expected)
+
+
+@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+def test_workflow_rejects_other_dimensionalities(workflow) -> None:
+    """Only (Y, X) planes and (Z, Y, X) volumes are accepted."""
+    with pytest.raises(ValueError, match="2D .* or 3D"):
+        workflow(np.zeros((2, 4, 8, 8), dtype=np.float32))
+
+
 @pytest.mark.parametrize(
     ("workflow", "module_name", "func_name"),
     [
@@ -422,3 +468,21 @@ def test_workflow_matches_aicssegmentation(
     img = _filaments((6, 48, 64), seed=5)
     expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(img), expected)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "module_name", "func_name"),
+    [
+        (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
+        (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
+    ],
+)
+def test_workflow_plane_matches_aicssegmentation(
+    workflow, module_name: str, func_name: str
+) -> None:
+    """A plane's mask equals ``aicssegmentation`` run on the one-plane volume."""
+    pytest.importorskip("itk")
+    module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
+    plane = _filaments((6, 48, 64), seed=5)[2]
+    expected = getattr(module, func_name)(plane[None].copy(), output_type="array") > 0
+    np.testing.assert_array_equal(workflow(plane), expected[0])
