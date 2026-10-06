@@ -38,11 +38,11 @@ pip install 'cubic[cuda13]'  # CUDA 13.x
 ```
 
 These install CuPy and cuCIM together with the CUDA runtime libraries from
-PyPI, so only the NVIDIA driver is needed, not a CUDA Toolkit. The two extras
-are mutually exclusive. pip and uv cannot yet detect the CUDA version
-themselves; conda can, so `conda install -c rapidsai -c conda-forge cupy cucim`
-followed by `pip install cubic` is an alternative. Without CuPy and cuCIM,
-cubic runs on the CPU.
+PyPI, so only the NVIDIA driver is needed, not a CUDA Toolkit. Install only
+one of the two: uv refuses to combine them, but pip does not. pip and uv cannot
+yet detect the CUDA version themselves; conda can, so
+`conda install -c rapidsai -c conda-forge cupy cucim` followed by
+`pip install cubic` is an alternative.
 
 Or install from source:
 
