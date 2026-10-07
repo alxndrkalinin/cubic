@@ -69,7 +69,9 @@ pip install '.[plot]'
 pip install '.[examples]'
 # developer tools (pre-commit, pytest)
 pip install -e '.[dev]'
-# install everything
+# GPU support (pick one, see above)
+pip install -e '.[cuda12]'
+# install every extra except the GPU ones
 pip install -e '.[all]'
 ```
 
