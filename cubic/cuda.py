@@ -53,12 +53,12 @@ class CUDAManager:
             self.cp = cp
             self.cucim = cucim
             self.num_gpus = cp.cuda.runtime.getDeviceCount()
-        except ImportError:
+        except ImportError as exc:
             self.cp = self.cucim = None
             self.num_gpus = 0
             warnings.warn(
-                "CuPy or CuCIM is not installed. Falling back to CPU. For GPU "
-                f"support, {GPU_INSTALL_HINT}."
+                f"CuPy or CuCIM could not be imported ({exc}). Falling back to "
+                f"CPU. For GPU support, {GPU_INSTALL_HINT}."
             )
         except Exception:
             self.cp = self.cucim = None

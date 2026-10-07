@@ -1,5 +1,6 @@
 """Tests for CUDA helper utilities."""
 
+import sys
 import time
 import threading
 
@@ -152,6 +153,23 @@ def test_cuda_manager_has_class_level_defaults() -> None:
     assert hasattr(CUDAManager, "cp")
     assert hasattr(CUDAManager, "cucim")
     assert CUDAManager.num_gpus >= 0
+
+
+def test_cuda_manager_import_failure_warns_with_cause_and_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed CuPy import falls back to CPU, naming the cause and the extras.
+
+    CuPy also raises ``ImportError`` when installed but unable to load its CUDA
+    libraries, so the warning keeps the original message rather than claiming
+    the package is missing.
+    """
+    monkeypatch.setitem(sys.modules, "cupy", None)  # makes ``import cupy`` raise
+    manager = object.__new__(CUDAManager)  # bypass the shared singleton
+    with pytest.warns(UserWarning, match=r"import of cupy.*cubic\[cuda12\]"):
+        manager.init_gpu()
+    assert manager.get_cp() is None
+    assert manager.get_num_gpus() == 0
 
 
 def test_cuda_manager_concurrent_construction_is_atomic(
