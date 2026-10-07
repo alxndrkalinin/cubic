@@ -14,7 +14,13 @@ try:
 except ImportError:  # cucim is an optional GPU-only dep
     _cu_morphology = None  # type: ignore[assignment]
 
-from ..cuda import asnumpy, to_device, get_device, to_same_device
+from ..cuda import (
+    GPU_INSTALL_HINT,
+    asnumpy,
+    to_device,
+    get_device,
+    to_same_device,
+)
 from ..scipy import ndimage as _ndimage
 from ..skimage import feature, filters, transform, morphology
 from ..image_utils import label, pad_image, rescale_xy, distance_transform_edt
@@ -149,7 +155,7 @@ def _remove_small_objects(label_img: np.ndarray, min_size: int) -> np.ndarray:
         if _cu_morphology is None:
             raise ImportError(
                 "cucim is required to process GPU arrays but is not installed; "
-                "install cubic[cuda12] or cubic[cuda13], or move the input to CPU."
+                f"{GPU_INSTALL_HINT}, or move the input to CPU."
             )
         return _cu_morphology.remove_small_objects(label_img, min_size=min_size)
     if _SKIMAGE_USES_MAX_SIZE:
@@ -170,7 +176,7 @@ def _remove_small_holes(mask: np.ndarray, area_threshold: int) -> np.ndarray:
         if _cu_morphology is None:
             raise ImportError(
                 "cucim is required to process GPU arrays but is not installed; "
-                "install cubic[cuda12] or cubic[cuda13], or move the input to CPU."
+                f"{GPU_INSTALL_HINT}, or move the input to CPU."
             )
         return _cu_morphology.remove_small_holes(mask, area_threshold=area_threshold)
     if _SKIMAGE_USES_MAX_SIZE:

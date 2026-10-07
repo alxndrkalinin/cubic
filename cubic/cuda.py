@@ -15,6 +15,9 @@ import numpy as np
 #: host copy and leave the caller's GPU array untouched.
 _OUTPUT_KWARGS = ("out", "output", "distances", "indices")
 
+#: How to get the GPU dependencies; see the extras in ``pyproject.toml``.
+GPU_INSTALL_HINT = "install cubic[cuda12] or cubic[cuda13]"
+
 
 class CUDAManager:
     """Manages CUDA resources."""
@@ -55,7 +58,7 @@ class CUDAManager:
             self.num_gpus = 0
             warnings.warn(
                 "CuPy or CuCIM is not installed. Falling back to CPU. For GPU "
-                "support, install cubic[cuda12] or cubic[cuda13]."
+                f"support, {GPU_INSTALL_HINT}."
             )
         except Exception:
             self.cp = self.cucim = None
