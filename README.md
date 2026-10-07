@@ -29,18 +29,19 @@ Install from PyPI:
 pip install cubic
 ```
 
-For GPU support, pick the extra matching the highest CUDA major version your
-driver supports (the `CUDA Version` shown by `nvidia-smi`):
+For GPU support on Linux, install one of the CUDA extras:
 
 ```bash
-pip install 'cubic[cuda12]'  # CUDA 12.x
-pip install 'cubic[cuda13]'  # CUDA 13.x
+pip install 'cubic[cuda13]'  # driver with CUDA 13.x and a Turing or newer GPU
+pip install 'cubic[cuda12]'  # driver with CUDA 12.x, or a Maxwell, Pascal or Volta GPU
 ```
 
-These install CuPy and cuCIM together with the CUDA runtime libraries from
-PyPI, so only the NVIDIA driver is needed, not a CUDA Toolkit. Install only
-one of the two: uv refuses to combine them, but pip does not. pip and uv cannot
-yet detect the CUDA version themselves; conda can, so
+`nvidia-smi` shows the driver's `CUDA Version`. These extras install CuPy and
+cuCIM together with the CUDA runtime libraries from PyPI, so only the NVIDIA
+driver is needed, not a CUDA Toolkit. cuCIM publishes Linux wheels only.
+Install one extra into an environment that has no other `cupy-cuda*` package:
+uv refuses to combine the two extras, but pip does not. pip and uv cannot yet
+detect the CUDA version themselves; conda can, so
 `conda install -c rapidsai -c conda-forge cupy cucim` followed by
 `pip install cubic` is an alternative.
 
