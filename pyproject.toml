@@ -60,12 +60,28 @@ dev = [
     "pytest",
     "pre-commit",
 ]
+# GPU support: pick the extra matching the CUDA major version the driver
+# supports. [ctk] pulls the CUDA runtime libraries from PyPI, so only the
+# driver is needed. Not part of `all`, since the two are mutually exclusive.
+cuda12 = [
+    "cupy-cuda12x[ctk]>=14",  # 13.x has no [ctk] extra
+    "cucim-cu12",
+]
+cuda13 = [
+    "cupy-cuda13x[ctk]>=14",
+    "cucim-cu13",
+]
 all = [
     "cubic[cellpose]",
     "cubic[mesh]",
     "cubic[plot]",
     "cubic[examples]",
     "cubic[dev]",
+]
+
+[tool.uv]
+conflicts = [
+    [{ extra = "cuda12" }, { extra = "cuda13" }],
 ]
 
 [tool.setuptools.dynamic]
