@@ -300,6 +300,25 @@ def test_curvature_converts_with_the_spacing_unit() -> None:
     assert fine[names[1]] == coarse[names[1]] == 2
 
 
+def test_cavity_counts_as_concave_in_the_mean_curvature() -> None:
+    """A cavity's shell faces the material, so its curvature counts negative.
+
+    The hollow ball integrates to the outer ball minus the inner one (82.1).
+    Orienting each shell outward on its own would add them instead (244.2).
+    """
+    outer, inner = _ball(12, 32), _ball(6, 32)
+    names = ["Avg Mean Curvature", "Area"]
+
+    def integral(mask: np.ndarray) -> float:
+        h, area = mesh.extract_surface_features(mask, features=names).values()
+        return h * area
+
+    # The two sides agree to 1.5e-7 relative, not to the last bit.
+    assert integral(outer & ~inner) == pytest.approx(
+        integral(outer) - integral(inner), rel=1e-6
+    )
+
+
 def test_euler_characteristic_counts_topology() -> None:
     """Twice the pieces plus cavities, minus twice the handles."""
     z, y, x = _centred_grid(50, 50, 50)
