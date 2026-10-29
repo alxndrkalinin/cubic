@@ -52,9 +52,11 @@ def mesh_feature_list() -> list[str]:
     oriented bounding box volume. Voxelization still moves every feature a little
     with orientation, and the oriented box and bounding cylinder come from
     trimesh's approximate minimum searches, so they move more: ``Extent`` spans
-    0.50-0.55 for one ellipsoid turned by 0, 30 and 45 degrees. The curvatures
-    are averages over the surface, in inverse units of ``spacing`` (squared for
-    the Gaussian curvature).
+    0.50-0.55 for one ellipsoid turned by 0, 30 and 45 degrees. The mean
+    curvature is averaged over the surface, in inverse units of ``spacing``.
+    ``Euler Characteristic`` is twice the number of separate pieces plus
+    cavities, minus twice the number of handles: 2 for a ball, 4 for a hollow
+    ball, 0 for a torus.
     """
     return list(_MESH_FEATURES)
 
@@ -277,16 +279,6 @@ def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
     return np.sort(2 * np.sqrt(5 * second_moments / mesh.mass))
 
 
-def _avg_gaussian_curvature(mesh: trimesh.Trimesh) -> float:
-    """Return the surface average of the Gaussian curvature, ``1 / R^2`` on a sphere.
-
-    The angle defects of a closed surface sum to ``2 pi`` times its Euler
-    characteristic (Gauss-Bonnet), so this is ``4 pi / area`` for an object
-    without handles or cavities and 0 for a torus.
-    """
-    return mesh.vertex_defects.sum() / mesh.area
-
-
 def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
     """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
 
@@ -316,6 +308,9 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     "Sphericity": lambda m: sphericity(float(m.volume), float(m.area)),
     "Extent": lambda m: m.volume / m.bounding_box_oriented.volume,
     "Solidity": lambda m: m.volume / m.convex_hull.volume,
-    "Avg Gaussian Curvature": _avg_gaussian_curvature,
+    # The surface average of the Gaussian curvature would be exactly
+    # 2 pi * euler_number / area (Gauss-Bonnet), so it adds nothing to Area
+    # beyond this integer.
+    "Euler Characteristic": lambda m: m.euler_number,
     "Avg Mean Curvature": _avg_mean_curvature,
 }

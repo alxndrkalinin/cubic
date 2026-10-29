@@ -274,50 +274,51 @@ def test_extract_surface_features_full_pipeline() -> None:
 
 
 def test_curvature_of_a_sphere() -> None:
-    """The curvatures are surface averages: 1 / R and 1 / R^2 on a sphere."""
+    """Mean curvature is a surface average, 1 / R on a sphere of radius R."""
     radius = 8
     features = mesh.extract_surface_features(
-        _ball(radius, 22),
-        features=["Avg Mean Curvature", "Avg Gaussian Curvature", "Area"],
+        _ball(radius, 22), features=["Avg Mean Curvature"]
     )
 
     # The voxel staircase leaves the mean curvature 1.6% low at this radius.
     assert features["Avg Mean Curvature"] == pytest.approx(1 / radius, rel=0.03)
-    # Gauss-Bonnet: the Gaussian curvature integrates to 4 pi exactly.
-    integral = features["Avg Gaussian Curvature"] * features["Area"]
-    assert integral == pytest.approx(4 * np.pi, rel=1e-9)
 
 
 def test_curvature_converts_with_the_spacing_unit() -> None:
     """Giving the same spacing in other units rescales curvature as 1 / length.
 
-    The vertex-averaged ball measures used before integrated over a radius of 1
-    in the units of ``spacing``: spacing 0.1 instead of 1 changed them 78x and
-    11x rather than 100x and 10x.
+    The vertex-averaged ball measure used before integrated over a radius of 1
+    in the units of ``spacing``: spacing 0.1 instead of 1 changed it 11x rather
+    than 10x.
     """
-    names = ["Avg Mean Curvature", "Avg Gaussian Curvature"]
+    names = ["Avg Mean Curvature", "Euler Characteristic"]
     mask = _ball(8, 22)
     coarse = mesh.extract_surface_features(mask, (1.0, 1.0, 1.0), names)
     fine = mesh.extract_surface_features(mask, (0.1, 0.1, 0.1), names)
 
     assert fine[names[0]] / coarse[names[0]] == pytest.approx(10, rel=1e-6)
-    assert fine[names[1]] / coarse[names[1]] == pytest.approx(100, rel=1e-6)
+    assert fine[names[1]] == coarse[names[1]] == 2
 
 
-def test_gaussian_curvature_follows_topology() -> None:
-    """A torus has zero total Gaussian curvature, a hollow ball twice a ball's."""
+def test_euler_characteristic_counts_topology() -> None:
+    """Twice the pieces plus cavities, minus twice the handles."""
     z, y, x = _centred_grid(50, 50, 50)
     torus = (np.sqrt(y**2 + x**2) - 14) ** 2 + z**2 <= 6**2
-    hollow = _ball(12, 32) & ~_ball(6, 32)
-    names = ["Avg Gaussian Curvature", "Area"]
+    two_balls = np.concatenate([_ball(6, 16), _ball(6, 16)])
+    shapes = {
+        "ball": (_ball(8, 22), 2),
+        "hollow ball": (_ball(12, 32) & ~_ball(6, 32), 4),
+        "two balls": (two_balls, 4),
+        "torus": (torus, 0),
+    }
+    got = {
+        name: mesh.extract_surface_features(mask, features=["Euler Characteristic"])
+        for name, (mask, _) in shapes.items()
+    }
 
-    torus_k, _ = mesh.extract_surface_features(torus, features=names).values()
-    hollow_k, hollow_area = mesh.extract_surface_features(
-        hollow, features=names
-    ).values()
-
-    assert torus_k == pytest.approx(0, abs=1e-12)
-    assert hollow_k * hollow_area == pytest.approx(8 * np.pi, rel=1e-9)
+    assert {name: f["Euler Characteristic"] for name, f in got.items()} == {
+        name: expected for name, (_, expected) in shapes.items()
+    }
 
 
 def test_sphericity_is_one_for_a_sphere_only() -> None:
