@@ -7,7 +7,7 @@ with ``trimesh``.
 from __future__ import annotations
 
 import warnings
-from typing import Any, TypeVar, Callable
+from typing import Any, TypeVar, Callable, SupportsFloat
 from functools import wraps
 from collections.abc import Sequence
 
@@ -295,7 +295,7 @@ def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
 
 # Each feature is computed only when requested; the dict order is the default
 # column order of ``mesh_feature_list``.
-_MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], float]] = {
+_MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     "Area": lambda m: m.area,
     "Volume": lambda m: m.volume,
     "Min Axis Length": lambda m: _equivalent_ellipsoid_axes(m)[0],
@@ -309,7 +309,7 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], float]] = {
     "Bounding Sphere Volume": lambda m: m.bounding_sphere.volume,
     "Convex Hull Volume": lambda m: m.convex_hull.volume,
     "Convex Hull Area": lambda m: m.convex_hull.area,
-    "Sphericity": lambda m: sphericity(m.volume, m.area),
+    "Sphericity": lambda m: sphericity(float(m.volume), float(m.area)),
     "Extent": lambda m: m.volume / m.bounding_box_oriented.volume,
     "Solidity": lambda m: m.volume / m.convex_hull.volume,
     "Avg Gaussian Curvature": _avg_gaussian_curvature,
