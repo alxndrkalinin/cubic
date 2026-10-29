@@ -259,9 +259,8 @@ def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
     A solid ellipsoid of mass ``m`` and semi-axes ``a, b, c`` has principal
     moments ``m (b^2 + c^2) / 5`` and so on, so
     ``a^2 = 5 (I_b + I_c - I_a) / (2 m)``, the convention of regionprops'
-    ``axis_major_length``. Unlike the axis-aligned bounding box extents used
-    before, it does not change when the object rotates: those moved from
-    (12, 16, 48) to (12, 36, 36) for an ellipsoid turned by 45 degrees.
+    ``axis_major_length``. Unlike bounding box extents, they do not depend on
+    the object's orientation.
     """
     moments = mesh.principal_inertia_components
     # (I_b + I_c - I_a) / 2 is the second moment along axis a, so it is never
