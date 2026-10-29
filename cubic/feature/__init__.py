@@ -6,8 +6,8 @@ from importlib import import_module
 from .voxel import regionprops, regionprops_table
 from .texture import glcm_features, glcm_features_by_label
 
+# ``mesh`` stays out of ``__all__`` so that a star import does not load trimesh.
 __all__ = [
-    "mesh",
     "regionprops",
     "glcm_features",
     "glcm_features_by_label",

@@ -325,6 +325,9 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
     every user of the voxel and texture features.
     """
     assert cubic.feature.__getattr__("mesh") is mesh
-    # Only a fresh interpreter can show that the package import skips trimesh.
-    code = "import sys, cubic.feature\nassert 'trimesh' not in sys.modules\n"
+    # Only a fresh interpreter can show that the package import, star import
+    # included, skips trimesh.
+    code = (
+        "import sys\nfrom cubic.feature import *\nassert 'trimesh' not in sys.modules\n"
+    )
     subprocess.run([sys.executable, "-c", code], check=True)
