@@ -173,8 +173,12 @@ def mask2mesh(
     return mesh
 
 
-def ellipsoid_sphericity(v: float, sa: float) -> float:
-    """Calculate the sphericity of an ellipsoid given its volume and surface area."""
+def sphericity(v: float, sa: float) -> float:
+    """Return the Wadell sphericity of a body of volume ``v`` and surface area ``sa``.
+
+    This is the surface area of the sphere of equal volume divided by ``sa``: 1
+    for a sphere and smaller for any other shape.
+    """
     return np.power(np.pi, 1 / 3) * np.power(6 * v, 2 / 3) / sa
 
 
@@ -294,7 +298,7 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], float]] = {
     "Bounding Sphere Volume": lambda m: m.bounding_sphere.volume,
     "Convex Hull Volume": lambda m: m.convex_hull.volume,
     "Convex Hull Area": lambda m: m.convex_hull.area,
-    "Sphericity": lambda m: ellipsoid_sphericity(m.volume, m.area),
+    "Sphericity": lambda m: sphericity(m.volume, m.area),
     "Extent": lambda m: m.volume / m.bounding_box_oriented.volume,
     "Solidity": lambda m: m.volume / m.convex_hull.volume,
     "Avg Gaussian Curvature": _avg_gaussian_curvature,

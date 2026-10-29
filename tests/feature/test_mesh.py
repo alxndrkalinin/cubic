@@ -311,3 +311,9 @@ def test_gaussian_curvature_follows_topology() -> None:
 
     assert torus_k == pytest.approx(0, abs=1e-12)
     assert hollow_k * hollow_area == pytest.approx(8 * np.pi, rel=1e-9)
+
+
+def test_sphericity_is_one_for_a_sphere_only() -> None:
+    """Wadell sphericity is 1 for a sphere and below 1 for a cube."""
+    assert mesh.sphericity(4 / 3 * np.pi, 4 * np.pi) == pytest.approx(1)
+    assert mesh.sphericity(1.0, 6.0) == pytest.approx((np.pi / 6) ** (1 / 3))
