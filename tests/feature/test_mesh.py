@@ -100,6 +100,13 @@ def test_extract_features_empty_label_image() -> None:
     assert np.vstack([feature_values, np.zeros((1, 2))]).shape == (1, 2)
 
 
+@pytest.mark.parametrize("label", [0, 1])
+def test_extract_features_rejects_unknown_feature_names(label: int) -> None:
+    """An unknown name raises before any label is meshed, even with no labels."""
+    with pytest.raises(ValueError, match=r"Unknown mesh features \['Scale'\]"):
+        mesh.extract_features(_cube_volume(4) * label, ["Volume", "Scale"])
+
+
 def test_extract_features_rejects_non_integer_labels() -> None:
     """A float label image raises instead of failing inside find_objects."""
     with pytest.raises(ValueError, match="integer dtype"):

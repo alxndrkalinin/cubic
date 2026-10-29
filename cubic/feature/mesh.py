@@ -59,6 +59,19 @@ def mesh_feature_list() -> list[str]:
     return list(_MESH_FEATURES)
 
 
+def _check_feature_names(features: Sequence[str]) -> None:
+    """Raise for names that are not in ``mesh_feature_list()``.
+
+    Checked before any meshing: an unknown name used to raise ``KeyError`` only
+    after every feature of the first label had been computed.
+    """
+    unknown = [name for name in features if name not in _MESH_FEATURES]
+    if unknown:
+        raise ValueError(
+            f"Unknown mesh features {unknown}; available: {mesh_feature_list()}"
+        )
+
+
 @_require_trimesh
 def extract_features(
     label_image: np.ndarray,
@@ -101,7 +114,9 @@ def extract_features(
     labels = np.unique(label_image)
     labels = labels[labels > 0]
 
-    features = features or mesh_feature_list()
+    if features is None:
+        features = mesh_feature_list()
+    _check_feature_names(features)
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
     # so each label is meshed over its own crop instead of the whole volume.
     bboxes = ndimage.find_objects(label_image)
@@ -199,8 +214,9 @@ def extract_mesh_features(
     Raises
     ------
     ValueError
-        If the mesh volume or surface area is not finite and positive, which is
-        what an open (non-watertight) surface reports.
+        If a feature name is unknown, or if the mesh volume or surface area is
+        not finite and positive, which is what an open (non-watertight) surface
+        reports.
     """
     # Validate before anything else: an open surface (e.g. a mask meshed without
     # a background border) reports a negative volume, which silently propagates
@@ -219,6 +235,7 @@ def extract_mesh_features(
 
     if features is None:
         features = mesh_feature_list()
+    _check_feature_names(features)
     # trimesh caches volume, convex hull and bounding primitives on the mesh, so
     # features sharing them do not recompute them.
     return {name: float(_MESH_FEATURES[name](mesh)) for name in features}
