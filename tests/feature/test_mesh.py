@@ -330,4 +330,5 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
     code = (
         "import sys\nfrom cubic.feature import *\nassert 'trimesh' not in sys.modules\n"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    # A timeout turns a hung import (e.g. a CUDA probe) into a failure.
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
