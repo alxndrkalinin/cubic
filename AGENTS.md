@@ -68,7 +68,7 @@ These modules automatically route function calls to CPU (NumPy/SciPy/scikit-imag
 
 ### Feature Extraction (`cubic/feature/`)
 
-- `mesh.py` – Mesh-based feature extraction
+- `mesh.py` – Mesh-based size and shape features (`cubic[mesh]`, CPU only): marching cubes per label, measured with trimesh; every feature is orientation-invariant and the curvatures are surface averages in inverse units of `spacing`
 - `voxel.py` – Voxel-based feature extraction
 
 ### Other Metrics (`cubic/metrics/`)
