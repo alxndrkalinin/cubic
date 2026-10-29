@@ -22,21 +22,42 @@ def _cube_volume(origin: int, shape: int = 14) -> np.ndarray:
     return volume
 
 
+def _centred_grid(*shape: int) -> list[np.ndarray]:
+    """Return ``ij`` voxel coordinates of ``shape``, centred on its middle."""
+    return np.meshgrid(*[np.arange(n) - (n - 1) / 2 for n in shape], indexing="ij")
+
+
+def _ball(radius: float, shape: int) -> np.ndarray:
+    """Return a ``shape**3`` boolean mask of a centred ball of ``radius`` voxels."""
+    return sum(axis**2 for axis in _centred_grid(shape, shape, shape)) <= radius**2
+
+
 def _rotated_ellipsoid(rot_deg: float) -> np.ndarray:
     """Return a label image of an ellipsoid with full axes (12, 48, 16).
 
     The ellipsoid is rotated by ``rot_deg`` about axis 0, i.e. within the
     plane of axes 1 and 2.
     """
-    z, y, x = np.meshgrid(
-        *[np.arange(n) - (n - 1) / 2 for n in (20, 60, 60)], indexing="ij"
-    )
+    z, y, x = _centred_grid(20, 60, 60)
     t = np.deg2rad(rot_deg)
     y, x = np.cos(t) * y + np.sin(t) * x, -np.sin(t) * y + np.cos(t) * x
     return ((z / 6) ** 2 + (y / 24) ** 2 + (x / 8) ** 2 <= 1).astype(np.int32)
 
 
-def test_extract_features_excludes_background_label(monkeypatch) -> None:
+@pytest.fixture
+def surface_calls(monkeypatch) -> list[dict]:
+    """Stub per-label meshing and record the mask and spacing of each call."""
+    calls: list[dict] = []
+
+    def fake_surface_features(mask, spacing=None, features=None) -> dict[str, float]:
+        calls.append({"mask": mask, "spacing": spacing})
+        return dict.fromkeys(features or mesh.mesh_feature_list(), 0.0)
+
+    monkeypatch.setattr(mesh, "extract_surface_features", fake_surface_features)
+    return calls
+
+
+def test_extract_features_excludes_background_label(surface_calls) -> None:
     """Background (label 0) produces no row, matching voxel.regionprops.
 
     Previously ``np.unique`` kept 0, so a meaningless background mesh and a
@@ -45,17 +66,6 @@ def test_extract_features_excludes_background_label(monkeypatch) -> None:
     filtering alone.
     """
     names = mesh.mesh_feature_list()
-    seen_masks: list[int] = []
-
-    def fake_surface_features(
-        mask: np.ndarray, spacing=None, features=None
-    ) -> dict[str, float]:
-        # Record which label each call corresponds to (mask sum is unique here).
-        seen_masks.append(int(mask.sum()))
-        return dict.fromkeys(names, 0.0)
-
-    monkeypatch.setattr(mesh, "extract_surface_features", fake_surface_features)
-
     volume = np.zeros((12, 12, 12), dtype=np.int32)
     volume[2:6, 2:6, 2:6] = 1  # 64 voxels
     volume[7:11, 7:11, 7:11] = 2  # 64 voxels
@@ -67,28 +77,18 @@ def test_extract_features_excludes_background_label(monkeypatch) -> None:
     assert feature_values.shape == (2, len(names))
     assert columns == names
     # Background (label 0) mask sum would be 12**3 - 128 = 1600; never visited.
-    assert 1600 not in seen_masks
+    assert [int(call["mask"].sum()) for call in surface_calls] == [64, 64]
 
 
-def test_extract_features_meshes_only_the_label_bbox(monkeypatch) -> None:
+def test_extract_features_meshes_only_the_label_bbox(surface_calls) -> None:
     """Each label is meshed over its own bounding box, not the whole volume."""
-    seen_shapes: list[tuple[int, ...]] = []
-
-    def fake_surface_features(
-        mask: np.ndarray, spacing=None, features=None
-    ) -> dict[str, float]:
-        seen_shapes.append(mask.shape)
-        return dict.fromkeys(mesh.mesh_feature_list(), 0.0)
-
-    monkeypatch.setattr(mesh, "extract_surface_features", fake_surface_features)
-
     volume = np.zeros((64, 64, 64), dtype=np.int32)
     volume[2:6, 2:6, 2:6] = 1
     volume[10:13, 20:24, 30:35] = 2
 
     mesh.extract_features(volume)
 
-    assert seen_shapes == [(4, 4, 4), (3, 4, 5)]
+    assert [call["mask"].shape for call in surface_calls] == [(4, 4, 4), (3, 4, 5)]
 
 
 def test_extract_features_empty_label_image() -> None:
@@ -176,20 +176,11 @@ def test_mask2mesh_spacing_scales_geometry() -> None:
         )
 
 
-def test_extract_features_forwards_spacing(monkeypatch) -> None:
+def test_extract_features_forwards_spacing(surface_calls) -> None:
     """``extract_features`` threads ``spacing`` down to the per-label mesh."""
-    seen: list[object] = []
-
-    def fake_surface_features(
-        mask: np.ndarray, spacing=None, features=None
-    ) -> dict[str, float]:
-        seen.append(spacing)
-        return dict.fromkeys(mesh.mesh_feature_list(), 0.0)
-
-    monkeypatch.setattr(mesh, "extract_surface_features", fake_surface_features)
     mesh.extract_features(_cube_volume(4), spacing=(4.0, 1.0, 1.0))
 
-    assert seen == [(4.0, 1.0, 1.0)]
+    assert [call["spacing"] for call in surface_calls] == [(4.0, 1.0, 1.0)]
 
 
 def test_extract_mesh_features_rejects_open_mesh() -> None:
@@ -272,12 +263,6 @@ def test_extract_surface_features_full_pipeline() -> None:
     assert 0 < features["Extent"] <= 1
 
 
-def _ball(radius: float, shape: int) -> np.ndarray:
-    """Return a ``shape**3`` boolean mask of a centred ball of ``radius`` voxels."""
-    grid = np.meshgrid(*[np.arange(shape) - (shape - 1) / 2] * 3, indexing="ij")
-    return sum(axis**2 for axis in grid) <= radius**2
-
-
 def test_curvature_of_a_sphere() -> None:
     """The curvatures are surface averages: 1 / R and 1 / R^2 on a sphere."""
     radius = 8
@@ -311,7 +296,7 @@ def test_curvature_converts_with_the_spacing_unit() -> None:
 
 def test_gaussian_curvature_follows_topology() -> None:
     """A torus has zero total Gaussian curvature, a hollow ball twice a ball's."""
-    z, y, x = np.meshgrid(*[np.arange(50) - 24.5] * 3, indexing="ij")
+    z, y, x = _centred_grid(50, 50, 50)
     torus = (np.sqrt(y**2 + x**2) - 14) ** 2 + z**2 <= 6**2
     hollow = _ball(12, 32) & ~_ball(6, 32)
     names = ["Avg Gaussian Curvature", "Area"]
