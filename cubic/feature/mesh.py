@@ -63,6 +63,11 @@ def _resolve_features(features: Sequence[str] | None) -> list[str]:
     """Return ``features``, or all of them for ``None``; raise for unknown names."""
     if features is None:
         return mesh_feature_list()
+    # A string is a sequence too, and would be checked letter by letter.
+    if isinstance(features, str):
+        raise TypeError(
+            f"features must be a sequence of names, not the string {features!r}"
+        )
     unknown = [name for name in features if name not in _MESH_FEATURES]
     if unknown:
         raise ValueError(

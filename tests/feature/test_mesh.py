@@ -113,6 +113,15 @@ def test_extract_features_rejects_unknown_feature_names(label: int) -> None:
         mesh.extract_features(_cube_volume(4) * label, ["Volume", "Scale"])
 
 
+def test_extract_features_rejects_a_bare_feature_name() -> None:
+    """A single name passed as a string is rejected, not split into letters.
+
+    It used to report ``Unknown mesh features ['V', 'o', 'l', 'u', 'm', 'e']``.
+    """
+    with pytest.raises(TypeError, match="not the string 'Volume'"):
+        mesh.extract_features(_cube_volume(4), "Volume")
+
+
 def test_extract_features_rejects_non_integer_labels() -> None:
     """A float label image raises instead of failing inside find_objects."""
     with pytest.raises(ValueError, match="integer dtype"):
