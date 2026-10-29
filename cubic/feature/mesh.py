@@ -1,13 +1,13 @@
 """Extract features from a label image using ``trimesh``.
 
 Each label is converted into a surface mesh with marching cubes and measured
-with ``trimesh``. ``rtree`` is additionally required for the curvature features.
+with ``trimesh``.
 """
 
 from __future__ import annotations
 
 import warnings
-from typing import Any, TypeVar, Callable
+from typing import Any, TypeVar, Callable, SupportsFloat
 from functools import wraps
 from collections.abc import Sequence
 
@@ -16,31 +16,12 @@ from scipy import ndimage
 from scipy.spatial import QhullError
 from skimage.measure import marching_cubes
 
-_MISSING_MESH_DEPS: list[str] = []
 try:  # pragma: no cover - optional dependency
     import trimesh
-    from trimesh.curvature import (
-        discrete_mean_curvature_measure,
-        discrete_gaussian_curvature_measure,
-    )
 except ImportError:  # pragma: no cover - import failure path
     trimesh = None  # type: ignore[assignment]
-    _MISSING_MESH_DEPS.append("trimesh")
-try:  # pragma: no cover - optional dependency
-    # ``discrete_mean_curvature_measure`` queries ``mesh.face_adjacency_tree``,
-    # which trimesh builds with ``rtree``; without it the curvature features
-    # raise ``ModuleNotFoundError`` deep inside trimesh instead of here.
-    import rtree  # noqa: F401
-except ImportError:  # pragma: no cover - import failure path
-    _MISSING_MESH_DEPS.append("rtree")
-if "trimesh" in _MISSING_MESH_DEPS:  # pragma: no cover - import failure path
     warnings.warn(
         "trimesh is not installed. Mesh features are unavailable.",
-        stacklevel=2,
-    )
-elif "rtree" in _MISSING_MESH_DEPS:  # pragma: no cover - import failure path
-    warnings.warn(
-        "rtree is not installed. Mesh curvature features are unavailable.",
         stacklevel=2,
     )
 
@@ -49,62 +30,60 @@ from ..cuda import asnumpy
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def _require_mesh_deps(*deps: str) -> Callable[[F], F]:
-    """Ensure the optional mesh dependencies ``deps`` are importable.
+def _require_trimesh(func: F) -> F:
+    """Ensure ``trimesh`` is available before calling ``func``."""
 
-    Only the curvature features need ``rtree``, so it is required per function
-    rather than module-wide: mesh construction and every other feature work with
-    ``trimesh`` alone.
-    """
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if trimesh is None:
+            raise RuntimeError(
+                "trimesh is required for mesh operations. Install with 'cubic[mesh]'"
+            )
+        return func(*args, **kwargs)
 
-    def decorator(func: F) -> F:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            missing = [dep for dep in deps if dep in _MISSING_MESH_DEPS]
-            if missing:
-                raise RuntimeError(
-                    f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} "
-                    "required for mesh operations. Install with 'cubic[mesh]'"
-                )
-            return func(*args, **kwargs)
-
-        return wrapper  # type: ignore[return-value]
-
-    return decorator
+    return wrapper  # type: ignore[return-value]
 
 
 def mesh_feature_list() -> list[str]:
-    """Return a list of features extracted from a trimesh object."""
-    return [
-        "Area",
-        "Volume",
-        "Min Axis Length",
-        "Med Axis Length",
-        "Max Axis Length",
-        "Scale",
-        "Inertia PC1",
-        "Inertia PC2",
-        "Inertia PC3",
-        "Bounding Box Volume",
-        "Oriented Bounding Box Volume",
-        "Bounding Cylinder Volume",
-        "Bounding Sphere Volume",
-        "Convex Hull Volume",
-        "Convex Hull Area",
-        "Sphericity",
-        "Extent",
-        "Solidity",
-        "Avg Gaussian Curvature",
-        "Avg Mean Curvature",
-    ]
+    """Return the names of the features extracted from a trimesh object.
+
+    No feature is defined on the image axes. The axis lengths are the full axes
+    of the ellipsoid with the same inertia, and ``Extent`` is the volume over the
+    oriented bounding box volume. Voxelization still moves every feature a little
+    with orientation, and the oriented box and bounding cylinder come from
+    trimesh's approximate minimum searches, so they move more: ``Extent`` spans
+    0.50-0.55 for one ellipsoid turned by 0, 30 and 45 degrees. The mean
+    curvature is averaged over the surface, in inverse units of ``spacing``.
+    ``Euler Characteristic`` is twice the number of separate pieces plus
+    cavities, minus twice the number of handles: 2 for a ball, 4 for a hollow
+    ball, 0 for a torus.
+    """
+    return list(_MESH_FEATURES)
 
 
-@_require_mesh_deps("trimesh")
+def _resolve_features(features: Sequence[str] | None) -> list[str]:
+    """Return ``features``, or all of them for ``None``; raise for unknown names."""
+    if features is None:
+        return mesh_feature_list()
+    # A string is a sequence too, and would be checked letter by letter.
+    if isinstance(features, str):
+        raise TypeError(
+            f"features must be a sequence of names, not the string {features!r}"
+        )
+    unknown = [name for name in features if name not in _MESH_FEATURES]
+    if unknown:
+        raise ValueError(
+            f"Unknown mesh features {unknown}; available: {mesh_feature_list()}"
+        )
+    return list(features)
+
+
+@_require_trimesh
 def extract_features(
     label_image: np.ndarray,
     features: list[str] | None = None,
     spacing: Sequence[float] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Extract mesh features for every label of a label image.
 
     Each label is meshed independently over its own bounding box, which is
@@ -117,7 +96,7 @@ def extract_features(
         3D integer label image. Background (label 0) is excluded.
     features : list of str, optional
         Feature names to extract, defaults to ``mesh_feature_list()``; the
-        columns follow this order.
+        columns follow this order. Only these features are computed.
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)`` forwarded to marching cubes. Without it an
         anisotropic stack is meshed as if isotropic, scaling volumes and areas
@@ -130,6 +109,9 @@ def extract_features(
     feature_values : np.ndarray
         ``(n_labels, n_features)`` matrix, ``(0, n_features)`` when there are no
         labels, so that it always stacks with results from other images.
+    column_names : list of str
+        Name of each column, in column order, as returned by
+        ``voxel.extract_features``.
     """
     label_image = asnumpy(label_image)
     if not np.issubdtype(label_image.dtype, np.integer):
@@ -141,31 +123,41 @@ def extract_features(
     labels = np.unique(label_image)
     labels = labels[labels > 0]
 
-    features = features or mesh_feature_list()
+    # Resolved before any meshing, so an unknown name fails even on an image
+    # without labels.
+    features = _resolve_features(features)
+    if not features:
+        return labels, np.empty((len(labels), 0)), features
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
     # so each label is meshed over its own crop instead of the whole volume.
     bboxes = ndimage.find_objects(label_image)
     feature_values = []
     for label in labels:
         mask = label_image[bboxes[label - 1]] == label
-        mesh_features = extract_surface_features(mask, spacing=spacing)
+        mesh_features = extract_surface_features(
+            mask, spacing=spacing, features=features
+        )
         feature_values.append([mesh_features[feat] for feat in features])
 
-    return labels, np.asarray(feature_values, dtype=float).reshape(
+    feature_matrix = np.asarray(feature_values, dtype=float).reshape(
         len(labels), len(features)
     )
+    return labels, feature_matrix, features
 
 
-@_require_mesh_deps("trimesh")
+@_require_trimesh
 def extract_surface_features(
-    mask: np.ndarray, spacing: Sequence[float] | None = None
+    mask: np.ndarray,
+    spacing: Sequence[float] | None = None,
+    features: Sequence[str] | None = None,
 ) -> dict[str, float]:
     """Generate mesh from a single label mask and extract its surface features."""
+    features = _resolve_features(features)
     mesh = mask2mesh(mask, spacing=spacing)
-    return extract_mesh_features(mesh)
+    return extract_mesh_features(mesh, features=features)
 
 
-@_require_mesh_deps("trimesh")
+@_require_trimesh
 def mask2mesh(
     mask_3d: np.ndarray,
     spacing: Sequence[float] | None = None,
@@ -209,26 +201,41 @@ def mask2mesh(
     return mesh
 
 
-def ellipsoid_sphericity(v: float, sa: float) -> float:
-    """Calculate the sphericity of an ellipsoid given its volume and surface area."""
+def sphericity(v: float, sa: float) -> float:
+    """Return the Wadell sphericity of a body of volume ``v`` and surface area ``sa``.
+
+    This is the surface area of the sphere of equal volume divided by ``sa``: 1
+    for a sphere and smaller for any other shape.
+    """
     return np.power(np.pi, 1 / 3) * np.power(6 * v, 2 / 3) / sa
 
 
-@_require_mesh_deps("trimesh")
-def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
+@_require_trimesh
+def extract_mesh_features(
+    mesh: trimesh.Trimesh, features: Sequence[str] | None = None
+) -> dict[str, float]:
     """Extract surface features from a ``trimesh`` object.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Closed surface of a single object.
+    features : sequence of str, optional
+        Feature names to compute, defaults to ``mesh_feature_list()``. Only
+        these are computed.
 
     Raises
     ------
     ValueError
-        If the mesh volume or surface area is not finite and positive, which is
-        what an open (non-watertight) surface reports.
-    RuntimeError
-        If ``rtree`` is missing, as the curvature features need it.
+        If a feature name is unknown, or if the mesh volume or surface area is
+        not finite and positive, which is what an open (non-watertight) surface
+        reports.
     """
-    # Validate before anything else: an open surface (e.g. a mask meshed without
-    # a background border) reports a negative volume, which silently propagates
-    # into a NaN sphericity and negative solidity and extent instead of failing.
+    features = _resolve_features(features)
+    # Validate the mesh before any feature: an open surface (e.g. a mask meshed
+    # without a background border) reports a negative volume, which silently
+    # propagates into a NaN sphericity and negative solidity and extent instead
+    # of failing.
     volume = float(mesh.volume)
     surface_area = float(mesh.area)
     if not np.isfinite(volume) or volume <= 0:
@@ -241,53 +248,73 @@ def extract_mesh_features(mesh: trimesh.Trimesh) -> dict[str, float]:
             f"Mesh surface area must be finite and positive; got {surface_area}."
         )
 
-    axis_len = sorted(mesh.extents)
-    inertia_pcs = mesh.principal_inertia_components
+    # trimesh caches volume, convex hull and bounding primitives on the mesh, so
+    # features sharing them do not recompute them.
+    return {name: float(_MESH_FEATURES[name](mesh)) for name in features}
 
+
+def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
+    """Return the minimum bounding cylinder volume, 0 for degenerate meshes."""
     try:
-        bounding_volume = mesh.bounding_cylinder.volume
+        return mesh.bounding_cylinder.volume
     except (ValueError, QhullError) as e:
         # Degenerate meshes fail in the convex hull (QhullError) or in the
         # eigendecomposition of the inertia tensor (LinAlgError, a ValueError).
-        bounding_volume = 0.0
         warnings.warn(
             f"Unable extract bounding cylinder volume. Returning 0. Exception: {e}",
             stacklevel=2,
         )
-
-    gaussian_curvature, mean_curvature = _average_curvatures(mesh)
-
-    return {
-        "Area": surface_area,
-        "Volume": volume,
-        "Min Axis Length": axis_len[0],
-        "Med Axis Length": axis_len[1],
-        "Max Axis Length": axis_len[2],
-        "Scale": mesh.scale,
-        "Inertia PC1": inertia_pcs[0],
-        "Inertia PC2": inertia_pcs[1],
-        "Inertia PC3": inertia_pcs[2],
-        "Bounding Box Volume": mesh.bounding_box.volume,
-        "Oriented Bounding Box Volume": mesh.bounding_box_oriented.volume,
-        "Bounding Cylinder Volume": bounding_volume,
-        "Bounding Sphere Volume": mesh.bounding_sphere.volume,
-        "Convex Hull Volume": mesh.convex_hull.volume,
-        "Convex Hull Area": mesh.convex_hull.area,
-        "Sphericity": ellipsoid_sphericity(volume, surface_area),
-        "Extent": volume / mesh.bounding_box.volume,
-        "Solidity": volume / mesh.convex_hull.volume,
-        "Avg Gaussian Curvature": gaussian_curvature,
-        "Avg Mean Curvature": mean_curvature,
-    }
+        return 0.0
 
 
-@_require_mesh_deps("trimesh", "rtree")
-def _average_curvatures(mesh: trimesh.Trimesh) -> tuple[float, float]:
-    """Return the vertex-averaged (Gaussian, mean) discrete curvatures.
+def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Return the full axis lengths, ascending, of the same-inertia ellipsoid.
 
-    ``discrete_mean_curvature_measure`` queries ``mesh.face_adjacency_tree``,
-    which trimesh builds with ``rtree``, hence the extra dependency.
+    A solid ellipsoid of mass ``m`` and semi-axes ``a, b, c`` has principal
+    moments ``m (b^2 + c^2) / 5`` and so on, so
+    ``a^2 = 5 (I_b + I_c - I_a) / (2 m)``, the convention of regionprops'
+    ``axis_major_length``. Unlike bounding box extents, they do not depend on
+    the object's orientation.
     """
-    gaussian = discrete_gaussian_curvature_measure(mesh, mesh.vertices, 1).mean()
-    mean = discrete_mean_curvature_measure(mesh, mesh.vertices, 1).mean()
-    return float(gaussian), float(mean)
+    moments = mesh.principal_inertia_components
+    # (I_b + I_c - I_a) / 2 is the second moment along axis a, so it is never
+    # negative; the clip only absorbs rounding for flat objects.
+    second_moments = np.maximum(moments.sum() - 2 * moments, 0) / 2
+    return np.sort(2 * np.sqrt(5 * second_moments / mesh.mass))
+
+
+def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
+    """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
+
+    trimesh integrates it as half the sum of edge length times signed dihedral
+    angle over the edges (Cohen-Steiner and Morvan, 2003). Before trimesh 4.6.12
+    the angles were unsigned, which overstated it on any concave surface.
+    """
+    return mesh.integral_mean_curvature / mesh.area
+
+
+# Each feature is computed only when requested; the dict order is the default
+# column order of ``mesh_feature_list``.
+_MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
+    "Area": lambda m: m.area,
+    "Volume": lambda m: m.volume,
+    "Min Axis Length": lambda m: _equivalent_ellipsoid_axes(m)[0],
+    "Med Axis Length": lambda m: _equivalent_ellipsoid_axes(m)[1],
+    "Max Axis Length": lambda m: _equivalent_ellipsoid_axes(m)[2],
+    "Inertia PC1": lambda m: m.principal_inertia_components[0],
+    "Inertia PC2": lambda m: m.principal_inertia_components[1],
+    "Inertia PC3": lambda m: m.principal_inertia_components[2],
+    "Oriented Bounding Box Volume": lambda m: m.bounding_box_oriented.volume,
+    "Bounding Cylinder Volume": _bounding_cylinder_volume,
+    "Bounding Sphere Volume": lambda m: m.bounding_sphere.volume,
+    "Convex Hull Volume": lambda m: m.convex_hull.volume,
+    "Convex Hull Area": lambda m: m.convex_hull.area,
+    "Sphericity": lambda m: sphericity(float(m.volume), float(m.area)),
+    "Extent": lambda m: m.volume / m.bounding_box_oriented.volume,
+    "Solidity": lambda m: m.volume / m.convex_hull.volume,
+    # The surface average of the Gaussian curvature would be exactly
+    # 2 pi * euler_number / area (Gauss-Bonnet), so it adds nothing to Area
+    # beyond this integer.
+    "Euler Characteristic": lambda m: m.euler_number,
+    "Avg Mean Curvature": _avg_mean_curvature,
+}

@@ -43,8 +43,10 @@ jobs:
       - name: set up python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: install project with dev dependencies
-        run: uv sync --extra dev
+      # Test modules for an optional extra skip at import without it. cellpose
+      # stays out: it pulls in torch, and its tests mostly need a GPU anyway.
+      - name: install project with dev, mesh and plot dependencies
+        run: uv sync --extra dev --extra mesh --extra plot
 
       - name: run tests
         run: uv run pytest
