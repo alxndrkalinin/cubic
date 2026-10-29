@@ -77,7 +77,7 @@ def extract_features(
     label_image: np.ndarray,
     features: list[str] | None = None,
     spacing: Sequence[float] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Extract mesh features for every label of a label image.
 
     Each label is meshed independently over its own bounding box, which is
@@ -103,6 +103,9 @@ def extract_features(
     feature_values : np.ndarray
         ``(n_labels, n_features)`` matrix, ``(0, n_features)`` when there are no
         labels, so that it always stacks with results from other images.
+    column_names : list of str
+        Name of each column, in column order, as returned by
+        ``voxel.extract_features``.
     """
     label_image = asnumpy(label_image)
     if not np.issubdtype(label_image.dtype, np.integer):
@@ -128,9 +131,10 @@ def extract_features(
         )
         feature_values.append([mesh_features[feat] for feat in features])
 
-    return labels, np.asarray(feature_values, dtype=float).reshape(
+    feature_matrix = np.asarray(feature_values, dtype=float).reshape(
         len(labels), len(features)
     )
+    return labels, feature_matrix, list(features)
 
 
 @_require_trimesh

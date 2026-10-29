@@ -57,11 +57,12 @@ def test_extract_features_excludes_background_label(monkeypatch) -> None:
     volume[2:6, 2:6, 2:6] = 1  # 64 voxels
     volume[7:11, 7:11, 7:11] = 2  # 64 voxels
 
-    labels, feature_values = mesh.extract_features(volume)
+    labels, feature_values, columns = mesh.extract_features(volume)
 
     assert sorted(labels.tolist()) == [1, 2]
     assert 0 not in labels.tolist()
     assert feature_values.shape == (2, len(names))
+    assert columns == names
     # Background (label 0) mask sum would be 12**3 - 128 = 1600; never visited.
     assert 1600 not in seen_masks
 
@@ -90,13 +91,14 @@ def test_extract_features_meshes_only_the_label_bbox(monkeypatch) -> None:
 def test_extract_features_empty_label_image() -> None:
     """An empty label image gives a (0, n_features) matrix, not shape (0,)."""
     features = ["Volume", "Area"]
-    labels, feature_values = mesh.extract_features(
+    labels, feature_values, columns = mesh.extract_features(
         np.zeros((8, 8, 8), dtype=np.int32), features
     )
 
     assert labels.shape == (0,)
     # (0,) would break ``feature_values[:, k]`` and vstack across FOVs.
     assert feature_values.shape == (0, 2)
+    assert columns == features
     assert np.vstack([feature_values, np.zeros((1, 2))]).shape == (1, 2)
 
 
@@ -208,8 +210,8 @@ def test_extract_features_border_label_geometry() -> None:
     """
     features = ["Volume", "Area", "Sphericity", "Solidity", "Extent"]
 
-    _, border = mesh.extract_features(_cube_volume(0), features)
-    _, interior = mesh.extract_features(_cube_volume(4), features)
+    _, border, _ = mesh.extract_features(_cube_volume(0), features)
+    _, interior, _ = mesh.extract_features(_cube_volume(4), features)
 
     np.testing.assert_allclose(border, interior)
     volume, area, sphericity, solidity, extent = border[0]
@@ -228,7 +230,7 @@ def test_shape_features_do_not_depend_on_orientation(rot_deg: float) -> None:
     (12, 36, 36) and the extent from 0.52 to 0.31.
     """
     features = ["Min Axis Length", "Med Axis Length", "Max Axis Length", "Extent"]
-    _, values = mesh.extract_features(_rotated_ellipsoid(rot_deg), features)
+    _, values, _ = mesh.extract_features(_rotated_ellipsoid(rot_deg), features)
 
     np.testing.assert_allclose(values[0, :3], [12, 16, 48], rtol=0.03)
     # An ellipsoid fills pi / 6 of the box around its axes.
@@ -249,7 +251,7 @@ def test_extract_features_computes_only_requested(monkeypatch) -> None:
         if name not in ("Volume", "Area"):
             monkeypatch.setitem(mesh._MESH_FEATURES, name, fail)
 
-    _, values = mesh.extract_features(_cube_volume(4), ["Area", "Volume"])
+    _, values, _ = mesh.extract_features(_cube_volume(4), ["Area", "Volume"])
 
     cube = mesh.mask2mesh(_cube_volume(4) == 1)
     np.testing.assert_allclose(values, [[cube.area, cube.volume]])
