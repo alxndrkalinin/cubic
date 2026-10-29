@@ -150,6 +150,7 @@ def extract_surface_features(
     features: Sequence[str] | None = None,
 ) -> dict[str, float]:
     """Generate mesh from a single label mask and extract its surface features."""
+    features = _resolve_features(features)
     mesh = mask2mesh(mask, spacing=spacing)
     return extract_mesh_features(mesh, features=features)
 
@@ -228,9 +229,11 @@ def extract_mesh_features(
         not finite and positive, which is what an open (non-watertight) surface
         reports.
     """
-    # Validate before anything else: an open surface (e.g. a mask meshed without
-    # a background border) reports a negative volume, which silently propagates
-    # into a NaN sphericity and negative solidity and extent instead of failing.
+    features = _resolve_features(features)
+    # Validate the mesh before any feature: an open surface (e.g. a mask meshed
+    # without a background border) reports a negative volume, which silently
+    # propagates into a NaN sphericity and negative solidity and extent instead
+    # of failing.
     volume = float(mesh.volume)
     surface_area = float(mesh.area)
     if not np.isfinite(volume) or volume <= 0:
@@ -243,7 +246,6 @@ def extract_mesh_features(
             f"Mesh surface area must be finite and positive; got {surface_area}."
         )
 
-    features = _resolve_features(features)
     # trimesh caches volume, convex hull and bounding primitives on the mesh, so
     # features sharing them do not recompute them.
     return {name: float(_MESH_FEATURES[name](mesh)) for name in features}

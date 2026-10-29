@@ -193,12 +193,35 @@ def test_extract_features_forwards_spacing(surface_calls) -> None:
     assert [call["spacing"] for call in surface_calls] == [(4.0, 1.0, 1.0)]
 
 
-def test_extract_mesh_features_rejects_open_mesh() -> None:
-    """A non-watertight mesh raises instead of reporting a negative volume."""
-    # Reproduce the pre-padding behaviour: mesh a border-touching mask directly.
+def _open_mesh() -> trimesh.Trimesh:
+    """Return the open surface of a border-touching mask meshed without padding."""
     verts, faces, _, _ = marching_cubes(_cube_volume(0) == 1)
     open_mesh = trimesh.Trimesh(vertices=verts, faces=faces)
     trimesh.repair.fix_normals(open_mesh)
+    return open_mesh
+
+
+def test_unknown_feature_names_are_reported_before_any_meshing(monkeypatch) -> None:
+    """Every entry point names the unknown feature before meshing or validating.
+
+    ``extract_surface_features`` used to mesh first, and ``extract_mesh_features``
+    rejected an open mesh before looking at the names.
+    """
+
+    def fail(*args, **kwargs):
+        raise AssertionError("meshed before checking the feature names")
+
+    with pytest.raises(ValueError, match="Unknown mesh features"):
+        mesh.extract_mesh_features(_open_mesh(), ["Scale"])
+    monkeypatch.setattr(mesh, "mask2mesh", fail)
+    with pytest.raises(ValueError, match="Unknown mesh features"):
+        mesh.extract_surface_features(_cube_volume(4) == 1, features=["Scale"])
+
+
+def test_extract_mesh_features_rejects_open_mesh() -> None:
+    """A non-watertight mesh raises instead of reporting a negative volume."""
+    # Reproduce the pre-padding behaviour: mesh a border-touching mask directly.
+    open_mesh = _open_mesh()
 
     assert not open_mesh.is_watertight
     with pytest.raises(ValueError, match="volume must be finite and positive"):
