@@ -16,7 +16,6 @@ from scipy import ndimage
 from scipy.spatial import QhullError
 from skimage.measure import marching_cubes
 
-_TRIMESH_AVAILABLE = False
 try:  # pragma: no cover - optional dependency
     import trimesh
 except ImportError:  # pragma: no cover - import failure path
@@ -25,8 +24,6 @@ except ImportError:  # pragma: no cover - import failure path
         "trimesh is not installed. Mesh features are unavailable.",
         stacklevel=2,
     )
-else:
-    _TRIMESH_AVAILABLE = True
 
 from ..cuda import asnumpy
 
@@ -38,7 +35,7 @@ def _require_trimesh(func: F) -> F:
 
     @wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        if not _TRIMESH_AVAILABLE:
+        if trimesh is None:
             raise RuntimeError(
                 "trimesh is required for mesh operations. Install with 'cubic[mesh]'"
             )
