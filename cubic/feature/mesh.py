@@ -47,11 +47,14 @@ def _require_trimesh(func: F) -> F:
 def mesh_feature_list() -> list[str]:
     """Return the names of the features extracted from a trimesh object.
 
-    Every feature is independent of the object's orientation. The axis lengths
-    are the full axes of the ellipsoid with the same inertia, and ``Extent`` is
-    the volume over the oriented bounding box volume. The curvatures are
-    averages over the surface, in inverse units of ``spacing`` (squared for the
-    Gaussian curvature).
+    No feature is defined on the image axes. The axis lengths are the full axes
+    of the ellipsoid with the same inertia, and ``Extent`` is the volume over the
+    oriented bounding box volume. Voxelization still moves every feature a little
+    with orientation, and the oriented box and bounding cylinder come from
+    trimesh's approximate minimum searches, so they move more: ``Extent`` spans
+    0.50-0.55 for one ellipsoid turned by 0, 30 and 45 degrees. The curvatures
+    are averages over the surface, in inverse units of ``spacing`` (squared for
+    the Gaussian curvature).
     """
     return list(_MESH_FEATURES)
 
