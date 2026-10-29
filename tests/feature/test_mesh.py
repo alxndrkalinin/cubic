@@ -39,7 +39,7 @@ def test_extract_features_excludes_background_label(monkeypatch) -> None:
     Previously ``np.unique`` kept 0, so a meaningless background mesh and a
     spurious ``label == 0`` row were emitted alongside the real objects. The
     per-label surface computation is stubbed so the test targets the label
-    filtering without depending on trimesh's optional ``rtree`` backend.
+    filtering alone.
     """
     names = mesh.mesh_feature_list()
     seen_masks: list[int] = []
@@ -250,8 +250,6 @@ def test_extract_features_computes_only_requested(monkeypatch) -> None:
 
 def test_extract_surface_features_full_pipeline() -> None:
     """The full per-label pipeline returns finite, physically sensible features."""
-    pytest.importorskip("rtree", reason="trimesh curvature requires rtree")
-
     features = mesh.extract_surface_features(_cube_volume(0) == 1)
 
     assert set(features) == set(mesh.mesh_feature_list())
@@ -262,17 +260,54 @@ def test_extract_surface_features_full_pipeline() -> None:
     assert 0 < features["Extent"] <= 1
 
 
-def test_curvature_requires_rtree() -> None:
-    """The missing-dependency error names ``rtree``, not just ``trimesh``.
+def _ball(radius: float, shape: int) -> np.ndarray:
+    """Return a ``shape**3`` boolean mask of a centred ball of ``radius`` voxels."""
+    grid = np.meshgrid(*[np.arange(shape) - (shape - 1) / 2] * 3, indexing="ij")
+    return sum(axis**2 for axis in grid) <= radius**2
 
-    ``discrete_mean_curvature_measure`` imports ``rtree`` deep inside trimesh,
-    so without this guard the failure was a bare ``ModuleNotFoundError`` while
-    the guard advertised ``trimesh`` as the only requirement.
+
+def test_curvature_of_a_sphere() -> None:
+    """The curvatures are surface averages: 1 / R and 1 / R^2 on a sphere."""
+    radius = 8
+    features = mesh.extract_surface_features(
+        _ball(radius, 22),
+        features=["Avg Mean Curvature", "Avg Gaussian Curvature", "Area"],
+    )
+
+    # The voxel staircase leaves the mean curvature 1.6% low at this radius.
+    assert features["Avg Mean Curvature"] == pytest.approx(1 / radius, rel=0.03)
+    # Gauss-Bonnet: the Gaussian curvature integrates to 4 pi exactly.
+    integral = features["Avg Gaussian Curvature"] * features["Area"]
+    assert integral == pytest.approx(4 * np.pi, rel=1e-9)
+
+
+def test_curvature_converts_with_the_spacing_unit() -> None:
+    """Giving the same spacing in other units rescales curvature as 1 / length.
+
+    The vertex-averaged ball measures used before integrated over a radius of 1
+    in the units of ``spacing``: spacing 0.1 instead of 1 changed them 78x and
+    11x rather than 100x and 10x.
     """
-    mesh_obj = mesh.mask2mesh(_cube_volume(4) == 1)
+    names = ["Avg Mean Curvature", "Avg Gaussian Curvature"]
+    mask = _ball(8, 22)
+    coarse = mesh.extract_surface_features(mask, (1.0, 1.0, 1.0), names)
+    fine = mesh.extract_surface_features(mask, (0.1, 0.1, 0.1), names)
 
-    if "rtree" in mesh._MISSING_MESH_DEPS:
-        with pytest.raises(RuntimeError, match=r"rtree.*cubic\[mesh\]"):
-            mesh._avg_mean_curvature(mesh_obj)
-    else:
-        assert np.isfinite(mesh._avg_mean_curvature(mesh_obj))
+    assert fine[names[0]] / coarse[names[0]] == pytest.approx(10, rel=1e-6)
+    assert fine[names[1]] / coarse[names[1]] == pytest.approx(100, rel=1e-6)
+
+
+def test_gaussian_curvature_follows_topology() -> None:
+    """A torus has zero total Gaussian curvature, a hollow ball twice a ball's."""
+    z, y, x = np.meshgrid(*[np.arange(50) - 24.5] * 3, indexing="ij")
+    torus = (np.sqrt(y**2 + x**2) - 14) ** 2 + z**2 <= 6**2
+    hollow = _ball(12, 32) & ~_ball(6, 32)
+    names = ["Avg Gaussian Curvature", "Area"]
+
+    torus_k, _ = mesh.extract_surface_features(torus, features=names).values()
+    hollow_k, hollow_area = mesh.extract_surface_features(
+        hollow, features=names
+    ).values()
+
+    assert torus_k == pytest.approx(0, abs=1e-12)
+    assert hollow_k * hollow_area == pytest.approx(8 * np.pi, rel=1e-9)

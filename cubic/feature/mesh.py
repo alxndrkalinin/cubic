@@ -1,7 +1,7 @@
 """Extract features from a label image using ``trimesh``.
 
 Each label is converted into a surface mesh with marching cubes and measured
-with ``trimesh``. ``rtree`` is additionally required for the curvature features.
+with ``trimesh``.
 """
 
 from __future__ import annotations
@@ -16,61 +16,35 @@ from scipy import ndimage
 from scipy.spatial import QhullError
 from skimage.measure import marching_cubes
 
-_MISSING_MESH_DEPS: list[str] = []
+_TRIMESH_AVAILABLE = False
 try:  # pragma: no cover - optional dependency
     import trimesh
-    from trimesh.curvature import (
-        discrete_mean_curvature_measure,
-        discrete_gaussian_curvature_measure,
-    )
 except ImportError:  # pragma: no cover - import failure path
     trimesh = None  # type: ignore[assignment]
-    _MISSING_MESH_DEPS.append("trimesh")
-try:  # pragma: no cover - optional dependency
-    # ``discrete_mean_curvature_measure`` queries ``mesh.face_adjacency_tree``,
-    # which trimesh builds with ``rtree``; without it the curvature features
-    # raise ``ModuleNotFoundError`` deep inside trimesh instead of here.
-    import rtree  # noqa: F401
-except ImportError:  # pragma: no cover - import failure path
-    _MISSING_MESH_DEPS.append("rtree")
-if "trimesh" in _MISSING_MESH_DEPS:  # pragma: no cover - import failure path
     warnings.warn(
         "trimesh is not installed. Mesh features are unavailable.",
         stacklevel=2,
     )
-elif "rtree" in _MISSING_MESH_DEPS:  # pragma: no cover - import failure path
-    warnings.warn(
-        "rtree is not installed. Mesh curvature features are unavailable.",
-        stacklevel=2,
-    )
+else:
+    _TRIMESH_AVAILABLE = True
 
 from ..cuda import asnumpy
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def _require_mesh_deps(*deps: str) -> Callable[[F], F]:
-    """Ensure the optional mesh dependencies ``deps`` are importable.
+def _require_trimesh(func: F) -> F:
+    """Ensure ``trimesh`` is available before calling ``func``."""
 
-    Only the mean curvature feature needs ``rtree``, so it is required per
-    function rather than module-wide: mesh construction and every other feature
-    work with ``trimesh`` alone.
-    """
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not _TRIMESH_AVAILABLE:
+            raise RuntimeError(
+                "trimesh is required for mesh operations. Install with 'cubic[mesh]'"
+            )
+        return func(*args, **kwargs)
 
-    def decorator(func: F) -> F:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            missing = [dep for dep in deps if dep in _MISSING_MESH_DEPS]
-            if missing:
-                raise RuntimeError(
-                    f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} "
-                    "required for mesh operations. Install with 'cubic[mesh]'"
-                )
-            return func(*args, **kwargs)
-
-        return wrapper  # type: ignore[return-value]
-
-    return decorator
+    return wrapper  # type: ignore[return-value]
 
 
 def mesh_feature_list() -> list[str]:
@@ -78,12 +52,14 @@ def mesh_feature_list() -> list[str]:
 
     Every feature is independent of the object's orientation. The axis lengths
     are the full axes of the ellipsoid with the same inertia, and ``Extent`` is
-    the volume over the oriented bounding box volume.
+    the volume over the oriented bounding box volume. The curvatures are
+    averages over the surface, in inverse units of ``spacing`` (squared for the
+    Gaussian curvature).
     """
     return list(_MESH_FEATURES)
 
 
-@_require_mesh_deps("trimesh")
+@_require_trimesh
 def extract_features(
     label_image: np.ndarray,
     features: list[str] | None = None,
@@ -142,7 +118,7 @@ def extract_features(
     )
 
 
-@_require_mesh_deps("trimesh")
+@_require_trimesh
 def extract_surface_features(
     mask: np.ndarray,
     spacing: Sequence[float] | None = None,
@@ -153,7 +129,7 @@ def extract_surface_features(
     return extract_mesh_features(mesh, features=features)
 
 
-@_require_mesh_deps("trimesh")
+@_require_trimesh
 def mask2mesh(
     mask_3d: np.ndarray,
     spacing: Sequence[float] | None = None,
@@ -202,7 +178,7 @@ def ellipsoid_sphericity(v: float, sa: float) -> float:
     return np.power(np.pi, 1 / 3) * np.power(6 * v, 2 / 3) / sa
 
 
-@_require_mesh_deps("trimesh")
+@_require_trimesh
 def extract_mesh_features(
     mesh: trimesh.Trimesh, features: Sequence[str] | None = None
 ) -> dict[str, float]:
@@ -214,16 +190,13 @@ def extract_mesh_features(
         Closed surface of a single object.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()``. Only
-        these are computed, so leaving out the curvature features skips their
-        cost, which dominates the default set.
+        these are computed.
 
     Raises
     ------
     ValueError
         If the mesh volume or surface area is not finite and positive, which is
         what an open (non-watertight) surface reports.
-    RuntimeError
-        If the mean curvature is requested without ``rtree`` installed.
     """
     # Validate before anything else: an open surface (e.g. a mask meshed without
     # a background border) reports a negative volume, which silently propagates
@@ -279,18 +252,30 @@ def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
 
 
 def _avg_gaussian_curvature(mesh: trimesh.Trimesh) -> float:
-    """Return the vertex average of the discrete Gaussian curvature measure."""
-    return discrete_gaussian_curvature_measure(mesh, mesh.vertices, 1).mean()
+    """Return the surface average of the Gaussian curvature, ``1 / R^2`` on a sphere.
 
-
-@_require_mesh_deps("rtree")
-def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
-    """Return the vertex average of the discrete mean curvature measure.
-
-    ``discrete_mean_curvature_measure`` queries ``mesh.face_adjacency_tree``,
-    which trimesh builds with ``rtree``, hence the extra dependency.
+    The angle defects of a closed surface sum to ``2 pi`` times its Euler
+    characteristic (Gauss-Bonnet), so this is ``4 pi / area`` for an object
+    without handles or cavities and 0 for a torus.
     """
-    return discrete_mean_curvature_measure(mesh, mesh.vertices, 1).mean()
+    return mesh.vertex_defects.sum() / mesh.area
+
+
+def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
+    """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
+
+    The integral of the mean curvature over a polyhedral surface is half the sum
+    of edge length times signed dihedral angle over its edges (Cohen-Steiner and
+    Morvan, 2003). Both curvatures used to be vertex averages of trimesh's
+    curvature measures over balls of radius 1 in the units of ``spacing``, so
+    they did not convert with the unit: giving the spacing in tenths changed
+    them 78x and 11x instead of 100x and 10x. The mean curvature measure also
+    looped over vertices in Python, 15 s for a 13k-vertex nucleus.
+    """
+    edges = mesh.vertices[mesh.face_adjacency_edges]
+    lengths = np.linalg.norm(edges[:, 1] - edges[:, 0], axis=1)
+    signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
+    return 0.5 * np.sum(lengths * mesh.face_adjacency_angles * signs) / mesh.area
 
 
 # Each feature is computed only when requested; the dict order is the default

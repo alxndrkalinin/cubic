@@ -44,7 +44,6 @@ cellpose = [
 ]
 mesh = [
     "trimesh>=3.3.0",
-    "rtree>=1.0",  # trimesh curvature: mesh.face_adjacency_tree
 ]
 plot = [
     "matplotlib>=3.5",
