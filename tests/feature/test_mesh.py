@@ -9,6 +9,7 @@ from skimage.measure import marching_cubes
 
 trimesh = pytest.importorskip("trimesh")
 
+import cubic.feature  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
 
 _CUBE_SIDE = 5
@@ -323,10 +324,7 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
     explicitly; importing it eagerly would add trimesh's 0.75-3 s import to
     every user of the voxel and texture features.
     """
-    code = (
-        "import sys, cubic.feature\n"
-        "assert 'trimesh' not in sys.modules\n"
-        "assert 'Volume' in cubic.feature.mesh.mesh_feature_list()\n"
-        "assert 'trimesh' in sys.modules\n"
-    )
+    assert cubic.feature.__getattr__("mesh") is mesh
+    # Only a fresh interpreter can show that the package import skips trimesh.
+    code = "import sys, cubic.feature\nassert 'trimesh' not in sys.modules\n"
     subprocess.run([sys.executable, "-c", code], check=True)
