@@ -56,17 +56,16 @@ def mesh_feature_list() -> list[str]:
     return list(_MESH_FEATURES)
 
 
-def _check_feature_names(features: Sequence[str]) -> None:
-    """Raise for names that are not in ``mesh_feature_list()``.
-
-    Checked before any meshing: an unknown name used to raise ``KeyError`` only
-    after every feature of the first label had been computed.
-    """
+def _resolve_features(features: Sequence[str] | None) -> list[str]:
+    """Return ``features``, or all of them for ``None``; raise for unknown names."""
+    if features is None:
+        return mesh_feature_list()
     unknown = [name for name in features if name not in _MESH_FEATURES]
     if unknown:
         raise ValueError(
             f"Unknown mesh features {unknown}; available: {mesh_feature_list()}"
         )
+    return list(features)
 
 
 @_require_trimesh
@@ -114,9 +113,9 @@ def extract_features(
     labels = np.unique(label_image)
     labels = labels[labels > 0]
 
-    if features is None:
-        features = mesh_feature_list()
-    _check_feature_names(features)
+    # Resolved before any meshing, so an unknown name fails even on an image
+    # without labels.
+    features = _resolve_features(features)
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
     # so each label is meshed over its own crop instead of the whole volume.
     bboxes = ndimage.find_objects(label_image)
@@ -131,7 +130,7 @@ def extract_features(
     feature_matrix = np.asarray(feature_values, dtype=float).reshape(
         len(labels), len(features)
     )
-    return labels, feature_matrix, list(features)
+    return labels, feature_matrix, features
 
 
 @_require_trimesh
@@ -234,9 +233,7 @@ def extract_mesh_features(
             f"Mesh surface area must be finite and positive; got {surface_area}."
         )
 
-    if features is None:
-        features = mesh_feature_list()
-    _check_feature_names(features)
+    features = _resolve_features(features)
     # trimesh caches volume, convex hull and bounding primitives on the mesh, so
     # features sharing them do not recompute them.
     return {name: float(_MESH_FEATURES[name](mesh)) for name in features}
