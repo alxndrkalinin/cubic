@@ -43,8 +43,9 @@ jobs:
       - name: set up python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: install project with dev dependencies
-        run: uv sync --extra dev
+      # Without the mesh extra, tests/feature/test_mesh.py skips at import.
+      - name: install project with dev and mesh dependencies
+        run: uv sync --extra dev --extra mesh
 
       - name: run tests
         run: uv run pytest
