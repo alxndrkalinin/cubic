@@ -43,7 +43,8 @@ cellpose = [
     "torch",
 ]
 mesh = [
-    "trimesh>=3.3.0",
+    # >=4.6.12 for Trimesh.integral_mean_curvature with signed angles
+    "trimesh>=4.6.12",
 ]
 plot = [
     "matplotlib>=3.5",

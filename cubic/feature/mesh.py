@@ -289,18 +289,11 @@ def _avg_gaussian_curvature(mesh: trimesh.Trimesh) -> float:
 def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
     """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
 
-    The integral of the mean curvature over a polyhedral surface is half the sum
-    of edge length times signed dihedral angle over its edges (Cohen-Steiner and
-    Morvan, 2003). Both curvatures used to be vertex averages of trimesh's
-    curvature measures over balls of radius 1 in the units of ``spacing``, so
-    they did not convert with the unit: giving the spacing in tenths changed
-    them 78x and 11x instead of 100x and 10x. The mean curvature measure also
-    looped over vertices in Python, 15 s for a 13k-vertex nucleus.
+    trimesh integrates it as half the sum of edge length times signed dihedral
+    angle over the edges (Cohen-Steiner and Morvan, 2003). Before trimesh 4.6.12
+    the angles were unsigned, which overstated it on any concave surface.
     """
-    edges = mesh.vertices[mesh.face_adjacency_edges]
-    lengths = np.linalg.norm(edges[:, 1] - edges[:, 0], axis=1)
-    signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
-    return 0.5 * np.sum(lengths * mesh.face_adjacency_angles * signs) / mesh.area
+    return mesh.integral_mean_curvature / mesh.area
 
 
 # Each feature is computed only when requested; the dict order is the default

@@ -643,7 +643,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scikit-image", specifier = ">=0.25" },
     { name = "torch", marker = "extra == 'cellpose'" },
-    { name = "trimesh", marker = "extra == 'mesh'", specifier = ">=3.3.0" },
+    { name = "trimesh", marker = "extra == 'mesh'", specifier = ">=4.6.12" },
 ]
 provides-extras = ["cellpose", "mesh", "plot", "examples", "dev", "cuda12", "cuda13", "all"]
 
