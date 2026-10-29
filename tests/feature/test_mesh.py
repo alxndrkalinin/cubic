@@ -19,6 +19,20 @@ def _cube_volume(origin: int, shape: int = 14) -> np.ndarray:
     return volume
 
 
+def _rotated_ellipsoid(rot_deg: float) -> np.ndarray:
+    """Return a label image of an ellipsoid with full axes (12, 48, 16).
+
+    The ellipsoid is rotated by ``rot_deg`` about axis 0, i.e. within the
+    plane of axes 1 and 2.
+    """
+    z, y, x = np.meshgrid(
+        *[np.arange(n) - (n - 1) / 2 for n in (20, 60, 60)], indexing="ij"
+    )
+    t = np.deg2rad(rot_deg)
+    y, x = np.cos(t) * y + np.sin(t) * x, -np.sin(t) * y + np.cos(t) * x
+    return ((z / 6) ** 2 + (y / 24) ** 2 + (x / 8) ** 2 <= 1).astype(np.int32)
+
+
 def test_extract_features_excludes_background_label(monkeypatch) -> None:
     """Background (label 0) produces no row, matching voxel.regionprops.
 
@@ -196,6 +210,22 @@ def test_extract_features_border_label_geometry() -> None:
     assert 0 < sphericity <= 1
     assert 0 < solidity <= 1.001
     assert 0 < extent <= 1
+
+
+@pytest.mark.parametrize("rot_deg", [0, 30, 45])
+def test_shape_features_do_not_depend_on_orientation(rot_deg: float) -> None:
+    """Axis lengths and extent follow the object's axes, not the image axes.
+
+    They used to come from the axis-aligned bounding box: turning this
+    ellipsoid by 45 degrees moved the axis lengths from (12, 16, 48) to
+    (12, 36, 36) and the extent from 0.52 to 0.31.
+    """
+    features = ["Min Axis Length", "Med Axis Length", "Max Axis Length", "Extent"]
+    _, values = mesh.extract_features(_rotated_ellipsoid(rot_deg), features)
+
+    np.testing.assert_allclose(values[0, :3], [12, 16, 48], rtol=0.03)
+    # An ellipsoid fills pi / 6 of the box around its axes.
+    assert values[0, 3] == pytest.approx(np.pi / 6, rel=0.1)
 
 
 def test_extract_features_computes_only_requested(monkeypatch) -> None:

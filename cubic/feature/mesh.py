@@ -74,7 +74,12 @@ def _require_mesh_deps(*deps: str) -> Callable[[F], F]:
 
 
 def mesh_feature_list() -> list[str]:
-    """Return the names of the features extracted from a trimesh object."""
+    """Return the names of the features extracted from a trimesh object.
+
+    Every feature is independent of the object's orientation. The axis lengths
+    are the full axes of the ellipsoid with the same inertia, and ``Extent`` is
+    the volume over the oriented bounding box volume.
+    """
     return list(_MESH_FEATURES)
 
 
@@ -256,6 +261,23 @@ def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
         return 0.0
 
 
+def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Return the full axis lengths, ascending, of the same-inertia ellipsoid.
+
+    A solid ellipsoid of mass ``m`` and semi-axes ``a, b, c`` has principal
+    moments ``m (b^2 + c^2) / 5`` and so on, so ``a^2 = 5 (I_b + I_c - I_a) /
+    (2 m)``, the convention of regionprops' ``axis_major_length``. Unlike the
+    axis-aligned bounding box extents used before, it does not change when the
+    object rotates: those moved from (12, 16, 48) to (12, 36, 36) for an
+    ellipsoid turned by 45 degrees.
+    """
+    moments = mesh.principal_inertia_components
+    # (I_b + I_c - I_a) / 2 is the second moment along axis a, so it is never
+    # negative; the clip only absorbs rounding for flat objects.
+    second_moments = np.maximum(moments.sum() - 2 * moments, 0) / 2
+    return np.sort(2 * np.sqrt(5 * second_moments / mesh.mass))
+
+
 def _avg_gaussian_curvature(mesh: trimesh.Trimesh) -> float:
     """Return the vertex average of the discrete Gaussian curvature measure."""
     return discrete_gaussian_curvature_measure(mesh, mesh.vertices, 1).mean()
@@ -276,21 +298,19 @@ def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
 _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], float]] = {
     "Area": lambda m: m.area,
     "Volume": lambda m: m.volume,
-    "Min Axis Length": lambda m: np.sort(m.extents)[0],
-    "Med Axis Length": lambda m: np.sort(m.extents)[1],
-    "Max Axis Length": lambda m: np.sort(m.extents)[2],
-    "Scale": lambda m: m.scale,
+    "Min Axis Length": lambda m: _equivalent_ellipsoid_axes(m)[0],
+    "Med Axis Length": lambda m: _equivalent_ellipsoid_axes(m)[1],
+    "Max Axis Length": lambda m: _equivalent_ellipsoid_axes(m)[2],
     "Inertia PC1": lambda m: m.principal_inertia_components[0],
     "Inertia PC2": lambda m: m.principal_inertia_components[1],
     "Inertia PC3": lambda m: m.principal_inertia_components[2],
-    "Bounding Box Volume": lambda m: m.bounding_box.volume,
     "Oriented Bounding Box Volume": lambda m: m.bounding_box_oriented.volume,
     "Bounding Cylinder Volume": _bounding_cylinder_volume,
     "Bounding Sphere Volume": lambda m: m.bounding_sphere.volume,
     "Convex Hull Volume": lambda m: m.convex_hull.volume,
     "Convex Hull Area": lambda m: m.convex_hull.area,
     "Sphericity": lambda m: ellipsoid_sphericity(m.volume, m.area),
-    "Extent": lambda m: m.volume / m.bounding_box.volume,
+    "Extent": lambda m: m.volume / m.bounding_box_oriented.volume,
     "Solidity": lambda m: m.volume / m.convex_hull.volume,
     "Avg Gaussian Curvature": _avg_gaussian_curvature,
     "Avg Mean Curvature": _avg_mean_curvature,
