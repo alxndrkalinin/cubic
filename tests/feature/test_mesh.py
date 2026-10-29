@@ -30,7 +30,9 @@ def test_extract_features_excludes_background_label(monkeypatch) -> None:
     names = mesh.mesh_feature_list()
     seen_masks: list[int] = []
 
-    def fake_surface_features(mask: np.ndarray, spacing=None) -> dict[str, float]:
+    def fake_surface_features(
+        mask: np.ndarray, spacing=None, features=None
+    ) -> dict[str, float]:
         # Record which label each call corresponds to (mask sum is unique here).
         seen_masks.append(int(mask.sum()))
         return dict.fromkeys(names, 0.0)
@@ -54,7 +56,9 @@ def test_extract_features_meshes_only_the_label_bbox(monkeypatch) -> None:
     """Each label is meshed over its own bounding box, not the whole volume."""
     seen_shapes: list[tuple[int, ...]] = []
 
-    def fake_surface_features(mask: np.ndarray, spacing=None) -> dict[str, float]:
+    def fake_surface_features(
+        mask: np.ndarray, spacing=None, features=None
+    ) -> dict[str, float]:
         seen_shapes.append(mask.shape)
         return dict.fromkeys(mesh.mesh_feature_list(), 0.0)
 
@@ -150,7 +154,9 @@ def test_extract_features_forwards_spacing(monkeypatch) -> None:
     """``extract_features`` threads ``spacing`` down to the per-label mesh."""
     seen: list[object] = []
 
-    def fake_surface_features(mask: np.ndarray, spacing=None) -> dict[str, float]:
+    def fake_surface_features(
+        mask: np.ndarray, spacing=None, features=None
+    ) -> dict[str, float]:
         seen.append(spacing)
         return dict.fromkeys(mesh.mesh_feature_list(), 0.0)
 
@@ -172,15 +178,13 @@ def test_extract_mesh_features_rejects_open_mesh() -> None:
         mesh.extract_mesh_features(open_mesh)
 
 
-def test_extract_features_border_label_geometry(monkeypatch) -> None:
+def test_extract_features_border_label_geometry() -> None:
     """A border-touching label yields the same valid geometry as an interior one.
 
-    Runs the real mesh pipeline end to end with only the curvature step stubbed,
-    so it covers the padding fix without the optional ``rtree`` backend. Before
-    the fix the corner cube gave ``Volume=-89.52``, ``Sphericity=nan``,
-    ``Solidity=-1.20`` and ``Extent=-0.98``.
+    Runs the real mesh pipeline end to end. Before the padding fix the corner
+    cube gave ``Volume=-89.52``, ``Sphericity=nan``, ``Solidity=-1.20`` and
+    ``Extent=-0.98``.
     """
-    monkeypatch.setattr(mesh, "_average_curvatures", lambda _mesh: (0.0, 0.0))
     features = ["Volume", "Area", "Sphericity", "Solidity", "Extent"]
 
     _, border = mesh.extract_features(_cube_volume(0), features)
@@ -192,6 +196,26 @@ def test_extract_features_border_label_geometry(monkeypatch) -> None:
     assert 0 < sphericity <= 1
     assert 0 < solidity <= 1.001
     assert 0 < extent <= 1
+
+
+def test_extract_features_computes_only_requested(monkeypatch) -> None:
+    """Features that were not requested are never computed.
+
+    Mean curvature took 15.4 s of a 15.8 s per-label total on a 13k-vertex
+    nucleus, and a ``["Volume"]`` request used to pay for it anyway.
+    """
+
+    def fail(_mesh) -> float:
+        raise AssertionError("an unrequested feature was computed")
+
+    for name in mesh.mesh_feature_list():
+        if name not in ("Volume", "Area"):
+            monkeypatch.setitem(mesh._MESH_FEATURES, name, fail)
+
+    _, values = mesh.extract_features(_cube_volume(4), ["Area", "Volume"])
+
+    cube = mesh.mask2mesh(_cube_volume(4) == 1)
+    np.testing.assert_allclose(values, [[cube.area, cube.volume]])
 
 
 def test_extract_surface_features_full_pipeline() -> None:
@@ -219,7 +243,6 @@ def test_curvature_requires_rtree() -> None:
 
     if "rtree" in mesh._MISSING_MESH_DEPS:
         with pytest.raises(RuntimeError, match=r"rtree.*cubic\[mesh\]"):
-            mesh._average_curvatures(mesh_obj)
+            mesh._avg_mean_curvature(mesh_obj)
     else:
-        gaussian, mean = mesh._average_curvatures(mesh_obj)
-        assert np.isfinite(gaussian) and np.isfinite(mean)
+        assert np.isfinite(mesh._avg_mean_curvature(mesh_obj))
