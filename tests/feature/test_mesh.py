@@ -1,5 +1,8 @@
 """Tests for mesh-based feature extraction."""
 
+import sys
+import subprocess
+
 import numpy as np
 import pytest
 from skimage.measure import marching_cubes
@@ -326,3 +329,19 @@ def test_sphericity_is_one_for_a_sphere_only() -> None:
     """Wadell sphericity is 1 for a sphere and below 1 for a cube."""
     assert mesh.sphericity(4 / 3 * np.pi, 4 * np.pi) == pytest.approx(1)
     assert mesh.sphericity(1.0, 6.0) == pytest.approx((np.pi / 6) ** (1 / 3))
+
+
+def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
+    """``cubic.feature.mesh`` resolves on access, not on ``import cubic.feature``.
+
+    It used to raise ``AttributeError`` unless the submodule had been imported
+    explicitly; importing it eagerly would add trimesh's 0.75-3 s import to
+    every user of the voxel and texture features.
+    """
+    code = (
+        "import sys, cubic.feature\n"
+        "assert 'trimesh' not in sys.modules\n"
+        "assert 'Volume' in cubic.feature.mesh.mesh_feature_list()\n"
+        "assert 'trimesh' in sys.modules\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
