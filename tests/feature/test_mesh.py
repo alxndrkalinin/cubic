@@ -106,6 +106,16 @@ def test_extract_features_empty_label_image() -> None:
     assert np.vstack([feature_values, np.zeros((1, 2))]).shape == (1, 2)
 
 
+def test_extract_features_with_no_features_meshes_nothing(surface_calls) -> None:
+    """``features=[]`` gives one empty row per label without meshing any."""
+    labels, feature_values, columns = mesh.extract_features(_cube_volume(4), [])
+
+    assert labels.tolist() == [1]
+    assert feature_values.shape == (1, 0)
+    assert columns == []
+    assert surface_calls == []
+
+
 @pytest.mark.parametrize("label", [0, 1])
 def test_extract_features_rejects_unknown_feature_names(label: int) -> None:
     """An unknown name raises before any label is meshed, even with no labels."""

@@ -126,6 +126,8 @@ def extract_features(
     # Resolved before any meshing, so an unknown name fails even on an image
     # without labels.
     features = _resolve_features(features)
+    if not features:
+        return labels, np.empty((len(labels), 0)), features
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
     # so each label is meshed over its own crop instead of the whole volume.
     bboxes = ndimage.find_objects(label_image)
