@@ -986,6 +986,34 @@ def select_max_contrast_slices(
     return img[indices]
 
 
+def gaussian_filter_like_scipy(
+    image: np.ndarray,
+    sigma: npt.ArrayLike,
+    mode: str = "reflect",
+    truncate: float = 4.0,
+) -> np.ndarray:
+    """Gaussian filter that rounds like ``scipy.ndimage.gaussian_filter`` on GPU too.
+
+    SciPy filters a float32 image one axis at a time, accumulating each pass in
+    float64 and storing it as float32. cupyx accumulates float32 input in
+    float32, so on GPU each pass runs on a float64 copy to stay on SciPy's
+    arithmetic, which makes the result bitwise equal to SciPy's. Axes with
+    ``sigma <= 1e-15`` are skipped, as in SciPy.
+    """
+    sigmas = [float(s) for s in np.broadcast_to(sigma, (image.ndim,))]
+    if not is_gpu_array(image):
+        return ndimage.gaussian_filter(
+            image, sigma=sigmas, mode=mode, truncate=truncate
+        )
+    out = image
+    for axis, s in enumerate(sigmas):
+        if s > 1e-15:
+            out = ndimage.gaussian_filter1d(
+                out.astype(np.float64), s, axis=axis, mode=mode, truncate=truncate
+            ).astype(image.dtype)
+    return out
+
+
 def distance_transform_edt(
     img: npt.ArrayLike,
     sampling: Sequence[float] | None = None,

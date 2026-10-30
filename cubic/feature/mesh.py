@@ -1,7 +1,10 @@
 """Extract features from a label image using ``trimesh``.
 
 Each label is converted into a surface mesh with marching cubes and measured
-with ``trimesh``.
+with ``trimesh``. A CuPy label image or mask stays on the GPU: it is meshed by a
+CUDA port of the same marching cubes and measured as an ``ArrayMesh``, which
+computes the trimesh quantities on the device and hands the convex hull,
+bounding primitives and decimation to trimesh on the host.
 """
 
 from __future__ import annotations
@@ -26,7 +29,10 @@ except ImportError:  # pragma: no cover - import failure path
         stacklevel=2,
     )
 
-from ..cuda import asnumpy
+from ..cuda import asnumpy, get_device, get_array_module
+from ._array_mesh import ArrayMesh
+from ..image_utils import gaussian_filter_like_scipy
+from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -107,7 +113,8 @@ def extract_features(
     Parameters
     ----------
     label_image : np.ndarray
-        3D integer label image. Background (label 0) is excluded.
+        3D integer label image, NumPy or CuPy. Background (label 0) is
+        excluded. A CuPy image is meshed and measured on the GPU.
     features : list of str, optional
         Feature names to extract, defaults to ``mesh_feature_list()``; the
         columns follow this order. Only these features are computed.
@@ -130,14 +137,16 @@ def extract_features(
         Name of each column, in column order, as returned by
         ``voxel.extract_features``.
     """
-    label_image = asnumpy(label_image)
-    if not np.issubdtype(label_image.dtype, np.integer):
+    # Labels and bounding boxes come from a host copy; the crops are taken from
+    # the input itself, so a CuPy image is meshed on the GPU.
+    host_labels = asnumpy(label_image)
+    if not np.issubdtype(host_labels.dtype, np.integer):
         raise ValueError(
-            f"label_image must have an integer dtype; got {label_image.dtype}"
+            f"label_image must have an integer dtype; got {host_labels.dtype}"
         )
     # Keep only positive labels, matching ``voxel.regionprops``, which ignores
     # both the background and negative values.
-    labels = np.unique(label_image)
+    labels = np.unique(host_labels)
     labels = labels[labels > 0]
 
     # Resolved before any meshing, so an unknown name fails even on an image
@@ -147,7 +156,7 @@ def extract_features(
         return labels, np.empty((len(labels), 0)), features
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
     # so each label is meshed over its own crop instead of the whole volume.
-    bboxes = ndimage.find_objects(label_image)
+    bboxes = ndimage.find_objects(host_labels)
     feature_values = []
     for label in labels:
         mask = label_image[bboxes[label - 1]] == label
@@ -217,9 +226,33 @@ def _curvature_sigma(spacing: Sequence[float] | None, sigma: float | None) -> fl
     return sigma
 
 
+def _marching_cubes(
+    volume: np.ndarray,
+    level: float,
+    spacing: Sequence[float],
+    allow_degenerate: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Skimage's Lewiner marching cubes, or its CUDA port for a CuPy volume."""
+    if get_device(volume) == "GPU":
+        return _marching_cubes_gpu(volume, level, spacing, allow_degenerate)
+    verts, faces, _, _ = marching_cubes(
+        volume, level, spacing=spacing, allow_degenerate=allow_degenerate
+    )
+    return verts, faces
+
+
+def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
+    """Wrap marching-cubes output as an outward-oriented mesh on its device."""
+    if get_device(verts) == "GPU":
+        return ArrayMesh(verts, faces)
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+    trimesh.repair.fix_normals(mesh)
+    return mesh
+
+
 def _smooth_mask2mesh(
     mask_3d: np.ndarray, spacing: Sequence[float] | None, sigma: float
-) -> trimesh.Trimesh | None:
+) -> Any:
     """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes.
 
     The blur is isotropic in physical units, so its width in voxels differs per
@@ -230,17 +263,15 @@ def _smooth_mask2mesh(
     # Pad past the blur's reach so it neither clips at the crop nor touches the
     # border, which would leave the surface open.
     pad = np.ceil(3 * sigma_voxels).astype(int) + 1
-    volume = ndimage.gaussian_filter(
+    # Rounds like SciPy on the GPU too, so both devices mesh the same volume.
+    volume = gaussian_filter_like_scipy(
         np.pad(mask_3d.astype(np.float32), [(p, p) for p in pad]), sigma_voxels
     )
-    if volume.max() <= 0.5:
+    if float(volume.max()) <= 0.5:
         return None
-    verts, faces, _, _ = marching_cubes(
-        volume, 0.5, spacing=tuple(step), allow_degenerate=False
-    )
-    mesh = trimesh.Trimesh(vertices=verts - pad * step, faces=faces)
-    trimesh.repair.fix_normals(mesh)
-    return mesh
+    verts, faces = _marching_cubes(volume, 0.5, tuple(step), allow_degenerate=False)
+    offset = get_array_module(verts).asarray(pad * step)
+    return _closed_mesh(verts - offset, faces)
 
 
 @_require_trimesh
@@ -249,7 +280,7 @@ def mask2mesh(
     spacing: Sequence[float] | None = None,
     marching_cubes_kwargs: dict[str, Any] | None = None,
     sigma: float | None = None,
-) -> trimesh.Trimesh:
+) -> Any:
     """Convert 3D mask to a mesh using marching cubes.
 
     The mask is padded with one voxel of background on every side. Without it a
@@ -260,12 +291,14 @@ def mask2mesh(
     Parameters
     ----------
     mask_3d : np.ndarray
-        Boolean mask of a single object.
+        Boolean mask of a single object. A CuPy mask is meshed on the GPU and
+        returned as an ``ArrayMesh``; a NumPy one as a ``trimesh.Trimesh``.
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)`` passed to marching cubes, so that lengths,
         areas and volumes are in physical units.
     marching_cubes_kwargs : dict, optional
-        Extra keyword arguments for ``skimage.measure.marching_cubes``.
+        Extra keyword arguments for ``skimage.measure.marching_cubes``; on the
+        GPU only ``spacing`` is supported.
     sigma : float, optional
         If given, mesh the mask blurred by a Gaussian of this width, in units of
         ``spacing``, instead of the voxel staircase. ``marching_cubes_kwargs``
@@ -290,17 +323,28 @@ def mask2mesh(
                 "'marching_cubes_kwargs'; pass it only once."
             )
         marching_cubes_kwargs["spacing"] = tuple(float(s) for s in spacing)
-    verts, faces, _, _ = marching_cubes(np.pad(mask_3d, 1), **marching_cubes_kwargs)
+    padded = np.pad(mask_3d, 1)
+    if get_device(mask_3d) == "GPU":
+        unsupported = sorted(set(marching_cubes_kwargs) - {"spacing"})
+        if unsupported:
+            raise ValueError(f"GPU marching cubes does not support {unsupported}.")
+        volume = padded.astype(np.float32)
+        # skimage's default level: halfway between the extremes, 0.5 for a mask
+        level = 0.5 * (float(volume.min()) + float(volume.max()))
+        verts, faces = _marching_cubes(
+            volume, level, marching_cubes_kwargs.get("spacing", (1.0, 1.0, 1.0))
+        )
+    else:
+        verts, faces, _, _ = marching_cubes(padded, **marching_cubes_kwargs)
     # Undo the 1-voxel pad so vertices stay in the input's coordinate frame.
     # Without this every vertex, and therefore ``bounds`` and ``centroid``, sits
     # one voxel high on each axis -- scaled by ``spacing``, so the offset is in
     # physical units. Every feature in ``mesh_feature_list`` is
     # translation-invariant, but ``mask2mesh`` is public and its mesh is
     # expected to overlay the image.
-    verts = verts - np.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-    trimesh.repair.fix_normals(mesh)
-    return mesh
+    xp = get_array_module(verts)
+    verts = verts - xp.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
+    return _closed_mesh(verts, faces)
 
 
 def sphericity(v: float, sa: float) -> float:
