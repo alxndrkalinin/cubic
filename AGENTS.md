@@ -68,7 +68,9 @@ These modules automatically route function calls to CPU (NumPy/SciPy/scikit-imag
 
 ### Feature Extraction (`cubic/feature/`)
 
-- `mesh.py` – Mesh-based size and shape features (`cubic[mesh]`, CPU only): marching cubes per label, measured with trimesh; no feature is defined on the image axes, the mean curvature is a surface average in inverse units of `spacing`, and topology is reported as the Euler characteristic
+- `mesh.py` – Mesh-based size and shape features (`cubic[mesh]`): marching cubes per label, measured with trimesh; no feature is defined on the image axes, the mean curvature is a surface average in inverse units of `spacing`, topology is reported as the Euler characteristic, and total |K|, shape index, curvedness and fractal dimension are measured on a mesh of the mask blurred at `curvature_sigma`. CuPy input stays on the GPU:
+  - `_marching_cubes_cuda.py` – CUDA port of skimage's Lewiner marching cubes, identical mesh up to vertex/face order
+  - `_array_mesh.py` – `ArrayMesh`, trimesh's feature attributes computed on NumPy or CuPy arrays; hull, bounding primitives and QEM decimation fall back to trimesh on the host
 - `voxel.py` – Voxel-based feature extraction
 
 ### Other Metrics (`cubic/metrics/`)
