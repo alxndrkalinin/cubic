@@ -7,6 +7,7 @@ with ``trimesh``.
 from __future__ import annotations
 
 import warnings
+import importlib.util
 from typing import Any, TypeVar, Callable, SupportsFloat
 from functools import wraps
 from collections.abc import Sequence
@@ -58,7 +59,7 @@ def mesh_feature_list() -> list[str]:
     cavities, minus twice the number of handles: 2 for a ball, 4 for a hollow
     ball, 0 for a torus.
 
-    The last three features need curvature at each vertex, which on a voxel
+    The last four features need curvature at each vertex, which on a voxel
     staircase measures the staircase, so they are computed on a mesh of the mask
     blurred at ``curvature_sigma`` (see ``extract_surface_features``).
     ``Total Absolute Gaussian Curvature`` is the integral of ``|K|`` over the
@@ -66,7 +67,9 @@ def mesh_feature_list() -> list[str]:
     region (grooves, waists, the necks of lobes), unitless. ``Avg Shape Index``
     (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
     (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
-    units of ``spacing``; both are averaged over the surface by area.
+    units of ``spacing``; both are averaged over the surface by area. ``Fractal
+    Dimension`` is ``2 + 2 * slope`` of log area against log face count as the
+    mesh is decimated, about 2 for a smooth surface.
     """
     return list(_MESH_FEATURES)
 
@@ -481,11 +484,38 @@ def _avg_curvedness(mesh: trimesh.Trimesh) -> float:
     return _area_average(np.sqrt((k1**2 + k2**2) / 2), area)
 
 
+def _fractal_dimension(mesh: trimesh.Trimesh, n_levels: int = 6) -> float:
+    """Return ``2 + 2 * slope`` of log area against log face count under decimation.
+
+    The mesh is simplified by quadric error metrics to ``n_levels`` face counts
+    from a sixteenth of its own up to all of it. Area scales as ``n^((D-2)/2)``
+    with the face count ``n`` for a surface of fractal dimension ``D``.
+    """
+    if importlib.util.find_spec("fast_simplification") is None:
+        raise RuntimeError(
+            "Fractal Dimension needs fast-simplification. Install with 'cubic[mesh]'"
+        )
+    n_faces = len(mesh.faces)
+    counts = np.unique(
+        np.geomspace(max(n_faces // 16, 64), n_faces, n_levels).astype(int)
+    )
+    if len(counts) < 3:
+        return float("nan")
+    areas = [
+        mesh.area
+        if n == n_faces
+        else mesh.simplify_quadric_decimation(face_count=int(n)).area
+        for n in counts
+    ]
+    return 2 + 2 * float(np.polyfit(np.log(counts), np.log(areas), 1)[0])
+
+
 # Measured on the smoothed mesh when one is available; see mesh_feature_list.
 _SMOOTHED_FEATURES = (
     "Total Absolute Gaussian Curvature",
     "Avg Shape Index",
     "Avg Curvedness",
+    "Fractal Dimension",
 )
 
 # Each feature is computed only when requested; the dict order is the default
@@ -517,4 +547,5 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     ),
     "Avg Shape Index": _avg_shape_index,
     "Avg Curvedness": _avg_curvedness,
+    "Fractal Dimension": _fractal_dimension,
 }

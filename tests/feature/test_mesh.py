@@ -302,6 +302,7 @@ def test_extract_surface_features_full_pipeline() -> None:
     The cube touches the volume border and is large enough to survive the
     default curvature blur.
     """
+    pytest.importorskip("fast_simplification")
     cube = np.zeros((14, 14, 14), dtype=bool)
     cube[:10, :10, :10] = True
     features = mesh.extract_surface_features(cube)
@@ -459,6 +460,28 @@ def test_curvature_distribution_does_not_depend_on_orientation(rot_deg: float) -
         assert turned[name] == pytest.approx(upright[name], rel=0.01)
     for features in (upright, turned):
         assert 1 <= features["Total Absolute Gaussian Curvature"] < 1.06
+
+
+def test_fractal_dimension_of_a_smooth_surface_is_two() -> None:
+    """Decimating a smooth surface barely changes its area, so D is about 2."""
+    pytest.importorskip("fast_simplification")
+    name = ["Fractal Dimension"]
+
+    value = mesh.extract_surface_features(_ball(10, 26), features=name)[name[0]]
+
+    assert value == pytest.approx(2, abs=0.02)
+
+
+def test_fractal_dimension_names_its_dependency(monkeypatch) -> None:
+    """Without fast-simplification the error says what to install."""
+    real_find_spec = mesh.importlib.util.find_spec
+
+    def find_spec(name, *args):
+        return None if name == "fast_simplification" else real_find_spec(name, *args)
+
+    monkeypatch.setattr(mesh.importlib.util, "find_spec", find_spec)
+    with pytest.raises(RuntimeError, match=r"fast-simplification.*cubic\[mesh\]"):
+        mesh.extract_surface_features(_ball(10, 26), features=["Fractal Dimension"])
 
 
 def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
