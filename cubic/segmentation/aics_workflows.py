@@ -34,6 +34,7 @@ from scipy.ndimage import generate_binary_structure
 
 from ..cuda import CUDAManager, asnumpy, get_device, get_array_module
 from ..scipy import ndimage as _ndimage
+from ..image_utils import gaussian_filter_like_scipy
 from .segment_utils import _SKIMAGE_USES_MAX_SIZE
 
 # Relative distance from a float32 rounding midpoint below which ITK's serially
@@ -445,24 +446,8 @@ def _diffusion_step_cuda(
 
 
 def _gaussian_nearest(image: np.ndarray, sigmas: list[float]) -> np.ndarray:
-    """Separable Gaussian (``mode="nearest"``, ``truncate=3``) rounded like SciPy.
-
-    SciPy filters a float32 image one axis at a time, accumulating each pass in
-    float64 and storing it as float32. cupyx accumulates float32 input in
-    float32, so on GPU each pass runs on a float64 copy to stay on SciPy's
-    arithmetic. Axes with ``sigma == 0`` are skipped, as in SciPy.
-    """
-    if get_device(image) == "CPU":
-        return _ndimage.gaussian_filter(
-            image, sigma=sigmas, mode="nearest", truncate=3.0
-        )
-    out = image
-    for axis, sigma in enumerate(sigmas):
-        if sigma > 1e-15:
-            out = _ndimage.gaussian_filter1d(
-                out.astype(np.float64), sigma, axis=axis, mode="nearest", truncate=3.0
-            ).astype(image.dtype)
-    return out
+    """Separable Gaussian (``mode="nearest"``, ``truncate=3``) rounded like SciPy."""
+    return gaussian_filter_like_scipy(image, sigmas, mode="nearest", truncate=3.0)
 
 
 def _hessian_2d_eigen_max(image: np.ndarray, sigma: float) -> np.ndarray:
