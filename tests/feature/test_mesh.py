@@ -50,7 +50,9 @@ def surface_calls(monkeypatch) -> list[dict]:
     """Stub per-label meshing and record the mask and spacing of each call."""
     calls: list[dict] = []
 
-    def fake_surface_features(mask, spacing=None, features=None) -> dict[str, float]:
+    def fake_surface_features(
+        mask, spacing=None, features=None, curvature_sigma=None
+    ) -> dict[str, float]:
         calls.append({"mask": mask, "spacing": spacing})
         return dict.fromkeys(features or mesh.mesh_feature_list(), 0.0)
 
@@ -295,8 +297,14 @@ def test_extract_features_computes_only_requested(monkeypatch) -> None:
 
 
 def test_extract_surface_features_full_pipeline() -> None:
-    """The full per-label pipeline returns finite, physically sensible features."""
-    features = mesh.extract_surface_features(_cube_volume(0) == 1)
+    """The full per-label pipeline returns finite, physically sensible features.
+
+    The cube touches the volume border and is large enough to survive the
+    default curvature blur.
+    """
+    cube = np.zeros((14, 14, 14), dtype=bool)
+    cube[:10, :10, :10] = True
+    features = mesh.extract_surface_features(cube)
 
     assert set(features) == set(mesh.mesh_feature_list())
     assert all(np.isfinite(value) for value in features.values())
@@ -371,6 +379,139 @@ def test_euler_characteristic_counts_topology() -> None:
     assert {name: f["Euler Characteristic"] for name, f in got.items()} == {
         name: expected for name, (_, expected) in shapes.items()
     }
+
+
+_CURVATURE_FEATURES = [
+    "Total Absolute Gaussian Curvature",
+    "Avg Shape Index",
+    "Avg Curvedness",
+]
+
+
+def test_curvature_distribution_of_a_ball() -> None:
+    """A convex ball: total |K| / 4 pi of 1, shape index near 1, curvedness 1 / R."""
+    features = mesh.extract_surface_features(
+        _ball(10, 26), features=_CURVATURE_FEATURES
+    )
+
+    # Every angle defect of a convex surface is positive, so |K| integrates to
+    # exactly the 4 pi of Gauss-Bonnet.
+    assert features["Total Absolute Gaussian Curvature"] == pytest.approx(1, rel=1e-6)
+    # Per-vertex principal curvatures are noisy, which pulls the area-average
+    # below 1 (0.92 here).
+    assert features["Avg Shape Index"] > 0.85
+    # The blur shrinks a convex body by about sigma^2 / R, raising curvedness.
+    assert features["Avg Curvedness"] == pytest.approx(1 / 10, rel=0.15)
+
+
+def test_total_absolute_gaussian_curvature_grows_with_saddles() -> None:
+    """Saddle regions push total |K| / 4 pi above the convex value of 1.
+
+    A torus has as much negative as positive curvature, so 2; two overlapping
+    balls have a saddle-shaped waist where they join.
+    """
+    z, y, x = _centred_grid(50, 50, 50)
+    torus = (np.sqrt(y**2 + x**2) - 14) ** 2 + z**2 <= 6**2
+    zz, yy, xx = _centred_grid(24, 24, 36)
+    peanut = (zz**2 + yy**2 + (xx - 6) ** 2 <= 8**2) | (
+        zz**2 + yy**2 + (xx + 6) ** 2 <= 8**2
+    )
+    name = ["Total Absolute Gaussian Curvature"]
+
+    torus_k = mesh.extract_surface_features(torus, features=name)[name[0]]
+    peanut_k = mesh.extract_surface_features(peanut, features=name)[name[0]]
+
+    assert torus_k == pytest.approx(2, rel=0.05)
+    assert peanut_k > 1.1
+
+
+def test_curvature_distribution_converts_with_the_spacing_unit() -> None:
+    """The default blur follows the spacing, so a unit change only rescales.
+
+    Unitless features stay put and curvedness scales as 1 / length.
+    """
+    mask = _ball(8, 22)
+    coarse = mesh.extract_surface_features(mask, (1.0, 1.0, 1.0), _CURVATURE_FEATURES)
+    fine = mesh.extract_surface_features(mask, (0.1, 0.1, 0.1), _CURVATURE_FEATURES)
+
+    for name in ("Total Absolute Gaussian Curvature", "Avg Shape Index"):
+        assert fine[name] == pytest.approx(coarse[name], rel=1e-6)
+    assert fine["Avg Curvedness"] == pytest.approx(10 * coarse["Avg Curvedness"])
+
+
+@pytest.mark.parametrize("rot_deg", [30, 45])
+def test_curvature_distribution_does_not_depend_on_orientation(rot_deg: float) -> None:
+    """Rotating an ellipsoid barely moves the curvature features.
+
+    Shape index and curvedness agree within 1%. Total |K| of this thin convex
+    ellipsoid (minor semi-axis 6 voxels) reads 1.02-1.05 rather than 1: the
+    default blur leaves faint terraces on its shallow slopes, and their saddles
+    depend on how the slopes meet the voxel grid.
+    """
+    upright = mesh.extract_surface_features(
+        _rotated_ellipsoid(0) == 1, features=_CURVATURE_FEATURES
+    )
+    turned = mesh.extract_surface_features(
+        _rotated_ellipsoid(rot_deg) == 1, features=_CURVATURE_FEATURES
+    )
+
+    for name in ("Avg Shape Index", "Avg Curvedness"):
+        assert turned[name] == pytest.approx(upright[name], rel=0.01)
+    for features in (upright, turned):
+        assert 1 <= features["Total Absolute Gaussian Curvature"] < 1.06
+
+
+def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
+    """A mask that vanishes under the blur gets NaN for those features only."""
+    names = ["Volume", "Total Absolute Gaussian Curvature", "Avg Shape Index"]
+
+    with pytest.warns(UserWarning, match="vanishes when blurred at curvature_sigma=2"):
+        features = mesh.extract_surface_features(
+            np.ones((1, 1, 1), dtype=bool), features=names
+        )
+
+    assert features["Volume"] > 0
+    assert np.isnan(features["Total Absolute Gaussian Curvature"])
+    assert np.isnan(features["Avg Shape Index"])
+
+
+def test_mesh_is_smoothed_only_for_curvature_features(monkeypatch) -> None:
+    """Features that do not need the smoothed mesh never build it."""
+
+    def fail(*args, **kwargs):
+        raise AssertionError("built the smoothed mesh")
+
+    monkeypatch.setattr(mesh, "_smooth_mask2mesh", fail)
+    features = mesh.extract_surface_features(
+        _ball(8, 22), features=["Volume", "Avg Mean Curvature"]
+    )
+
+    assert features["Volume"] > 0
+
+
+def test_extract_mesh_features_measures_curvature_on_the_smooth_mesh() -> None:
+    """Passing the smoothed mesh reproduces the per-mask pipeline exactly."""
+    mask = _ball(8, 22)
+    raw, smooth = mesh.mask2mesh(mask), mesh.mask2mesh(mask, sigma=2.0)
+
+    from_meshes = mesh.extract_mesh_features(
+        raw, _CURVATURE_FEATURES + ["Volume"], smooth_mesh=smooth
+    )
+    from_mask = mesh.extract_surface_features(
+        mask, features=_CURVATURE_FEATURES + ["Volume"]
+    )
+
+    assert from_meshes == pytest.approx(from_mask)
+
+
+def test_curvature_sigma_is_validated() -> None:
+    """A non-positive blur is rejected, and mask2mesh refuses a vanished mask."""
+    with pytest.raises(ValueError, match="curvature_sigma must be finite and positive"):
+        mesh.extract_surface_features(
+            _ball(8, 22), features=_CURVATURE_FEATURES, curvature_sigma=0
+        )
+    with pytest.raises(ValueError, match="vanishes when blurred"):
+        mesh.mask2mesh(np.ones((1, 1, 1), dtype=bool), sigma=2.0)
 
 
 def test_sphericity_is_one_for_a_sphere_only() -> None:
