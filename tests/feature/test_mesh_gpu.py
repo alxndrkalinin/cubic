@@ -1,12 +1,18 @@
-"""GPU mesh features: CUDA marching cubes against skimage."""
+"""GPU mesh features: CUDA marching cubes and ``ArrayMesh`` against the CPU path."""
 
 import numpy as np
 import pytest
 from scipy import ndimage
 from skimage.measure import marching_cubes
 
-from cubic.cuda import ascupy, asnumpy
-from cubic.feature._marching_cubes_cuda import marching_cubes as marching_cubes_gpu
+trimesh = pytest.importorskip("trimesh")
+
+from cubic.cuda import ascupy, asnumpy  # noqa: E402
+from cubic.feature import mesh  # noqa: E402
+from cubic.feature._array_mesh import ArrayMesh  # noqa: E402
+from cubic.feature._marching_cubes_cuda import (  # noqa: E402
+    marching_cubes as marching_cubes_gpu,
+)
 
 
 def _canonical(verts: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -72,3 +78,26 @@ def test_gpu_marching_cubes_matches_skimage(name: str, gpu_available: bool) -> N
     cpu, gpu = _canonical(v_cpu, f_cpu), _canonical(asnumpy(v_gpu), asnumpy(f_gpu))
     np.testing.assert_array_equal(gpu[0], cpu[0])
     np.testing.assert_array_equal(gpu[1], cpu[1])
+
+
+def test_array_mesh_matches_trimesh() -> None:
+    """On NumPy arrays, ArrayMesh reproduces trimesh's features to rounding.
+
+    It recomputes the trimesh quantities the features read (mass properties,
+    adjacency, dihedral angles, angle defects) with trimesh's formulas, and
+    hands hull-based features to trimesh itself.
+    """
+    z, y, x = np.meshgrid(
+        *[np.arange(n) - (n - 1) / 2 for n in (30, 30, 30)], indexing="ij"
+    )
+    r2 = z**2 + y**2 + x**2
+    hollow = np.pad((r2 <= 12**2) & ~(r2 <= 5**2), 1)
+    verts, faces, _, _ = marching_cubes(hollow, spacing=(2.0, 1.0, 1.0))
+    reference = trimesh.Trimesh(verts, faces)
+    trimesh.repair.fix_normals(reference)
+    names = [n for n in mesh.mesh_feature_list() if n != "Fractal Dimension"]
+
+    expected = mesh.extract_mesh_features(reference, names)
+    got = mesh.extract_mesh_features(ArrayMesh(verts, faces), names)
+
+    assert got == pytest.approx(expected, rel=1e-12)
