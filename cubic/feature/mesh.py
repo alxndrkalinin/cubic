@@ -7,6 +7,7 @@ with ``trimesh``.
 from __future__ import annotations
 
 import warnings
+import importlib.util
 from typing import Any, TypeVar, Callable, SupportsFloat
 from functools import wraps
 from collections.abc import Sequence
@@ -57,6 +58,18 @@ def mesh_feature_list() -> list[str]:
     ``Euler Characteristic`` is twice the number of separate pieces plus
     cavities, minus twice the number of handles: 2 for a ball, 4 for a hollow
     ball, 0 for a torus.
+
+    The last four features need curvature at each vertex, which on a voxel
+    staircase measures the staircase, so they are computed on a mesh of the mask
+    blurred at ``curvature_sigma`` (see ``extract_surface_features``).
+    ``Total Absolute Gaussian Curvature`` is the integral of ``|K|`` over the
+    surface divided by ``4 pi``: 1 for any convex body and more for every saddle
+    region (grooves, waists, the necks of lobes), unitless. ``Avg Shape Index``
+    (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
+    (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
+    units of ``spacing``; both are averaged over the surface by area. ``Fractal
+    Dimension`` is ``2 + 2 * slope`` of log area against log face count as the
+    mesh is decimated, about 2 for a smooth surface.
     """
     return list(_MESH_FEATURES)
 
@@ -83,6 +96,7 @@ def extract_features(
     label_image: np.ndarray,
     features: list[str] | None = None,
     spacing: Sequence[float] | None = None,
+    curvature_sigma: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Extract mesh features for every label of a label image.
 
@@ -101,6 +115,9 @@ def extract_features(
         Voxel spacing ``(z, y, x)`` forwarded to marching cubes. Without it an
         anisotropic stack is meshed as if isotropic, scaling volumes and areas
         by the spacing product.
+    curvature_sigma : float, optional
+        Blur scale, in units of ``spacing``, of the mesh behind the
+        curvature-distribution features; see ``extract_surface_features``.
 
     Returns
     -------
@@ -135,7 +152,7 @@ def extract_features(
     for label in labels:
         mask = label_image[bboxes[label - 1]] == label
         mesh_features = extract_surface_features(
-            mask, spacing=spacing, features=features
+            mask, spacing=spacing, features=features, curvature_sigma=curvature_sigma
         )
         feature_values.append([mesh_features[feat] for feat in features])
 
@@ -150,11 +167,80 @@ def extract_surface_features(
     mask: np.ndarray,
     spacing: Sequence[float] | None = None,
     features: Sequence[str] | None = None,
+    curvature_sigma: float | None = None,
 ) -> dict[str, float]:
-    """Generate mesh from a single label mask and extract its surface features."""
+    """Generate mesh from a single label mask and extract its surface features.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Boolean mask of a single object.
+    spacing : sequence of float, optional
+        Voxel spacing ``(z, y, x)``.
+    features : sequence of str, optional
+        Feature names to compute, defaults to ``mesh_feature_list()``.
+    curvature_sigma : float, optional
+        Gaussian blur scale, in units of ``spacing``, of the mask that the
+        curvature-distribution features are measured on. Defaults to twice the
+        coarsest voxel spacing, which removes the voxel staircase on every axis.
+        It sets the scale of the shape being described: larger values keep only
+        coarser folds. An object too small to survive the blur gets NaN for those
+        features, with a warning.
+    """
     features = _resolve_features(features)
     mesh = mask2mesh(mask, spacing=spacing)
-    return extract_mesh_features(mesh, features=features)
+    smoothed = [name for name in features if name in _SMOOTHED_FEATURES]
+    if not smoothed:
+        return extract_mesh_features(mesh, features=features)
+    sigma = _curvature_sigma(spacing, curvature_sigma)
+    smooth_mesh = _smooth_mask2mesh(mask, spacing, sigma)
+    if smooth_mesh is not None:
+        return extract_mesh_features(mesh, features=features, smooth_mesh=smooth_mesh)
+    warnings.warn(
+        f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
+        f"curvature_sigma={sigma:g}; returning NaN for {smoothed}.",
+        stacklevel=2,
+    )
+    rest = extract_mesh_features(
+        mesh, features=[name for name in features if name not in smoothed]
+    )
+    return {name: rest.get(name, float("nan")) for name in features}
+
+
+def _curvature_sigma(spacing: Sequence[float] | None, sigma: float | None) -> float:
+    """Return ``sigma``, or twice the coarsest voxel spacing for ``None``."""
+    if sigma is None:
+        return 2 * (1.0 if spacing is None else float(max(spacing)))
+    sigma = float(sigma)
+    if not np.isfinite(sigma) or sigma <= 0:
+        raise ValueError(f"curvature_sigma must be finite and positive; got {sigma}")
+    return sigma
+
+
+def _smooth_mask2mesh(
+    mask_3d: np.ndarray, spacing: Sequence[float] | None, sigma: float
+) -> trimesh.Trimesh | None:
+    """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes.
+
+    The blur is isotropic in physical units, so its width in voxels differs per
+    axis on an anisotropic stack.
+    """
+    step = np.ones(3) if spacing is None else np.asarray(spacing, dtype=float)
+    sigma_voxels = sigma / step
+    # Pad past the blur's reach so it neither clips at the crop nor touches the
+    # border, which would leave the surface open.
+    pad = np.ceil(3 * sigma_voxels).astype(int) + 1
+    volume = ndimage.gaussian_filter(
+        np.pad(mask_3d.astype(np.float32), [(p, p) for p in pad]), sigma_voxels
+    )
+    if volume.max() <= 0.5:
+        return None
+    verts, faces, _, _ = marching_cubes(
+        volume, 0.5, spacing=tuple(step), allow_degenerate=False
+    )
+    mesh = trimesh.Trimesh(vertices=verts - pad * step, faces=faces)
+    trimesh.repair.fix_normals(mesh)
+    return mesh
 
 
 @_require_trimesh
@@ -162,6 +248,7 @@ def mask2mesh(
     mask_3d: np.ndarray,
     spacing: Sequence[float] | None = None,
     marching_cubes_kwargs: dict[str, Any] | None = None,
+    sigma: float | None = None,
 ) -> trimesh.Trimesh:
     """Convert 3D mask to a mesh using marching cubes.
 
@@ -179,7 +266,22 @@ def mask2mesh(
         areas and volumes are in physical units.
     marching_cubes_kwargs : dict, optional
         Extra keyword arguments for ``skimage.measure.marching_cubes``.
+    sigma : float, optional
+        If given, mesh the mask blurred by a Gaussian of this width, in units of
+        ``spacing``, instead of the voxel staircase. ``marching_cubes_kwargs``
+        is then not used.
+
+    Raises
+    ------
+    ValueError
+        If ``sigma`` is given and the blurred mask never reaches 0.5, i.e. the
+        object is too small for that blur.
     """
+    if sigma is not None:
+        mesh = _smooth_mask2mesh(mask_3d, spacing, _curvature_sigma(spacing, sigma))
+        if mesh is None:
+            raise ValueError(f"The mask vanishes when blurred at sigma={sigma}.")
+        return mesh
     marching_cubes_kwargs = dict(marching_cubes_kwargs or {})
     if spacing is not None:
         if "spacing" in marching_cubes_kwargs:
@@ -212,7 +314,9 @@ def sphericity(v: float, sa: float) -> float:
 
 @_require_trimesh
 def extract_mesh_features(
-    mesh: trimesh.Trimesh, features: Sequence[str] | None = None
+    mesh: trimesh.Trimesh,
+    features: Sequence[str] | None = None,
+    smooth_mesh: trimesh.Trimesh | None = None,
 ) -> dict[str, float]:
     """Extract surface features from a ``trimesh`` object.
 
@@ -223,6 +327,10 @@ def extract_mesh_features(
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()``. Only
         these are computed.
+    smooth_mesh : trimesh.Trimesh, optional
+        Smoothed surface of the same object (e.g. ``mask2mesh(mask, sigma=...)``)
+        for the curvature-distribution features. Without it they are measured on
+        ``mesh``, which on a raw voxel mesh mostly measures the staircase.
 
     Raises
     ------
@@ -248,9 +356,15 @@ def extract_mesh_features(
             f"Mesh surface area must be finite and positive; got {surface_area}."
         )
 
+    curvature_mesh = mesh if smooth_mesh is None else smooth_mesh
     # trimesh caches volume, convex hull and bounding primitives on the mesh, so
     # features sharing them do not recompute them.
-    return {name: float(_MESH_FEATURES[name](mesh)) for name in features}
+    return {
+        name: float(
+            _MESH_FEATURES[name](curvature_mesh if name in _SMOOTHED_FEATURES else mesh)
+        )
+        for name in features
+    }
 
 
 def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
@@ -293,6 +407,117 @@ def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
     return mesh.integral_mean_curvature / mesh.area
 
 
+def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Return the mixed Voronoi area of each vertex (Meyer et al., 2003).
+
+    Each triangle gives a vertex its Voronoi share, or half or a quarter of its
+    area when the triangle is obtuse at or away from that vertex, so the areas
+    sum to the mesh area.
+    """
+    corners = mesh.vertices[mesh.faces]
+    angles = mesh.face_angles
+    # Squared length of the edge opposite each corner.
+    opposite = np.stack(
+        [
+            ((corners[:, (i + 1) % 3] - corners[:, (i + 2) % 3]) ** 2).sum(axis=1)
+            for i in range(3)
+        ],
+        axis=1,
+    )
+    cot = 1 / np.tan(angles)
+    nxt, prv = [1, 2, 0], [2, 0, 1]
+    voronoi = (opposite[:, nxt] * cot[:, nxt] + opposite[:, prv] * cot[:, prv]) / 8
+    face_area = mesh.area_faces[:, None]
+    obtuse = angles > np.pi / 2
+    area = np.where(
+        obtuse,
+        face_area / 2,
+        np.where(obtuse.any(axis=1, keepdims=True), face_area / 4, voronoi),
+    )
+    return np.bincount(
+        mesh.faces.ravel(), weights=area.ravel(), minlength=len(mesh.vertices)
+    )
+
+
+def _principal_curvatures(
+    mesh: trimesh.Trimesh,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the per-vertex principal curvatures ``k1 <= k2`` and vertex areas.
+
+    Gaussian curvature is the angle defect and mean curvature the edge sum of
+    length times signed dihedral angle over four times the vertex area, as in
+    LONI ShapeTools; ``k1, k2 = H -+ sqrt(H^2 - K)``, clamped to ``H`` where
+    discretisation makes ``H^2 < K``.
+    """
+    area = _mixed_area(mesh)
+    gaussian = mesh.vertex_defects / area
+    edges = mesh.face_adjacency_edges
+    lengths = np.linalg.norm(
+        mesh.vertices[edges[:, 1]] - mesh.vertices[edges[:, 0]], axis=1
+    )
+    signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
+    edge_sum = np.bincount(
+        edges.ravel(),
+        weights=np.repeat(lengths * mesh.face_adjacency_angles * signs, 2),
+        minlength=len(mesh.vertices),
+    )
+    mean = edge_sum / (4 * area)
+    spread = np.sqrt(np.maximum(mean**2 - gaussian, 0))
+    return mean - spread, mean + spread, area
+
+
+def _area_average(values: np.ndarray, area: np.ndarray) -> float:
+    """Average per-vertex ``values`` over the surface, weighting by vertex area."""
+    valid = (area > 0) & np.isfinite(values)
+    return float((values[valid] * area[valid]).sum() / area[valid].sum())
+
+
+def _avg_shape_index(mesh: trimesh.Trimesh) -> float:
+    """Return the area-weighted shape index, 1 on a sphere and 0 on a saddle."""
+    k1, k2, area = _principal_curvatures(mesh)
+    return _area_average((2 / np.pi) * np.arctan2(k1 + k2, k2 - k1), area)
+
+
+def _avg_curvedness(mesh: trimesh.Trimesh) -> float:
+    """Return the area-weighted curvedness, ``1 / R`` on a sphere of radius R."""
+    k1, k2, area = _principal_curvatures(mesh)
+    return _area_average(np.sqrt((k1**2 + k2**2) / 2), area)
+
+
+def _fractal_dimension(mesh: trimesh.Trimesh, n_levels: int = 6) -> float:
+    """Return ``2 + 2 * slope`` of log area against log face count under decimation.
+
+    The mesh is simplified by quadric error metrics to ``n_levels`` face counts
+    from a sixteenth of its own up to all of it. Area scales as ``n^((D-2)/2)``
+    with the face count ``n`` for a surface of fractal dimension ``D``.
+    """
+    if importlib.util.find_spec("fast_simplification") is None:
+        raise RuntimeError(
+            "Fractal Dimension needs fast-simplification. Install with 'cubic[mesh]'"
+        )
+    n_faces = len(mesh.faces)
+    counts = np.unique(
+        np.geomspace(max(n_faces // 16, 64), n_faces, n_levels).astype(int)
+    )
+    if len(counts) < 3:
+        return float("nan")
+    areas = [
+        mesh.area
+        if n == n_faces
+        else mesh.simplify_quadric_decimation(face_count=int(n)).area
+        for n in counts
+    ]
+    return 2 + 2 * float(np.polyfit(np.log(counts), np.log(areas), 1)[0])
+
+
+# Measured on the smoothed mesh when one is available; see mesh_feature_list.
+_SMOOTHED_FEATURES = (
+    "Total Absolute Gaussian Curvature",
+    "Avg Shape Index",
+    "Avg Curvedness",
+    "Fractal Dimension",
+)
+
 # Each feature is computed only when requested; the dict order is the default
 # column order of ``mesh_feature_list``.
 _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
@@ -317,4 +542,10 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     # beyond this integer.
     "Euler Characteristic": lambda m: m.euler_number,
     "Avg Mean Curvature": _avg_mean_curvature,
+    "Total Absolute Gaussian Curvature": lambda m: (
+        np.abs(m.vertex_defects).sum() / (4 * np.pi)
+    ),
+    "Avg Shape Index": _avg_shape_index,
+    "Avg Curvedness": _avg_curvedness,
+    "Fractal Dimension": _fractal_dimension,
 }
