@@ -101,3 +101,51 @@ def test_array_mesh_matches_trimesh() -> None:
     got = mesh.extract_mesh_features(ArrayMesh(verts, faces), names)
 
     assert got == pytest.approx(expected, rel=1e-12)
+
+
+def _labels() -> np.ndarray:
+    z, y, x = np.meshgrid(*[np.arange(n) for n in (30, 64, 64)], indexing="ij")
+    labels = np.zeros((30, 64, 64), dtype=np.int32)
+    labels[(z - 14) ** 2 + (y - 18) ** 2 / 2 + (x - 20) ** 2 <= 9**2] = 1
+    torus = (np.sqrt((y - 44) ** 2 + (x - 42) ** 2) - 12) ** 2 + (z - 14) ** 2 <= 5**2
+    labels[torus] = 2
+    labels[0:6, 50:64, 0:14] = 3  # touches the border
+    return labels
+
+
+def test_extract_features_on_gpu_matches_cpu(gpu_available: bool) -> None:
+    """A CuPy label image gives the CPU features, to rounding.
+
+    Both meshes are identical: the marching cubes port matches skimage, and the
+    curvature blur rounds like SciPy on the GPU. Only summation order differs.
+    The third label is too thin for the default blur, so its four
+    curvature-distribution features are NaN on both devices.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    pytest.importorskip("fast_simplification")
+    labels = _labels()
+    spacing = (0.3, 0.1, 0.1)
+
+    with pytest.warns(UserWarning, match="vanishes"):
+        cpu_labels, cpu, _ = mesh.extract_features(labels, spacing=spacing)
+    with pytest.warns(UserWarning, match="vanishes"):
+        gpu_labels, gpu, _ = mesh.extract_features(ascupy(labels), spacing=spacing)
+
+    np.testing.assert_array_equal(gpu_labels, cpu_labels)
+    np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
+
+
+def test_mask2mesh_on_gpu(gpu_available: bool) -> None:
+    """A CuPy mask is meshed on the GPU; only ``spacing`` is accepted as a kwarg."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    mask = ascupy(_labels() == 1)
+
+    on_gpu = mesh.mask2mesh(mask, spacing=(0.3, 0.1, 0.1))
+    on_cpu = mesh.mask2mesh(asnumpy(mask), spacing=(0.3, 0.1, 0.1))
+
+    assert isinstance(on_gpu, ArrayMesh)
+    assert on_gpu.volume == pytest.approx(on_cpu.volume, rel=1e-12)
+    with pytest.raises(ValueError, match="does not support"):
+        mesh.mask2mesh(mask, marching_cubes_kwargs={"step_size": 2})
