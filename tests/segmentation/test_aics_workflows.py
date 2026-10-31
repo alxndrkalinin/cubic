@@ -465,6 +465,21 @@ def test_dot_slice_by_slice_matches_reference(
     np.testing.assert_array_equal(asnumpy(out), expected)
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_dot_slice_by_slice_gpu_sums_like_scipy(dtype, gpu_available: bool) -> None:
+    """GPU passes replay SciPy's symmetric-pair summation order, not cupyx's.
+
+    On this noise cupyx's tap-by-tap float64 sum rounds one voxel differently.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    img = np.random.default_rng(0).random((16, 256, 256)).astype(dtype)
+    expected = np.stack([-4 * ndi.gaussian_laplace(plane, 2) for plane in img])
+    out = dot_slice_by_slice(ascupy(img), 2)
+    assert out.dtype == dtype
+    np.testing.assert_array_equal(asnumpy(out), expected)
+
+
 @pytest.mark.parametrize("use_gpu", [False, True])
 def test_thresholds_follow_numpy_promotion(use_gpu: bool, gpu_available: bool) -> None:
     """Host scalars of either precision compare as NumPy compares them on the host."""

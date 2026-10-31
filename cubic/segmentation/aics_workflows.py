@@ -42,6 +42,7 @@ import numpy as np
 from scipy.ndimage import generate_binary_structure
 from skimage.filters import threshold_otsu
 from skimage.morphology import ball
+from scipy.ndimage._filters import _gaussian_kernel1d as _scipy_gaussian_kernel1d
 
 from ..cuda import CUDAManager, asnumpy, get_device, to_same_device, get_array_module
 from ..scipy import ndimage as _ndimage
@@ -942,14 +943,102 @@ def _median(image: np.ndarray) -> Any:
     return np.percentile(asnumpy(flat[k : k + 2 - flat.size % 2]), 50)
 
 
+# SciPy's NI_Correlate1D for a symmetric odd-length filter, one output per
+# thread: the line is read in double, the centre tap goes first, then each pair
+# of taps (left + right) * w from the outermost inwards, accumulated in double
+# and stored in the output dtype. cupyx sums tap by tap instead, which rounds
+# differently where a second-derivative pass cancels to near zero. Boundaries
+# follow mode="reflect" (half-sample symmetric) at any distance.
+_CORRELATE_CUDA_SOURCE = r"""
+__device__ __forceinline__ long reflect_index(long j, long n) {
+  long period = 2 * n;
+  j %= period;
+  if (j < 0) j += period;
+  return j < n ? j : period - 1 - j;
+}
+
+template <typename T>
+__device__ void correlate1d_symmetric(
+    const T* in, T* out, const double* w, int half,
+    long outer, long length, long inner) {
+  long n = outer * length * inner;
+  for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += (long)blockDim.x * gridDim.x) {
+    long i = idx % inner, l = (idx / inner) % length, o = idx / (inner * length);
+    const T* line = in + o * length * inner + i;
+    double acc = (double)line[l * inner] * w[half];
+    for (int k = half; k >= 1; --k) {
+      double left = (double)line[reflect_index(l - k, length) * inner];
+      double right = (double)line[reflect_index(l + k, length) * inner];
+      acc += (left + right) * w[half - k];
+    }
+    out[idx] = (T)acc;
+  }
+}
+
+extern "C" __global__ void correlate1d_symmetric_f32(
+    const float* in, float* out, const double* w, int half,
+    long outer, long length, long inner) {
+  correlate1d_symmetric<float>(in, out, w, half, outer, length, inner);
+}
+
+extern "C" __global__ void correlate1d_symmetric_f64(
+    const double* in, double* out, const double* w, int half,
+    long outer, long length, long inner) {
+  correlate1d_symmetric<double>(in, out, w, half, outer, length, inner);
+}
+"""
+
+
+def _gaussian_filter1d_cuda(
+    image: np.ndarray, sigma: float, axis: int, order: int, truncate: float
+) -> np.ndarray:
+    """``scipy.ndimage.gaussian_filter1d(mode="reflect")`` of a float CuPy array.
+
+    SciPy's own weights (``_gaussian_kernel1d``, reversed as SciPy reverses
+    them) through :data:`_CORRELATE_CUDA_SOURCE`; bitwise equal to SciPy for
+    float32 and float64 input.
+    """
+    xp = get_array_module(image)
+    radius = int(truncate * float(sigma) + 0.5)
+    weights = _scipy_gaussian_kernel1d(sigma, order, radius)[::-1]
+    # SciPy's symmetry test; Gaussian kernels of even order always pass it.
+    if np.abs(weights - weights[::-1]).max() > np.finfo(np.float64).eps:
+        raise ValueError(f"order {order} gives an asymmetric Gaussian kernel")
+    name = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64"}[image.dtype]
+    image = xp.ascontiguousarray(image)
+    shape = image.shape
+    outer = int(np.prod(shape[:axis]))
+    inner = int(np.prod(shape[axis + 1 :]))
+    device = _cupy_device(image)
+    with device:
+        (kernel,) = _cuda_functions(
+            _CORRELATE_CUDA_SOURCE, (f"correlate1d_symmetric_{name}",), device.id
+        )
+        out = xp.empty_like(image)
+        kernel(
+            *_launch_config(image.size),
+            (
+                image,
+                out,
+                xp.asarray(np.ascontiguousarray(weights)),
+                np.int32(radius),
+                np.int64(outer),
+                np.int64(shape[axis]),
+                np.int64(inner),
+            ),
+        )
+    return out
+
+
 def dot_slice_by_slice(image: np.ndarray, log_sigma: float) -> np.ndarray:
     """2D spot filter ``-sigma**2 * LoG`` on each z-plane of an image.
 
     Port of ``aicssegmentation.core.seg_dot.dot_slice_by_slice`` without a
     cutoff: ``scipy.ndimage.gaussian_laplace`` (``mode="reflect"``,
     ``truncate=4``) over the last two axes, every plane at once. Each 1D
-    Gaussian pass is stored in the image dtype, as in SciPy; on GPU the pass
-    runs on a float64 copy to accumulate in float64 as SciPy does.
+    Gaussian pass is stored in the image dtype, as in SciPy; on GPU a kernel
+    replays SciPy's float64 summation order (float32 and float64 input).
 
     Parameters
     ----------
@@ -964,19 +1053,20 @@ def dot_slice_by_slice(image: np.ndarray, log_sigma: float) -> np.ndarray:
         Filter response in the image dtype, on the input's device.
     """
     on_gpu = get_device(image) == "GPU"
+    if on_gpu and image.dtype not in (np.float32, np.float64):
+        raise TypeError(f"image must be float32 or float64 on GPU, got {image.dtype}")
     axes = (image.ndim - 2, image.ndim - 1)
     laplace = None
     for derivative_axis in axes:
         out = image
         for axis in axes:
-            out = _ndimage.gaussian_filter1d(
-                out.astype(np.float64) if on_gpu else out,
-                log_sigma,
-                axis=axis,
-                order=2 if axis == derivative_axis else 0,
-                mode="reflect",
-                truncate=4.0,
-            ).astype(image.dtype, copy=False)
+            order = 2 if axis == derivative_axis else 0
+            if on_gpu:
+                out = _gaussian_filter1d_cuda(out, log_sigma, axis, order, 4.0)
+            else:
+                out = _ndimage.gaussian_filter1d(
+                    out, log_sigma, axis=axis, order=order, mode="reflect", truncate=4.0
+                )
         laplace = out if laplace is None else laplace + out
     assert laplace is not None  # two axes
     return ((-1 * (log_sigma**2)) * laplace).astype(image.dtype, copy=False)
