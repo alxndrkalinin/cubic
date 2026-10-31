@@ -1072,16 +1072,18 @@ def dot_slice_by_slice(image: np.ndarray, log_sigma: float) -> np.ndarray:
     return ((-1 * (log_sigma**2)) * laplace).astype(image.dtype, copy=False)
 
 
-def _low_level_mask(smooth: np.ndarray, inclusive: bool) -> np.ndarray:
+def _low_level_mask(
+    smooth: np.ndarray, inclusive: bool, min_size: int = 700
+) -> np.ndarray:
     """Step 1 of the nucleolar workflows: the dim, nucleus-scale regions.
 
     ``smooth > (triangle + median) / 2``, keeping face-connected objects of at
-    least 700 voxels.
+    least ``min_size`` voxels.
     """
     (triangle,) = _histogram_thresholds(smooth, _triangle_from_histogram)
     threshold = (triangle + _median(smooth)) / 2
     return remove_small_objects_aics(
-        _greater(smooth, threshold), 700, inclusive=inclusive
+        _greater(smooth, threshold), min_size, inclusive=inclusive
     )
 
 
@@ -1199,14 +1201,23 @@ def workflow_tomm20(
 
 
 def workflow_fbl(
-    image: np.ndarray, *, size_filter_inclusive: bool | None = None
+    image: np.ndarray,
+    *,
+    normalization: tuple[float, float] = (0.5, 18),
+    smoothing_sigma: float = 1.0,
+    dot_sigma: float = 1,
+    dot_cutoff: float | None = 0.01,
+    low_level_min_size: int = 700,
+    min_area: int = 5,
+    size_filter_inclusive: bool | None = None,
 ) -> np.ndarray:
     """FBL (nucleolus, dense fibrillar component) classic segmentation.
 
-    Port of ``aicssegmentation.structure_wrapper.seg_fbl.Workflow_fbl`` with its
-    fixed parameters (no rescaling): Gaussian smoothing, a low-level
-    triangle-median threshold, an Otsu threshold within each low-level object,
-    and 2D spot detections merged in.
+    Port of ``aicssegmentation.structure_wrapper.seg_fbl.Workflow_fbl`` (no
+    rescaling): Gaussian smoothing, a low-level triangle-median threshold, an
+    Otsu threshold within each low-level object, and 2D spot detections merged
+    in. The defaults are the reference's fixed parameters; other values tune
+    the workflow to a dataset, as the Allen Cell Segmenter intends.
 
     Parameters
     ----------
@@ -1218,6 +1229,21 @@ def workflow_fbl(
         step sees only that plane: its own intensity statistics and no
         smoothing or connectivity across z. The mask can therefore differ from
         the same plane of a whole-volume segmentation.
+    normalization : tuple[float, float]
+        Auto-contrast bounds ``(a, b)``: the image is clipped to
+        ``[mean - a*std, mean + b*std]`` and rescaled to ``[0, 1]``.
+    smoothing_sigma : float
+        Sigma of the 3D Gaussian smoothing (``mode="nearest"``, ``truncate=3``).
+    low_level_min_size : int
+        Smallest low-level (nucleus-scale) object kept, in voxels.
+    min_area : int
+        Smallest object kept in the final mask, in voxels.
+    dot_sigma : float
+        Scale of the 2D spot filter (:func:`dot_slice_by_slice`) whose
+        detections are merged into the mask, roughly the spot radius in pixels.
+    dot_cutoff : float | None
+        Spot-filter response above which a pixel is a detection; ``None``
+        skips the spot step, leaving the per-object Otsu mask.
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
@@ -1230,31 +1256,55 @@ def workflow_fbl(
         Boolean mask of the input's shape, on the input's device.
     """
     if _is_plane(image):
-        return workflow_fbl(image[None], size_filter_inclusive=size_filter_inclusive)[0]
+        return workflow_fbl(
+            image[None],
+            normalization=normalization,
+            smoothing_sigma=smoothing_sigma,
+            dot_sigma=dot_sigma,
+            dot_cutoff=dot_cutoff,
+            low_level_min_size=low_level_min_size,
+            min_area=min_area,
+            size_filter_inclusive=size_filter_inclusive,
+        )[0]
     inclusive = _resolve_inclusive(size_filter_inclusive)
-    norm = intensity_normalization(image.astype(np.float32, copy=False), (0.5, 18))
-    smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
+    norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
+    smooth = _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
     del norm
-    labels, count = _label_faces(_low_level_mask(smooth, inclusive))
+    labels, count = _label_faces(_low_level_mask(smooth, inclusive, low_level_min_size))
     thresholds = _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
     bw = _local_threshold_mask(smooth, labels, thresholds)
     del labels
-    finer = _greater(dot_slice_by_slice(smooth, 1), 0.01)
-    bw |= remove_small_objects_aics(finer, 5, inclusive=inclusive)
-    return remove_small_objects_aics(bw, 5, inclusive=inclusive)
+    if dot_cutoff is not None:
+        finer = _greater(dot_slice_by_slice(smooth, dot_sigma), dot_cutoff)
+        bw |= remove_small_objects_aics(finer, min_area, inclusive=inclusive)
+    return remove_small_objects_aics(bw, min_area, inclusive=inclusive)
 
 
 def workflow_npm1(
-    image: np.ndarray, *, size_filter_inclusive: bool | None = None
+    image: np.ndarray,
+    *,
+    normalization: tuple[float, float] = (0.5, 15),
+    smoothing_sigma: float = 1.0,
+    dot_sigma: float = 2,
+    dot_cutoff: float | None = 0.025,
+    hole_sigmas: Sequence[float] = (2, 1),
+    hole_cutoff: float | None = 0.025,
+    low_level_min_size: int = 700,
+    dilation_radius: int = 2,
+    local_cutoff_factor: float = 0.333,
+    local_otsu_factor: float = 0.98,
+    min_area: int = 5,
+    size_filter_inclusive: bool | None = None,
 ) -> np.ndarray:
     """NPM1 (nucleolus, granular component) classic segmentation.
 
-    Port of ``aicssegmentation.structure_wrapper.seg_npm1.Workflow_npm1`` with
-    its fixed parameters (no rescaling): Gaussian smoothing, a low-level
-    triangle-median threshold dilated by a radius-2 ball, an Otsu threshold
-    within each low-level object bright enough against the global Otsu
-    threshold, bright 2D spots inside the low level, and dark 2D spots cut out
-    as holes.
+    Port of ``aicssegmentation.structure_wrapper.seg_npm1.Workflow_npm1`` (no
+    rescaling): Gaussian smoothing, a low-level triangle-median threshold
+    dilated by a ball, a scaled Otsu threshold within each low-level object
+    bright enough against the global Otsu threshold, bright 2D spots inside the
+    low level, and dark 2D spots cut out as holes. The defaults are the
+    reference's fixed parameters; other values tune the workflow to a dataset,
+    as the Allen Cell Segmenter intends.
 
     Parameters
     ----------
@@ -1266,6 +1316,31 @@ def workflow_npm1(
         step sees only that plane: its own intensity statistics and no
         smoothing, dilation or connectivity across z. The mask can therefore
         differ from the same plane of a whole-volume segmentation.
+    normalization : tuple[float, float]
+        Auto-contrast bounds ``(a, b)``: the image is clipped to
+        ``[mean - a*std, mean + b*std]`` and rescaled to ``[0, 1]``.
+    smoothing_sigma : float
+        Sigma of the 3D Gaussian smoothing (``mode="nearest"``, ``truncate=3``).
+    low_level_min_size : int
+        Smallest low-level (nucleus-scale) object kept, in voxels.
+    min_area : int
+        Smallest object kept in the final mask, in voxels.
+    dot_sigma : float
+        Scale of the 2D spot filter for bright spots added inside the low level.
+    dot_cutoff : float | None
+        Bright-spot response threshold; ``None`` adds no spots.
+    hole_sigmas : Sequence[float]
+        Scales of the 2D spot filter on the inverted image; dark spots at any
+        of them are cut out as holes.
+    hole_cutoff : float | None
+        Dark-spot response threshold; ``None`` cuts no holes.
+    dilation_radius : int
+        Radius of the ball the low-level mask is dilated by; ``0`` skips it.
+    local_cutoff_factor : float
+        An object is thresholded only if its Otsu level exceeds this factor
+        times the global Otsu level; dimmer objects are dropped.
+    local_otsu_factor : float
+        Factor applied to each object's Otsu level to give its threshold.
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
@@ -1278,31 +1353,47 @@ def workflow_npm1(
         Boolean mask of the input's shape, on the input's device.
     """
     if _is_plane(image):
-        return workflow_npm1(image[None], size_filter_inclusive=size_filter_inclusive)[
-            0
-        ]
+        return workflow_npm1(
+            image[None],
+            normalization=normalization,
+            smoothing_sigma=smoothing_sigma,
+            dot_sigma=dot_sigma,
+            dot_cutoff=dot_cutoff,
+            hole_sigmas=hole_sigmas,
+            hole_cutoff=hole_cutoff,
+            low_level_min_size=low_level_min_size,
+            dilation_radius=dilation_radius,
+            local_cutoff_factor=local_cutoff_factor,
+            local_otsu_factor=local_otsu_factor,
+            min_area=min_area,
+            size_filter_inclusive=size_filter_inclusive,
+        )[0]
     inclusive = _resolve_inclusive(size_filter_inclusive)
-    norm = intensity_normalization(image.astype(np.float32, copy=False), (0.5, 15))
-    smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
+    norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
+    smooth = _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
     del norm
-    # skimage's grey dilation reflects at the border; for a binary mask and a
-    # ball that adds nothing a zero border does not, as each reflected voxel
-    # has a nearer in-image twin inside the ball.
-    low = _ndimage.binary_dilation(
-        _low_level_mask(smooth, inclusive), structure=to_same_device(ball(2), smooth)
-    )
+    low = _low_level_mask(smooth, inclusive, low_level_min_size)
+    if dilation_radius > 0:
+        # skimage's grey dilation reflects at the border; for a binary mask and
+        # a ball that adds nothing a zero border does not, as each reflected
+        # voxel has a nearer in-image twin inside the ball.
+        low = _ndimage.binary_dilation(
+            low, structure=to_same_device(ball(dilation_radius), smooth)
+        )
     (global_otsu,) = _histogram_thresholds(smooth, _otsu_from_histogram)
-    local_cutoff = 0.333 * global_otsu
+    local_cutoff = local_cutoff_factor * global_otsu
     labels, count = _label_faces(low)
     thresholds = [
-        0.98 * t if t > local_cutoff else None
+        local_otsu_factor * t if t > local_cutoff else None
         for t in _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
     ]
     bw = _local_threshold_mask(smooth, labels, thresholds)
     del labels
-    bw |= _greater(dot_slice_by_slice(smooth, 2), 0.025) & low
-    inverted = 1 - smooth
-    del smooth
-    bw &= ~_greater(dot_slice_by_slice(inverted, 2), 0.025)
-    bw &= ~_greater(dot_slice_by_slice(inverted, 1), 0.025)
-    return remove_small_objects_aics(bw, 5, inclusive=inclusive)
+    if dot_cutoff is not None:
+        bw |= _greater(dot_slice_by_slice(smooth, dot_sigma), dot_cutoff) & low
+    if hole_cutoff is not None:
+        inverted = 1 - smooth
+        del smooth
+        for sigma in hole_sigmas:
+            bw &= ~_greater(dot_slice_by_slice(inverted, sigma), hole_cutoff)
+    return remove_small_objects_aics(bw, min_area, inclusive=inclusive)

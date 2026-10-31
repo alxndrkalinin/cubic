@@ -684,6 +684,92 @@ def test_workflow_plane_matches_planar_steps(
     np.testing.assert_array_equal(asnumpy(mask), expected)
 
 
+def _components_at_least(mask: np.ndarray, size: int) -> bool:
+    """Whether every face-connected component of ``mask`` has ``size`` voxels."""
+    labels, _ = _label_faces(mask)
+    return bool((np.bincount(labels.ravel())[1:] >= size).all())
+
+
+def test_fbl_parameters_change_the_mask() -> None:
+    """Disabling spots, raising the low-level size or the min area act as documented."""
+    img = _nucleoli()
+    default = workflow_fbl(img)
+    no_spots = workflow_fbl(img, dot_cutoff=None)
+    # The spots only add to the per-object Otsu mask.
+    assert not (no_spots & ~default).any() and no_spots.sum() < default.sum()
+    assert not workflow_fbl(img, dot_cutoff=None, low_level_min_size=10**6).any()
+    big = workflow_fbl(img, min_area=40)
+    assert _components_at_least(big, 40) and not _components_at_least(default, 40)
+    assert not (big & ~default).any()
+    assert (workflow_fbl(img, smoothing_sigma=2.0) != default).any()
+    assert (workflow_fbl(img, normalization=(1.0, 10.0)) != default).any()
+    assert (workflow_fbl(img, dot_sigma=2) != default).any()
+
+
+def test_npm1_parameters_change_the_mask() -> None:
+    """Each NPM1 step can be switched off or loosened as documented."""
+    img = _nucleoli()
+    default = workflow_npm1(img)
+    no_holes = workflow_npm1(img, hole_cutoff=None)
+    assert not (default & ~no_holes).any() and no_holes.sum() > default.sum()
+    no_spots = workflow_npm1(img, dot_cutoff=None)
+    assert not (no_spots & ~default).any() and no_spots.sum() < default.sum()
+    looser = workflow_npm1(img, local_otsu_factor=0.8)
+    assert not (default & ~looser).any() and looser.sum() > default.sum()
+    # No object beats 100x the global Otsu level, so only spots could remain.
+    assert not workflow_npm1(img, local_cutoff_factor=100.0, dot_cutoff=None).any()
+    assert (workflow_npm1(img, dilation_radius=0) != default).any()
+    assert (workflow_npm1(img, hole_sigmas=(2,)) != default).any()
+    assert _components_at_least(workflow_npm1(img, min_area=40), 40)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "kwargs"),
+    [
+        (
+            workflow_fbl,
+            {
+                "normalization": (1.0, 12.0),
+                "smoothing_sigma": 1.5,
+                "dot_sigma": 2,
+                "dot_cutoff": 0.02,
+                "low_level_min_size": 500,
+                "min_area": 10,
+            },
+        ),
+        (workflow_fbl, {"dot_cutoff": None}),
+        (
+            workflow_npm1,
+            {
+                "normalization": (1.0, 12.0),
+                "smoothing_sigma": 1.5,
+                "dot_sigma": 1.5,
+                "dot_cutoff": 0.03,
+                "hole_sigmas": (1.5,),
+                "hole_cutoff": 0.02,
+                "low_level_min_size": 500,
+                "dilation_radius": 1,
+                "local_cutoff_factor": 0.5,
+                "local_otsu_factor": 0.9,
+                "min_area": 10,
+            },
+        ),
+        (workflow_npm1, {"dot_cutoff": None, "hole_cutoff": None}),
+    ],
+)
+def test_workflow_parameters_gpu_matches_cpu(
+    workflow, kwargs: dict, gpu_available: bool
+) -> None:
+    """Non-default parameters give the same mask on both devices."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    img = _nucleoli(seed=3)
+    cpu = workflow(img, **kwargs)
+    gpu = workflow(ascupy(img), **kwargs)
+    assert cpu.any() and (cpu != workflow(img)).any()
+    np.testing.assert_array_equal(asnumpy(gpu), cpu)
+
+
 @pytest.mark.parametrize("workflow", _WORKFLOWS)
 def test_workflow_rejects_other_dimensionalities(workflow) -> None:
     """Only (Y, X) planes and (Z, Y, X) volumes are accepted."""
