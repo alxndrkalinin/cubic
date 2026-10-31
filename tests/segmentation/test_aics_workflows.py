@@ -6,18 +6,34 @@ import numpy as np
 import pytest
 from scipy import ndimage as ndi
 from scipy.stats import norm
-from skimage.morphology import remove_small_objects
+from skimage.filters import threshold_otsu, threshold_triangle
+from skimage.exposure import histogram
+from skimage.morphology import ball, remove_small_objects
 
 from cubic.cuda import ascupy, asnumpy, get_device
-from cubic.segmentation import aics_workflows, workflow_sec61b, workflow_tomm20
+from cubic.segmentation import (
+    aics_workflows,
+    workflow_sec61b,
+    workflow_tomm20,
+)
 from cubic.segmentation.segment_utils import _SKIMAGE_USES_MAX_SIZE
 from cubic.segmentation.aics_workflows import (
+    _median,
+    _greater,
+    _label_faces,
+    _low_level_mask,
     _gaussian_nearest,
+    _label_histograms,
+    dot_slice_by_slice,
+    _otsu_from_histogram,
     _hessian_2d_eigen_max,
+    _histogram_thresholds,
     _itk_boundary_regions,
+    _local_threshold_mask,
     _near_float32_midpoint,
     _vesselness_2d_response,
     intensity_normalization,
+    _triangle_from_histogram,
     remove_small_objects_aics,
     vesselness_slice_by_slice,
     gradient_anisotropic_diffusion,
@@ -48,6 +64,42 @@ def _filaments(shape: tuple[int, int, int], seed: int = 0) -> np.ndarray:
             if 0 <= y < ny and 0 <= x < nx:
                 img[z, y, x] = 1.0
     img = ndi.gaussian_filter(img, sigma=(0.8, 1.0, 1.0))
+    img += rng.normal(0, 0.02, size=shape).astype(np.float32)
+    return (img * 1000 + 100).astype(np.float32)
+
+
+def _nucleoli(shape: tuple[int, int, int] = (10, 80, 112), seed: int = 0) -> np.ndarray:
+    """Noisy nuclei holding bright nucleoli with dark holes, a stand-in for FBL/NPM1.
+
+    Three nuclei hold nucleoli; a fourth is dim and empty, so NPM1's local Otsu
+    falls below its cutoff there. A small dim blob stays under the 700-voxel
+    low-level size, and isolated bright dots outside the nuclei reach only the
+    spot filter.
+    """
+    rng = np.random.default_rng(seed)
+    img = np.full(shape, 0.05, dtype=np.float32)
+    zz, yy, xx = np.indices(shape)
+    nz, ny, nx = shape
+    cz = nz / 2 - 0.5
+    nuclei = [(18, 22, 13, 15), (20, 70, 12, 16), (60, 30, 14, 12), (58, 86, 11, 13)]
+    for k, (cy, cx, ry, rx) in enumerate(nuclei):
+        inside = ((zz - cz) / 3.6) ** 2 + ((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2
+        img[inside <= 1] = 0.1 if k == 3 else 0.3
+        if k == 3:
+            continue
+        for _ in range(3):
+            oy = cy + rng.integers(-(ry // 2), ry // 2 + 1)
+            ox = cx + rng.integers(-(rx // 2), rx // 2 + 1)
+            r = rng.uniform(2.0, 3.5)
+            blob = ((zz - cz) / 1.8) ** 2 + ((yy - oy) / r) ** 2 + ((xx - ox) / r) ** 2
+            img[blob <= 1] = 1.0
+            img[int(cz), oy, ox] = 0.3
+    small = ((zz - 4) / 2) ** 2 + ((yy - 40) / 4) ** 2 + ((xx - 56) / 4) ** 2
+    img[small <= 1] = 0.3
+    for _ in range(6):
+        y, x = rng.integers(2, ny - 2), rng.integers(2, nx - 2)
+        img[nz // 2, y - 1 : y + 1, x - 1 : x + 1] = 0.9
+    img = ndi.gaussian_filter(img, sigma=(0.7, 1.0, 1.0))
     img += rng.normal(0, 0.02, size=shape).astype(np.float32)
     return (img * 1000 + 100).astype(np.float32)
 
@@ -307,6 +359,115 @@ def test_intensity_normalization_validates_input() -> None:
         intensity_normalization(np.array([1.0, np.nan], dtype=np.float32), (1, 1))
     with pytest.raises(ValueError, match="scaling_param"):
         intensity_normalization(np.ones((2, 2), dtype=np.float32), (1, 1, 1, 1))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_label_histograms_match_numpy(use_gpu: bool, gpu_available: bool) -> None:
+    """Per-label counts and centers equal skimage's histogram of each label."""
+    rng = np.random.default_rng(6)
+    img = rng.normal(size=(5, 40, 48)).astype(np.float32) ** 3
+    labels = rng.integers(0, 5, size=img.shape).astype(np.int32)
+    labels[0, 0, :3] = 5
+    img[labels == 5] = 2.5  # a constant label
+    dev_img = _to_device(img, use_gpu, gpu_available)
+    dev_labels = _to_device(labels, use_gpu, gpu_available)
+    lowest, highest, counts, centers = _label_histograms(dev_img, dev_labels, 5)
+    for i in range(4):
+        expected_counts, expected_centers = histogram(img[labels == i + 1], 256)
+        np.testing.assert_array_equal(counts[i], expected_counts)
+        np.testing.assert_array_equal(centers[i], expected_centers)
+        assert lowest[i] == img[labels == i + 1].min()
+    assert lowest[4] == highest[4] == 2.5 and not counts[4].any()
+    _, _, counts, centers = _label_histograms(dev_img)
+    expected_counts, expected_centers = histogram(img, 256)
+    np.testing.assert_array_equal(counts[0], expected_counts)
+    np.testing.assert_array_equal(centers[0], expected_centers)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_histogram_thresholds_match_skimage(use_gpu: bool, gpu_available: bool) -> None:
+    """Otsu and triangle thresholds equal skimage's, per label and whole-image."""
+    img = _gaussian_nearest(
+        intensity_normalization(_nucleoli(seed=1), (0.5, 18)), [1.0, 1.0, 1.0]
+    )
+    labels, count = _label_faces(img > 0.15)
+    labels[0, 0, 0] = count + 1  # a single-voxel label returns its value
+    dev_img = _to_device(img, use_gpu, gpu_available)
+    dev_labels = _to_device(labels, use_gpu, gpu_available)
+    otsu = _histogram_thresholds(dev_img, _otsu_from_histogram, dev_labels, count + 1)
+    expected = [threshold_otsu(img[labels == i]) for i in range(1, count + 2)]
+    assert count > 1 and otsu == expected
+    (triangle,) = _histogram_thresholds(dev_img, _triangle_from_histogram)
+    assert triangle == threshold_triangle(img)
+    flat = np.full((2, 6, 6), 3.0, dtype=np.float32)
+    (constant,) = _histogram_thresholds(
+        _to_device(flat, use_gpu, gpu_available), _triangle_from_histogram
+    )
+    assert constant == threshold_triangle(flat)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("size", [1001, 1000])
+def test_median_matches_numpy(use_gpu: bool, size: int, gpu_available: bool) -> None:
+    """Odd and even sizes interpolate exactly as ``np.percentile(x, 50)``."""
+    x = np.random.default_rng(7).random(size).astype(np.float32)
+    median = _median(_to_device(x, use_gpu, gpu_available))
+    expected = np.percentile(x, 50)
+    assert median == expected and median.dtype == expected.dtype
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("sigma", [1, 2])
+def test_dot_slice_by_slice_matches_reference(
+    use_gpu: bool, sigma: int, gpu_available: bool
+) -> None:
+    """Bitwise equal to the per-plane ``-sigma**2 * gaussian_laplace`` reference."""
+    img = intensity_normalization(_nucleoli(seed=2), (0.5, 15))
+    expected = np.zeros_like(img)
+    for z in range(img.shape[0]):
+        expected[z] = -1 * (sigma**2) * ndi.gaussian_laplace(img[z], sigma)
+    out = dot_slice_by_slice(_to_device(img, use_gpu, gpu_available), sigma)
+    assert out.dtype == np.float32
+    np.testing.assert_array_equal(asnumpy(out), expected)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_thresholds_follow_numpy_promotion(use_gpu: bool, gpu_available: bool) -> None:
+    """Host scalars of either precision compare as NumPy compares them on the host."""
+    img = np.float32(1) + np.arange(-3, 4, dtype=np.float32) * np.float32(2**-23)
+    dev = _to_device(img, use_gpu, gpu_available)
+    labels = _to_device(np.ones(img.shape, np.int32), use_gpu, gpu_available)
+    # Rounds up to the next float32, so float32 and float64 comparisons differ.
+    between = np.float64(1) + 0.75 * np.float64(2**-23)
+    assert (img > between).sum() != (img > np.float32(between)).sum()
+    for threshold in (between, np.float32(between), float(between), 0.5):
+        expected = img > threshold
+        np.testing.assert_array_equal(asnumpy(_greater(dev, threshold)), expected)
+        local = _local_threshold_mask(dev, labels, [threshold])
+        np.testing.assert_array_equal(asnumpy(local), expected)
+    assert not asnumpy(_local_threshold_mask(dev, labels, [None])).any()
+
+
+def test_nucleoli_image_exercises_every_branch() -> None:
+    """The synthetic nucleoli reach each step of both nucleolar workflows."""
+    img = _nucleoli()
+    inclusive = _SKIMAGE_USES_MAX_SIZE
+    smooth = _gaussian_nearest(intensity_normalization(img, (0.5, 18)), [1.0] * 3)
+    low = _low_level_mask(smooth, inclusive)
+    (triangle,) = _histogram_thresholds(smooth, _triangle_from_histogram)
+    raw = smooth > (triangle + _median(smooth)) / 2
+    sizes = np.bincount(_label_faces(raw)[0].ravel())[1:]
+    assert _label_faces(low)[1] >= 3 and ((sizes > 50) & (sizes < 700)).any()
+    assert (dot_slice_by_slice(smooth, 1) > 0.01)[~low].any()
+    smooth = _gaussian_nearest(intensity_normalization(img, (0.5, 15)), [1.0] * 3)
+    low = ndi.binary_dilation(_low_level_mask(smooth, inclusive), structure=ball(2))
+    labels, count = _label_faces(low)
+    local = _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    cutoff = 0.333 * threshold_otsu(smooth)
+    assert any(t > cutoff for t in local) and any(t <= cutoff for t in local)
+    holes = dot_slice_by_slice(1 - smooth, 2) > 0.025
+    bright = dot_slice_by_slice(smooth, 2) > 0.025
+    assert holes[low].any() and bright[low].any() and bright[~low].any()
 
 
 def test_diffusion_constant_image_is_unchanged() -> None:

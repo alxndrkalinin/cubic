@@ -27,12 +27,13 @@ midpoint (see ``_K_SERIAL_MARGIN``).
 
 import functools
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure
+from skimage.filters import threshold_otsu
 
-from ..cuda import CUDAManager, asnumpy, get_device, get_array_module
+from ..cuda import CUDAManager, asnumpy, get_device, to_same_device, get_array_module
 from ..scipy import ndimage as _ndimage
 from ..image_utils import gaussian_filter_like_scipy
 from .segment_utils import _SKIMAGE_USES_MAX_SIZE
@@ -728,6 +729,267 @@ def remove_small_objects_aics(
     keep = sizes > min_size if inclusive else sizes >= min_size
     keep[0] = False
     return keep[labels]
+
+
+def _label_faces(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """Face-connected labels of ``mask``, as ``skimage.measure.label(connectivity=1)``.
+
+    The label numbering may differ from scikit-image's; the objects do not.
+    """
+    labels, count = _ndimage.label(
+        mask, structure=generate_binary_structure(mask.ndim, 1)
+    )
+    return labels, int(count)
+
+
+def _greater(image: np.ndarray, threshold: Any) -> np.ndarray:
+    """``image > threshold`` for a host scalar, promoted as NumPy promotes it.
+
+    NumPy 2 compares a float32 array with a float64 scalar in float64, NumPy 1
+    in float32; resolving the dtype on the host keeps CuPy on the same rule.
+    """
+    dtype = np.result_type(np.empty(0, dtype=image.dtype), threshold)
+    return image.astype(dtype, copy=False) > dtype.type(threshold)
+
+
+def _exact_threshold(dtype: np.dtype, threshold: Any) -> float:
+    """Return the value ``threshold`` takes when compared with a ``dtype`` array.
+
+    Float32 and float64 values are exact in float64, so comparing their float64
+    cast with this value reproduces :func:`_greater` for any threshold.
+    """
+    kind = np.result_type(np.empty(0, dtype=dtype), threshold)
+    return float(kind.type(threshold))
+
+
+_HIST_BINS = 256
+
+
+def _label_histograms(
+    image: np.ndarray, labels: np.ndarray | None = None, n_labels: int = 1
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """256-bin ``skimage.exposure.histogram`` of ``image`` within each label.
+
+    Each label is binned as ``np.histogram(values, 256)`` bins it: the range is
+    the label's own minimum and maximum, the edges are NumPy's ``linspace`` in
+    the image dtype, and each bin index is NumPy's estimate
+    ``(v - min) / (max - min) * 256``, corrected by one where it lands on the
+    wrong side of an edge. The per-voxel steps run on the input's device, the
+    per-label edges on the host.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Floating-point image; NumPy or CuPy.
+    labels : np.ndarray | None
+        Labels ``1..n_labels`` of ``image``'s shape; ``0`` is ignored.
+        ``None`` bins the whole image as one label.
+    n_labels : int
+        Number of labels.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        Host arrays: per-label minima and maxima ``(n_labels,)`` in the image
+        dtype, int64 counts ``(n_labels, 256)`` and bin centers
+        ``(n_labels, 256)``. A label holding a single value has no counts
+        (NumPy would widen its range), so callers return that value first, as
+        scikit-image's thresholds do.
+    """
+    dtype = image.dtype
+    groups: np.ndarray | None = None
+    if labels is None:
+        values = image.ravel()
+        lowest = asnumpy(values.min()).reshape(1).astype(dtype)
+        highest = asnumpy(values.max()).reshape(1).astype(dtype)
+    else:
+        flat_labels = labels.ravel()
+        inside = flat_labels > 0
+        groups = flat_labels[inside].astype(np.intp) - 1
+        values = image.ravel()[inside]
+        lowest, highest = _group_extremes(values, groups, n_labels)
+    varying = highest > lowest
+    edges = np.zeros((n_labels, _HIST_BINS + 1), dtype=dtype)
+    for i in np.flatnonzero(varying):
+        pair = np.array([lowest[i], highest[i]], dtype=dtype)
+        edges[i] = np.histogram_bin_edges(pair, _HIST_BINS)
+    centers = (edges[:, :-1] + edges[:, 1:]) / 2.0
+    # NumPy's norm_denom: last_edge - first_edge in the image dtype.
+    span = highest - lowest
+    flat_edges = to_same_device(edges.ravel(), image)
+    if labels is None:
+        if not varying[0]:
+            return lowest, highest, np.zeros((1, _HIST_BINS), np.int64), centers
+        first, denom = lowest[0], span[0]
+    else:
+        assert groups is not None
+        keep = to_same_device(varying, image)[groups]
+        groups, values = groups[keep], values[keep]
+        first = to_same_device(lowest, image)[groups]
+        denom = to_same_device(span, image)[groups]
+    index = (((values - first) / denom) * dtype.type(_HIST_BINS)).astype(np.intp)
+    index = np.where(index == _HIST_BINS, _HIST_BINS - 1, index)
+    row = 0 if groups is None else groups * (_HIST_BINS + 1)
+    index -= (values < flat_edges[row + index]).astype(np.intp)
+    index += (
+        (values >= flat_edges[row + index + 1]) & (index != _HIST_BINS - 1)
+    ).astype(np.intp)
+    if groups is not None:
+        index += groups * _HIST_BINS
+    counts = np.bincount(index, minlength=n_labels * _HIST_BINS)
+    return lowest, highest, asnumpy(counts).reshape(n_labels, _HIST_BINS), centers
+
+
+def _group_extremes(
+    values: np.ndarray, groups: np.ndarray, n_groups: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Host arrays of the minimum and maximum of ``values`` in each group ``0..n-1``.
+
+    On the host an unbuffered ``ufunc.at`` scatter; SciPy's labeled
+    ``minimum``/``maximum`` would argsort the whole image for each. On GPU
+    cupyx's labeled reductions. Extremes are exact in any dtype.
+    """
+    dtype = values.dtype
+    if get_device(values) == "CPU":
+        lowest = np.full(n_groups, np.inf, dtype=dtype)
+        highest = np.full(n_groups, -np.inf, dtype=dtype)
+        np.minimum.at(lowest, groups, values)
+        np.maximum.at(highest, groups, values)
+        return lowest, highest
+    index = to_same_device(np.arange(n_groups), values)
+    lowest = asnumpy(_ndimage.minimum(values, groups, index)).astype(dtype)
+    highest = asnumpy(_ndimage.maximum(values, groups, index)).astype(dtype)
+    return lowest, highest
+
+
+def _otsu_from_histogram(counts: np.ndarray, centers: np.ndarray) -> Any:
+    """``skimage.filters.threshold_otsu`` of an image with this histogram."""
+    return threshold_otsu(hist=(counts, centers))
+
+
+def _triangle_from_histogram(counts: np.ndarray, centers: np.ndarray) -> Any:
+    """``skimage.filters.threshold_triangle`` of an image with this histogram.
+
+    scikit-image's code after its histogram call, verbatim; the function itself
+    takes no histogram. The constant-image case is left to the caller.
+    """
+    hist, bin_centers = counts, centers
+    nbins = len(hist)
+    arg_peak_height = np.argmax(hist)
+    peak_height = hist[arg_peak_height]
+    arg_low_level, arg_high_level = np.flatnonzero(hist)[[0, -1]]
+    flip = arg_peak_height - arg_low_level < arg_high_level - arg_peak_height
+    if flip:
+        hist = hist[::-1]
+        arg_low_level = nbins - arg_high_level - 1
+        arg_peak_height = nbins - arg_peak_height - 1
+    width = arg_peak_height - arg_low_level
+    x1 = np.arange(width)
+    y1 = hist[x1 + arg_low_level]
+    norm = np.sqrt(peak_height**2 + width**2)
+    peak_height /= norm
+    width /= norm
+    length = peak_height * x1 - width * y1
+    arg_level = np.argmax(length) + arg_low_level
+    if flip:
+        arg_level = nbins - arg_level - 1
+    return bin_centers[arg_level]
+
+
+def _histogram_thresholds(
+    image: np.ndarray,
+    method: Callable[[np.ndarray, np.ndarray], Any],
+    labels: np.ndarray | None = None,
+    n_labels: int = 1,
+) -> list[Any]:
+    """Histogram threshold ``method`` of ``image`` within each label, on the host.
+
+    A label of a single value returns that value, as scikit-image's Otsu and
+    triangle thresholds do for a constant image.
+    """
+    lowest, highest, counts, centers = _label_histograms(image, labels, n_labels)
+    return [
+        lo if lo == hi else method(c, b)
+        for lo, hi, c, b in zip(lowest, highest, counts, centers)
+    ]
+
+
+def _median(image: np.ndarray) -> Any:
+    """``np.percentile(image, 50)`` on either device.
+
+    On GPU the middle order statistics come from a device sort, and NumPy
+    interpolates them on the host: a sorted array of the one or two middle
+    values has the same interpolation weight as the whole image.
+    """
+    if get_device(image) == "CPU":
+        return np.percentile(image, 50)
+    flat = np.sort(image.ravel())
+    k = (flat.size - 1) // 2
+    return np.percentile(asnumpy(flat[k : k + 2 - flat.size % 2]), 50)
+
+
+def dot_slice_by_slice(image: np.ndarray, log_sigma: float) -> np.ndarray:
+    """2D spot filter ``-sigma**2 * LoG`` on each z-plane of an image.
+
+    Port of ``aicssegmentation.core.seg_dot.dot_slice_by_slice`` without a
+    cutoff: ``scipy.ndimage.gaussian_laplace`` (``mode="reflect"``,
+    ``truncate=4``) over the last two axes, every plane at once. Each 1D
+    Gaussian pass is stored in the image dtype, as in SciPy; on GPU the pass
+    runs on a float64 copy to accumulate in float64 as SciPy does.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Floating-point image ``(..., Y, X)``; leading axes are independent planes.
+    log_sigma : float
+        Gaussian scale, roughly the radius of the target dots.
+
+    Returns
+    -------
+    np.ndarray
+        Filter response in the image dtype, on the input's device.
+    """
+    on_gpu = get_device(image) == "GPU"
+    axes = (image.ndim - 2, image.ndim - 1)
+    laplace = None
+    for derivative_axis in axes:
+        out = image
+        for axis in axes:
+            out = _ndimage.gaussian_filter1d(
+                out.astype(np.float64) if on_gpu else out,
+                log_sigma,
+                axis=axis,
+                order=2 if axis == derivative_axis else 0,
+                mode="reflect",
+                truncate=4.0,
+            ).astype(image.dtype, copy=False)
+        laplace = out if laplace is None else laplace + out
+    assert laplace is not None  # two axes
+    return ((-1 * (log_sigma**2)) * laplace).astype(image.dtype, copy=False)
+
+
+def _low_level_mask(smooth: np.ndarray, inclusive: bool) -> np.ndarray:
+    """Step 1 of the nucleolar workflows: the dim, nucleus-scale regions.
+
+    ``smooth > (triangle + median) / 2``, keeping face-connected objects of at
+    least 700 voxels.
+    """
+    (triangle,) = _histogram_thresholds(smooth, _triangle_from_histogram)
+    threshold = (triangle + _median(smooth)) / 2
+    return remove_small_objects_aics(
+        _greater(smooth, threshold), 700, inclusive=inclusive
+    )
+
+
+def _local_threshold_mask(
+    image: np.ndarray, labels: np.ndarray, thresholds: Sequence[Any]
+) -> np.ndarray:
+    """``image > thresholds[i - 1]`` within each label ``i``; ``None`` selects nothing."""
+    table = np.full(len(thresholds) + 1, np.inf)
+    for i, threshold in enumerate(thresholds, start=1):
+        if threshold is not None:
+            table[i] = _exact_threshold(image.dtype, threshold)
+    return image.astype(np.float64) > to_same_device(table, image)[labels]
 
 
 def _is_plane(image: np.ndarray) -> bool:
