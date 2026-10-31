@@ -8,10 +8,12 @@ from scipy import ndimage as ndi
 from scipy.stats import norm
 from skimage.filters import threshold_otsu, threshold_triangle
 from skimage.exposure import histogram
-from skimage.morphology import ball, remove_small_objects
+from skimage.morphology import ball, disk, remove_small_objects
 
 from cubic.cuda import ascupy, asnumpy, get_device
 from cubic.segmentation import (
+    workflow_fbl,
+    workflow_npm1,
     aics_workflows,
     workflow_sec61b,
     workflow_tomm20,
@@ -102,6 +104,21 @@ def _nucleoli(shape: tuple[int, int, int] = (10, 80, 112), seed: int = 0) -> np.
     img = ndi.gaussian_filter(img, sigma=(0.7, 1.0, 1.0))
     img += rng.normal(0, 0.02, size=shape).astype(np.float32)
     return (img * 1000 + 100).astype(np.float32)
+
+
+_NUCLEOLAR = (workflow_fbl, workflow_npm1)
+
+
+def _volume(workflow, seed: int) -> np.ndarray:
+    """Test volume suited to ``workflow``: nucleoli or filaments."""
+    if workflow in _NUCLEOLAR:
+        return _nucleoli(seed=seed)
+    return _filaments((6, 48, 64), seed=seed)
+
+
+def _plane(workflow, seed: int, index: int) -> np.ndarray:
+    """Return a plane of :func:`_volume`, through the nucleoli for nucleolar ones."""
+    return _volume(workflow, seed)[index + 3 if workflow in _NUCLEOLAR else index]
 
 
 def _reference_vesselness(image: np.ndarray, sigma: float) -> np.ndarray:
@@ -554,12 +571,15 @@ def test_diffusion_serial_k_matches_itk(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
 
-@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+_WORKFLOWS = [workflow_sec61b, workflow_tomm20, workflow_fbl, workflow_npm1]
+
+
+@pytest.mark.parametrize("workflow", _WORKFLOWS)
 def test_workflow_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
     """Each workflow returns the same mask on both devices."""
     if not gpu_available:
         pytest.skip("GPU not available")
-    img = _filaments((6, 48, 64), seed=4)
+    img = _volume(workflow, seed=4)
     cpu = workflow(img)
     gpu = workflow(ascupy(img))
     assert cpu.dtype == bool and cpu.any()
@@ -570,9 +590,10 @@ def test_workflow_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
 def _planar_workflow(workflow, plane: np.ndarray) -> np.ndarray:
     """Compose the workflow's steps on a 2D plane, without a one-plane volume.
 
-    Runs the 2D array-path diffusion, a 2D Gaussian and 2D labeling, so it shares
-    none of the one-plane (Z=1) volume handling the workflows use for a plane:
-    the 3D CUDA kernels, ITK's 3D boundary-face replay or 3D connectivity.
+    Runs the 2D array-path diffusion, a 2D Gaussian, a 2D dilation and 2D
+    labeling, so it shares none of the one-plane (Z=1) volume handling the
+    workflows use for a plane: the 3D CUDA kernels, ITK's 3D boundary-face
+    replay, the 3D ball or 3D connectivity.
     """
     inclusive = _SKIMAGE_USES_MAX_SIZE
     if workflow is workflow_sec61b:
@@ -583,21 +604,46 @@ def _planar_workflow(workflow, plane: np.ndarray) -> np.ndarray:
         for min_size in (15, 3, 15):
             bw = remove_small_objects_aics(bw, min_size, inclusive=inclusive)
         return bw
-    norm = intensity_normalization(plane, (3.5, 15.0))
-    smooth = _gaussian_nearest(norm, [1.0, 1.0])
-    bw = vesselness_slice_by_slice(smooth[None], [1.5])[0] > 0.16
-    return remove_small_objects_aics(bw, 10, inclusive=inclusive)
+    if workflow is workflow_tomm20:
+        norm = intensity_normalization(plane, (3.5, 15.0))
+        smooth = _gaussian_nearest(norm, [1.0, 1.0])
+        bw = vesselness_slice_by_slice(smooth[None], [1.5])[0] > 0.16
+        return remove_small_objects_aics(bw, 10, inclusive=inclusive)
+    fbl = workflow is workflow_fbl
+    smooth = _gaussian_nearest(
+        intensity_normalization(plane, (0.5, 18) if fbl else (0.5, 15)), [1.0, 1.0]
+    )
+    low = _low_level_mask(smooth, inclusive)
+    if not fbl:
+        # The radius-2 ball's central plane: its other planes leave the volume.
+        low = ndi.binary_dilation(low, structure=disk(2))
+    labels, count = _label_faces(low)
+    local = _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    if fbl:
+        bw = _local_threshold_mask(smooth, labels, local)
+        bw |= remove_small_objects_aics(
+            dot_slice_by_slice(smooth, 1) > 0.01, 5, inclusive=inclusive
+        )
+        return remove_small_objects_aics(bw, 5, inclusive=inclusive)
+    cutoff = 0.333 * threshold_otsu(smooth)
+    bw = _local_threshold_mask(
+        smooth, labels, [0.98 * t if t > cutoff else None for t in local]
+    )
+    bw |= (dot_slice_by_slice(smooth, 2) > 0.025) & low
+    bw &= dot_slice_by_slice(1 - smooth, 2) <= 0.025
+    bw &= dot_slice_by_slice(1 - smooth, 1) <= 0.025
+    return remove_small_objects_aics(bw, 5, inclusive=inclusive)
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
-@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+@pytest.mark.parametrize("workflow", _WORKFLOWS)
 def test_workflow_plane_matches_planar_steps(
     workflow, use_gpu: bool, gpu_available: bool
 ) -> None:
     """A (Y, X) plane is segmented as its steps run directly in 2D, on either device."""
     # This plane leaves components just below each size threshold, which a plane
     # filtered with connectivity across z would keep.
-    plane = _filaments((6, 48, 64), seed=4)[1]
+    plane = _plane(workflow, seed=4, index=1)
     mask = workflow(_to_device(plane, use_gpu, gpu_available))
     assert mask.shape == plane.shape and mask.dtype == bool
     assert get_device(mask) == ("GPU" if use_gpu else "CPU")
@@ -606,7 +652,7 @@ def test_workflow_plane_matches_planar_steps(
     np.testing.assert_array_equal(asnumpy(mask), expected)
 
 
-@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+@pytest.mark.parametrize("workflow", _WORKFLOWS)
 def test_workflow_rejects_other_dimensionalities(workflow) -> None:
     """Only (Y, X) planes and (Z, Y, X) volumes are accepted."""
     with pytest.raises(ValueError, match="2D .* or 3D"):
@@ -618,15 +664,18 @@ def test_workflow_rejects_other_dimensionalities(workflow) -> None:
     [
         (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
         (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
+        (workflow_fbl, "seg_fbl", "Workflow_fbl"),
+        (workflow_npm1, "seg_npm1", "Workflow_npm1"),
     ],
 )
 def test_workflow_matches_aicssegmentation(
     workflow, module_name: str, func_name: str
 ) -> None:
     """Masks equal ``aicssegmentation``'s under the installed scikit-image."""
-    pytest.importorskip("itk")
+    if workflow not in _NUCLEOLAR:
+        pytest.importorskip("itk")
     module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
-    img = _filaments((6, 48, 64), seed=5)
+    img = _volume(workflow, seed=5)
     expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(img), expected)
 
@@ -636,14 +685,17 @@ def test_workflow_matches_aicssegmentation(
     [
         (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
         (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
+        (workflow_fbl, "seg_fbl", "Workflow_fbl"),
+        (workflow_npm1, "seg_npm1", "Workflow_npm1"),
     ],
 )
 def test_workflow_plane_matches_aicssegmentation(
     workflow, module_name: str, func_name: str
 ) -> None:
     """A plane's mask equals ``aicssegmentation`` run on the one-plane volume."""
-    pytest.importorskip("itk")
+    if workflow not in _NUCLEOLAR:
+        pytest.importorskip("itk")
     module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
-    plane = _filaments((6, 48, 64), seed=5)[2]
+    plane = _plane(workflow, seed=5, index=2)
     expected = getattr(module, func_name)(plane[None].copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(plane), expected[0])

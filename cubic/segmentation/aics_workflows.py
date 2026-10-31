@@ -32,6 +32,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 from scipy.ndimage import generate_binary_structure
 from skimage.filters import threshold_otsu
+from skimage.morphology import ball
 
 from ..cuda import CUDAManager, asnumpy, get_device, to_same_device, get_array_module
 from ..scipy import ndimage as _ndimage
@@ -1092,3 +1093,113 @@ def workflow_tomm20(
     return remove_small_objects_aics(
         bw, 10, inclusive=_resolve_inclusive(size_filter_inclusive)
     )
+
+
+def workflow_fbl(
+    image: np.ndarray, *, size_filter_inclusive: bool | None = None
+) -> np.ndarray:
+    """FBL (nucleolus, dense fibrillar component) classic segmentation.
+
+    Port of ``aicssegmentation.structure_wrapper.seg_fbl.Workflow_fbl`` with its
+    fixed parameters (no rescaling): Gaussian smoothing, a low-level
+    triangle-median threshold, an Otsu threshold within each low-level object,
+    and 2D spot detections merged in.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        3D image ``(Z, Y, X)``, or one 2D plane ``(Y, X)``; NumPy or CuPy.
+        Converted to float32 first; the bitwise match with the reference holds
+        for float32 input (the reference normalizes other dtypes in their own
+        precision). A 2D plane is segmented as a one-plane volume, so every
+        step sees only that plane: its own intensity statistics and no
+        smoothing or connectivity across z. The mask can therefore differ from
+        the same plane of a whole-volume segmentation.
+    size_filter_inclusive : bool | None
+        Small-object semantics of the reference run: ``True`` reproduces
+        ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
+        releases, ``None`` (default) follows the installed scikit-image. See
+        :func:`remove_small_objects_aics`.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask of the input's shape, on the input's device.
+    """
+    if _is_plane(image):
+        return workflow_fbl(image[None], size_filter_inclusive=size_filter_inclusive)[0]
+    inclusive = _resolve_inclusive(size_filter_inclusive)
+    norm = intensity_normalization(image.astype(np.float32, copy=False), (0.5, 18))
+    smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
+    del norm
+    labels, count = _label_faces(_low_level_mask(smooth, inclusive))
+    thresholds = _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    bw = _local_threshold_mask(smooth, labels, thresholds)
+    del labels
+    finer = _greater(dot_slice_by_slice(smooth, 1), 0.01)
+    bw |= remove_small_objects_aics(finer, 5, inclusive=inclusive)
+    return remove_small_objects_aics(bw, 5, inclusive=inclusive)
+
+
+def workflow_npm1(
+    image: np.ndarray, *, size_filter_inclusive: bool | None = None
+) -> np.ndarray:
+    """NPM1 (nucleolus, granular component) classic segmentation.
+
+    Port of ``aicssegmentation.structure_wrapper.seg_npm1.Workflow_npm1`` with
+    its fixed parameters (no rescaling): Gaussian smoothing, a low-level
+    triangle-median threshold dilated by a radius-2 ball, an Otsu threshold
+    within each low-level object bright enough against the global Otsu
+    threshold, bright 2D spots inside the low level, and dark 2D spots cut out
+    as holes.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        3D image ``(Z, Y, X)``, or one 2D plane ``(Y, X)``; NumPy or CuPy.
+        Converted to float32 first; the bitwise match with the reference holds
+        for float32 input (the reference normalizes other dtypes in their own
+        precision). A 2D plane is segmented as a one-plane volume, so every
+        step sees only that plane: its own intensity statistics and no
+        smoothing, dilation or connectivity across z. The mask can therefore
+        differ from the same plane of a whole-volume segmentation.
+    size_filter_inclusive : bool | None
+        Small-object semantics of the reference run: ``True`` reproduces
+        ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
+        releases, ``None`` (default) follows the installed scikit-image. See
+        :func:`remove_small_objects_aics`.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask of the input's shape, on the input's device.
+    """
+    if _is_plane(image):
+        return workflow_npm1(image[None], size_filter_inclusive=size_filter_inclusive)[
+            0
+        ]
+    inclusive = _resolve_inclusive(size_filter_inclusive)
+    norm = intensity_normalization(image.astype(np.float32, copy=False), (0.5, 15))
+    smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
+    del norm
+    # skimage's grey dilation reflects at the border; for a binary mask and a
+    # ball that adds nothing a zero border does not, as each reflected voxel
+    # has a nearer in-image twin inside the ball.
+    low = _ndimage.binary_dilation(
+        _low_level_mask(smooth, inclusive), structure=to_same_device(ball(2), smooth)
+    )
+    (global_otsu,) = _histogram_thresholds(smooth, _otsu_from_histogram)
+    local_cutoff = 0.333 * global_otsu
+    labels, count = _label_faces(low)
+    thresholds = [
+        0.98 * t if t > local_cutoff else None
+        for t in _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    ]
+    bw = _local_threshold_mask(smooth, labels, thresholds)
+    del labels
+    bw |= _greater(dot_slice_by_slice(smooth, 2), 0.025) & low
+    inverted = 1 - smooth
+    del smooth
+    bw &= ~_greater(dot_slice_by_slice(inverted, 2), 0.025)
+    bw &= ~_greater(dot_slice_by_slice(inverted, 1), 0.025)
+    return remove_small_objects_aics(bw, 5, inclusive=inclusive)
