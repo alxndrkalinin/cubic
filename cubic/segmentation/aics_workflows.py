@@ -1,15 +1,24 @@
 """Device-agnostic Allen Cell Structure Segmenter classic workflows.
 
-Ports of the ``aicssegmentation`` SEC61B (ER) and TOMM20 (mitochondria)
-workflows and the primitives they share. The CPU reference runs ITK's
-gradient anisotropic diffusion and a per-slice Python loop for the 2D
-vesselness filter; here every step is a whole-volume array operation, so the
-same call runs on NumPy or CuPy input. The workflows also accept a single 2D
-plane, segmented as a one-plane volume.
+Ports of the ``aicssegmentation`` SEC61B (ER), TOMM20 (mitochondria), FBL
+and NPM1 (nucleolus) workflows and the primitives they share. The CPU
+reference runs ITK's gradient anisotropic diffusion, per-slice Python loops
+for the 2D vesselness and spot filters, and a whole-volume pass per object for
+its local Otsu thresholds; here every voxel-wise step is a whole-volume array
+operation, so the same call runs on NumPy or CuPy input. The workflows also
+accept a single 2D plane, segmented as a one-plane volume.
+
+The nucleolar workflows' scalar thresholds (triangle, median, global and
+per-object Otsu) are computed on the host from per-label histograms binned on
+the device exactly as ``np.histogram`` bins them, and compared with NumPy's
+promotion. Their masks were bitwise equal to ``aicssegmentation`` on CPU and
+GPU on every volume measured (24 confocal fibroblast tiles of
+31-38x1024x1024 voxels, 12 anti-fibrillarin through FBL and 12 EtBr through
+NPM1).
 
 Each primitive reproduces its reference's arithmetic, dtype, operation order
 and boundary handling (see the per-function notes). For float32 input the
-masks were bitwise equal to ``aicssegmentation`` on every volume measured
+SEC61B and TOMM20 masks were bitwise equal to ``aicssegmentation`` on every volume measured
 (250 light-sheet ER and mitochondria z-stacks of 48x640x960 voxels, acquired
 and predicted) on an x86-64 AVX2 host without AVX-512, where NumPy's float32 power returns glibc's FMA
 ``powf``.
