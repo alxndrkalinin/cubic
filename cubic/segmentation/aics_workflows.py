@@ -857,7 +857,10 @@ def _group_extremes(
 
     On the host an unbuffered ``ufunc.at`` scatter; SciPy's labeled
     ``minimum``/``maximum`` would argsort the whole image for each. On GPU
-    cupyx's labeled reductions. Extremes are exact in any dtype.
+    cupyx's labeled reductions, on labels ``1..n``: past 30 labels cupyx
+    switches to a sort that reads each label's extremes from where labels
+    ``1..max`` start, so label 0 is left at zero. Extremes are exact in any
+    dtype.
     """
     dtype = values.dtype
     if get_device(values) == "CPU":
@@ -866,9 +869,10 @@ def _group_extremes(
         np.minimum.at(lowest, groups, values)
         np.maximum.at(highest, groups, values)
         return lowest, highest
-    index = to_same_device(np.arange(n_groups), values)
-    lowest = asnumpy(_ndimage.minimum(values, groups, index)).astype(dtype)
-    highest = asnumpy(_ndimage.maximum(values, groups, index)).astype(dtype)
+    labels = groups + 1
+    index = to_same_device(np.arange(1, n_groups + 1), values)
+    lowest = asnumpy(_ndimage.minimum(values, labels, index)).astype(dtype)
+    highest = asnumpy(_ndimage.maximum(values, labels, index)).astype(dtype)
     return lowest, highest
 
 

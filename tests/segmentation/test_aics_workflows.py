@@ -402,6 +402,23 @@ def test_label_histograms_match_numpy(use_gpu: bool, gpu_available: bool) -> Non
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
+def test_label_histograms_many_labels(use_gpu: bool, gpu_available: bool) -> None:
+    """Every label's extremes are right past cupyx's 30-label looping cutoff."""
+    rng = np.random.default_rng(8)
+    img = (rng.random((4, 40, 48)) + 1).astype(np.float32)
+    labels = rng.integers(1, 41, size=img.shape).astype(np.int32)
+    lowest, highest, counts, _ = _label_histograms(
+        _to_device(img, use_gpu, gpu_available),
+        _to_device(labels, use_gpu, gpu_available),
+        40,
+    )
+    for i in range(40):
+        values = img[labels == i + 1]
+        assert (lowest[i], highest[i]) == (values.min(), values.max()), i
+        np.testing.assert_array_equal(counts[i], histogram(values, 256)[0])
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
 def test_histogram_thresholds_match_skimage(use_gpu: bool, gpu_available: bool) -> None:
     """Otsu and triangle thresholds equal skimage's, per label and whole-image."""
     img = _gaussian_nearest(
