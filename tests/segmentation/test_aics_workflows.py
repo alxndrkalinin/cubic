@@ -704,6 +704,12 @@ def test_fbl_parameters_change_the_mask() -> None:
     assert (workflow_fbl(img, smoothing_sigma=2.0) != default).any()
     assert (workflow_fbl(img, normalization=(1.0, 10.0)) != default).any()
     assert (workflow_fbl(img, dot_sigma=2) != default).any()
+    # A higher per-object threshold keeps a strict subset of the Otsu mask.
+    stricter = workflow_fbl(img, dot_cutoff=None, local_otsu_factor=1.3)
+    assert not (stricter & ~no_spots).any() and stricter.sum() < no_spots.sum()
+    np.testing.assert_array_equal(
+        workflow_fbl(img, dot_cutoff=None, local_otsu_factor=1.0), no_spots
+    )
 
 
 def test_npm1_parameters_change_the_mask() -> None:
@@ -738,6 +744,10 @@ def test_npm1_parameters_change_the_mask() -> None:
             },
         ),
         (workflow_fbl, {"dot_cutoff": None}),
+        (
+            workflow_fbl,
+            {"smoothing_sigma": 2.0, "dot_cutoff": None, "local_otsu_factor": 1.3},
+        ),
         (
             workflow_npm1,
             {

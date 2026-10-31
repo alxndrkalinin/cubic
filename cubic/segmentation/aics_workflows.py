@@ -1207,6 +1207,7 @@ def workflow_fbl(
     smoothing_sigma: float = 1.0,
     dot_sigma: float = 1,
     dot_cutoff: float | None = 0.01,
+    local_otsu_factor: float | None = None,
     low_level_min_size: int = 700,
     min_area: int = 5,
     size_filter_inclusive: bool | None = None,
@@ -1244,6 +1245,11 @@ def workflow_fbl(
     dot_cutoff : float | None
         Spot-filter response above which a pixel is a detection; ``None``
         skips the spot step, leaving the per-object Otsu mask.
+    local_otsu_factor : float | None
+        Factor applied to each low-level object's Otsu level to give its
+        threshold; ``None`` (default) uses the Otsu level itself, as the
+        reference does. Above 1 it keeps only the brightest part of each
+        object, for images where the low level spans whole cells.
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
@@ -1262,6 +1268,7 @@ def workflow_fbl(
             smoothing_sigma=smoothing_sigma,
             dot_sigma=dot_sigma,
             dot_cutoff=dot_cutoff,
+            local_otsu_factor=local_otsu_factor,
             low_level_min_size=low_level_min_size,
             min_area=min_area,
             size_filter_inclusive=size_filter_inclusive,
@@ -1272,6 +1279,8 @@ def workflow_fbl(
     del norm
     labels, count = _label_faces(_low_level_mask(smooth, inclusive, low_level_min_size))
     thresholds = _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    if local_otsu_factor is not None:
+        thresholds = [local_otsu_factor * t for t in thresholds]
     bw = _local_threshold_mask(smooth, labels, thresholds)
     del labels
     if dot_cutoff is not None:
