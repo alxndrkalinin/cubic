@@ -6,18 +6,36 @@ import numpy as np
 import pytest
 from scipy import ndimage as ndi
 from scipy.stats import norm
-from skimage.morphology import remove_small_objects
+from skimage.filters import threshold_otsu, threshold_triangle
+from skimage.exposure import histogram
+from skimage.morphology import ball, disk, remove_small_objects
 
 from cubic.cuda import ascupy, asnumpy, get_device
-from cubic.segmentation import aics_workflows, workflow_sec61b, workflow_tomm20
+from cubic.segmentation import (
+    workflow_fbl,
+    workflow_npm1,
+    aics_workflows,
+    workflow_sec61b,
+    workflow_tomm20,
+)
 from cubic.segmentation.segment_utils import _SKIMAGE_USES_MAX_SIZE
 from cubic.segmentation.aics_workflows import (
+    _median,
+    _greater,
+    _label_faces,
+    _low_level_mask,
     _gaussian_nearest,
+    _label_histograms,
+    dot_slice_by_slice,
+    _otsu_from_histogram,
     _hessian_2d_eigen_max,
+    _histogram_thresholds,
     _itk_boundary_regions,
+    _local_threshold_mask,
     _near_float32_midpoint,
     _vesselness_2d_response,
     intensity_normalization,
+    _triangle_from_histogram,
     remove_small_objects_aics,
     vesselness_slice_by_slice,
     gradient_anisotropic_diffusion,
@@ -50,6 +68,57 @@ def _filaments(shape: tuple[int, int, int], seed: int = 0) -> np.ndarray:
     img = ndi.gaussian_filter(img, sigma=(0.8, 1.0, 1.0))
     img += rng.normal(0, 0.02, size=shape).astype(np.float32)
     return (img * 1000 + 100).astype(np.float32)
+
+
+def _nucleoli(shape: tuple[int, int, int] = (10, 80, 112), seed: int = 0) -> np.ndarray:
+    """Noisy nuclei holding bright nucleoli with dark holes, a stand-in for FBL/NPM1.
+
+    Three nuclei hold nucleoli; a fourth is dim and empty, so NPM1's local Otsu
+    falls below its cutoff there. A small dim blob stays under the 700-voxel
+    low-level size, and isolated bright dots outside the nuclei reach only the
+    spot filter.
+    """
+    rng = np.random.default_rng(seed)
+    img = np.full(shape, 0.05, dtype=np.float32)
+    zz, yy, xx = np.indices(shape)
+    nz, ny, nx = shape
+    cz = nz / 2 - 0.5
+    nuclei = [(18, 22, 13, 15), (20, 70, 12, 16), (60, 30, 14, 12), (58, 86, 11, 13)]
+    for k, (cy, cx, ry, rx) in enumerate(nuclei):
+        inside = ((zz - cz) / 3.6) ** 2 + ((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2
+        img[inside <= 1] = 0.1 if k == 3 else 0.3
+        if k == 3:
+            continue
+        for _ in range(3):
+            oy = cy + rng.integers(-(ry // 2), ry // 2 + 1)
+            ox = cx + rng.integers(-(rx // 2), rx // 2 + 1)
+            r = rng.uniform(2.0, 3.5)
+            blob = ((zz - cz) / 1.8) ** 2 + ((yy - oy) / r) ** 2 + ((xx - ox) / r) ** 2
+            img[blob <= 1] = 1.0
+            img[int(cz), oy, ox] = 0.3
+    small = ((zz - 4) / 2) ** 2 + ((yy - 40) / 4) ** 2 + ((xx - 56) / 4) ** 2
+    img[small <= 1] = 0.3
+    for _ in range(6):
+        y, x = rng.integers(2, ny - 2), rng.integers(2, nx - 2)
+        img[nz // 2, y - 1 : y + 1, x - 1 : x + 1] = 0.9
+    img = ndi.gaussian_filter(img, sigma=(0.7, 1.0, 1.0))
+    img += rng.normal(0, 0.02, size=shape).astype(np.float32)
+    return (img * 1000 + 100).astype(np.float32)
+
+
+_NUCLEOLAR = (workflow_fbl, workflow_npm1)
+
+
+def _volume(workflow, seed: int) -> np.ndarray:
+    """Test volume suited to ``workflow``: nucleoli or filaments."""
+    if workflow in _NUCLEOLAR:
+        return _nucleoli(seed=seed)
+    return _filaments((6, 48, 64), seed=seed)
+
+
+def _plane(workflow, seed: int, index: int) -> np.ndarray:
+    """Return a plane of :func:`_volume`, through the nucleoli for nucleolar ones."""
+    return _volume(workflow, seed)[index + 3 if workflow in _NUCLEOLAR else index]
 
 
 def _reference_vesselness(image: np.ndarray, sigma: float) -> np.ndarray:
@@ -309,6 +378,147 @@ def test_intensity_normalization_validates_input() -> None:
         intensity_normalization(np.ones((2, 2), dtype=np.float32), (1, 1, 1, 1))  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_label_histograms_match_numpy(use_gpu: bool, gpu_available: bool) -> None:
+    """Per-label counts and centers equal skimage's histogram of each label."""
+    rng = np.random.default_rng(6)
+    img = rng.normal(size=(5, 40, 48)).astype(np.float32) ** 3
+    labels = rng.integers(0, 5, size=img.shape).astype(np.int32)
+    labels[0, 0, :3] = 5
+    img[labels == 5] = 2.5  # a constant label
+    dev_img = _to_device(img, use_gpu, gpu_available)
+    dev_labels = _to_device(labels, use_gpu, gpu_available)
+    lowest, highest, counts, centers = _label_histograms(dev_img, dev_labels, 5)
+    for i in range(4):
+        expected_counts, expected_centers = histogram(img[labels == i + 1], 256)
+        np.testing.assert_array_equal(counts[i], expected_counts)
+        np.testing.assert_array_equal(centers[i], expected_centers)
+        assert lowest[i] == img[labels == i + 1].min()
+    assert lowest[4] == highest[4] == 2.5 and not counts[4].any()
+    _, _, counts, centers = _label_histograms(dev_img)
+    expected_counts, expected_centers = histogram(img, 256)
+    np.testing.assert_array_equal(counts[0], expected_counts)
+    np.testing.assert_array_equal(centers[0], expected_centers)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_label_histograms_many_labels(use_gpu: bool, gpu_available: bool) -> None:
+    """Every label's extremes are right past cupyx's 30-label looping cutoff."""
+    rng = np.random.default_rng(8)
+    img = (rng.random((4, 40, 48)) + 1).astype(np.float32)
+    labels = rng.integers(1, 41, size=img.shape).astype(np.int32)
+    lowest, highest, counts, _ = _label_histograms(
+        _to_device(img, use_gpu, gpu_available),
+        _to_device(labels, use_gpu, gpu_available),
+        40,
+    )
+    for i in range(40):
+        values = img[labels == i + 1]
+        assert (lowest[i], highest[i]) == (values.min(), values.max()), i
+        np.testing.assert_array_equal(counts[i], histogram(values, 256)[0])
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_histogram_thresholds_match_skimage(use_gpu: bool, gpu_available: bool) -> None:
+    """Otsu and triangle thresholds equal skimage's, per label and whole-image."""
+    img = _gaussian_nearest(
+        intensity_normalization(_nucleoli(seed=1), (0.5, 18)), [1.0, 1.0, 1.0]
+    )
+    labels, count = _label_faces(img > 0.15)
+    labels[0, 0, 0] = count + 1  # a single-voxel label returns its value
+    dev_img = _to_device(img, use_gpu, gpu_available)
+    dev_labels = _to_device(labels, use_gpu, gpu_available)
+    otsu = _histogram_thresholds(dev_img, _otsu_from_histogram, dev_labels, count + 1)
+    expected = [threshold_otsu(img[labels == i]) for i in range(1, count + 2)]
+    assert count > 1 and otsu == expected
+    (triangle,) = _histogram_thresholds(dev_img, _triangle_from_histogram)
+    assert triangle == threshold_triangle(img)
+    flat = np.full((2, 6, 6), 3.0, dtype=np.float32)
+    (constant,) = _histogram_thresholds(
+        _to_device(flat, use_gpu, gpu_available), _triangle_from_histogram
+    )
+    assert constant == threshold_triangle(flat)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("size", [1001, 1000])
+def test_median_matches_numpy(use_gpu: bool, size: int, gpu_available: bool) -> None:
+    """Odd and even sizes interpolate exactly as ``np.percentile(x, 50)``."""
+    x = np.random.default_rng(7).random(size).astype(np.float32)
+    median = _median(_to_device(x, use_gpu, gpu_available))
+    expected = np.percentile(x, 50)
+    assert median == expected and median.dtype == expected.dtype
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("sigma", [1, 2])
+def test_dot_slice_by_slice_matches_reference(
+    use_gpu: bool, sigma: int, gpu_available: bool
+) -> None:
+    """Bitwise equal to the per-plane ``-sigma**2 * gaussian_laplace`` reference."""
+    img = intensity_normalization(_nucleoli(seed=2), (0.5, 15))
+    expected = np.zeros_like(img)
+    for z in range(img.shape[0]):
+        expected[z] = -1 * (sigma**2) * ndi.gaussian_laplace(img[z], sigma)
+    out = dot_slice_by_slice(_to_device(img, use_gpu, gpu_available), sigma)
+    assert out.dtype == np.float32
+    np.testing.assert_array_equal(asnumpy(out), expected)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_dot_slice_by_slice_gpu_sums_like_scipy(dtype, gpu_available: bool) -> None:
+    """GPU passes replay SciPy's symmetric-pair summation order, not cupyx's.
+
+    On this noise cupyx's tap-by-tap float64 sum rounds one voxel differently.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    img = np.random.default_rng(0).random((16, 256, 256)).astype(dtype)
+    expected = np.stack([-4 * ndi.gaussian_laplace(plane, 2) for plane in img])
+    out = dot_slice_by_slice(ascupy(img), 2)
+    assert out.dtype == dtype
+    np.testing.assert_array_equal(asnumpy(out), expected)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_thresholds_follow_numpy_promotion(use_gpu: bool, gpu_available: bool) -> None:
+    """Host scalars of either precision compare as NumPy compares them on the host."""
+    img = np.float32(1) + np.arange(-3, 4, dtype=np.float32) * np.float32(2**-23)
+    dev = _to_device(img, use_gpu, gpu_available)
+    labels = _to_device(np.ones(img.shape, np.int32), use_gpu, gpu_available)
+    # Rounds up to the next float32, so float32 and float64 comparisons differ.
+    between = np.float64(1) + 0.75 * np.float64(2**-23)
+    assert (img > between).sum() != (img > np.float32(between)).sum()
+    for threshold in (between, np.float32(between), float(between), 0.5):
+        expected = img > threshold
+        np.testing.assert_array_equal(asnumpy(_greater(dev, threshold)), expected)
+        local = _local_threshold_mask(dev, labels, [threshold])
+        np.testing.assert_array_equal(asnumpy(local), expected)
+    assert not asnumpy(_local_threshold_mask(dev, labels, [None])).any()
+
+
+def test_nucleoli_image_exercises_every_branch() -> None:
+    """The synthetic nucleoli reach each step of both nucleolar workflows."""
+    img = _nucleoli()
+    inclusive = _SKIMAGE_USES_MAX_SIZE
+    smooth = _gaussian_nearest(intensity_normalization(img, (0.5, 18)), [1.0] * 3)
+    low = _low_level_mask(smooth, inclusive)
+    (triangle,) = _histogram_thresholds(smooth, _triangle_from_histogram)
+    raw = smooth > (triangle + _median(smooth)) / 2
+    sizes = np.bincount(_label_faces(raw)[0].ravel())[1:]
+    assert _label_faces(low)[1] >= 3 and ((sizes > 50) & (sizes < 700)).any()
+    assert (dot_slice_by_slice(smooth, 1) > 0.01)[~low].any()
+    smooth = _gaussian_nearest(intensity_normalization(img, (0.5, 15)), [1.0] * 3)
+    low = ndi.binary_dilation(_low_level_mask(smooth, inclusive), structure=ball(2))
+    labels, count = _label_faces(low)
+    local = _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    cutoff = 0.333 * threshold_otsu(smooth)
+    assert any(t > cutoff for t in local) and any(t <= cutoff for t in local)
+    holes = dot_slice_by_slice(1 - smooth, 2) > 0.025
+    bright = dot_slice_by_slice(smooth, 2) > 0.025
+    assert holes[low].any() and bright[low].any() and bright[~low].any()
+
+
 def test_diffusion_constant_image_is_unchanged() -> None:
     """Zero gradient everywhere gives ``K == 0`` and, as in ITK, no update."""
     img = np.full((4, 8, 8), 3.0, dtype=np.float32)
@@ -393,12 +603,15 @@ def test_diffusion_serial_k_matches_itk(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
 
-@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+_WORKFLOWS = [workflow_sec61b, workflow_tomm20, workflow_fbl, workflow_npm1]
+
+
+@pytest.mark.parametrize("workflow", _WORKFLOWS)
 def test_workflow_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
     """Each workflow returns the same mask on both devices."""
     if not gpu_available:
         pytest.skip("GPU not available")
-    img = _filaments((6, 48, 64), seed=4)
+    img = _volume(workflow, seed=4)
     cpu = workflow(img)
     gpu = workflow(ascupy(img))
     assert cpu.dtype == bool and cpu.any()
@@ -409,9 +622,10 @@ def test_workflow_gpu_matches_cpu(workflow, gpu_available: bool) -> None:
 def _planar_workflow(workflow, plane: np.ndarray) -> np.ndarray:
     """Compose the workflow's steps on a 2D plane, without a one-plane volume.
 
-    Runs the 2D array-path diffusion, a 2D Gaussian and 2D labeling, so it shares
-    none of the one-plane (Z=1) volume handling the workflows use for a plane:
-    the 3D CUDA kernels, ITK's 3D boundary-face replay or 3D connectivity.
+    Runs the 2D array-path diffusion, a 2D Gaussian, a 2D dilation and 2D
+    labeling, so it shares none of the one-plane (Z=1) volume handling the
+    workflows use for a plane: the 3D CUDA kernels, ITK's 3D boundary-face
+    replay, the 3D ball or 3D connectivity.
     """
     inclusive = _SKIMAGE_USES_MAX_SIZE
     if workflow is workflow_sec61b:
@@ -422,21 +636,46 @@ def _planar_workflow(workflow, plane: np.ndarray) -> np.ndarray:
         for min_size in (15, 3, 15):
             bw = remove_small_objects_aics(bw, min_size, inclusive=inclusive)
         return bw
-    norm = intensity_normalization(plane, (3.5, 15.0))
-    smooth = _gaussian_nearest(norm, [1.0, 1.0])
-    bw = vesselness_slice_by_slice(smooth[None], [1.5])[0] > 0.16
-    return remove_small_objects_aics(bw, 10, inclusive=inclusive)
+    if workflow is workflow_tomm20:
+        norm = intensity_normalization(plane, (3.5, 15.0))
+        smooth = _gaussian_nearest(norm, [1.0, 1.0])
+        bw = vesselness_slice_by_slice(smooth[None], [1.5])[0] > 0.16
+        return remove_small_objects_aics(bw, 10, inclusive=inclusive)
+    fbl = workflow is workflow_fbl
+    smooth = _gaussian_nearest(
+        intensity_normalization(plane, (0.5, 18) if fbl else (0.5, 15)), [1.0, 1.0]
+    )
+    low = _low_level_mask(smooth, inclusive)
+    if not fbl:
+        # The radius-2 ball's central plane: its other planes leave the volume.
+        low = ndi.binary_dilation(low, structure=disk(2))
+    labels, count = _label_faces(low)
+    local = _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    if fbl:
+        bw = _local_threshold_mask(smooth, labels, local)
+        bw |= remove_small_objects_aics(
+            dot_slice_by_slice(smooth, 1) > 0.01, 5, inclusive=inclusive
+        )
+        return remove_small_objects_aics(bw, 5, inclusive=inclusive)
+    cutoff = 0.333 * threshold_otsu(smooth)
+    bw = _local_threshold_mask(
+        smooth, labels, [0.98 * t if t > cutoff else None for t in local]
+    )
+    bw |= (dot_slice_by_slice(smooth, 2) > 0.025) & low
+    bw &= dot_slice_by_slice(1 - smooth, 2) <= 0.025
+    bw &= dot_slice_by_slice(1 - smooth, 1) <= 0.025
+    return remove_small_objects_aics(bw, 5, inclusive=inclusive)
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
-@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+@pytest.mark.parametrize("workflow", _WORKFLOWS)
 def test_workflow_plane_matches_planar_steps(
     workflow, use_gpu: bool, gpu_available: bool
 ) -> None:
     """A (Y, X) plane is segmented as its steps run directly in 2D, on either device."""
     # This plane leaves components just below each size threshold, which a plane
     # filtered with connectivity across z would keep.
-    plane = _filaments((6, 48, 64), seed=4)[1]
+    plane = _plane(workflow, seed=4, index=1)
     mask = workflow(_to_device(plane, use_gpu, gpu_available))
     assert mask.shape == plane.shape and mask.dtype == bool
     assert get_device(mask) == ("GPU" if use_gpu else "CPU")
@@ -445,7 +684,103 @@ def test_workflow_plane_matches_planar_steps(
     np.testing.assert_array_equal(asnumpy(mask), expected)
 
 
-@pytest.mark.parametrize("workflow", [workflow_sec61b, workflow_tomm20])
+def _components_at_least(mask: np.ndarray, size: int) -> bool:
+    """Whether every face-connected component of ``mask`` has ``size`` voxels."""
+    labels, _ = _label_faces(mask)
+    return bool((np.bincount(labels.ravel())[1:] >= size).all())
+
+
+def test_fbl_parameters_change_the_mask() -> None:
+    """Disabling spots, raising the low-level size or the min area act as documented."""
+    img = _nucleoli()
+    default = workflow_fbl(img)
+    no_spots = workflow_fbl(img, dot_cutoff=None)
+    # The spots only add to the per-object Otsu mask.
+    assert not (no_spots & ~default).any() and no_spots.sum() < default.sum()
+    assert not workflow_fbl(img, dot_cutoff=None, low_level_min_size=10**6).any()
+    big = workflow_fbl(img, min_area=40)
+    assert _components_at_least(big, 40) and not _components_at_least(default, 40)
+    assert not (big & ~default).any()
+    assert (workflow_fbl(img, smoothing_sigma=2.0) != default).any()
+    assert (workflow_fbl(img, normalization=(1.0, 10.0)) != default).any()
+    assert (workflow_fbl(img, dot_sigma=2) != default).any()
+    # A higher per-object threshold keeps a strict subset of the Otsu mask.
+    stricter = workflow_fbl(img, dot_cutoff=None, local_otsu_factor=1.3)
+    assert not (stricter & ~no_spots).any() and stricter.sum() < no_spots.sum()
+    np.testing.assert_array_equal(
+        workflow_fbl(img, dot_cutoff=None, local_otsu_factor=1.0), no_spots
+    )
+
+
+def test_npm1_parameters_change_the_mask() -> None:
+    """Each NPM1 step can be switched off or loosened as documented."""
+    img = _nucleoli()
+    default = workflow_npm1(img)
+    no_holes = workflow_npm1(img, hole_cutoff=None)
+    assert not (default & ~no_holes).any() and no_holes.sum() > default.sum()
+    no_spots = workflow_npm1(img, dot_cutoff=None)
+    assert not (no_spots & ~default).any() and no_spots.sum() < default.sum()
+    looser = workflow_npm1(img, local_otsu_factor=0.8)
+    assert not (default & ~looser).any() and looser.sum() > default.sum()
+    # No object beats 100x the global Otsu level, so only spots could remain.
+    assert not workflow_npm1(img, local_cutoff_factor=100.0, dot_cutoff=None).any()
+    assert (workflow_npm1(img, dilation_radius=0) != default).any()
+    assert (workflow_npm1(img, hole_sigmas=(2,)) != default).any()
+    assert _components_at_least(workflow_npm1(img, min_area=40), 40)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "kwargs"),
+    [
+        (
+            workflow_fbl,
+            {
+                "normalization": (1.0, 12.0),
+                "smoothing_sigma": 1.5,
+                "dot_sigma": 2,
+                "dot_cutoff": 0.02,
+                "low_level_min_size": 500,
+                "min_area": 10,
+            },
+        ),
+        (workflow_fbl, {"dot_cutoff": None}),
+        (
+            workflow_fbl,
+            {"smoothing_sigma": 2.0, "dot_cutoff": None, "local_otsu_factor": 1.3},
+        ),
+        (
+            workflow_npm1,
+            {
+                "normalization": (1.0, 12.0),
+                "smoothing_sigma": 1.5,
+                "dot_sigma": 1.5,
+                "dot_cutoff": 0.03,
+                "hole_sigmas": (1.5,),
+                "hole_cutoff": 0.02,
+                "low_level_min_size": 500,
+                "dilation_radius": 1,
+                "local_cutoff_factor": 0.5,
+                "local_otsu_factor": 0.9,
+                "min_area": 10,
+            },
+        ),
+        (workflow_npm1, {"dot_cutoff": None, "hole_cutoff": None}),
+    ],
+)
+def test_workflow_parameters_gpu_matches_cpu(
+    workflow, kwargs: dict, gpu_available: bool
+) -> None:
+    """Non-default parameters give the same mask on both devices."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    img = _nucleoli(seed=3)
+    cpu = workflow(img, **kwargs)
+    gpu = workflow(ascupy(img), **kwargs)
+    assert cpu.any() and (cpu != workflow(img)).any()
+    np.testing.assert_array_equal(asnumpy(gpu), cpu)
+
+
+@pytest.mark.parametrize("workflow", _WORKFLOWS)
 def test_workflow_rejects_other_dimensionalities(workflow) -> None:
     """Only (Y, X) planes and (Z, Y, X) volumes are accepted."""
     with pytest.raises(ValueError, match="2D .* or 3D"):
@@ -457,15 +792,18 @@ def test_workflow_rejects_other_dimensionalities(workflow) -> None:
     [
         (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
         (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
+        (workflow_fbl, "seg_fbl", "Workflow_fbl"),
+        (workflow_npm1, "seg_npm1", "Workflow_npm1"),
     ],
 )
 def test_workflow_matches_aicssegmentation(
     workflow, module_name: str, func_name: str
 ) -> None:
     """Masks equal ``aicssegmentation``'s under the installed scikit-image."""
-    pytest.importorskip("itk")
+    if workflow not in _NUCLEOLAR:
+        pytest.importorskip("itk")
     module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
-    img = _filaments((6, 48, 64), seed=5)
+    img = _volume(workflow, seed=5)
     expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(img), expected)
 
@@ -475,14 +813,17 @@ def test_workflow_matches_aicssegmentation(
     [
         (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
         (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
+        (workflow_fbl, "seg_fbl", "Workflow_fbl"),
+        (workflow_npm1, "seg_npm1", "Workflow_npm1"),
     ],
 )
 def test_workflow_plane_matches_aicssegmentation(
     workflow, module_name: str, func_name: str
 ) -> None:
     """A plane's mask equals ``aicssegmentation`` run on the one-plane volume."""
-    pytest.importorskip("itk")
+    if workflow not in _NUCLEOLAR:
+        pytest.importorskip("itk")
     module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
-    plane = _filaments((6, 48, 64), seed=5)[2]
+    plane = _plane(workflow, seed=5, index=2)
     expected = getattr(module, func_name)(plane[None].copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(plane), expected[0])
