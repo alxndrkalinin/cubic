@@ -3,7 +3,7 @@
 ``ArrayMesh`` exposes the ``trimesh.Trimesh`` attributes that the mesh feature
 registry reads, computed with the same formulas as trimesh from NumPy or CuPy
 arrays, so the features run on whichever device holds the mesh. Anything it
-does not implement (convex hull, bounding primitives, decimation) is delegated
+does not implement (convex hull, bounding primitives) is delegated
 to a ``trimesh.Trimesh`` built on the host on first use.
 """
 

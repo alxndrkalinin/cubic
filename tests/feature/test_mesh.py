@@ -5,6 +5,7 @@ import subprocess
 
 import numpy as np
 import pytest
+from scipy import ndimage
 from skimage.measure import marching_cubes
 
 trimesh = pytest.importorskip("trimesh")
@@ -302,7 +303,6 @@ def test_extract_surface_features_full_pipeline() -> None:
     The cube touches the volume border and is large enough to survive the
     default curvature blur.
     """
-    pytest.importorskip("fast_simplification")
     cube = np.zeros((14, 14, 14), dtype=bool)
     cube[:10, :10, :10] = True
     features = mesh.extract_surface_features(cube)
@@ -462,31 +462,98 @@ def test_curvature_distribution_does_not_depend_on_orientation(rot_deg: float) -
         assert 1 <= features["Total Absolute Gaussian Curvature"] < 1.06
 
 
+_NUCLEUS_SPACING = (0.3, 0.13, 0.13)
+
+
+def _rough_ellipsoid(amplitude: float, axes=(2.5, 5.0, 6.0)) -> np.ndarray:
+    """Return an ellipsoid with semi-axes ``axes`` (um) at ``_NUCLEUS_SPACING``.
+
+    Its radius is perturbed by band-limited noise (0.4 um wavelength) of
+    relative standard deviation ``amplitude``; 0 gives the smooth ellipsoid.
+    """
+    shape = [
+        2 * int(np.ceil((1.3 * a + 1) / s)) + 1 for a, s in zip(axes, _NUCLEUS_SPACING)
+    ]
+    grid = _centred_grid(*shape)
+    radius = np.sqrt(
+        sum((g * s / a) ** 2 for g, s, a in zip(grid, _NUCLEUS_SPACING, axes))
+    )
+    if amplitude:
+        noise = ndimage.gaussian_filter(
+            np.random.default_rng(0).standard_normal(radius.shape),
+            [0.4 / s for s in _NUCLEUS_SPACING],
+        )
+        radius = radius + amplitude * noise / noise.std()
+    return radius < 1
+
+
+def _fractal_dimension(mask: np.ndarray) -> float:
+    name = "Fractal Dimension"
+    return mesh.extract_surface_features(
+        mask, spacing=_NUCLEUS_SPACING, features=[name]
+    )[name]
+
+
 def test_fractal_dimension_of_a_smooth_surface_is_two() -> None:
-    """Decimating a smooth surface barely changes its area, so D is about 2."""
-    pytest.importorskip("fast_simplification")
-    name = ["Fractal Dimension"]
+    """A surface without detail finer than curvature_sigma has D = 2, whatever its size.
 
-    value = mesh.extract_surface_features(_ball(10, 26), features=name)[name[0]]
+    Its area ratio to the smooth twin stays constant across blur scales. The
+    smallest curvature radius of these ellipsoids, c^2 / a, is 1.0-1.6 um, above
+    curvature_sigma (0.6 um). Measuring the area of the blurred mask alone gives
+    2.05-2.20 for them, because blur shrinks small, curved surfaces most. A flat
+    (1.5, 6, 8) um ellipsoid, whose rim radius is 0.28 um, measures 2.01: its rim
+    is detail finer than curvature_sigma.
+    """
+    for axes in [(2.5, 5.0, 6.0), (3.0, 6.0, 8.0), (4.0, 8.0, 10.0)]:
+        assert _fractal_dimension(_rough_ellipsoid(0, axes)) == pytest.approx(
+            2, abs=0.005
+        )
 
-    assert value == pytest.approx(2, abs=0.02)
+
+def test_fractal_dimension_rises_with_surface_roughness() -> None:
+    """Roughness finer than curvature_sigma raises D, monotonically."""
+    smooth, rough, rougher = (
+        _fractal_dimension(_rough_ellipsoid(amplitude)) for amplitude in (0, 0.04, 0.08)
+    )
+
+    assert smooth + 0.01 < rough < rougher
+    assert rougher > 2.05
 
 
-def test_fractal_dimension_names_its_dependency(monkeypatch) -> None:
-    """Without fast-simplification the error says what to install."""
-    real_find_spec = mesh.importlib.util.find_spec
+def test_fractal_dimension_needs_the_mask() -> None:
+    """extract_mesh_features refuses D and leaves it out of its defaults.
 
-    def find_spec(name, *args):
-        return None if name == "fast_simplification" else real_find_spec(name, *args)
+    A single mesh cannot be re-blurred.
+    """
+    ball = mesh.mask2mesh(_ball(8, 22))
 
-    monkeypatch.setattr(mesh.importlib.util, "find_spec", find_spec)
-    with pytest.raises(RuntimeError, match=r"fast-simplification.*cubic\[mesh\]"):
-        mesh.extract_surface_features(_ball(10, 26), features=["Fractal Dimension"])
+    with pytest.raises(ValueError, match="Fractal Dimension.*mask"):
+        mesh.extract_mesh_features(ball, ["Fractal Dimension"])
+    assert "Fractal Dimension" not in mesh.extract_mesh_features(ball)
+
+
+def test_fractal_dimension_needs_a_blur_above_the_finest_spacing() -> None:
+    """D is NaN, with a warning, when curvature_sigma is not above the finest spacing.
+
+    There is then no range of scales to fit.
+    """
+    with pytest.warns(UserWarning, match="finest voxel spacing"):
+        features = mesh.extract_surface_features(
+            _ball(8, 22), features=["Fractal Dimension", "Volume"], curvature_sigma=1.0
+        )
+
+    assert np.isnan(features["Fractal Dimension"])
+    assert features["Volume"] > 0
 
 
 def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
     """A mask that vanishes under the blur gets NaN for those features only."""
-    names = ["Volume", "Total Absolute Gaussian Curvature", "Avg Shape Index"]
+    names = [
+        "Volume",
+        "Total Absolute Gaussian Curvature",
+        "Avg Shape Index",
+        "Fractal Dimension",
+    ]
 
     with pytest.warns(UserWarning, match="vanishes when blurred at curvature_sigma=2"):
         features = mesh.extract_surface_features(
@@ -496,6 +563,7 @@ def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
     assert features["Volume"] > 0
     assert np.isnan(features["Total Absolute Gaussian Curvature"])
     assert np.isnan(features["Avg Shape Index"])
+    assert np.isnan(features["Fractal Dimension"])
 
 
 def test_mesh_is_smoothed_only_for_curvature_features(monkeypatch) -> None:

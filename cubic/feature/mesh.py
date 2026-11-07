@@ -3,14 +3,13 @@
 Each label is converted into a surface mesh with marching cubes and measured
 with ``trimesh``. A CuPy label image or mask stays on the GPU: it is meshed by a
 CUDA port of the same marching cubes and measured as an ``ArrayMesh``, which
-computes the trimesh quantities on the device and hands the convex hull,
-bounding primitives and decimation to trimesh on the host.
+computes the trimesh quantities on the device and hands the convex hull and
+bounding primitives to trimesh on the host.
 """
 
 from __future__ import annotations
 
 import warnings
-import importlib.util
 from typing import Any, TypeVar, Callable, SupportsFloat
 from functools import wraps
 from collections.abc import Sequence
@@ -65,19 +64,24 @@ def mesh_feature_list() -> list[str]:
     cavities, minus twice the number of handles: 2 for a ball, 4 for a hollow
     ball, 0 for a torus.
 
-    The last four features need curvature at each vertex, which on a voxel
-    staircase measures the staircase, so they are computed on a mesh of the mask
-    blurred at ``curvature_sigma`` (see ``extract_surface_features``).
+    Three of the last four features need curvature at each vertex, which on a
+    voxel staircase measures the staircase, so they are computed on a mesh of
+    the mask blurred at ``curvature_sigma`` (see ``extract_surface_features``).
     ``Total Absolute Gaussian Curvature`` is the integral of ``|K|`` over the
     surface divided by ``4 pi``: 1 for any convex body and more for every saddle
     region (grooves, waists, the necks of lobes), unitless. ``Avg Shape Index``
     (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
     (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
-    units of ``spacing``; both are averaged over the surface by area. ``Fractal
-    Dimension`` is ``2 + 2 * slope`` of log area against log face count as the
-    mesh is decimated, about 2 for a smooth surface.
+    units of ``spacing``; both are averaged over the surface by area.
+    ``Fractal Dimension`` describes the surface detail finer than
+    ``curvature_sigma``, which those three leave out: ``2 - slope`` of log
+    surface area against log blur scale, from the finest voxel spacing to
+    ``curvature_sigma``, relative to the mask's smooth twin (its blur at
+    ``curvature_sigma``). It is about 2 for a surface without such detail,
+    whatever its size and coarse shape, and rises with roughness. It is
+    measured on the mask, so ``extract_mesh_features`` cannot compute it.
     """
-    return list(_MESH_FEATURES)
+    return [*_MESH_FEATURES, *_MASK_FEATURES]
 
 
 def _resolve_features(features: Sequence[str] | None) -> list[str]:
@@ -89,7 +93,8 @@ def _resolve_features(features: Sequence[str] | None) -> list[str]:
         raise TypeError(
             f"features must be a sequence of names, not the string {features!r}"
         )
-    unknown = [name for name in features if name not in _MESH_FEATURES]
+    known = mesh_feature_list()
+    unknown = [name for name in features if name not in known]
     if unknown:
         raise ValueError(
             f"Unknown mesh features {unknown}; available: {mesh_feature_list()}"
@@ -193,27 +198,32 @@ def extract_surface_features(
         curvature-distribution features are measured on. Defaults to twice the
         coarsest voxel spacing, which removes the voxel staircase on every axis.
         It sets the scale of the shape being described: larger values keep only
-        coarser folds. An object too small to survive the blur gets NaN for those
+        coarser folds. It is also the top of the scale range of ``Fractal
+        Dimension``. An object too small to survive the blur gets NaN for those
         features, with a warning.
     """
     features = _resolve_features(features)
     mesh = mask2mesh(mask, spacing=spacing)
-    smoothed = [name for name in features if name in _SMOOTHED_FEATURES]
-    if not smoothed:
+    blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
+    if not blurred:
         return extract_mesh_features(mesh, features=features)
+    on_mesh = [name for name in features if name not in _MASK_FEATURES]
     sigma = _curvature_sigma(spacing, curvature_sigma)
     smooth_mesh = _smooth_mask2mesh(mask, spacing, sigma)
-    if smooth_mesh is not None:
-        return extract_mesh_features(mesh, features=features, smooth_mesh=smooth_mesh)
-    warnings.warn(
-        f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
-        f"curvature_sigma={sigma:g}; returning NaN for {smoothed}.",
-        stacklevel=2,
-    )
-    rest = extract_mesh_features(
-        mesh, features=[name for name in features if name not in smoothed]
-    )
-    return {name: rest.get(name, float("nan")) for name in features}
+    if smooth_mesh is None:
+        warnings.warn(
+            f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
+            f"curvature_sigma={sigma:g}; returning NaN for {blurred}.",
+            stacklevel=2,
+        )
+        rest = extract_mesh_features(
+            mesh, features=[name for name in features if name not in blurred]
+        )
+        return {name: rest.get(name, float("nan")) for name in features}
+    values = extract_mesh_features(mesh, features=on_mesh, smooth_mesh=smooth_mesh)
+    if "Fractal Dimension" in features:
+        values["Fractal Dimension"] = _fractal_dimension(mask, spacing, sigma)
+    return {name: values[name] for name in features}
 
 
 def _curvature_sigma(spacing: Sequence[float] | None, sigma: float | None) -> float:
@@ -258,7 +268,27 @@ def _smooth_mask2mesh(
     The blur is isotropic in physical units, so its width in voxels differs per
     axis on an anisotropic stack.
     """
-    step = np.ones(3) if spacing is None else np.asarray(spacing, dtype=float)
+    step = _step(spacing)
+    volume, pad = _padded_blur(mask_3d, step, sigma)
+    if float(volume.max()) <= 0.5:
+        return None
+    verts, faces = _marching_cubes(volume, 0.5, tuple(step), allow_degenerate=False)
+    offset = get_array_module(verts).asarray(pad * step)
+    return _closed_mesh(verts - offset, faces)
+
+
+def _step(spacing: Sequence[float] | None) -> np.ndarray:
+    return np.ones(3) if spacing is None else np.asarray(spacing, dtype=float)
+
+
+def _padded_blur(
+    mask_3d: np.ndarray, step: np.ndarray, sigma: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the mask blurred at ``sigma`` (units of ``step``) and its padding.
+
+    The blur is isotropic in physical units, so its width in voxels differs per
+    axis on an anisotropic stack.
+    """
     sigma_voxels = sigma / step
     # Pad past the blur's reach so it neither clips at the crop nor touches the
     # border, which would leave the surface open.
@@ -267,11 +297,15 @@ def _smooth_mask2mesh(
     volume = gaussian_filter_like_scipy(
         np.pad(mask_3d.astype(np.float32), [(p, p) for p in pad]), sigma_voxels
     )
+    return volume, pad
+
+
+def _level_set_area(volume: np.ndarray, step: np.ndarray) -> float:
+    """Area of the 0.5 level of ``volume``, on its device; NaN if it has none."""
     if float(volume.max()) <= 0.5:
-        return None
+        return float("nan")
     verts, faces = _marching_cubes(volume, 0.5, tuple(step), allow_degenerate=False)
-    offset = get_array_module(verts).asarray(pad * step)
-    return _closed_mesh(verts - offset, faces)
+    return ArrayMesh(verts, faces).area
 
 
 @_require_trimesh
@@ -369,8 +403,9 @@ def extract_mesh_features(
     mesh : trimesh.Trimesh
         Closed surface of a single object.
     features : sequence of str, optional
-        Feature names to compute, defaults to ``mesh_feature_list()``. Only
-        these are computed.
+        Feature names to compute, defaults to ``mesh_feature_list()`` without
+        ``Fractal Dimension``, which is measured on the mask. Only these are
+        computed.
     smooth_mesh : trimesh.Trimesh, optional
         Smoothed surface of the same object (e.g. ``mask2mesh(mask, sigma=...)``)
         for the curvature-distribution features. Without it they are measured on
@@ -379,11 +414,17 @@ def extract_mesh_features(
     Raises
     ------
     ValueError
-        If a feature name is unknown, or if the mesh volume or surface area is
-        not finite and positive, which is what an open (non-watertight) surface
-        reports.
+        If a feature name is unknown or needs the mask (``Fractal Dimension``),
+        or if the mesh volume or surface area is not finite and positive, which
+        is what an open (non-watertight) surface reports.
     """
-    features = _resolve_features(features)
+    features = list(_MESH_FEATURES) if features is None else _resolve_features(features)
+    from_mask = [name for name in features if name in _MASK_FEATURES]
+    if from_mask:
+        raise ValueError(
+            f"{from_mask} is measured on the mask at several blur scales, not on "
+            "one mesh; use extract_surface_features or extract_features."
+        )
     # Validate the mesh before any feature: an open surface (e.g. a mask meshed
     # without a background border) reports a negative volume, which silently
     # propagates into a NaN sphericity and negative solidity and extent instead
@@ -528,30 +569,43 @@ def _avg_curvedness(mesh: trimesh.Trimesh) -> float:
     return _area_average(np.sqrt((k1**2 + k2**2) / 2), area)
 
 
-def _fractal_dimension(mesh: trimesh.Trimesh, n_levels: int = 6) -> float:
-    """Return ``2 + 2 * slope`` of log area against log face count under decimation.
+def _fractal_dimension(
+    mask_3d: np.ndarray,
+    spacing: Sequence[float] | None,
+    sigma: float,
+    n_levels: int = 5,
+) -> float:
+    """Return ``2 - slope`` of log area ratio against log blur scale.
 
-    The mesh is simplified by quadric error metrics to ``n_levels`` face counts
-    from a sixteenth of its own up to all of it. Area scales as ``n^((D-2)/2)``
-    with the face count ``n`` for a surface of fractal dimension ``D``.
+    The area of a surface of fractal dimension ``D`` measured at resolution
+    ``s`` scales as ``s^(2 - D)``. The mask is blurred at ``n_levels`` scales
+    from the finest voxel spacing up to ``sigma``, and the area of each blur's
+    0.5 level is divided by the same area for the mask's smooth twin, its blur
+    at ``sigma`` thresholded at 0.5. The twin shares the object's coarse shape
+    and voxel grid, so the shrinking of curved surfaces under blur and the voxel
+    staircase cancel in the ratio, which leaves the detail finer than ``sigma``.
+    Without the twin, smooth ellipsoids of nucleus size measure 2.05-2.20.
+    Every step runs on the mask's device; NaN if any level vanishes.
     """
-    if importlib.util.find_spec("fast_simplification") is None:
-        raise RuntimeError(
-            "Fractal Dimension needs fast-simplification. Install with 'cubic[mesh]'"
+    step = _step(spacing)
+    if sigma <= step.min():
+        warnings.warn(
+            f"Fractal Dimension needs curvature_sigma above the finest voxel "
+            f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
+            stacklevel=3,
         )
-    n_faces = len(mesh.faces)
-    counts = np.unique(
-        np.geomspace(max(n_faces // 16, 64), n_faces, n_levels).astype(int)
-    )
-    if len(counts) < 3:
         return float("nan")
-    areas = [
-        mesh.area
-        if n == n_faces
-        else mesh.simplify_quadric_decimation(face_count=int(n)).area
-        for n in counts
+    blurred, _ = _padded_blur(mask_3d, step, sigma)
+    twin = blurred > 0.5
+    scales = np.geomspace(step.min(), sigma, n_levels)
+    ratios = [
+        _level_set_area(_padded_blur(mask_3d, step, s)[0], step)
+        / _level_set_area(_padded_blur(twin, step, s)[0], step)
+        for s in scales
     ]
-    return 2 + 2 * float(np.polyfit(np.log(counts), np.log(areas), 1)[0])
+    if not np.all(np.isfinite(ratios)):
+        return float("nan")
+    return 2 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])
 
 
 # Measured on the smoothed mesh when one is available; see mesh_feature_list.
@@ -559,8 +613,10 @@ _SMOOTHED_FEATURES = (
     "Total Absolute Gaussian Curvature",
     "Avg Shape Index",
     "Avg Curvedness",
-    "Fractal Dimension",
 )
+
+# Measured on the mask itself, at several blur scales; see mesh_feature_list.
+_MASK_FEATURES = ("Fractal Dimension",)
 
 # Each feature is computed only when requested; the dict order is the default
 # column order of ``mesh_feature_list``.
@@ -591,5 +647,4 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     ),
     "Avg Shape Index": _avg_shape_index,
     "Avg Curvedness": _avg_curvedness,
-    "Fractal Dimension": _fractal_dimension,
 }
