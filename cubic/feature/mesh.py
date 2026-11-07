@@ -604,6 +604,12 @@ def _fractal_dimension(
         for s in scales
     ]
     if not np.all(np.isfinite(ratios)):
+        warnings.warn(
+            f"Fractal Dimension: the mask or its smooth twin vanishes when blurred "
+            f"at a scale up to curvature_sigma={sigma:g} (an object thinner than the "
+            f"blur); returning NaN.",
+            stacklevel=3,
+        )
         return float("nan")
     return 2 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])
 

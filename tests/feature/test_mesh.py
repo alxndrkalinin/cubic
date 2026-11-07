@@ -532,6 +532,25 @@ def test_fractal_dimension_needs_the_mask() -> None:
     assert "Fractal Dimension" not in mesh.extract_mesh_features(ball)
 
 
+def test_fractal_dimension_of_a_sheet_thinner_than_the_blur() -> None:
+    """D of a slab thinner than the blur is NaN, with a warning.
+
+    The 3-plane slab survives the blur, so the curvature features stay finite,
+    but its thinner twin vanishes when blurred again.
+    """
+    slab = np.zeros((9, 60, 60), dtype=bool)
+    slab[3:6, 10:50, 10:50] = True
+    names = ["Fractal Dimension", "Avg Curvedness"]
+
+    with pytest.warns(UserWarning, match="smooth twin vanishes"):
+        features = mesh.extract_surface_features(
+            slab, spacing=_NUCLEUS_SPACING, features=names
+        )
+
+    assert np.isnan(features["Fractal Dimension"])
+    assert np.isfinite(features["Avg Curvedness"])
+
+
 def test_fractal_dimension_needs_a_blur_above_the_finest_spacing() -> None:
     """D is NaN, with a warning, when curvature_sigma is not above the finest spacing.
 
