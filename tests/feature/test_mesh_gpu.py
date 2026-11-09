@@ -153,6 +153,23 @@ def test_array_mesh_merges_vertices_like_trimesh(gpu_available: bool) -> None:
         )
 
 
+def test_array_mesh_refuses_in_place_changes() -> None:
+    """A delegated method that would change the mesh raises; reads still work.
+
+    Changing only the host copy would leave the arrays and the cached volume
+    and area describing a different mesh from the delegated attributes.
+    """
+    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
+    verts, faces, _, _ = marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    ball = ArrayMesh(verts, faces)
+
+    with pytest.raises(TypeError, match="in place"):
+        ball.apply_scale(2.0)
+
+    assert ball.to_trimesh().volume == pytest.approx(ball.volume, rel=1e-12)
+    assert ball.copy().volume == pytest.approx(ball.volume, rel=1e-12)
+
+
 def _labels() -> np.ndarray:
     z, y, x = np.meshgrid(*[np.arange(n) for n in (30, 64, 64)], indexing="ij")
     labels = np.zeros((30, 64, 64), dtype=np.int32)

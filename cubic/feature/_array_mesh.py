@@ -10,7 +10,7 @@ to a ``trimesh.Trimesh`` built on the host on first use.
 from __future__ import annotations
 
 from typing import Any
-from functools import cached_property
+from functools import wraps, cached_property
 
 import numpy as np
 
@@ -88,6 +88,12 @@ class ArrayMesh:
     The faces are flipped if the enclosed volume comes out negative, as
     ``trimesh.repair.fix_normals`` does for a mesh with consistent winding, and
     equal and unreferenced vertices are merged as trimesh's processing does.
+
+    Attributes not computed here are read from a ``trimesh.Trimesh`` copy on the
+    host. A delegated method that would change the mesh in place (e.g.
+    ``apply_scale``) raises ``TypeError``: the device arrays and cached
+    quantities would no longer describe it. Use ``to_trimesh()`` for a mutable
+    mesh.
     """
 
     def __init__(self, vertices: Any, faces: Any) -> None:
@@ -104,7 +110,26 @@ class ArrayMesh:
         # Called only for attributes not defined here: delegate to trimesh.
         if name.startswith("_"):
             raise AttributeError(name)
-        return getattr(self.to_trimesh(), name)
+        host = self.to_trimesh()
+        value = getattr(host, name)
+        if not callable(value):
+            return value
+
+        @wraps(value)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            # trimesh's hash covers vertices and faces, not its caches
+            before = hash(host)
+            result = value(*args, **kwargs)
+            if hash(host) != before:
+                del self._host  # rebuilt from the device arrays on next use
+                raise TypeError(
+                    f"ArrayMesh.{name} would change the mesh in place, which "
+                    "ArrayMesh does not support; call to_trimesh() for a mutable "
+                    "trimesh.Trimesh."
+                )
+            return result
+
+        return guarded
 
     def to_trimesh(self) -> Any:
         """Return (and cache) a ``trimesh.Trimesh`` of this mesh on the host."""
