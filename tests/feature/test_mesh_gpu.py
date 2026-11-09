@@ -170,6 +170,32 @@ def test_array_mesh_refuses_in_place_changes() -> None:
     assert ball.copy().volume == pytest.approx(ball.volume, rel=1e-12)
 
 
+def test_gpu_marching_cubes_runs_on_the_input_device(gpu_available: bool) -> None:
+    """A volume on GPU 1 is meshed on GPU 1 while GPU 0 is current."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    volume, level, spacing, allow_degenerate = _volumes()["anisotropic ball"]
+    v_cpu, f_cpu, _, _ = marching_cubes(volume, level, spacing=spacing)
+    cpu = _canonical(v_cpu, f_cpu)
+    # float32 is used as is; float64 makes the call copy it to contiguous float32,
+    # which the unfixed function did on GPU 0, returning the mesh there
+    for dtype in (cp.float32, cp.float64):
+        with cp.cuda.Device(1):
+            on_1 = cp.asarray(volume, dtype=dtype)
+
+        with cp.cuda.Device(0):
+            v_gpu, f_gpu = marching_cubes_gpu(on_1, level, spacing, allow_degenerate)
+
+        assert v_gpu.device.id == 1 and f_gpu.device.id == 1
+        gpu = _canonical(asnumpy(v_gpu), asnumpy(f_gpu))
+        np.testing.assert_array_equal(gpu[0], cpu[0])
+        np.testing.assert_array_equal(gpu[1], cpu[1])
+
+
 def _labels() -> np.ndarray:
     z, y, x = np.meshgrid(*[np.arange(n) for n in (30, 64, 64)], indexing="ij")
     labels = np.zeros((30, 64, 64), dtype=np.int32)

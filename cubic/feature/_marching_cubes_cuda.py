@@ -488,8 +488,20 @@ def marching_cubes(
     allow_degenerate=allow_degenerate)`` with the default Lewiner method and
     ``gradient_direction='descent'``, including the output dtypes: float32
     vertices with unit spacing or when degenerate faces are removed, float64
-    otherwise. Vertex and face order differ.
+    otherwise. Vertex and face order differ. Runs on the device of ``volume``,
+    whichever device is current.
     """
+    cp = _cupy()
+    # scratch arrays, launches and the outputs must live on the device whose
+    # kernels and LUTs _kernels returns
+    device = volume.device if isinstance(volume, cp.ndarray) else cp.cuda.Device()
+    with device:
+        return _marching_cubes_on_device(volume, level, spacing, allow_degenerate)
+
+
+def _marching_cubes_on_device(
+    volume: Any, level: float, spacing: Sequence[float], allow_degenerate: bool
+) -> tuple[Any, Any]:
     cp = _cupy()
     vol = cp.ascontiguousarray(volume, dtype=cp.float32)
     if vol.ndim != 3 or min(vol.shape) < 2:
