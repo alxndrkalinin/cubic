@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - import failure path
     )
 
 from ..cuda import asnumpy, get_device, get_array_module
-from ._array_mesh import ArrayMesh
+from ._array_mesh import ArrayMesh, face_areas
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
 
@@ -305,7 +305,7 @@ def _level_set_area(volume: np.ndarray, step: np.ndarray) -> float:
     if float(volume.max()) <= 0.5:
         return float("nan")
     verts, faces = _marching_cubes(volume, 0.5, tuple(step), allow_degenerate=False)
-    return ArrayMesh(verts, faces).area
+    return float(face_areas(verts.astype(np.float64), faces).sum())
 
 
 @_require_trimesh

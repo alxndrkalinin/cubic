@@ -103,6 +103,56 @@ def test_array_mesh_matches_trimesh() -> None:
     assert got == pytest.approx(expected, rel=1e-12)
 
 
+def _level_hit_mesh() -> tuple[np.ndarray, np.ndarray]:
+    """Mesh of noise rounded to quarters, whose 0.5 level is hit exactly.
+
+    Removing the degenerate faces leaves coincident and unreferenced vertices.
+    """
+    rng = np.random.default_rng(1)
+    volume = np.pad(np.round(rng.random((16, 16, 16)) * 4) / 4, 1).astype(np.float32)
+    verts, faces, _, _ = marching_cubes(volume, 0.5, allow_degenerate=False)
+    return verts, faces
+
+
+def test_array_mesh_merges_vertices_like_trimesh(gpu_available: bool) -> None:
+    """Equal and unreferenced vertices are merged as trimesh's processing does.
+
+    Unmerged, each unreferenced vertex added a 2 pi angle defect and each
+    duplicate split the defects and edges at a seam: the sum of |defect| / 4 pi
+    (total |K|) came out 480.9 against trimesh's 496.1 on this mesh. The mesh
+    is not watertight, so the topology-dependent quantities are compared
+    directly instead of through extract_mesh_features.
+
+    Defects are compared away from zero-area (collinear) faces: whether trimesh
+    or ArrayMesh zeroes such a face's angles depends on the last bit of a dot
+    product near 1, which arccos amplifies to its 1e-8 tolerance, on any device.
+    """
+    verts, faces = _level_hit_mesh()
+    assert len(np.unique(faces)) < len(verts)
+    assert len(np.unique(verts, axis=0)) < len(verts)
+    reference = trimesh.Trimesh(verts, faces)  # process=True, as on the CPU path
+    key = {tuple(p): i for i, p in enumerate(np.round(reference.vertices * 1e8))}
+
+    arrays = [(verts, faces)]
+    if gpu_available:
+        arrays.append((ascupy(verts), ascupy(faces)))
+    for v, f in arrays:
+        merged = ArrayMesh(v, f)
+        m_verts, m_faces = asnumpy(merged.vertices), asnumpy(merged.faces)
+        assert len(m_verts) == len(reference.vertices)
+        assert len(np.unique(m_faces)) == len(m_verts)
+        assert merged.euler_number == reference.euler_number
+        assert merged.area == pytest.approx(reference.area, rel=1e-12)
+        match = np.array([key[tuple(p)] for p in np.round(m_verts * 1e8)])
+        flat = np.zeros(len(m_verts), dtype=bool)
+        flat[m_faces[asnumpy(merged.area_faces) == 0].ravel()] = True
+        np.testing.assert_allclose(
+            asnumpy(merged.vertex_defects)[~flat],
+            reference.vertex_defects[match[~flat]],
+            atol=1e-9,
+        )
+
+
 def _labels() -> np.ndarray:
     z, y, x = np.meshgrid(*[np.arange(n) for n in (30, 64, 64)], indexing="ij")
     labels = np.zeros((30, 64, 64), dtype=np.int32)

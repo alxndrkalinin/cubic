@@ -33,6 +33,48 @@ def _unitize(vectors: Any) -> tuple[Any, Any]:
     return vectors * scale[:, None], valid
 
 
+def _merge_vertices(vertices: Any, faces: Any) -> tuple[Any, Any]:
+    """Drop unreferenced vertices and merge equal ones, as trimesh's processing does.
+
+    Marching cubes with degenerate faces removed leaves both after an exact level
+    hit. trimesh merges them on the CPU path (``process=True``); without this,
+    each unreferenced vertex adds a ``2 pi`` defect (0.5 to total |K|) and each
+    duplicate splits defects and edges at a seam. Vertices equal to trimesh's
+    merge tolerance (8 decimals) are merged. The arrays come back unchanged when
+    there is nothing to merge.
+    """
+    referenced = np.zeros_like(vertices[:, 0], dtype=bool)
+    referenced[faces.ravel()] = True
+    index = np.flatnonzero(referenced)
+    # trimesh.grouping.merge_vertices: vertices * 10**digits(tol.merge), rounded;
+    # dividing by 1e-8 instead rounds a few vertices into other groups
+    keys = np.round(vertices[index] * 1e8).astype(np.int64)
+    # lexsort and a diff: cupy.unique(axis=0) takes seconds for a few thousand rows
+    order = np.lexsort(keys.T[::-1])
+    sorted_keys = keys[order]
+    new = np.ones_like(order, dtype=bool)
+    new[1:] = (sorted_keys[1:] != sorted_keys[:-1]).any(axis=1)
+    if len(index) == len(vertices) and bool(new.all()):
+        return vertices, faces
+    remap = np.zeros_like(faces, shape=len(vertices))
+    remap[index[order]] = np.cumsum(new) - 1
+    return vertices[index[order[new]]], remap[faces]
+
+
+def _triangles_cross(triangles: Any) -> Any:
+    """Cross product of each triangle's edges, in trimesh's operand order."""
+    vectors = triangles[:, 1:, :] - triangles[:, :2, :]
+    return np.cross(vectors[:, 0], vectors[:, 1])
+
+
+def face_areas(vertices: Any, faces: Any) -> Any:
+    """Area of each triangle as trimesh computes it, on the arrays' device.
+
+    Needs neither merging nor orientation, so it is cheaper than an ArrayMesh.
+    """
+    return np.sqrt((_triangles_cross(vertices[faces]) ** 2).sum(axis=1)) / 2.0
+
+
 class ArrayMesh:
     """Closed, consistently oriented triangle mesh on the device of its arrays.
 
@@ -44,12 +86,14 @@ class ArrayMesh:
         ``(F, 3)`` vertex indices on the same device.
 
     The faces are flipped if the enclosed volume comes out negative, as
-    ``trimesh.repair.fix_normals`` does for a mesh with consistent winding.
+    ``trimesh.repair.fix_normals`` does for a mesh with consistent winding, and
+    equal and unreferenced vertices are merged as trimesh's processing does.
     """
 
     def __init__(self, vertices: Any, faces: Any) -> None:
-        self.vertices = vertices.astype(np.float64)
-        self.faces = faces.astype(np.int64)
+        self.vertices, self.faces = _merge_vertices(
+            vertices.astype(np.float64), faces.astype(np.int64)
+        )
         if self.volume < 0:
             self.faces = self.faces[:, ::-1].copy()
             for name in list(vars(self)):
@@ -80,9 +124,7 @@ class ArrayMesh:
 
     @cached_property
     def triangles_cross(self) -> Any:
-        tri = self.triangles
-        vectors = tri[:, 1:, :] - tri[:, :2, :]
-        return np.cross(vectors[:, 0], vectors[:, 1])
+        return _triangles_cross(self.triangles)
 
     @cached_property
     def area_faces(self) -> Any:
