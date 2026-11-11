@@ -489,6 +489,9 @@ def marching_cubes(
     maximum. Vertex and face order differ. Runs on the device of ``volume``,
     whichever device is current.
     """
+    # skimage's check; the port would otherwise broadcast a shorter spacing
+    if len(spacing) != 3:
+        raise ValueError("`spacing` must consist of three floats.")
     cp = _cupy()
     # scratch arrays, launches and the outputs must live on the device whose
     # kernels and LUTs _kernels returns

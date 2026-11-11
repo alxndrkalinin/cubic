@@ -106,6 +106,28 @@ def test_gpu_default_level_rounds_like_skimage(gpu_available: bool) -> None:
     _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
+@pytest.mark.parametrize("spacing", [(0.5,), (0.5, 1.0)])
+def test_gpu_marching_cubes_rejects_spacing_of_other_lengths(
+    spacing: tuple, gpu_available: bool
+) -> None:
+    """A spacing of other than three values raises skimage's error on the GPU too.
+
+    Unchecked, one value scaled every axis and two failed to broadcast.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    mask = _labels() == 1
+    volume = np.pad(mask, 1).astype(np.float32)
+    match = "`spacing` must consist of three floats"
+
+    with pytest.raises(ValueError, match=match):
+        marching_cubes(volume, 0.5, spacing=spacing)
+    with pytest.raises(ValueError, match=match):
+        marching_cubes_gpu(ascupy(volume), 0.5, spacing)
+    with pytest.raises(ValueError, match=match):
+        mesh.mask2mesh(ascupy(mask), spacing=spacing)
+
+
 def test_array_mesh_matches_trimesh() -> None:
     """On NumPy arrays, ArrayMesh reproduces trimesh's features to rounding.
 
