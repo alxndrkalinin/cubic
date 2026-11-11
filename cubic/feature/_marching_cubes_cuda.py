@@ -508,7 +508,11 @@ def _marching_cubes_on_device(
     if vol.ndim != 3 or min(vol.shape) < 2:
         raise ValueError("Input array must be a 3D array of at least 2x2x2.")
     low, high = float(vol.min()), float(vol.max())
-    level = 0.5 * (low + high) if level is None else float(level)
+    if level is None:
+        # skimage's 0.5 * (volume.min() + volume.max()) adds float32 scalars,
+        # so the sum rounds to float32 before it is halved
+        level = 0.5 * float(np.float32(low) + np.float32(high))
+    level = float(level)
     if level < low or level > high:
         raise ValueError("Surface level must be within volume data range.")
     classify, edge_vertices, center_vertices, write_faces, luts = _kernels(

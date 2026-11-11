@@ -86,6 +86,26 @@ def test_gpu_marching_cubes_matches_skimage(name: str, gpu_available: bool) -> N
     _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
+def test_gpu_default_level_rounds_like_skimage(gpu_available: bool) -> None:
+    """``level=None`` is skimage's midpoint, halved from the float32 sum of the extremes.
+
+    Here that sum rounds (0.1 + 3.0 is not a float32), so a midpoint taken in
+    float64 sits about 5e-8 away and moves vertices by an ulp.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    volume = np.random.default_rng(2).uniform(0.1, 3.0, (20, 20, 20))
+    volume = volume.astype(np.float32)
+    volume.flat[:2] = 0.1, 3.0
+    low, high = volume.min(), volume.max()
+    assert float(low + high) != float(low) + float(high)
+
+    v_cpu, f_cpu, _, _ = marching_cubes(volume)
+    v_gpu, f_gpu = marching_cubes_gpu(ascupy(volume))
+
+    _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
+
+
 def test_array_mesh_matches_trimesh() -> None:
     """On NumPy arrays, ArrayMesh reproduces trimesh's features to rounding.
 
