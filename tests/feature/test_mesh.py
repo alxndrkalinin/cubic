@@ -1,7 +1,6 @@
 """Tests for mesh-based feature extraction."""
 
 import sys
-import warnings
 import subprocess
 
 import numpy as np
@@ -573,33 +572,6 @@ def test_smooth_twin_fits_in_the_mask_frame(spacing) -> None:
             for axis in range(3):
                 assert twin.take(0, axis=axis).any()
                 assert twin.take(-1, axis=axis).any()
-
-
-def test_fractal_dimension_warns_over_a_short_scale_range() -> None:
-    """D is returned with a warning when its scales span less than a factor of 2.
-
-    The default curvature_sigma, twice the coarsest spacing, spans at least
-    that, so it does not warn on isotropic or on anisotropic nucleus data.
-    """
-    name = "Fractal Dimension"
-    defaults = [
-        (_ball(8, 22), None),
-        (_rough_ellipsoid(0), (0.29, 0.108, 0.108)),
-    ]
-    for mask, spacing in defaults:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            value = mesh.extract_surface_features(
-                mask, spacing=spacing, features=[name]
-            )[name]
-        assert np.isfinite(value)
-        assert not [w for w in caught if "factor of 2" in str(w.message)]
-
-    with pytest.warns(UserWarning, match="less than a factor of 2"):
-        value = mesh.extract_surface_features(
-            _ball(8, 22), features=[name], curvature_sigma=1.5
-        )[name]
-    assert np.isfinite(value)
 
 
 def test_fractal_dimension_needs_a_blur_above_the_finest_spacing() -> None:

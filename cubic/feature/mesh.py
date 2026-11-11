@@ -205,9 +205,8 @@ def extract_surface_features(
         coarser folds. It is also the top of the scale range of ``Fractal
         Dimension``, which starts at the finest voxel spacing: that feature is
         NaN, with a warning, unless ``curvature_sigma`` exceeds the finest
-        spacing, and warns when it is less than twice the finest spacing, a
-        range below the default's factor of 2 on isotropic data. An object too
-        small to survive the blur gets NaN for those features, with a warning.
+        spacing. An object too small to survive the blur gets NaN for those
+        features, with a warning.
     """
     features = _resolve_features(features)
     mesh = mask2mesh(mask, spacing=spacing)
@@ -639,14 +638,6 @@ def _fractal_dimension(
             stacklevel=3,
         )
         return float("nan")
-    if sigma < 2 * step.min():
-        # 2 is the default range on isotropic data, the smallest one validated
-        warnings.warn(
-            f"Fractal Dimension: curvature_sigma={sigma:g} is less than twice "
-            f"the finest voxel spacing {step.min():g}, so the fit spans less "
-            f"than a factor of 2 in scale and the estimate is noisy.",
-            stacklevel=3,
-        )
     twin = _smooth_twin(blurred, pad)
 
     def area(volume: np.ndarray, scale: float) -> float:
