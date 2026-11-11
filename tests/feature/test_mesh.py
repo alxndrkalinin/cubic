@@ -551,6 +551,29 @@ def test_fractal_dimension_of_a_sheet_thinner_than_the_blur() -> None:
     assert np.isfinite(features["Avg Curvedness"])
 
 
+@pytest.mark.parametrize("spacing", [None, _NUCLEUS_SPACING])
+def test_smooth_twin_fits_in_the_mask_frame(spacing) -> None:
+    """Cropping the twin to the mask's frame loses none of its voxels.
+
+    Both objects touch their frame on every face, where the blur outside the
+    frame is highest: a solid box along whole faces, a ball at their centres.
+    The twin of the box reaches every face too, so no tighter crop would do.
+    """
+    step = mesh._step(spacing)
+    sigma = mesh._curvature_sigma(spacing, None)
+    box = np.ones((12, 30, 30), dtype=bool)
+    for mask in (box, _ball(6, 13)):
+        blurred, pad = mesh._padded_blur(mask, step, sigma)
+        twin = mesh._smooth_twin(blurred, pad)
+
+        assert twin.shape == mask.shape
+        assert int(twin.sum()) == int((blurred > 0.5).sum()) > 0
+        if mask is box:
+            for axis in range(3):
+                assert twin.take(0, axis=axis).any()
+                assert twin.take(-1, axis=axis).any()
+
+
 def test_fractal_dimension_needs_a_blur_above_the_finest_spacing() -> None:
     """D is NaN, with a warning, when curvature_sigma is not above the finest spacing.
 

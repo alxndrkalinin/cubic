@@ -229,7 +229,7 @@ def extract_surface_features(
     values = extract_mesh_features(mesh, features=on_mesh, smooth_mesh=smooth_mesh)
     if "Fractal Dimension" in features:
         values["Fractal Dimension"] = _fractal_dimension(
-            mask, step, sigma, smooth_volume, level_set
+            mask, step, sigma, smooth_volume, pad, level_set
         )
     return {name: values[name] for name in features}
 
@@ -589,11 +589,22 @@ def _avg_curvedness(mesh: trimesh.Trimesh) -> float:
     return _area_average(np.sqrt((k1**2 + k2**2) / 2), area)
 
 
+def _smooth_twin(blurred: np.ndarray, pad: np.ndarray) -> np.ndarray:
+    """Return the mask's blur thresholded at 0.5, cropped to the mask's own frame.
+
+    Outside that frame every mask voxel lies to one side along some axis, so
+    the separable blur there is at most the kernel's weight beyond its centre,
+    ``(1 - w0) / 2 < 0.5``: the threshold loses nothing to the crop.
+    """
+    return (blurred > 0.5)[tuple(slice(p, -p) for p in pad)]
+
+
 def _fractal_dimension(
     mask_3d: np.ndarray,
     step: np.ndarray,
     sigma: float,
     blurred: np.ndarray,
+    pad: np.ndarray,
     level_set: tuple[np.ndarray, np.ndarray],
     n_levels: int = 5,
 ) -> float:
@@ -609,10 +620,10 @@ def _fractal_dimension(
     Without the twin, smooth ellipsoids of nucleus size measure 2.05-2.20.
     Every step runs on the mask's device; NaN if any level vanishes.
 
-    ``blurred`` is the mask's padded blur at ``sigma`` and ``level_set`` its 0.5
-    level from ``_level_set``, which the caller has already computed: the twin
-    is thresholded from the first, and the second is the mask's level at the
-    last scale.
+    ``blurred`` is the mask's blur at ``sigma`` with its padding ``pad``, and
+    ``level_set`` its 0.5 level from ``_level_set``, which the caller has
+    already computed: the twin is thresholded from the first and cropped to the
+    mask's frame, and the second is the mask's level at the last scale.
     """
     if sigma <= step.min():
         warnings.warn(
@@ -621,7 +632,7 @@ def _fractal_dimension(
             stacklevel=3,
         )
         return float("nan")
-    twin = blurred > 0.5
+    twin = _smooth_twin(blurred, pad)
 
     def area(volume: np.ndarray, scale: float) -> float:
         return _level_set_area(_level_set(_padded_blur(volume, step, scale)[0], step))
