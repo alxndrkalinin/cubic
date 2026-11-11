@@ -119,9 +119,15 @@ class ArrayMesh:
                     delattr(self, name)
 
     def __getattr__(self, name: str) -> Any:
-        # Called only for attributes not defined here: delegate to trimesh.
+        # Called for attributes not defined here, which go to trimesh, and also
+        # when one defined here raises AttributeError, which must not.
         if name.startswith("_"):
             raise AttributeError(name)
+        if hasattr(type(self), name):
+            raise AttributeError(
+                f"ArrayMesh.{name} itself failed with an AttributeError; it is "
+                "not delegated to trimesh."
+            )
         host = self.to_trimesh()
         value = getattr(host, name)
         if not callable(value):
