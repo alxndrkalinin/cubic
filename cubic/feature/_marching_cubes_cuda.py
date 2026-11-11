@@ -27,7 +27,7 @@ import numpy as np
 from skimage.measure import _marching_cubes_lewiner_luts as _mcluts
 from skimage.measure._marching_cubes_lewiner import _to_array
 
-from ..cuda import CUDAManager
+from ..cuda import CUDAManager, _launch_config, _cuda_functions
 from ._array_mesh import _group_rows
 
 # Lookup tables used by the Lewiner case analysis (the classic table is not).
@@ -462,19 +462,15 @@ def _cupy() -> Any:
 
 @functools.cache
 def _kernels(device_id: int) -> tuple[Any, ...]:
-    """Compile the kernels once per device; return them and the device LUTs."""
+    """Return the kernels compiled for a device and that device's copy of the LUTs."""
     cp = _cupy()
     luts, defines = _lut_layout()
+    # compiled with --fmad=false, so every multiply and add rounds separately,
+    # as in the Cython reference
+    names = ("mc_classify", "mc_edge_vertices", "mc_center_vertices", "mc_faces")
+    kernels = _cuda_functions(defines + _KERNELS, names, device_id)
     with cp.cuda.Device(device_id):
-        # --fmad=false keeps every multiply and add separately rounded, as in
-        # the Cython reference.
-        module = cp.RawModule(code=defines + _KERNELS, options=("--fmad=false",))
-        names = ("mc_classify", "mc_edge_vertices", "mc_center_vertices", "mc_faces")
-        return tuple(module.get_function(n) for n in names) + (cp.asarray(luts),)
-
-
-def _grid(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
-    return (max(1, min((size + threads - 1) // threads, 65535 * 8)),), (threads,)
+        return kernels + (cp.asarray(luts),)
 
 
 def marching_cubes(
@@ -521,7 +517,10 @@ def _marching_cubes_on_device(
     edge_used = cp.zeros(3 * n, dtype=cp.uint8)
     center_used = cp.zeros(ncubes, dtype=cp.uint8)
     args = (vol, np.int32(nz), np.int32(ny), np.int32(nx), np.float64(level))
-    classify(*_grid(ncubes), args + (luts, tri_base, tri_count, edge_used, center_used))
+    classify(
+        *_launch_config(ncubes),
+        args + (luts, tri_base, tri_count, edge_used, center_used),
+    )
 
     edge_id = cp.cumsum(edge_used, dtype=cp.int32) - 1
     n_edges = int(edge_id[-1]) + 1
@@ -533,11 +532,11 @@ def _marching_cubes_on_device(
         raise RuntimeError("No surface found at the given iso value.")
 
     verts = cp.empty((n_verts, 3), dtype=cp.float32)
-    edge_vertices(*_grid(3 * n), args + (edge_used, edge_id, verts))
-    center_vertices(*_grid(ncubes), args + (center_used, center_id, verts))
+    edge_vertices(*_launch_config(3 * n), args + (edge_used, edge_id, verts))
+    center_vertices(*_launch_config(ncubes), args + (center_used, center_id, verts))
     faces = cp.empty((n_faces, 3), dtype=cp.int32)
     write_faces(
-        *_grid(ncubes),
+        *_launch_config(ncubes),
         (
             np.int32(nz),
             np.int32(ny),
