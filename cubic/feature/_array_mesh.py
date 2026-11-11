@@ -241,8 +241,12 @@ class ArrayMesh:
     # -- edges and adjacency (trimesh.graph) ----------------------------------
 
     @cached_property
-    def _edge_groups(self) -> tuple[Any, Any, Any]:
-        """Sorted edge keys: (order, start of each run, run length)."""
+    def _edge_groups(self) -> tuple[Any, Any, Any, Any]:
+        """Edges grouped by vertex pair: (edges, order, start of each run, run length).
+
+        ``edges`` holds each face's three edges with sorted vertex indices, in
+        face order; ``order`` sorts them so that equal edges form runs.
+        """
         edges = np.sort(self.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
         keys = edges[:, 0] * len(self.vertices) + edges[:, 1]
         order = np.argsort(keys)
@@ -251,29 +255,31 @@ class ArrayMesh:
         is_start[1:] = sorted_keys[1:] != sorted_keys[:-1]
         starts = np.flatnonzero(is_start)
         lengths = np.diff(starts, append=len(keys))
-        self._edges_sorted = edges
-        return order, starts, lengths
+        return edges, order, starts, lengths
 
     @cached_property
     def euler_number(self) -> int:
         referenced = int(np.unique(self.faces).size)
-        _, starts, _ = self._edge_groups
+        _, _, starts, _ = self._edge_groups
         return referenced - int(starts.size) + len(self.faces)
 
     @cached_property
-    def face_adjacency(self) -> Any:
-        order, starts, lengths = self._edge_groups
+    def _face_adjacency(self) -> tuple[Any, Any]:
+        """Pairs of faces sharing an edge, and that edge: (pairs, edges)."""
+        edges, order, starts, lengths = self._edge_groups
         first = starts[lengths == 2]
         edge_a, edge_b = order[first], order[first + 1]
         pair = np.stack([edge_a // 3, edge_b // 3], axis=1)
         keep = pair[:, 0] != pair[:, 1]
-        self.face_adjacency_edges = self._edges_sorted[edge_a[keep]]
-        return np.sort(pair[keep], axis=1)
+        return np.sort(pair[keep], axis=1), edges[edge_a[keep]]
+
+    @cached_property
+    def face_adjacency(self) -> Any:
+        return self._face_adjacency[0]
 
     @cached_property
     def face_adjacency_edges(self) -> Any:
-        _ = self.face_adjacency
-        return self.__dict__["face_adjacency_edges"]
+        return self._face_adjacency[1]
 
     @cached_property
     def face_adjacency_angles(self) -> Any:
