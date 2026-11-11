@@ -14,7 +14,7 @@ from functools import wraps, cached_property
 
 import numpy as np
 
-from ..cuda import asnumpy, get_array_module
+from ..cuda import asnumpy
 
 # trimesh.constants.tol: zero for unitize, merge for angles and convexity.
 _TOL_ZERO = 1e-13
@@ -243,15 +243,14 @@ class ArrayMesh:
     @cached_property
     def _edge_groups(self) -> tuple[Any, Any, Any]:
         """Sorted edge keys: (order, start of each run, run length)."""
-        xp = get_array_module(self.faces)
         edges = np.sort(self.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
         keys = edges[:, 0] * len(self.vertices) + edges[:, 1]
         order = np.argsort(keys)
         sorted_keys = keys[order]
-        is_start = xp.ones(len(keys), dtype=bool)
+        is_start = np.ones_like(keys, dtype=bool)
         is_start[1:] = sorted_keys[1:] != sorted_keys[:-1]
-        starts = xp.flatnonzero(is_start)
-        lengths = np.diff(xp.concatenate([starts, xp.asarray([len(keys)])]))
+        starts = np.flatnonzero(is_start)
+        lengths = np.diff(starts, append=len(keys))
         self._edges_sorted = edges
         return order, starts, lengths
 
@@ -263,11 +262,10 @@ class ArrayMesh:
 
     @cached_property
     def face_adjacency(self) -> Any:
-        xp = get_array_module(self.faces)
         order, starts, lengths = self._edge_groups
         first = starts[lengths == 2]
         edge_a, edge_b = order[first], order[first + 1]
-        pair = xp.stack([edge_a // 3, edge_b // 3], axis=1)
+        pair = np.stack([edge_a // 3, edge_b // 3], axis=1)
         keep = pair[:, 0] != pair[:, 1]
         self.face_adjacency_edges = self._edges_sorted[edge_a[keep]]
         return np.sort(pair[keep], axis=1)
@@ -285,16 +283,16 @@ class ArrayMesh:
 
     @cached_property
     def face_adjacency_unshared(self) -> Any:
-        xp = get_array_module(self.faces)
         edges = self.face_adjacency_edges
         out = []
         for side in range(2):
             faces = self.faces[self.face_adjacency[:, side]]
             unshared = (faces != edges[:, :1]) & (faces != edges[:, 1:])
             row_ok = unshared.sum(axis=1) == 1
-            picked = faces[xp.arange(len(faces)), np.argmax(unshared, axis=1)]
+            column = np.argmax(unshared, axis=1)[:, None]
+            picked = np.take_along_axis(faces, column, axis=1)[:, 0]
             out.append(np.where(row_ok, picked, -1))
-        return xp.stack(out, axis=1)
+        return np.stack(out, axis=1)
 
     @cached_property
     def face_adjacency_convex(self) -> Any:

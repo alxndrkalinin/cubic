@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - import failure path
         stacklevel=2,
     )
 
-from ..cuda import asnumpy, get_device, get_array_module
+from ..cuda import asnumpy, get_device, to_same_device
 from ._array_mesh import ArrayMesh, face_areas
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
@@ -273,7 +273,7 @@ def _smooth_mask2mesh(
     if float(volume.max()) <= 0.5:
         return None
     verts, faces = _marching_cubes(volume, 0.5, tuple(step), allow_degenerate=False)
-    offset = get_array_module(verts).asarray(pad * step)
+    offset = to_same_device(pad * step, verts)
     return _closed_mesh(verts - offset, faces)
 
 
@@ -376,8 +376,8 @@ def mask2mesh(
     # physical units. Every feature in ``mesh_feature_list`` is
     # translation-invariant, but ``mask2mesh`` is public and its mesh is
     # expected to overlay the image.
-    xp = get_array_module(verts)
-    verts = verts - xp.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
+    one_voxel = np.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
+    verts = verts - to_same_device(one_voxel, verts)
     return _closed_mesh(verts, faces)
 
 
