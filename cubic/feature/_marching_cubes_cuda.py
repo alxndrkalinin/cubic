@@ -28,6 +28,7 @@ from skimage.measure import _marching_cubes_lewiner_luts as _mcluts
 from skimage.measure._marching_cubes_lewiner import _to_array
 
 from ..cuda import CUDAManager
+from ._array_mesh import _group_rows
 
 # Lookup tables used by the Lewiner case analysis (the classic table is not).
 _TABLES = (
@@ -565,16 +566,10 @@ def _remove_degenerate_faces(verts: Any, faces: Any) -> tuple[Any, Any]:
     skimage merges the vertices of degenerate faces and trimesh then merges any
     remaining coincident ones; merging every exact duplicate does both.
     """
-    cp = _cupy()
-    # A lexicographic sort brings duplicates together; cp.unique(axis=0) does
-    # the same but took hours on a few thousand vertices.
-    order = cp.lexsort(verts.T[::-1])
-    ordered = verts[order]
-    first = cp.ones(len(ordered), dtype=bool)
-    first[1:] = (ordered[1:] != ordered[:-1]).any(axis=1)
-    inverse = cp.empty(len(verts), dtype=cp.int32)
-    inverse[order] = (cp.cumsum(first) - 1).astype(cp.int32)
-    unique = ordered[first]
+    order, first = _group_rows(verts)
+    inverse = np.empty_like(faces, shape=len(verts))
+    inverse[order] = (np.cumsum(first) - 1).astype(faces.dtype)
+    unique = verts[order[first]]
     faces = inverse[faces]
     keep = (
         (faces[:, 0] != faces[:, 1])
