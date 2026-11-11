@@ -238,15 +238,25 @@ def _curvature_sigma(spacing: Sequence[float] | None, sigma: float | None) -> fl
 
 def _marching_cubes(
     volume: np.ndarray,
-    level: float,
-    spacing: Sequence[float],
+    level: float | None = None,
+    *,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
     allow_degenerate: bool = True,
+    **kwargs: Any,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Skimage's Lewiner marching cubes, or its CUDA port for a CuPy volume."""
+    """``(verts, faces)`` from skimage's Lewiner marching cubes, or its CUDA port.
+
+    Takes the arguments of ``skimage.measure.marching_cubes``; ``level=None``
+    is halfway between the volume's minimum and maximum. A CuPy volume is
+    meshed on the GPU, which takes only ``level``, ``spacing`` and
+    ``allow_degenerate``; other keywords go to skimage for a NumPy volume.
+    """
     if get_device(volume) == "GPU":
+        if kwargs:
+            raise ValueError(f"GPU marching cubes does not support {sorted(kwargs)}.")
         return _marching_cubes_gpu(volume, level, spacing, allow_degenerate)
     verts, faces, _, _ = marching_cubes(
-        volume, level, spacing=spacing, allow_degenerate=allow_degenerate
+        volume, level, spacing=spacing, allow_degenerate=allow_degenerate, **kwargs
     )
     return verts, faces
 
@@ -272,7 +282,9 @@ def _smooth_mask2mesh(
     volume, pad = _padded_blur(mask_3d, step, sigma)
     if float(volume.max()) <= 0.5:
         return None
-    verts, faces = _marching_cubes(volume, 0.5, tuple(step), allow_degenerate=False)
+    verts, faces = _marching_cubes(
+        volume, 0.5, spacing=tuple(step), allow_degenerate=False
+    )
     offset = to_same_device(pad * step, verts)
     return _closed_mesh(verts - offset, faces)
 
@@ -304,7 +316,9 @@ def _level_set_area(volume: np.ndarray, step: np.ndarray) -> float:
     """Area of the 0.5 level of ``volume``, on its device; NaN if it has none."""
     if float(volume.max()) <= 0.5:
         return float("nan")
-    verts, faces = _marching_cubes(volume, 0.5, tuple(step), allow_degenerate=False)
+    verts, faces = _marching_cubes(
+        volume, 0.5, spacing=tuple(step), allow_degenerate=False
+    )
     return float(face_areas(verts.astype(np.float64), faces).sum())
 
 
@@ -332,7 +346,7 @@ def mask2mesh(
         areas and volumes are in physical units.
     marching_cubes_kwargs : dict, optional
         Extra keyword arguments for ``skimage.measure.marching_cubes``; on the
-        GPU only ``spacing`` is supported.
+        GPU only ``level``, ``spacing`` and ``allow_degenerate`` are supported.
     sigma : float, optional
         If given, mesh the mask blurred by a Gaussian of this width, in units of
         ``spacing``, instead of the voxel staircase. ``marching_cubes_kwargs``
@@ -357,19 +371,7 @@ def mask2mesh(
                 "'marching_cubes_kwargs'; pass it only once."
             )
         marching_cubes_kwargs["spacing"] = tuple(float(s) for s in spacing)
-    padded = np.pad(mask_3d, 1)
-    if get_device(mask_3d) == "GPU":
-        unsupported = sorted(set(marching_cubes_kwargs) - {"spacing"})
-        if unsupported:
-            raise ValueError(f"GPU marching cubes does not support {unsupported}.")
-        volume = padded.astype(np.float32)
-        # skimage's default level: halfway between the extremes, 0.5 for a mask
-        level = 0.5 * (float(volume.min()) + float(volume.max()))
-        verts, faces = _marching_cubes(
-            volume, level, marching_cubes_kwargs.get("spacing", (1.0, 1.0, 1.0))
-        )
-    else:
-        verts, faces, _, _ = marching_cubes(padded, **marching_cubes_kwargs)
+    verts, faces = _marching_cubes(np.pad(mask_3d, 1), **marching_cubes_kwargs)
     # Undo the 1-voxel pad so vertices stay in the input's coordinate frame.
     # Without this every vertex, and therefore ``bounds`` and ``centroid``, sits
     # one voxel high on each axis -- scaled by ``spacing``, so the offset is in

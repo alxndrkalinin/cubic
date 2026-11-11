@@ -475,7 +475,7 @@ def _kernels(device_id: int) -> tuple[Any, ...]:
 
 def marching_cubes(
     volume: Any,
-    level: float,
+    level: float | None = None,
     spacing: Sequence[float] = (1.0, 1.0, 1.0),
     allow_degenerate: bool = True,
 ) -> tuple[Any, Any]:
@@ -485,7 +485,8 @@ def marching_cubes(
     allow_degenerate=allow_degenerate)`` with the default Lewiner method and
     ``gradient_direction='descent'``, including the output dtypes: float32
     vertices with unit spacing or when degenerate faces are removed, float64
-    otherwise. Vertex and face order differ. Runs on the device of ``volume``,
+    otherwise. ``level=None`` is halfway between the volume's minimum and
+    maximum. Vertex and face order differ. Runs on the device of ``volume``,
     whichever device is current.
     """
     cp = _cupy()
@@ -497,14 +498,18 @@ def marching_cubes(
 
 
 def _marching_cubes_on_device(
-    volume: Any, level: float, spacing: Sequence[float], allow_degenerate: bool
+    volume: Any,
+    level: float | None,
+    spacing: Sequence[float],
+    allow_degenerate: bool,
 ) -> tuple[Any, Any]:
     cp = _cupy()
     vol = cp.ascontiguousarray(volume, dtype=cp.float32)
     if vol.ndim != 3 or min(vol.shape) < 2:
         raise ValueError("Input array must be a 3D array of at least 2x2x2.")
-    level = float(level)
-    if level < float(vol.min()) or level > float(vol.max()):
+    low, high = float(vol.min()), float(vol.max())
+    level = 0.5 * (low + high) if level is None else float(level)
+    if level < low or level > high:
         raise ValueError("Surface level must be within volume data range.")
     classify, edge_vertices, center_vertices, write_faces, luts = _kernels(
         vol.device.id
