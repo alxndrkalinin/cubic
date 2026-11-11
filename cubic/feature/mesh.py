@@ -51,7 +51,11 @@ def _require_trimesh(func: F) -> F:
 
 
 def mesh_feature_list() -> list[str]:
-    """Return the names of the features extracted from a trimesh object.
+    """Return the names of the surface features of a label, in column order.
+
+    ``extract_features`` and ``extract_surface_features`` return these. All but
+    ``Fractal Dimension``, which is measured on the mask, are measured on a mesh
+    of it.
 
     No feature is defined on the image axes. The axis lengths are the full axes
     of the ellipsoid with the same inertia, and ``Extent`` is the volume over the

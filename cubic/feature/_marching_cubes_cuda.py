@@ -16,7 +16,9 @@ reference's centre-of-mass interpolation sums the same two terms whichever
 cube creates the vertex, and addition is commutative. With the corner values,
 tests and interpolation kept in float64 in the reference's operation order,
 and ``--fmad=false``, the vertices round to the same float32 values as on the
-CPU. The mesh is the same up to the order of vertices and faces.
+CPU. The mesh is the same up to the order of vertices and faces, except with
+``allow_degenerate=False``, where every coincident vertex is merged (see
+``marching_cubes``).
 """
 
 import functools
@@ -515,6 +517,11 @@ def marching_cubes(
     otherwise. ``level=None`` is halfway between the volume's minimum and
     maximum. Vertex and face order differ. Runs on the device of ``volume``,
     whichever device is current.
+
+    With ``allow_degenerate=False`` the vertices differ from skimage's too:
+    every coincident vertex is merged, where skimage merges only those of
+    degenerate faces, and vertices used only by the dropped faces stay in the
+    array, unreferenced. ``ArrayMesh`` drops them when it merges vertices.
     """
     _require_lookup_tables()
     # skimage's check; the port would otherwise broadcast a shorter spacing

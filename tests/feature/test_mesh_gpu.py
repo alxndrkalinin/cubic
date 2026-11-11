@@ -310,7 +310,11 @@ def test_fractal_dimension_stays_on_the_gpu(gpu_available: bool, monkeypatch) ->
 
 
 def test_mask2mesh_on_gpu(gpu_available: bool) -> None:
-    """A CuPy mask is meshed on the GPU; only ``spacing`` is accepted as a kwarg."""
+    """A CuPy mask is meshed on the GPU.
+
+    Of skimage's keywords, only ``level``, ``spacing`` and ``allow_degenerate``
+    are accepted there; others raise.
+    """
     if not gpu_available:
         pytest.skip("GPU not available")
     mask = ascupy(_labels() == 1)
