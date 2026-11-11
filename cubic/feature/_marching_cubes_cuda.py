@@ -524,11 +524,11 @@ def _marching_cubes_on_device(
     classify(*_grid(ncubes), args + (luts, tri_base, tri_count, edge_used, center_used))
 
     edge_id = cp.cumsum(edge_used, dtype=cp.int32) - 1
-    n_edges = int(edge_id[-1]) + 1 if n else 0
+    n_edges = int(edge_id[-1]) + 1
     center_id = cp.cumsum(center_used, dtype=cp.int32) - 1 + n_edges
-    n_verts = int(center_id[-1]) + 1 if ncubes else n_edges
+    n_verts = int(center_id[-1]) + 1
     face_end = cp.cumsum(tri_count, dtype=cp.int64)
-    n_faces = int(face_end[-1]) if ncubes else 0
+    n_faces = int(face_end[-1])
     if n_verts == 0 or n_faces == 0:
         raise RuntimeError("No surface found at the given iso value.")
 
