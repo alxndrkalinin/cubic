@@ -25,7 +25,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from ..cuda import CUDAManager, _launch_config, _cuda_functions
+from ..cuda import CUDAManager, ascupy, _launch_config, _cuda_functions
 from ._array_mesh import _group_rows
 
 # The lookup tables live in scikit-image's private modules, which a release may
@@ -497,7 +497,7 @@ def _kernels(device_id: int) -> tuple[Any, ...]:
     names = ("mc_classify", "mc_edge_vertices", "mc_center_vertices", "mc_faces")
     kernels = _cuda_functions(defines + _KERNELS, names, device_id)
     with cp.cuda.Device(device_id):
-        return kernels + (cp.asarray(luts),)
+        return kernels + (ascupy(luts),)
 
 
 def marching_cubes(
