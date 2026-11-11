@@ -586,17 +586,30 @@ def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
 
 
 def test_mesh_is_smoothed_only_for_curvature_features(monkeypatch) -> None:
-    """Features that do not need the smoothed mesh never build it."""
+    """Features that need neither the blur nor the smoothed mesh never compute it."""
 
     def fail(*args, **kwargs):
-        raise AssertionError("built the smoothed mesh")
+        raise AssertionError("blurred the mask")
 
-    monkeypatch.setattr(mesh, "_smooth_mask2mesh", fail)
+    monkeypatch.setattr(mesh, "_padded_blur", fail)
     features = mesh.extract_surface_features(
         _ball(8, 22), features=["Volume", "Avg Mean Curvature"]
     )
 
     assert features["Volume"] > 0
+
+
+def test_fractal_dimension_alone_builds_no_smoothed_mesh(monkeypatch) -> None:
+    """Fractal Dimension reuses the blurred level set but needs no mesh object."""
+
+    def fail(*args, **kwargs):
+        raise AssertionError("built the smoothed mesh")
+
+    monkeypatch.setattr(mesh, "_level_set_mesh", fail)
+    name = "Fractal Dimension"
+    features = mesh.extract_surface_features(_ball(8, 22), features=[name])
+
+    assert features[name] == pytest.approx(2, abs=0.05)
 
 
 def test_extract_mesh_features_measures_curvature_on_the_smooth_mesh() -> None:

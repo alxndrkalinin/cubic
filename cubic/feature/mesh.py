@@ -209,8 +209,11 @@ def extract_surface_features(
         return extract_mesh_features(mesh, features=features)
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
     sigma = _curvature_sigma(spacing, curvature_sigma)
-    smooth_mesh = _smooth_mask2mesh(mask, spacing, sigma)
-    if smooth_mesh is None:
+    step = _step(spacing)
+    # Blurred and meshed once, for both the smoothed mesh and Fractal Dimension.
+    smooth_volume, pad = _padded_blur(mask, step, sigma)
+    level_set = _level_set(smooth_volume, step)
+    if level_set is None:
         warnings.warn(
             f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
             f"curvature_sigma={sigma:g}; returning NaN for {blurred}.",
@@ -220,9 +223,14 @@ def extract_surface_features(
             mesh, features=[name for name in features if name not in blurred]
         )
         return {name: rest.get(name, float("nan")) for name in features}
+    smooth_mesh = None
+    if any(name in _SMOOTHED_FEATURES for name in features):
+        smooth_mesh = _level_set_mesh(level_set, pad, step)
     values = extract_mesh_features(mesh, features=on_mesh, smooth_mesh=smooth_mesh)
     if "Fractal Dimension" in features:
-        values["Fractal Dimension"] = _fractal_dimension(mask, spacing, sigma)
+        values["Fractal Dimension"] = _fractal_dimension(
+            mask, step, sigma, smooth_volume, level_set
+        )
     return {name: values[name] for name in features}
 
 
@@ -273,20 +281,19 @@ def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
 def _smooth_mask2mesh(
     mask_3d: np.ndarray, spacing: Sequence[float] | None, sigma: float
 ) -> Any:
-    """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes.
-
-    The blur is isotropic in physical units, so its width in voxels differs per
-    axis on an anisotropic stack.
-    """
+    """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes."""
     step = _step(spacing)
     volume, pad = _padded_blur(mask_3d, step, sigma)
-    if float(volume.max()) <= 0.5:
-        return None
-    verts, faces = _marching_cubes(
-        volume, 0.5, spacing=tuple(step), allow_degenerate=False
-    )
-    offset = to_same_device(pad * step, verts)
-    return _closed_mesh(verts - offset, faces)
+    level_set = _level_set(volume, step)
+    return None if level_set is None else _level_set_mesh(level_set, pad, step)
+
+
+def _level_set_mesh(
+    level_set: tuple[np.ndarray, np.ndarray], pad: np.ndarray, step: np.ndarray
+) -> Any:
+    """Return the closed mesh of a padded blur's level set, in the mask's frame."""
+    verts, faces = level_set
+    return _closed_mesh(verts - to_same_device(pad * step, verts), faces)
 
 
 def _step(spacing: Sequence[float] | None) -> np.ndarray:
@@ -312,13 +319,24 @@ def _padded_blur(
     return volume, pad
 
 
-def _level_set_area(volume: np.ndarray, step: np.ndarray) -> float:
-    """Area of the 0.5 level of ``volume``, on its device; NaN if it has none."""
+def _level_set(
+    volume: np.ndarray, step: np.ndarray
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return ``(verts, faces)`` of the 0.5 level of ``volume``, on its device.
+
+    None if the volume never exceeds 0.5. Vertices are in the volume's frame,
+    padding included.
+    """
     if float(volume.max()) <= 0.5:
+        return None
+    return _marching_cubes(volume, 0.5, spacing=tuple(step), allow_degenerate=False)
+
+
+def _level_set_area(level_set: tuple[np.ndarray, np.ndarray] | None) -> float:
+    """Return the surface area of a level set from ``_level_set``; NaN for None."""
+    if level_set is None:
         return float("nan")
-    verts, faces = _marching_cubes(
-        volume, 0.5, spacing=tuple(step), allow_degenerate=False
-    )
+    verts, faces = level_set
     return float(face_areas(verts.astype(np.float64), faces).sum())
 
 
@@ -573,8 +591,10 @@ def _avg_curvedness(mesh: trimesh.Trimesh) -> float:
 
 def _fractal_dimension(
     mask_3d: np.ndarray,
-    spacing: Sequence[float] | None,
+    step: np.ndarray,
     sigma: float,
+    blurred: np.ndarray,
+    level_set: tuple[np.ndarray, np.ndarray],
     n_levels: int = 5,
 ) -> float:
     """Return ``2 - slope`` of log area ratio against log blur scale.
@@ -588,8 +608,12 @@ def _fractal_dimension(
     staircase cancel in the ratio, which leaves the detail finer than ``sigma``.
     Without the twin, smooth ellipsoids of nucleus size measure 2.05-2.20.
     Every step runs on the mask's device; NaN if any level vanishes.
+
+    ``blurred`` is the mask's padded blur at ``sigma`` and ``level_set`` its 0.5
+    level from ``_level_set``, which the caller has already computed: the twin
+    is thresholded from the first, and the second is the mask's level at the
+    last scale.
     """
-    step = _step(spacing)
     if sigma <= step.min():
         warnings.warn(
             f"Fractal Dimension needs curvature_sigma above the finest voxel "
@@ -597,14 +621,17 @@ def _fractal_dimension(
             stacklevel=3,
         )
         return float("nan")
-    blurred, _ = _padded_blur(mask_3d, step, sigma)
     twin = blurred > 0.5
+
+    def area(volume: np.ndarray, scale: float) -> float:
+        return _level_set_area(_level_set(_padded_blur(volume, step, scale)[0], step))
+
+    # geomspace returns ``sigma`` itself as the last scale, where the mask's
+    # level set is the one already computed
     scales = np.geomspace(step.min(), sigma, n_levels)
-    ratios = [
-        _level_set_area(_padded_blur(mask_3d, step, s)[0], step)
-        / _level_set_area(_padded_blur(twin, step, s)[0], step)
-        for s in scales
-    ]
+    mask_areas = [area(mask_3d, s) for s in scales[:-1]]
+    mask_areas.append(_level_set_area(level_set))
+    ratios = [a / area(twin, s) for a, s in zip(mask_areas, scales)]
     if not np.all(np.isfinite(ratios)):
         warnings.warn(
             f"Fractal Dimension: the mask or its smooth twin vanishes when blurred "
