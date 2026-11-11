@@ -29,6 +29,14 @@ def _canonical(verts: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.nda
     return unique, np.unique(rotated, axis=0)
 
 
+def _assert_same_mesh(v_gpu, f_gpu, v_cpu: np.ndarray, f_cpu: np.ndarray) -> None:
+    """Assert a GPU mesh equals a CPU one bit for bit, up to vertex and face order."""
+    gpu = _canonical(asnumpy(v_gpu), asnumpy(f_gpu))
+    cpu = _canonical(v_cpu, f_cpu)
+    np.testing.assert_array_equal(gpu[0], cpu[0])
+    np.testing.assert_array_equal(gpu[1], cpu[1])
+
+
 def _volumes() -> dict[str, tuple[np.ndarray, float, tuple, bool]]:
     rng = np.random.default_rng(0)
     smooth = ndimage.gaussian_filter(rng.normal(size=(28, 28, 28)), 2).astype(
@@ -75,9 +83,7 @@ def test_gpu_marching_cubes_matches_skimage(name: str, gpu_available: bool) -> N
     v_gpu, f_gpu = marching_cubes_gpu(ascupy(volume), level, spacing, allow_degenerate)
 
     assert asnumpy(v_gpu).dtype == v_cpu.dtype
-    cpu, gpu = _canonical(v_cpu, f_cpu), _canonical(asnumpy(v_gpu), asnumpy(f_gpu))
-    np.testing.assert_array_equal(gpu[0], cpu[0])
-    np.testing.assert_array_equal(gpu[1], cpu[1])
+    _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
 def test_array_mesh_matches_trimesh() -> None:
@@ -95,10 +101,9 @@ def test_array_mesh_matches_trimesh() -> None:
     verts, faces, _, _ = marching_cubes(hollow, spacing=(2.0, 1.0, 1.0))
     reference = trimesh.Trimesh(verts, faces)
     trimesh.repair.fix_normals(reference)
-    names = [n for n in mesh.mesh_feature_list() if n != "Fractal Dimension"]
 
-    expected = mesh.extract_mesh_features(reference, names)
-    got = mesh.extract_mesh_features(ArrayMesh(verts, faces), names)
+    expected = mesh.extract_mesh_features(reference)
+    got = mesh.extract_mesh_features(ArrayMesh(verts, faces))
 
     assert got == pytest.approx(expected, rel=1e-12)
 
@@ -180,7 +185,6 @@ def test_gpu_marching_cubes_runs_on_the_input_device(gpu_available: bool) -> Non
         pytest.skip("needs two GPUs")
     volume, level, spacing, allow_degenerate = _volumes()["anisotropic ball"]
     v_cpu, f_cpu, _, _ = marching_cubes(volume, level, spacing=spacing)
-    cpu = _canonical(v_cpu, f_cpu)
     # float32 is used as is; float64 makes the call copy it to contiguous float32,
     # which the unfixed function did on GPU 0, returning the mesh there
     for dtype in (cp.float32, cp.float64):
@@ -191,9 +195,7 @@ def test_gpu_marching_cubes_runs_on_the_input_device(gpu_available: bool) -> Non
             v_gpu, f_gpu = marching_cubes_gpu(on_1, level, spacing, allow_degenerate)
 
         assert v_gpu.device.id == 1 and f_gpu.device.id == 1
-        gpu = _canonical(asnumpy(v_gpu), asnumpy(f_gpu))
-        np.testing.assert_array_equal(gpu[0], cpu[0])
-        np.testing.assert_array_equal(gpu[1], cpu[1])
+        _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
 def _labels() -> np.ndarray:
