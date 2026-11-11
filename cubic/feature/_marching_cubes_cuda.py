@@ -24,11 +24,21 @@ from typing import Any
 from collections.abc import Sequence
 
 import numpy as np
-from skimage.measure import _marching_cubes_lewiner_luts as _mcluts
-from skimage.measure._marching_cubes_lewiner import _to_array
 
 from ..cuda import CUDAManager, _launch_config, _cuda_functions
 from ._array_mesh import _group_rows
+
+# The lookup tables live in scikit-image's private modules, which a release may
+# move. Only the GPU path reads them, so a failed import must not break
+# ``import cubic.feature.mesh`` for CPU users; marching_cubes raises instead.
+try:
+    from skimage.measure import _marching_cubes_lewiner_luts as _mcluts
+except ImportError:  # pragma: no cover - depends on the scikit-image version
+    _mcluts = None  # type: ignore[assignment]
+try:
+    from skimage.measure._marching_cubes_lewiner import _to_array
+except ImportError:  # pragma: no cover - depends on the scikit-image version
+    _to_array = None  # type: ignore[assignment]
 
 # Lookup tables used by the Lewiner case analysis (the classic table is not).
 _TABLES = (
@@ -435,6 +445,23 @@ extern "C" __global__ void mc_faces(
 """
 
 
+def _require_lookup_tables() -> None:
+    """Raise ``ImportError`` naming the scikit-image internals that did not import."""
+    missing = [
+        name
+        for name, found in (
+            ("skimage.measure._marching_cubes_lewiner_luts", _mcluts),
+            ("skimage.measure._marching_cubes_lewiner._to_array", _to_array),
+        )
+        if found is None
+    ]
+    if missing:
+        raise ImportError(
+            "GPU marching cubes runs on scikit-image's Lewiner lookup tables, "
+            f"but this scikit-image does not provide {', '.join(missing)}."
+        )
+
+
 @functools.cache
 def _lut_layout() -> tuple[np.ndarray, str]:
     """Return the concatenated int8 lookup tables and their offset/shape macros."""
@@ -489,6 +516,7 @@ def marching_cubes(
     maximum. Vertex and face order differ. Runs on the device of ``volume``,
     whichever device is current.
     """
+    _require_lookup_tables()
     # skimage's check; the port would otherwise broadcast a shorter spacing
     if len(spacing) != 3:
         raise ValueError("`spacing` must consist of three floats.")

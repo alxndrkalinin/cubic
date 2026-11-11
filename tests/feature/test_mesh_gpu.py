@@ -8,7 +8,7 @@ from skimage.measure import marching_cubes
 trimesh = pytest.importorskip("trimesh")
 
 from cubic.cuda import ascupy, asnumpy  # noqa: E402
-from cubic.feature import mesh  # noqa: E402
+from cubic.feature import mesh, _marching_cubes_cuda  # noqa: E402
 from cubic.feature._array_mesh import ArrayMesh  # noqa: E402
 from cubic.feature._marching_cubes_cuda import (  # noqa: E402
     marching_cubes as marching_cubes_gpu,
@@ -126,6 +126,21 @@ def test_gpu_marching_cubes_rejects_spacing_of_other_lengths(
         marching_cubes_gpu(ascupy(volume), 0.5, spacing)
     with pytest.raises(ValueError, match=match):
         mesh.mask2mesh(ascupy(mask), spacing=spacing)
+
+
+def test_missing_skimage_tables_break_only_the_gpu_path(monkeypatch) -> None:
+    """Without skimage's private lookup tables only GPU marching cubes fails.
+
+    The CPU path of mask2mesh still meshes, and the GPU entry point names the
+    missing module before any CuPy call, so this needs no GPU.
+    """
+    monkeypatch.setattr(_marching_cubes_cuda, "_mcluts", None)
+    monkeypatch.setattr(_marching_cubes_cuda, "_to_array", None)
+    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
+
+    assert mesh.mask2mesh(z**2 + y**2 + x**2 <= 8**2).volume > 0
+    with pytest.raises(ImportError, match=r"_marching_cubes_lewiner_luts.*_to_array"):
+        marching_cubes_gpu(np.zeros((2, 2, 2), dtype=np.float32), 0.5)
 
 
 def test_array_mesh_matches_trimesh() -> None:
