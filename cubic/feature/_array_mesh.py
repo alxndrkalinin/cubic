@@ -14,6 +14,11 @@ from functools import wraps, cached_property
 
 import numpy as np
 
+try:  # pragma: no cover - optional dependency; mesh.py warns when it is missing
+    import trimesh
+except ImportError:  # pragma: no cover - import failure path
+    trimesh = None  # type: ignore[assignment]
+
 from ..cuda import asnumpy
 
 # trimesh.constants.tol: zero for unitize, merge for angles and convexity.
@@ -152,8 +157,11 @@ class ArrayMesh:
     def to_trimesh(self) -> Any:
         """Return (and cache) a ``trimesh.Trimesh`` of this mesh on the host."""
         if "_host" not in vars(self):
-            import trimesh
-
+            if trimesh is None:
+                raise RuntimeError(
+                    "trimesh is required for mesh operations. Install with "
+                    "'cubic[mesh]'"
+                )
             self._host = trimesh.Trimesh(
                 asnumpy(self.vertices), asnumpy(self.faces), process=False
             )
