@@ -919,7 +919,7 @@ def test_outline_fractal_dimension_of_a_footprint_narrower_than_the_blur() -> No
     blur; the other features stay finite.
     """
     names = [_OUTLINE, "Fractal Dimension", "Volume"]
-    with pytest.warns(UserWarning, match="Outline Fractal Dimension: the footprint"):
+    with pytest.warns(UserWarning, match="Outline Fractal Dimension: the mask or its"):
         features = mesh.extract_surface_features(_ball(8, 22), features=names)
 
     assert np.isnan(features[_OUTLINE])

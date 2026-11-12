@@ -285,14 +285,20 @@ def extract_surface_features(
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
     sigma = _curvature_sigma(spacing, curvature_sigma)
     step = _step(spacing)
+    # Each fractal feature's (lowest, highest) blur scale, resolved once.
+    fd_low, fd_high = (float(step.min()), sigma) if window is None else window
+    in_plane = float(step[1:].max())
+    outline_low, outline_high = (
+        (4 * in_plane, 16 * in_plane) if outline_window is None else outline_window
+    )
     # Features that need the mask's blur at curvature_sigma, which is blurred
-    # and meshed once for all of them. A Fractal Dimension over its own window
-    # does not.
+    # and meshed once for all of them, Fractal Dimension included whenever its
+    # top scale is curvature_sigma.
     at_sigma = [
         name
         for name in blurred
         if name in _SMOOTHED_FEATURES
-        or (name == "Fractal Dimension" and window is None)
+        or (name == "Fractal Dimension" and fd_high == sigma)
     ]
     values: dict[str, float] = {}
     smooth_mesh = None
@@ -317,17 +323,11 @@ def extract_surface_features(
     )
     if "Outline Fractal Dimension" in features:
         values["Outline Fractal Dimension"] = _outline_fractal_dimension(
-            mask, step, outline_window
+            mask, step, outline_low, outline_high
         )
     if "Fractal Dimension" in features and "Fractal Dimension" not in values:
-        if window is not None:
-            low, high = window
-            top_volume, top_pad = _padded_blur(mask, step, high)
-            top_level_set = _level_set(top_volume, step)
-            values["Fractal Dimension"] = _fractal_dimension(
-                mask, step, low, high, top_volume, top_pad, top_level_set
-            )
-        elif sigma <= step.min():
+        # An explicit window is validated, so only the default can be empty.
+        if fd_low >= fd_high:
             warnings.warn(
                 f"Fractal Dimension needs curvature_sigma above the finest voxel "
                 f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
@@ -335,15 +335,19 @@ def extract_surface_features(
             )
             values["Fractal Dimension"] = float("nan")
         else:
+            if fd_high == sigma:
+                top_volume, top_pad, top_level_set = smooth_volume, pad, level_set
+            else:
+                top_volume, top_pad = _padded_blur(mask, step, fd_high)
+                top_level_set = _level_set(top_volume, step)
             values["Fractal Dimension"] = _fractal_dimension(
-                mask, step, float(step.min()), sigma, smooth_volume, pad, level_set
+                mask, step, fd_low, fd_high, top_volume, top_pad, top_level_set
             )
-        top = sigma if window is None else window[1]
         # Half the shortest axis of the same-inertia ellipsoid is the smallest
         # half-extent; the estimate is unbiased only while the top scale stays
         # below half of it.
-        if np.isfinite(values["Fractal Dimension"]) and top > (
-            float(_equivalent_ellipsoid_axes(mesh)[0]) / 4
+        if np.isfinite(values["Fractal Dimension"]) and fd_high > (
+            float(_equivalent_ellipsoid_axes(mesh)[0]) / _THIN_OBJECT_RATIO
         ):
             # One text for every object, so that the default filter reports a
             # label image of many thin objects once.
@@ -351,11 +355,14 @@ def extract_surface_features(
     return {name: values[name] for name in features}
 
 
+# Fractal Dimension reads low once the object's thickness (Min Axis Length) is
+# below this many times the top blur scale.
+_THIN_OBJECT_RATIO = 4
 _THIN_OBJECT_WARNING = (
     "Fractal Dimension: the 3D estimate is biased low for objects thinner than "
-    "four times the top blur scale of its fit (curvature_sigma, or the highest "
-    "of fractal_scales); at least one object is that thin. For flat objects "
-    "imaged along the first axis, see Outline Fractal Dimension."
+    f"{_THIN_OBJECT_RATIO} times the top blur scale of its fit (curvature_sigma, "
+    "or the highest of fractal_scales); at least one object is that thin. For "
+    "flat objects imaged along the first axis, see Outline Fractal Dimension."
 )
 
 
@@ -751,6 +758,58 @@ def _smooth_twin(blurred: np.ndarray, pad: np.ndarray) -> np.ndarray:
     return (blurred > 0.5)[tuple(slice(p, -p) for p in pad)]
 
 
+def _blur_ladder_dimension(
+    name: str,
+    mask: np.ndarray,
+    step: np.ndarray,
+    low: float,
+    high: float,
+    measure: Callable[[np.ndarray], float],
+    top_blur: np.ndarray,
+    top_pad: np.ndarray,
+    top_measure: float,
+    n_levels: int = 5,
+) -> float:
+    """Return ``mask.ndim - 1 - slope`` of log measure ratio against log blur scale.
+
+    The boundary measure (area in 3D, length in 2D) of a boundary of fractal
+    dimension ``D`` taken at resolution ``s`` scales as ``s^(ndim - 1 - D)``.
+    The mask is blurred at ``n_levels`` geometric scales from ``low`` up to
+    ``high``, and ``measure`` of each blur's 0.5 level is divided by the same
+    for the mask's smooth twin, its blur at ``high`` thresholded at 0.5. The
+    twin shares the object's coarse shape and voxel grid, so the shrinking of
+    curved boundaries under blur and the voxel staircase cancel in the ratio,
+    which leaves the detail finer than ``high``. Without the twin, smooth
+    ellipsoids of nucleus size measure 2.05-2.20 in 3D. Every step runs on the
+    mask's device; NaN, with a warning naming ``name``, if any level vanishes.
+
+    ``top_blur`` is the mask's blur at ``high`` with its padding ``top_pad``,
+    and ``top_measure`` the measure of its 0.5 level, which the caller has
+    already computed: the twin is thresholded from the first and cropped to
+    the mask's frame, and the second is the mask's value at the last scale.
+    """
+    twin = _smooth_twin(top_blur, top_pad)
+
+    def at(image: np.ndarray, scale: float) -> float:
+        return measure(_padded_blur(image, step, scale)[0])
+
+    # geomspace returns ``high`` itself as the last scale, where the mask's
+    # measure is the one already computed
+    scales = np.geomspace(low, high, n_levels)
+    mask_values = [at(mask, s) for s in scales[:-1]]
+    mask_values.append(top_measure)
+    ratios = [v / at(twin, s) for v, s in zip(mask_values, scales)]
+    if not np.all(np.isfinite(ratios)):
+        warnings.warn(
+            f"{name}: the mask or its smooth twin vanishes when blurred at a "
+            f"scale up to {high:g} (an object narrower than the blur); "
+            f"returning NaN.",
+            stacklevel=4,
+        )
+        return float("nan")
+    return mask.ndim - 1 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])
+
+
 def _fractal_dimension(
     mask_3d: np.ndarray,
     step: np.ndarray,
@@ -759,46 +818,28 @@ def _fractal_dimension(
     blurred: np.ndarray,
     pad: np.ndarray,
     level_set: tuple[np.ndarray, np.ndarray] | None,
-    n_levels: int = 5,
 ) -> float:
-    """Return ``2 - slope`` of log area ratio against log blur scale.
+    """Return ``2 - slope`` of log surface-area ratio against log blur scale.
 
-    The area of a surface of fractal dimension ``D`` measured at resolution
-    ``s`` scales as ``s^(2 - D)``. The mask is blurred at ``n_levels`` scales
-    from ``low`` up to ``high``, and the area of each blur's 0.5 level is
-    divided by the same area for the mask's smooth twin, its blur at ``high``
-    thresholded at 0.5. The twin shares the object's coarse shape and voxel
-    grid, so the shrinking of curved surfaces under blur and the voxel
-    staircase cancel in the ratio, which leaves the detail finer than ``high``.
-    Without the twin, smooth ellipsoids of nucleus size measure 2.05-2.20.
-    Every step runs on the mask's device; NaN, with a warning, if any level
-    vanishes. ``_outline_fractal_dimension`` is the 2D form on the footprint.
-
+    ``_blur_ladder_dimension`` on the 3D mask, with the area of each level set.
     ``blurred`` is the mask's blur at ``high`` with its padding ``pad``, and
-    ``level_set`` its 0.5 level from ``_level_set``, which the caller has
-    already computed: the twin is thresholded from the first and cropped to the
-    mask's frame, and the second is the mask's level at the last scale.
+    ``level_set`` its 0.5 level from ``_level_set``.
     """
-    twin = _smooth_twin(blurred, pad)
 
-    def area(volume: np.ndarray, scale: float) -> float:
-        return _level_set_area(_level_set(_padded_blur(volume, step, scale)[0], step))
+    def area(volume: np.ndarray) -> float:
+        return _level_set_area(_level_set(volume, step))
 
-    # geomspace returns ``high`` itself as the last scale, where the mask's
-    # level set is the one already computed
-    scales = np.geomspace(low, high, n_levels)
-    mask_areas = [area(mask_3d, s) for s in scales[:-1]]
-    mask_areas.append(_level_set_area(level_set))
-    ratios = [a / area(twin, s) for a, s in zip(mask_areas, scales)]
-    if not np.all(np.isfinite(ratios)):
-        warnings.warn(
-            f"Fractal Dimension: the mask or its smooth twin vanishes when blurred "
-            f"at a scale up to {high:g} (an object thinner than the blur); "
-            f"returning NaN.",
-            stacklevel=3,
-        )
-        return float("nan")
-    return 2 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])
+    return _blur_ladder_dimension(
+        "Fractal Dimension",
+        mask_3d,
+        step,
+        low,
+        high,
+        area,
+        blurred,
+        pad,
+        _level_set_area(level_set),
+    )
 
 
 def _contour_length(field: np.ndarray, plane_step: np.ndarray) -> float:
@@ -816,48 +857,31 @@ def _contour_length(field: np.ndarray, plane_step: np.ndarray) -> float:
 
 
 def _outline_fractal_dimension(
-    mask_3d: np.ndarray,
-    step: np.ndarray,
-    window: tuple[float, float] | None,
-    n_levels: int = 5,
+    mask_3d: np.ndarray, step: np.ndarray, low: float, high: float
 ) -> float:
     """Return ``1 - slope`` of log contour-length ratio against log blur scale.
 
-    The 2D form of ``_fractal_dimension`` on the mask's footprint along the
-    first axis: the footprint is blurred at ``n_levels`` geometric scales over
-    ``window`` (4 to 16 times the coarser in-plane spacing by default), and the
-    length of each blur's 0.5 contour is divided by the same length for the
-    footprint's smooth twin, its blur at the top scale thresholded at 0.5.
-    Every step runs on the mask's device; NaN, with a warning, if any contour
-    vanishes.
+    ``_blur_ladder_dimension`` on the mask's footprint along the first axis,
+    with the length of each blur's 0.5 contour and the in-plane spacing.
     """
     footprint = mask_3d.any(axis=0)
     plane_step = step[1:]
-    if window is None:
-        low, high = 4 * float(plane_step.max()), 16 * float(plane_step.max())
-    else:
-        low, high = window
     top, pad = _padded_blur(footprint, plane_step, high)
-    twin = _smooth_twin(top, pad)
 
-    def length(image: np.ndarray, scale: float) -> float:
-        return _contour_length(_padded_blur(image, plane_step, scale)[0], plane_step)
+    def length(field: np.ndarray) -> float:
+        return _contour_length(field, plane_step)
 
-    # geomspace returns ``high`` itself as the last scale, where the footprint's
-    # blur is the one already computed
-    scales = np.geomspace(low, high, n_levels)
-    lengths = [length(footprint, s) for s in scales[:-1]]
-    lengths.append(_contour_length(top, plane_step))
-    ratios = [a / length(twin, s) for a, s in zip(lengths, scales)]
-    if not np.all(np.isfinite(ratios)):
-        warnings.warn(
-            f"Outline Fractal Dimension: the footprint or its smooth twin vanishes "
-            f"when blurred at a scale up to {high:g} (an outline narrower than the "
-            f"blur); returning NaN.",
-            stacklevel=3,
-        )
-        return float("nan")
-    return 1 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])
+    return _blur_ladder_dimension(
+        "Outline Fractal Dimension",
+        footprint,
+        plane_step,
+        low,
+        high,
+        length,
+        top,
+        pad,
+        length(top),
+    )
 
 
 # Measured on the smoothed mesh when one is available; see mesh_feature_list.
