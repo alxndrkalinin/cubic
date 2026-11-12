@@ -9,6 +9,7 @@ bounding primitives to trimesh on the host.
 
 from __future__ import annotations
 
+import numbers
 import warnings
 from typing import Any, TypeVar, Callable, SupportsFloat
 from functools import wraps
@@ -272,6 +273,9 @@ def extract_surface_features(
 
     Raises
     ------
+    TypeError
+        If ``fractal_scales`` or ``outline_fractal_scales`` is not a sequence
+        of real numbers.
     ValueError
         If ``fractal_scales`` or ``outline_fractal_scales`` is not two finite
         numbers with ``0 < lowest < highest``.
@@ -388,21 +392,30 @@ def _fractal_window(
 ) -> tuple[float, float] | None:
     """Return ``(lowest, highest)`` of the window ``keyword``, or None for None.
 
-    Raises ``ValueError``, naming ``keyword``, unless they are two finite
+    Raises ``TypeError``, naming ``keyword``, unless it is a sequence (or 1D
+    array) of real numbers, and ``ValueError`` unless those are two finite
     numbers with ``0 < lowest < highest``.
     """
     if scales is None:
         return None
+    # str and bytes are sequences, of characters and of byte values.
+    is_array = isinstance(scales, np.ndarray) and scales.ndim == 1
+    if isinstance(scales, (str, bytes)) or not (
+        is_array or isinstance(scales, Sequence)
+    ):
+        raise TypeError(
+            f"{keyword} must be a sequence of two numbers (lowest, highest); "
+            f"got {scales!r}"
+        )
+    if not all(isinstance(s, numbers.Real) for s in scales):
+        raise TypeError(f"{keyword} must hold real numbers; got {scales!r}")
     message = (
         f"{keyword} must be two finite numbers (lowest, highest) with "
         f"0 < lowest < highest; got {scales!r}"
     )
-    if isinstance(scales, str):
+    if len(scales) != 2:
         raise ValueError(message)
-    try:
-        low, high = (float(s) for s in scales)
-    except (TypeError, ValueError) as e:
-        raise ValueError(message) from e
+    low, high = (float(s) for s in scales)
     # False for NaN and for either infinity, too.
     if not 0 < low < high < float("inf"):
         raise ValueError(message)

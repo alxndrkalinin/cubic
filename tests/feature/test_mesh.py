@@ -627,36 +627,39 @@ def test_fractal_window_does_not_need_curvature_sigma() -> None:
 
 
 @pytest.mark.parametrize(
-    "scales",
+    ("scales", "error"),
     [
-        (1.0,),
-        (1.0, 2.0, 3.0),
-        (2.0, 1.0),
-        (1.0, 1.0),
-        (0.0, 1.0),
-        (-1.0, 1.0),
-        (1.0, float("inf")),
-        (float("nan"), 1.0),
-        (1.0, float("nan")),
-        (float("-inf"), 1.0),
-        ("a", "b"),
-        "12",
-        2.0,
+        ((1.0,), ValueError),
+        ((1.0, 2.0, 3.0), ValueError),
+        ((2.0, 1.0), ValueError),
+        ((1.0, 1.0), ValueError),
+        ((0.0, 1.0), ValueError),
+        ((-1.0, 1.0), ValueError),
+        ((1.0, float("inf")), ValueError),
+        ((float("nan"), 1.0), ValueError),
+        ((1.0, float("nan")), ValueError),
+        ((float("-inf"), 1.0), ValueError),
+        (("a", "b"), TypeError),
+        ("12", TypeError),
+        (b"12", TypeError),
+        ({1.0: None, 2.0: None}, TypeError),
+        (2.0, TypeError),
     ],
 )
 @pytest.mark.parametrize("keyword", ["fractal_scales", "outline_fractal_scales"])
-def test_fractal_window_is_validated(scales, keyword: str) -> None:
+def test_fractal_window_is_validated(scales, error: type, keyword: str) -> None:
     """A window that is not two finite numbers 0 < lowest < highest raises.
 
-    The error names the keyword. It raises before any meshing, so also on a
-    label image without labels.
+    TypeError when it is not a sequence of numbers, ValueError when the values
+    or their count are wrong. The error names the keyword. It raises before
+    any meshing, so also on a label image without labels.
     """
-    match = f"^{keyword} must be two finite numbers"
-    with pytest.raises(ValueError, match=match):
+    match = f"^{keyword} must"
+    with pytest.raises(error, match=match):
         mesh.extract_surface_features(
             _ball(8, 22), features=["Fractal Dimension"], **{keyword: scales}
         )
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(error, match=match):
         mesh.extract_features(np.zeros((4, 4, 4), np.int32), **{keyword: scales})
 
 
