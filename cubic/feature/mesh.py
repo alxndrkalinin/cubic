@@ -83,7 +83,9 @@ def mesh_feature_list() -> list[str]:
     (its blur at the top scale). The scales run from the finest voxel spacing
     to ``curvature_sigma``, or over ``fractal_scales`` when it is given (see
     ``extract_surface_features``). It is about 2 for a surface without such
-    detail, whatever its size and coarse shape, and rises with roughness. It is
+    detail, whatever its size and coarse shape, and rises with roughness, as
+    long as the top scale is at most a quarter of the object's thickness
+    (``Min Axis Length``). Above that it reads low, and a warning says so. It is
     measured on the mask, so ``extract_mesh_features`` cannot compute it.
     """
     return [*_MESH_FEATURES, *_MASK_FEATURES]
@@ -224,7 +226,10 @@ def extract_surface_features(
         fractal-dimension fit, which uses 5 geometric scales between them and
         a smooth twin blurred at the highest. Both must be finite, with
         ``0 < lowest < highest``. Defaults to the finest voxel spacing up to
-        ``curvature_sigma``.
+        ``curvature_sigma``. When the highest scale exceeds a quarter of the
+        object's ``Min Axis Length``, the value is still returned, with a
+        warning that it is biased low; the warning text is the same for every
+        object, so Python's default filter shows it once.
 
     Raises
     ------
@@ -290,7 +295,24 @@ def extract_surface_features(
             values["Fractal Dimension"] = _fractal_dimension(
                 mask, step, float(step.min()), sigma, smooth_volume, pad, level_set
             )
+        top = sigma if window is None else window[1]
+        # Half the shortest axis of the same-inertia ellipsoid is the smallest
+        # half-extent; the estimate is unbiased only while the top scale stays
+        # below half of it.
+        if np.isfinite(values["Fractal Dimension"]) and top > (
+            float(_equivalent_ellipsoid_axes(mesh)[0]) / 4
+        ):
+            # One text for every object, so that the default filter reports a
+            # label image of many thin objects once.
+            warnings.warn(_THIN_OBJECT_WARNING, stacklevel=2)
     return {name: values[name] for name in features}
+
+
+_THIN_OBJECT_WARNING = (
+    "Fractal Dimension: the 3D estimate is biased low for objects thinner than "
+    "four times the top blur scale of its fit (curvature_sigma, or the highest "
+    "of fractal_scales); at least one object is that thin."
+)
 
 
 def _fractal_window(scales: Sequence[float] | None) -> tuple[float, float] | None:

@@ -616,6 +616,82 @@ def test_extract_features_forwards_the_fractal_window() -> None:
     assert values[0, 0] == expected[name[0]] != default[name[0]]
 
 
+def _slab(planes: int, shape=(12, 60, 60)) -> np.ndarray:
+    """Return a square slab ``planes`` voxels thick, 40 voxels wide."""
+    slab = np.zeros(shape, dtype=bool)
+    z0 = (shape[0] - planes) // 2
+    slab[z0 : z0 + planes, 10:50, 10:50] = True
+    return slab
+
+
+def _thin_warnings(caught) -> list:
+    return [w for w in caught if "biased low for objects thinner" in str(w.message)]
+
+
+def test_fractal_dimension_warns_for_an_object_thinner_than_four_top_scales() -> None:
+    """A slab under 4 x curvature_sigma thick warns once and keeps its value.
+
+    The 6-plane slab is 1.8 um thick, its Min Axis Length 2.3 um, below 4 x 0.6
+    um; the ellipsoid's is 5 um. A window topping out at 0.5 um clears the slab.
+    """
+    names = ["Fractal Dimension", "Min Axis Length"]
+    results = {}
+    for name, mask, scales in [
+        ("slab", _slab(6), None),
+        ("ball", _rough_ellipsoid(0), None),
+        ("slab, low window", _slab(6), (0.13, 0.5)),
+    ]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            features = mesh.extract_surface_features(
+                mask, _NUCLEUS_SPACING, names, fractal_scales=scales
+            )
+        results[name] = (len(_thin_warnings(caught)), features)
+
+    count, slab = results["slab"]
+    assert count == 1
+    assert slab["Min Axis Length"] < 4 * 0.6
+    assert np.isfinite(slab["Fractal Dimension"])
+    for name in ("ball", "slab, low window"):
+        count, features = results[name]
+        assert count == 0
+        assert np.isfinite(features["Fractal Dimension"])
+
+
+def test_thin_object_warning_is_shown_once_for_a_label_image() -> None:
+    """Many thin labels give one warning under Python's default filter.
+
+    The slabs differ in thickness and width, so a text naming each object's
+    size would be shown once per label.
+    """
+    labels = np.zeros((12, 60, 180), dtype=np.int32)
+    for i, (planes, width) in enumerate([(6, 40), (5, 34), (6, 28)]):
+        labels[3 : 3 + planes, 10 : 10 + width, 60 * i : 60 * i + width] = i + 1
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        _, values, _ = mesh.extract_features(
+            labels, ["Fractal Dimension"], spacing=_NUCLEUS_SPACING
+        )
+
+    assert len(_thin_warnings(caught)) == 1
+    assert np.isfinite(values).all()
+
+
+def test_thin_object_check_runs_only_for_fractal_dimension(monkeypatch) -> None:
+    """Without Fractal Dimension the ellipsoid axes are never computed."""
+
+    def fail(*args, **kwargs):
+        raise AssertionError("computed the ellipsoid axes")
+
+    monkeypatch.setattr(mesh, "_equivalent_ellipsoid_axes", fail)
+    features = mesh.extract_surface_features(
+        _slab(6), _NUCLEUS_SPACING, ["Volume", "Avg Curvedness"]
+    )
+
+    assert features["Volume"] > 0
+
+
 def test_fractal_dimension_needs_the_mask() -> None:
     """extract_mesh_features refuses D and leaves it out of its defaults.
 
