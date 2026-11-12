@@ -50,15 +50,17 @@ def _require_trimesh(func: F) -> F:
     return wrapper  # type: ignore[return-value]
 
 
-def mesh_feature_list() -> list[str]:
+def mesh_feature_list(optional: bool = False) -> list[str]:
     """Return the names of the surface features of a label, in column order.
 
-    ``extract_features`` and ``extract_surface_features`` return these. All but
+    ``extract_features`` and ``extract_surface_features`` return the default
+    features. With ``optional=True`` the optional ones follow them; those are
+    computed only when requested by name (``features=[...]``). All but
     ``Fractal Dimension`` and ``Outline Fractal Dimension``, which are measured
     on the mask, are measured on a mesh of it.
 
-    No feature but ``Outline Fractal Dimension`` is defined on the image axes.
-    The axis lengths are the full axes
+    No default feature is defined on the image axes. The axis lengths are the
+    full axes
     of the ellipsoid with the same inertia, and ``Extent`` is the volume over the
     oriented bounding box volume. Voxelization still moves every feature a little
     with orientation, and the oriented box and bounding cylinder come from
@@ -88,23 +90,32 @@ def mesh_feature_list() -> list[str]:
     long as the top scale is at most a quarter of the object's thickness
     (``Min Axis Length``). Above that it reads low, and a warning says so.
 
-    ``Outline Fractal Dimension`` is the same construction on the outline of the
-    mask's projection along the first axis: ``1 - slope`` of log contour length
-    of the blurred footprint against log blur scale, relative to the footprint's
-    smooth twin, with the blur isotropic in the in-plane spacing. Its scales run
-    from 4 to 16 times the coarser in-plane spacing, or over ``fractal_scales``.
-    It is about 1 for a smooth outline and rises with outline roughness, and it
-    does not read low for flat objects. It is the one feature defined on the
-    image axes, meant for adherent, flat objects imaged along the first axis:
-    turning an object about that axis leaves it nearly unchanged, tilting it
-    does not. Both fractal dimensions are measured on the mask, so
-    ``extract_mesh_features`` cannot compute them.
+    ``Outline Fractal Dimension``, the one optional feature, is the same
+    construction on the outline of the mask's projection along the first axis:
+    ``1 - slope`` of log contour length of the blurred footprint against log
+    blur scale, relative to the footprint's smooth twin, with the blur isotropic
+    in the in-plane spacing. Its scales run from 4 to 16 times the coarser
+    in-plane spacing, or over ``fractal_scales``. It is about 1 for a smooth
+    outline and rises with outline roughness, and it does not read low for
+    flat objects. It is defined on the image axes, and meant for adherent, flat
+    objects imaged along the first axis: turning an object about that axis
+    leaves it nearly unchanged, tilting it does not. Its footprint must be
+    wide against the top scale: a disc narrower than about 3.2 times the top
+    scale (51 voxels across at the default window) gives NaN, with a warning,
+    because its smooth twin vanishes, and a smooth disc reads 0.95 at 4 and
+    0.99 at 5 times the top scale across. Both fractal dimensions are measured
+    on the mask, so ``extract_mesh_features`` cannot compute them.
     """
-    return [*_MESH_FEATURES, *_MASK_FEATURES]
+    if optional:
+        return [*_MESH_FEATURES, *_MASK_FEATURES]
+    return [*_MESH_FEATURES, *_DEFAULT_MASK_FEATURES]
 
 
 def _resolve_features(features: Sequence[str] | None) -> list[str]:
-    """Return ``features``, or all of them for ``None``; raise for unknown names."""
+    """Return ``features``, or the default ones for ``None``; raise for unknown names.
+
+    An explicit list may name default and optional features.
+    """
     if features is None:
         return mesh_feature_list()
     # A string is a sequence too, and would be checked letter by letter.
@@ -112,12 +123,10 @@ def _resolve_features(features: Sequence[str] | None) -> list[str]:
         raise TypeError(
             f"features must be a sequence of names, not the string {features!r}"
         )
-    known = mesh_feature_list()
+    known = mesh_feature_list(optional=True)
     unknown = [name for name in features if name not in known]
     if unknown:
-        raise ValueError(
-            f"Unknown mesh features {unknown}; available: {mesh_feature_list()}"
-        )
+        raise ValueError(f"Unknown mesh features {unknown}; available: {known}")
     return list(features)
 
 
@@ -142,7 +151,9 @@ def extract_features(
         excluded. A CuPy image is meshed and measured on the GPU.
     features : list of str, optional
         Feature names to extract, defaults to ``mesh_feature_list()``; the
-        columns follow this order. Only these features are computed.
+        columns follow this order. Only these features are computed. Optional
+        features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
+        Dimension``) are computed only when named here.
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)`` forwarded to marching cubes. Without it an
         anisotropic stack is meshed as if isotropic, scaling volumes and areas
@@ -221,7 +232,9 @@ def extract_surface_features(
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)``.
     features : sequence of str, optional
-        Feature names to compute, defaults to ``mesh_feature_list()``.
+        Feature names to compute, defaults to ``mesh_feature_list()``. Optional
+        features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
+        Dimension``) are computed only when named here.
     curvature_sigma : float, optional
         Gaussian blur scale, in units of ``spacing``, of the mask that the
         curvature-distribution features are measured on. Defaults to twice the
@@ -843,7 +856,10 @@ _SMOOTHED_FEATURES = (
 )
 
 # Measured on the mask itself, at several blur scales; see mesh_feature_list.
-_MASK_FEATURES = ("Fractal Dimension", "Outline Fractal Dimension")
+# The optional ones are computed only when requested by name.
+_DEFAULT_MASK_FEATURES = ("Fractal Dimension",)
+_OPTIONAL_FEATURES = ("Outline Fractal Dimension",)
+_MASK_FEATURES = (*_DEFAULT_MASK_FEATURES, *_OPTIONAL_FEATURES)
 
 # Each feature is computed only when requested; the dict order is the default
 # column order of ``mesh_feature_list``.

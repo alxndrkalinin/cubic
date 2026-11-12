@@ -71,8 +71,8 @@ def test_extract_features_excludes_background_label(surface_calls) -> None:
     filtering alone.
     """
     names = mesh.mesh_feature_list()
-    assert len(names) == 23
-    assert names[-2:] == ["Fractal Dimension", "Outline Fractal Dimension"]
+    assert len(names) == 22
+    assert names[-1] == "Fractal Dimension"
     volume = np.zeros((12, 12, 12), dtype=np.int32)
     volume[2:6, 2:6, 2:6] = 1  # 64 voxels
     volume[7:11, 7:11, 7:11] = 2  # 64 voxels
@@ -124,9 +124,56 @@ def test_extract_features_with_no_features_meshes_nothing(surface_calls) -> None
 
 @pytest.mark.parametrize("label", [0, 1])
 def test_extract_features_rejects_unknown_feature_names(label: int) -> None:
-    """An unknown name raises before any label is meshed, even with no labels."""
-    with pytest.raises(ValueError, match=r"Unknown mesh features \['Scale'\]"):
+    """An unknown name raises before any label is meshed, even with no labels.
+
+    The message lists the optional features too.
+    """
+    with pytest.raises(
+        ValueError,
+        match=r"Unknown mesh features \['Scale'\].*'Outline Fractal Dimension'",
+    ):
         mesh.extract_features(_cube_volume(4) * label, ["Volume", "Scale"])
+
+
+def test_outline_fractal_dimension_is_optional() -> None:
+    """The default features leave out the outline; the optional list ends with it.
+
+    The defaults are the 22 orientation-invariant features. Every entry point
+    computes the outline when it is named.
+    """
+    default = mesh.mesh_feature_list()
+    full = mesh.mesh_feature_list(optional=True)
+
+    assert len(default) == 22 and "Outline Fractal Dimension" not in default
+    assert full == [*default, "Outline Fractal Dimension"]
+
+    labels = np.zeros((3, 80, 80), dtype=np.int32)
+    labels[1, 2:78, 2:78] = 1
+    _, values, columns = mesh.extract_features(labels, ["Outline Fractal Dimension"])
+    assert columns == ["Outline Fractal Dimension"]
+    assert np.isfinite(values).all()
+    crop = labels[ndimage.find_objects(labels)[0]] == 1
+    surface = mesh.extract_surface_features(
+        crop, features=["Volume", "Outline Fractal Dimension"]
+    )
+    assert list(surface) == ["Volume", "Outline Fractal Dimension"]
+    assert surface["Outline Fractal Dimension"] == values[0, 0]
+
+
+def test_default_features_skip_the_outline(monkeypatch) -> None:
+    """features=None never computes the optional outline."""
+
+    def fail(*args, **kwargs):
+        raise AssertionError("computed the outline")
+
+    monkeypatch.setattr(mesh, "_outline_fractal_dimension", fail)
+    labels = _ball(8, 22).astype(np.int32)
+
+    _, values, columns = mesh.extract_features(labels)
+    features = mesh.extract_surface_features(labels == 1)
+
+    assert values.shape == (1, 22) and columns == mesh.mesh_feature_list()
+    assert list(features) == mesh.mesh_feature_list()
 
 
 def test_extract_features_rejects_a_bare_feature_name() -> None:
@@ -306,9 +353,8 @@ def test_extract_surface_features_full_pipeline() -> None:
     The cube touches the volume border and is large enough to survive the
     default curvature blur.
     """
-    # 60 voxels wide, so the footprint survives the outline's 16-voxel blur.
-    cube = np.zeros((14, 64, 64), dtype=bool)
-    cube[:10, :60, :60] = True
+    cube = np.zeros((14, 14, 14), dtype=bool)
+    cube[:10, :10, :10] = True
     features = mesh.extract_surface_features(cube)
 
     assert set(features) == set(mesh.mesh_feature_list())
