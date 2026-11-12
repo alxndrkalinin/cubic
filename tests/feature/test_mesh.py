@@ -53,7 +53,12 @@ def surface_calls(monkeypatch) -> list[dict]:
     calls: list[dict] = []
 
     def fake_surface_features(
-        mask, spacing=None, features=None, curvature_sigma=None, fractal_scales=None
+        mask,
+        spacing=None,
+        features=None,
+        curvature_sigma=None,
+        fractal_scales=None,
+        outline_fractal_scales=None,
     ) -> dict[str, float]:
         calls.append({"mask": mask, "spacing": spacing})
         return dict.fromkeys(features or mesh.mesh_feature_list(), 0.0)
@@ -631,23 +636,46 @@ def test_fractal_window_does_not_need_curvature_sigma() -> None:
         (-1.0, 1.0),
         (1.0, float("inf")),
         (float("nan"), 1.0),
+        (1.0, float("nan")),
+        (float("-inf"), 1.0),
         ("a", "b"),
         "12",
         2.0,
     ],
 )
-def test_fractal_window_is_validated(scales) -> None:
+@pytest.mark.parametrize("keyword", ["fractal_scales", "outline_fractal_scales"])
+def test_fractal_window_is_validated(scales, keyword: str) -> None:
     """A window that is not two finite numbers 0 < lowest < highest raises.
 
-    It raises before any meshing, so also on a label image without labels.
+    The error names the keyword. It raises before any meshing, so also on a
+    label image without labels.
     """
-    match = "fractal_scales must be two finite numbers"
+    match = f"^{keyword} must be two finite numbers"
     with pytest.raises(ValueError, match=match):
         mesh.extract_surface_features(
-            _ball(8, 22), features=["Fractal Dimension"], fractal_scales=scales
+            _ball(8, 22), features=["Fractal Dimension"], **{keyword: scales}
         )
     with pytest.raises(ValueError, match=match):
-        mesh.extract_features(np.zeros((4, 4, 4), np.int32), fractal_scales=scales)
+        mesh.extract_features(np.zeros((4, 4, 4), np.int32), **{keyword: scales})
+
+
+def test_each_fractal_window_moves_only_its_own_feature() -> None:
+    """fractal_scales leaves the outline bitwise as is, and the other way round."""
+    mask = _rough_cylinder(0.04)
+    names = ["Fractal Dimension", _OUTLINE]
+
+    def measure(**windows) -> dict[str, float]:
+        return mesh.extract_surface_features(mask, _FLAT_SPACING, names, **windows)
+
+    default = measure()
+    by_3d = measure(fractal_scales=(0.15, 0.4))
+    by_outline = measure(outline_fractal_scales=(0.3, 0.9))
+
+    assert by_3d[_OUTLINE] == default[_OUTLINE]
+    assert by_3d["Fractal Dimension"] != default["Fractal Dimension"]
+    assert by_outline["Fractal Dimension"] == default["Fractal Dimension"]
+    assert by_outline[_OUTLINE] != default[_OUTLINE]
+    assert all(np.isfinite(v) for f in (by_3d, by_outline) for v in f.values())
 
 
 def test_extract_features_forwards_the_fractal_window() -> None:
@@ -757,9 +785,9 @@ def test_fractal_dimension_needs_the_mask(name: str) -> None:
 _OUTLINE = "Outline Fractal Dimension"
 
 
-def _outline_fd(mask: np.ndarray, spacing=None, fractal_scales=None) -> float:
+def _outline_fd(mask: np.ndarray, spacing=None, scales=None) -> float:
     return mesh.extract_surface_features(
-        mask, spacing=spacing, features=[_OUTLINE], fractal_scales=fractal_scales
+        mask, spacing=spacing, features=[_OUTLINE], outline_fractal_scales=scales
     )[_OUTLINE]
 
 
@@ -869,7 +897,10 @@ def test_outline_fractal_dimension_is_measured_along_the_first_axis() -> None:
 
 
 def test_outline_fractal_window() -> None:
-    """The default window is 4 to 16 coarser in-plane voxels; fractal_scales moves it."""
+    """The default window is 4 to 16 coarser in-plane voxels.
+
+    outline_fractal_scales moves it.
+    """
     mask = _rough_cylinder(0.04)
     default = _outline_fd(mask, _FLAT_SPACING)
 

@@ -330,9 +330,9 @@ def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:
 
 
 @pytest.mark.parametrize("spacing", [(0.29, 0.108, 0.108), (0.5, 0.2, 0.1)])
-@pytest.mark.parametrize("fractal_scales", [None, (0.3, 1.2)])
+@pytest.mark.parametrize("outline_fractal_scales", [None, (0.3, 1.2)])
 def test_outline_fractal_dimension_stays_on_the_gpu(
-    spacing: tuple, fractal_scales, gpu_available: bool, monkeypatch
+    spacing: tuple, outline_fractal_scales, gpu_available: bool, monkeypatch
 ) -> None:
     """Outline Fractal Dimension of a CuPy mask runs on the GPU and matches the CPU.
 
@@ -348,7 +348,7 @@ def test_outline_fractal_dimension_stays_on_the_gpu(
     monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
     mask = _rough_flat_ellipsoid(spacing)
     name = "Outline Fractal Dimension"
-    kwargs = {"spacing": spacing, "fractal_scales": fractal_scales}
+    kwargs = {"spacing": spacing, "outline_fractal_scales": outline_fractal_scales}
 
     on_gpu = mesh.extract_surface_features(ascupy(mask), features=[name], **kwargs)
     on_cpu = mesh.extract_surface_features(mask, features=[name], **kwargs)

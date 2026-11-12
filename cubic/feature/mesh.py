@@ -95,7 +95,7 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     ``1 - slope`` of log contour length of the blurred footprint against log
     blur scale, relative to the footprint's smooth twin, with the blur isotropic
     in the in-plane spacing. Its scales run from 4 to 16 times the coarser
-    in-plane spacing, or over ``fractal_scales``. It is about 1 for a smooth
+    in-plane spacing, or over ``outline_fractal_scales``. It is about 1 for a smooth
     outline and rises with outline roughness, and it does not read low for
     flat objects. It is defined on the image axes, and meant for adherent, flat
     objects imaged along the first axis: turning an object about that axis
@@ -137,6 +137,7 @@ def extract_features(
     spacing: Sequence[float] | None = None,
     curvature_sigma: float | None = None,
     fractal_scales: Sequence[float] | None = None,
+    outline_fractal_scales: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Extract mesh features for every label of a label image.
 
@@ -163,7 +164,10 @@ def extract_features(
         curvature-distribution features; see ``extract_surface_features``.
     fractal_scales : sequence of float, optional
         ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
-        fractal-dimension fits; see ``extract_surface_features``.
+        ``Fractal Dimension`` fit; see ``extract_surface_features``.
+    outline_fractal_scales : sequence of float, optional
+        ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
+        ``Outline Fractal Dimension`` fit; see ``extract_surface_features``.
 
     Returns
     -------
@@ -191,7 +195,8 @@ def extract_features(
     # Resolved before any meshing, so an unknown name or a bad window fails
     # even on an image without labels.
     features = _resolve_features(features)
-    _fractal_window(fractal_scales)
+    _fractal_window(fractal_scales, "fractal_scales")
+    _fractal_window(outline_fractal_scales, "outline_fractal_scales")
     if not features:
         return labels, np.empty((len(labels), 0)), features
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
@@ -206,6 +211,7 @@ def extract_features(
             features=features,
             curvature_sigma=curvature_sigma,
             fractal_scales=fractal_scales,
+            outline_fractal_scales=outline_fractal_scales,
         )
         feature_values.append([mesh_features[feat] for feat in features])
 
@@ -222,6 +228,7 @@ def extract_surface_features(
     features: Sequence[str] | None = None,
     curvature_sigma: float | None = None,
     fractal_scales: Sequence[float] | None = None,
+    outline_fractal_scales: Sequence[float] | None = None,
 ) -> dict[str, float]:
     """Generate mesh from a single label mask and extract its surface features.
 
@@ -248,26 +255,29 @@ def extract_surface_features(
         warning.
     fractal_scales : sequence of float, optional
         ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
-        fractal-dimension fits, applied to both ``Fractal Dimension`` and
-        ``Outline Fractal Dimension``. Each fit uses 5 geometric scales between
-        them and a smooth twin blurred at the highest. Both must be finite,
-        with ``0 < lowest < highest``. Without it, ``Fractal Dimension`` spans
-        the finest voxel spacing up to ``curvature_sigma``, and ``Outline
-        Fractal Dimension`` 4 to 16 times the coarser in-plane spacing. An
-        outline that vanishes at these scales gives NaN, with a warning. When
-        the highest scale of ``Fractal Dimension`` exceeds a quarter of the
+        ``Fractal Dimension`` fit, which uses 5 geometric scales between them
+        and a smooth twin blurred at the highest. Both must be finite, with
+        ``0 < lowest < highest``. Defaults to the finest voxel spacing up to
+        ``curvature_sigma``. When the highest scale exceeds a quarter of the
         object's ``Min Axis Length``, the value is still returned, with a
         warning that it is biased low; the warning text is the same for every
         object, so Python's default filter shows it once.
+    outline_fractal_scales : sequence of float, optional
+        ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
+        ``Outline Fractal Dimension`` fit, in the same form as
+        ``fractal_scales``. Defaults to 4 to 16 times the coarser in-plane
+        spacing. An outline that vanishes at these scales gives NaN, with a
+        warning.
 
     Raises
     ------
     ValueError
-        If ``fractal_scales`` is not two finite numbers with
-        ``0 < lowest < highest``.
+        If ``fractal_scales`` or ``outline_fractal_scales`` is not two finite
+        numbers with ``0 < lowest < highest``.
     """
     features = _resolve_features(features)
-    window = _fractal_window(fractal_scales)
+    window = _fractal_window(fractal_scales, "fractal_scales")
+    outline_window = _fractal_window(outline_fractal_scales, "outline_fractal_scales")
     mesh = mask2mesh(mask, spacing=spacing)
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
     if not blurred:
@@ -307,7 +317,7 @@ def extract_surface_features(
     )
     if "Outline Fractal Dimension" in features:
         values["Outline Fractal Dimension"] = _outline_fractal_dimension(
-            mask, step, window
+            mask, step, outline_window
         )
     if "Fractal Dimension" in features and "Fractal Dimension" not in values:
         if window is not None:
@@ -349,16 +359,18 @@ _THIN_OBJECT_WARNING = (
 )
 
 
-def _fractal_window(scales: Sequence[float] | None) -> tuple[float, float] | None:
-    """Return ``(lowest, highest)`` of ``fractal_scales``, or None for None.
+def _fractal_window(
+    scales: Sequence[float] | None, keyword: str
+) -> tuple[float, float] | None:
+    """Return ``(lowest, highest)`` of the window ``keyword``, or None for None.
 
-    Raises ``ValueError`` unless they are two finite numbers with
-    ``0 < lowest < highest``.
+    Raises ``ValueError``, naming ``keyword``, unless they are two finite
+    numbers with ``0 < lowest < highest``.
     """
     if scales is None:
         return None
     message = (
-        "fractal_scales must be two finite numbers (lowest, highest) with "
+        f"{keyword} must be two finite numbers (lowest, highest) with "
         f"0 < lowest < highest; got {scales!r}"
     )
     if isinstance(scales, str):
