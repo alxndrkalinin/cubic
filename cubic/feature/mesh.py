@@ -57,19 +57,19 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     features. With ``optional=True`` the optional ones follow them; those are
     computed only when requested by name (``features=[...]``). All but
     ``Fractal Dimension`` and ``Outline Fractal Dimension``, which are measured
-    on the mask, are measured on a mesh of it.
+    on the mask at several blur scales, are measured on a mesh of it, so
+    ``extract_mesh_features`` cannot compute those two.
 
     No default feature is defined on the image axes. The axis lengths are the
-    full axes
-    of the ellipsoid with the same inertia, and ``Extent`` is the volume over the
-    oriented bounding box volume. Voxelization still moves every feature a little
-    with orientation, and the oriented box and bounding cylinder come from
-    trimesh's approximate minimum searches, so they move more: ``Extent`` spans
-    0.50-0.55 for one ellipsoid turned by 0, 30 and 45 degrees. The mean
-    curvature is averaged over the surface, in inverse units of ``spacing``.
-    ``Euler Characteristic`` is twice the number of separate pieces plus
-    cavities, minus twice the number of handles: 2 for a ball, 4 for a hollow
-    ball, 0 for a torus.
+    full axes of the ellipsoid with the same inertia, and ``Extent`` is the
+    volume over the oriented bounding box volume. Voxelization still moves
+    every feature a little with orientation, and the oriented box and bounding
+    cylinder come from trimesh's approximate minimum searches, so they move
+    more: ``Extent`` spans 0.50-0.55 for one ellipsoid turned by 0, 30 and 45
+    degrees. The mean curvature is averaged over the surface, in inverse units
+    of ``spacing``. ``Euler Characteristic`` is twice the number of separate
+    pieces plus cavities, minus twice the number of handles: 2 for a ball, 4
+    for a hollow ball, 0 for a torus.
 
     Three of the last four features need curvature at each vertex, which on a
     voxel staircase measures the staircase, so they are computed on a mesh of
@@ -83,9 +83,8 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     ``Fractal Dimension`` describes the surface detail finer than
     ``curvature_sigma``, which those three leave out: ``2 - slope`` of log
     surface area against log blur scale, relative to the mask's smooth twin
-    (its blur at the top scale). The scales run from the finest voxel spacing
-    to ``curvature_sigma``, or over ``fractal_scales`` when it is given (see
-    ``extract_surface_features``). It is about 2 for a surface without such
+    (its blur at the top scale), over the window ``fractal_scales`` of
+    ``extract_surface_features``. It is about 2 for a surface without such
     detail, whatever its size and coarse shape, and rises with roughness, as
     long as the top scale is at most a quarter of the object's thickness
     (``Min Axis Length``). Above that it reads low, and a warning says so.
@@ -94,21 +93,22 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     construction on the outline of the mask's projection along the first axis:
     ``1 - slope`` of log contour length of the blurred footprint against log
     blur scale, relative to the footprint's smooth twin, with the blur isotropic
-    in the in-plane spacing. Its scales run from 4 to 16 times the coarser
-    in-plane spacing, or over ``outline_fractal_scales``. It is about 1 for a smooth
-    outline and rises with outline roughness, and it does not read low for
-    flat objects. It is defined on the image axes, and meant for adherent, flat
-    objects imaged along the first axis: turning an object about that axis
-    leaves it nearly unchanged, tilting it does not. Its footprint must be
-    wide against the top scale: a disc narrower than about 3.2 times the top
-    scale (51 voxels across at the default window) gives NaN, with a warning,
-    because its smooth twin vanishes, and a smooth disc reads 0.95 at 4 and
-    0.99 at 5 times the top scale across. Both fractal dimensions are measured
-    on the mask, so ``extract_mesh_features`` cannot compute them.
+    in the in-plane spacing, over the window ``outline_fractal_scales`` of
+    ``extract_surface_features``. It is about 1 for a smooth outline and rises
+    with outline roughness, and it does not read low for flat objects. It is
+    defined on the image axes, and meant for adherent, flat objects imaged
+    along the first axis: turning an object about that axis leaves it nearly
+    unchanged, tilting it does not. Its footprint must be wide against the top
+    scale: a disc narrower than about 3.2 times the top scale gives NaN, with a
+    warning, because its smooth twin vanishes, and a smooth disc reads 0.95 at
+    4 and 0.99 at 5 times the top scale across.
     """
     if optional:
         return [*_MESH_FEATURES, *_MASK_FEATURES]
-    return [*_MESH_FEATURES, *_DEFAULT_MASK_FEATURES]
+    return [
+        *_MESH_FEATURES,
+        *(name for name in _MASK_FEATURES if name not in _OPTIONAL_FEATURES),
+    ]
 
 
 def _resolve_features(features: Sequence[str] | None) -> list[str]:
@@ -247,18 +247,17 @@ def extract_surface_features(
         curvature-distribution features are measured on. Defaults to twice the
         coarsest voxel spacing, which removes the voxel staircase on every axis.
         It sets the scale of the shape being described: larger values keep only
-        coarser folds. Without ``fractal_scales`` it is also the top of the
-        scale range of ``Fractal Dimension``, which then starts at the finest
-        voxel spacing: that feature is NaN, with a warning, unless
-        ``curvature_sigma`` exceeds the finest spacing. An object too small to
-        survive the blur gets NaN for the features that depend on it, with a
-        warning.
+        coarser folds. It is also the top of the default ``fractal_scales``.
+        An object too small to survive the blur gets NaN for the features that
+        depend on it, with a warning.
     fractal_scales : sequence of float, optional
         ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
         ``Fractal Dimension`` fit, which uses 5 geometric scales between them
         and a smooth twin blurred at the highest. Both must be finite, with
         ``0 < lowest < highest``. Defaults to the finest voxel spacing up to
-        ``curvature_sigma``. When the highest scale exceeds a quarter of the
+        ``curvature_sigma``, which gives NaN, with a warning, unless
+        ``curvature_sigma`` exceeds the finest spacing. When the highest scale
+        exceeds a quarter of the
         object's ``Min Axis Length``, the value is still returned, with a
         warning that it is biased low; the warning text is the same for every
         object, so Python's default filter shows it once.
@@ -386,7 +385,8 @@ def _fractal_window(
         low, high = (float(s) for s in scales)
     except (TypeError, ValueError) as e:
         raise ValueError(message) from e
-    if not (np.isfinite(low) and np.isfinite(high) and 0 < low < high):
+    # False for NaN and for either infinity, too.
+    if not 0 < low < high < float("inf"):
         raise ValueError(message)
     return low, high
 
@@ -910,10 +910,10 @@ _SMOOTHED_FEATURES = (
 )
 
 # Measured on the mask itself, at several blur scales; see mesh_feature_list.
-# The optional ones are computed only when requested by name.
-_DEFAULT_MASK_FEATURES = ("Fractal Dimension",)
+_MASK_FEATURES = ("Fractal Dimension", "Outline Fractal Dimension")
+
+# Computed only when requested by name; see mesh_feature_list.
 _OPTIONAL_FEATURES = ("Outline Fractal Dimension",)
-_MASK_FEATURES = (*_DEFAULT_MASK_FEATURES, *_OPTIONAL_FEATURES)
 
 # Each feature is computed only when requested; the dict order is the default
 # column order of ``mesh_feature_list``.
