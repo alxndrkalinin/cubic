@@ -292,27 +292,49 @@ def extract_surface_features(
     outline_low, outline_high = (
         (4 * in_plane, 16 * in_plane) if outline_window is None else outline_window
     )
-    # Features that need the mask's blur at curvature_sigma, which is blurred
-    # and meshed once for all of them, Fractal Dimension included whenever its
-    # top scale is curvature_sigma.
+    values: dict[str, float] = {}
+    # An explicit window is validated, so only the default can be empty; it is
+    # decided before any blur.
+    if "Fractal Dimension" in features and fd_low >= fd_high:
+        warnings.warn(
+            f"Fractal Dimension needs curvature_sigma above the finest voxel "
+            f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
+            stacklevel=_CALLER,
+        )
+        values["Fractal Dimension"] = float("nan")
+
+    # The mask's blur, padding and 0.5 level at a scale, each computed at most
+    # once per call: the curvature features and Fractal Dimension's top scale
+    # share it when both are curvature_sigma.
+    blurs: dict[float, tuple[np.ndarray, np.ndarray, Any]] = {}
+
+    def blur_at(scale: float) -> tuple[np.ndarray, np.ndarray, Any]:
+        if scale not in blurs:
+            volume, pad = _padded_blur(mask, step, scale)
+            blurs[scale] = (volume, pad, _level_set(volume, step))
+        return blurs[scale]
+
+    # Features that need the blur at curvature_sigma, NaN together if the mask
+    # vanishes there.
     at_sigma = [
         name
         for name in blurred
-        if name in _SMOOTHED_FEATURES
-        or (name == "Fractal Dimension" and fd_high == sigma)
+        if name not in values
+        and (
+            name in _SMOOTHED_FEATURES
+            or (name == "Fractal Dimension" and fd_high == sigma)
+        )
     ]
-    values: dict[str, float] = {}
     smooth_mesh = None
     if at_sigma:
-        smooth_volume, pad = _padded_blur(mask, step, sigma)
-        level_set = _level_set(smooth_volume, step)
+        _, pad, level_set = blur_at(sigma)
         if level_set is None:
             warnings.warn(
                 f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
                 f"curvature_sigma={sigma:g}; returning NaN for {at_sigma}.",
                 stacklevel=_CALLER,
             )
-            values = dict.fromkeys(at_sigma, float("nan"))
+            values.update(dict.fromkeys(at_sigma, float("nan")))
         elif any(name in _SMOOTHED_FEATURES for name in features):
             smooth_mesh = _level_set_mesh(level_set, pad, step)
     values.update(
@@ -327,23 +349,9 @@ def extract_surface_features(
             mask, step, outline_low, outline_high
         )
     if "Fractal Dimension" in features and "Fractal Dimension" not in values:
-        # An explicit window is validated, so only the default can be empty.
-        if fd_low >= fd_high:
-            warnings.warn(
-                f"Fractal Dimension needs curvature_sigma above the finest voxel "
-                f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
-                stacklevel=_CALLER,
-            )
-            values["Fractal Dimension"] = float("nan")
-        else:
-            if fd_high == sigma:
-                top_volume, top_pad, top_level_set = smooth_volume, pad, level_set
-            else:
-                top_volume, top_pad = _padded_blur(mask, step, fd_high)
-                top_level_set = _level_set(top_volume, step)
-            values["Fractal Dimension"] = _fractal_dimension(
-                mask, step, fd_low, fd_high, top_volume, top_pad, top_level_set
-            )
+        values["Fractal Dimension"] = _fractal_dimension(
+            mask, step, fd_low, fd_high, *blur_at(fd_high)
+        )
         # Half the shortest axis of the same-inertia ellipsoid is the smallest
         # half-extent; the estimate is unbiased only while the top scale stays
         # below half of it.

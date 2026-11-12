@@ -1072,6 +1072,38 @@ def test_fractal_dimension_needs_a_blur_above_the_finest_spacing() -> None:
     assert features["Volume"] > 0
 
 
+def test_empty_fractal_window_is_decided_before_any_blur(monkeypatch) -> None:
+    """An empty default window gives NaN without blurring the mask.
+
+    With a curvature feature too, a mask that vanishes at curvature_sigma
+    reports only that feature as vanishing, not Fractal Dimension.
+    """
+
+    def fail(*args, **kwargs):
+        raise AssertionError("blurred the mask")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mesh, "_padded_blur", fail)
+        with pytest.warns(UserWarning, match="finest voxel spacing"):
+            alone = mesh.extract_surface_features(
+                _ball(8, 22), features=["Fractal Dimension"], curvature_sigma=1.0
+            )
+    assert np.isnan(alone["Fractal Dimension"])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mesh.extract_surface_features(
+            np.ones((1, 1, 1), dtype=bool),
+            features=["Avg Curvedness", "Fractal Dimension"],
+            curvature_sigma=1.0,
+        )
+    vanished = [str(w.message) for w in caught if "vanishes" in str(w.message)]
+    assert vanished == [
+        "Mask of 1 voxels vanishes when blurred at curvature_sigma=1; "
+        "returning NaN for ['Avg Curvedness']."
+    ]
+
+
 def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
     """A mask that vanishes under the blur gets NaN for those features only."""
     names = [
