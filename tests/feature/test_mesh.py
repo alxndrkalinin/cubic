@@ -1,6 +1,7 @@
 """Tests for mesh-based feature extraction."""
 
 import sys
+import warnings
 import subprocess
 
 import numpy as np
@@ -52,7 +53,7 @@ def surface_calls(monkeypatch) -> list[dict]:
     calls: list[dict] = []
 
     def fake_surface_features(
-        mask, spacing=None, features=None, curvature_sigma=None
+        mask, spacing=None, features=None, curvature_sigma=None, fractal_scales=None
     ) -> dict[str, float]:
         calls.append({"mask": mask, "spacing": spacing})
         return dict.fromkeys(features or mesh.mesh_feature_list(), 0.0)
@@ -487,10 +488,10 @@ def _rough_ellipsoid(amplitude: float, axes=(2.5, 5.0, 6.0)) -> np.ndarray:
     return radius < 1
 
 
-def _fractal_dimension(mask: np.ndarray) -> float:
+def _fractal_dimension(mask: np.ndarray, fractal_scales=None) -> float:
     name = "Fractal Dimension"
     return mesh.extract_surface_features(
-        mask, spacing=_NUCLEUS_SPACING, features=[name]
+        mask, spacing=_NUCLEUS_SPACING, features=[name], fractal_scales=fractal_scales
     )[name]
 
 
@@ -518,6 +519,101 @@ def test_fractal_dimension_rises_with_surface_roughness() -> None:
 
     assert smooth + 0.01 < rough < rougher
     assert rougher > 2.05
+
+
+def test_default_fractal_window_is_the_finest_spacing_to_curvature_sigma() -> None:
+    """Without fractal_scales the fit spans the finest spacing to curvature_sigma.
+
+    The explicit window blurs the mask at its top scale itself instead of
+    reusing the curvature blur, and gets the same value bit for bit.
+    """
+    mask = _rough_ellipsoid(0.04)
+    sigma = mesh._curvature_sigma(_NUCLEUS_SPACING, None)
+
+    default = _fractal_dimension(mask)
+    explicit = _fractal_dimension(mask, (min(_NUCLEUS_SPACING), sigma))
+
+    assert np.isfinite(default)
+    assert explicit == default
+
+
+def test_fractal_window_changes_only_fractal_dimension() -> None:
+    """A custom window moves Fractal Dimension and leaves the curvature features."""
+    mask = _rough_ellipsoid(0.04)
+    names = ["Fractal Dimension", *_CURVATURE_FEATURES]
+    default = mesh.extract_surface_features(mask, _NUCLEUS_SPACING, names)
+    custom = mesh.extract_surface_features(
+        mask, _NUCLEUS_SPACING, names, fractal_scales=(0.3, 1.2)
+    )
+
+    assert np.isfinite(custom["Fractal Dimension"])
+    assert abs(custom["Fractal Dimension"] - default["Fractal Dimension"]) > 1e-3
+    for name in _CURVATURE_FEATURES:
+        assert custom[name] == default[name]
+
+
+def test_fractal_window_does_not_need_curvature_sigma() -> None:
+    """With its own window, D no longer needs curvature_sigma above the spacing.
+
+    The default window of this call would be empty and give NaN.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        features = mesh.extract_surface_features(
+            _ball(10, 26),
+            features=["Fractal Dimension"],
+            curvature_sigma=1.0,
+            fractal_scales=(1.0, 3.0),
+        )
+
+    assert not [w for w in caught if "Fractal Dimension" in str(w.message)]
+    # 1.96: a top scale of 0.3 radii already biases a smooth ball low.
+    assert features["Fractal Dimension"] == pytest.approx(2, abs=0.05)
+
+
+@pytest.mark.parametrize(
+    "scales",
+    [
+        (1.0,),
+        (1.0, 2.0, 3.0),
+        (2.0, 1.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (1.0, float("inf")),
+        (float("nan"), 1.0),
+        ("a", "b"),
+        "12",
+        2.0,
+    ],
+)
+def test_fractal_window_is_validated(scales) -> None:
+    """A window that is not two finite numbers 0 < lowest < highest raises.
+
+    It raises before any meshing, so also on a label image without labels.
+    """
+    match = "fractal_scales must be two finite numbers"
+    with pytest.raises(ValueError, match=match):
+        mesh.extract_surface_features(
+            _ball(8, 22), features=["Fractal Dimension"], fractal_scales=scales
+        )
+    with pytest.raises(ValueError, match=match):
+        mesh.extract_features(np.zeros((4, 4, 4), np.int32), fractal_scales=scales)
+
+
+def test_extract_features_forwards_the_fractal_window() -> None:
+    """extract_features passes fractal_scales to every label's crop."""
+    name = ["Fractal Dimension"]
+    labels = _ball(10, 26).astype(np.int32)
+    crop = labels[ndimage.find_objects(labels)[0]] == 1
+
+    _, values, _ = mesh.extract_features(labels, name, fractal_scales=(1.0, 3.0))
+    expected = mesh.extract_surface_features(
+        crop, features=name, fractal_scales=(1.0, 3.0)
+    )
+    default = mesh.extract_surface_features(crop, features=name)
+
+    assert values[0, 0] == expected[name[0]] != default[name[0]]
 
 
 def test_fractal_dimension_needs_the_mask() -> None:

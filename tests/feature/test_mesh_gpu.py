@@ -287,7 +287,10 @@ def test_extract_features_on_gpu_matches_cpu(gpu_available: bool) -> None:
     np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
 
 
-def test_fractal_dimension_stays_on_the_gpu(gpu_available: bool, monkeypatch) -> None:
+@pytest.mark.parametrize("fractal_scales", [None, (0.15, 0.45)])
+def test_fractal_dimension_stays_on_the_gpu(
+    fractal_scales, gpu_available: bool, monkeypatch
+) -> None:
     """Fractal Dimension of a CuPy mask never builds a host trimesh."""
     if not gpu_available:
         pytest.skip("GPU not available")
@@ -298,14 +301,14 @@ def test_fractal_dimension_stays_on_the_gpu(gpu_available: bool, monkeypatch) ->
     monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
     mask = ascupy(_labels() == 1)
     name = "Fractal Dimension"
+    kwargs = {"spacing": (0.3, 0.1, 0.1), "fractal_scales": fractal_scales}
 
-    on_gpu = mesh.extract_surface_features(
-        mask, spacing=(0.3, 0.1, 0.1), features=[name]
-    )[name]
-    on_cpu = mesh.extract_surface_features(
-        asnumpy(mask), spacing=(0.3, 0.1, 0.1), features=[name]
-    )[name]
+    on_gpu = mesh.extract_surface_features(mask, features=[name], **kwargs)[name]
+    on_cpu = mesh.extract_surface_features(asnumpy(mask), features=[name], **kwargs)[
+        name
+    ]
 
+    assert np.isfinite(on_cpu)
     assert on_gpu == pytest.approx(on_cpu, rel=1e-9)
 
 

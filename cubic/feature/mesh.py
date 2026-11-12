@@ -79,10 +79,11 @@ def mesh_feature_list() -> list[str]:
     units of ``spacing``; both are averaged over the surface by area.
     ``Fractal Dimension`` describes the surface detail finer than
     ``curvature_sigma``, which those three leave out: ``2 - slope`` of log
-    surface area against log blur scale, from the finest voxel spacing to
-    ``curvature_sigma``, relative to the mask's smooth twin (its blur at
-    ``curvature_sigma``). It is about 2 for a surface without such detail,
-    whatever its size and coarse shape, and rises with roughness. It is
+    surface area against log blur scale, relative to the mask's smooth twin
+    (its blur at the top scale). The scales run from the finest voxel spacing
+    to ``curvature_sigma``, or over ``fractal_scales`` when it is given (see
+    ``extract_surface_features``). It is about 2 for a surface without such
+    detail, whatever its size and coarse shape, and rises with roughness. It is
     measured on the mask, so ``extract_mesh_features`` cannot compute it.
     """
     return [*_MESH_FEATURES, *_MASK_FEATURES]
@@ -112,6 +113,7 @@ def extract_features(
     features: list[str] | None = None,
     spacing: Sequence[float] | None = None,
     curvature_sigma: float | None = None,
+    fractal_scales: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Extract mesh features for every label of a label image.
 
@@ -134,6 +136,9 @@ def extract_features(
     curvature_sigma : float, optional
         Blur scale, in units of ``spacing``, of the mesh behind the
         curvature-distribution features; see ``extract_surface_features``.
+    fractal_scales : sequence of float, optional
+        ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
+        fractal-dimension fits; see ``extract_surface_features``.
 
     Returns
     -------
@@ -158,9 +163,10 @@ def extract_features(
     labels = np.unique(host_labels)
     labels = labels[labels > 0]
 
-    # Resolved before any meshing, so an unknown name fails even on an image
-    # without labels.
+    # Resolved before any meshing, so an unknown name or a bad window fails
+    # even on an image without labels.
     features = _resolve_features(features)
+    _fractal_window(fractal_scales)
     if not features:
         return labels, np.empty((len(labels), 0)), features
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
@@ -170,7 +176,11 @@ def extract_features(
     for label in labels:
         mask = label_image[bboxes[label - 1]] == label
         mesh_features = extract_surface_features(
-            mask, spacing=spacing, features=features, curvature_sigma=curvature_sigma
+            mask,
+            spacing=spacing,
+            features=features,
+            curvature_sigma=curvature_sigma,
+            fractal_scales=fractal_scales,
         )
         feature_values.append([mesh_features[feat] for feat in features])
 
@@ -186,6 +196,7 @@ def extract_surface_features(
     spacing: Sequence[float] | None = None,
     features: Sequence[str] | None = None,
     curvature_sigma: float | None = None,
+    fractal_scales: Sequence[float] | None = None,
 ) -> dict[str, float]:
     """Generate mesh from a single label mask and extract its surface features.
 
@@ -202,13 +213,27 @@ def extract_surface_features(
         curvature-distribution features are measured on. Defaults to twice the
         coarsest voxel spacing, which removes the voxel staircase on every axis.
         It sets the scale of the shape being described: larger values keep only
-        coarser folds. It is also the top of the scale range of ``Fractal
-        Dimension``, which starts at the finest voxel spacing: that feature is
-        NaN, with a warning, unless ``curvature_sigma`` exceeds the finest
-        spacing. An object too small to survive the blur gets NaN for those
-        features, with a warning.
+        coarser folds. Without ``fractal_scales`` it is also the top of the
+        scale range of ``Fractal Dimension``, which then starts at the finest
+        voxel spacing: that feature is NaN, with a warning, unless
+        ``curvature_sigma`` exceeds the finest spacing. An object too small to
+        survive the blur gets NaN for the features that depend on it, with a
+        warning.
+    fractal_scales : sequence of float, optional
+        ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
+        fractal-dimension fit, which uses 5 geometric scales between them and
+        a smooth twin blurred at the highest. Both must be finite, with
+        ``0 < lowest < highest``. Defaults to the finest voxel spacing up to
+        ``curvature_sigma``.
+
+    Raises
+    ------
+    ValueError
+        If ``fractal_scales`` is not two finite numbers with
+        ``0 < lowest < highest``.
     """
     features = _resolve_features(features)
+    window = _fractal_window(fractal_scales)
     mesh = mask2mesh(mask, spacing=spacing)
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
     if not blurred:
@@ -216,28 +241,79 @@ def extract_surface_features(
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
     sigma = _curvature_sigma(spacing, curvature_sigma)
     step = _step(spacing)
-    # Blurred and meshed once, for both the smoothed mesh and Fractal Dimension.
-    smooth_volume, pad = _padded_blur(mask, step, sigma)
-    level_set = _level_set(smooth_volume, step)
-    if level_set is None:
-        warnings.warn(
-            f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
-            f"curvature_sigma={sigma:g}; returning NaN for {blurred}.",
-            stacklevel=2,
-        )
-        rest = extract_mesh_features(
-            mesh, features=[name for name in features if name not in blurred]
-        )
-        return {name: rest.get(name, float("nan")) for name in features}
+    # Features that need the mask's blur at curvature_sigma, which is blurred
+    # and meshed once for all of them. A Fractal Dimension over its own window
+    # does not.
+    at_sigma = [
+        name
+        for name in blurred
+        if name in _SMOOTHED_FEATURES
+        or (name == "Fractal Dimension" and window is None)
+    ]
+    values: dict[str, float] = {}
     smooth_mesh = None
-    if any(name in _SMOOTHED_FEATURES for name in features):
-        smooth_mesh = _level_set_mesh(level_set, pad, step)
-    values = extract_mesh_features(mesh, features=on_mesh, smooth_mesh=smooth_mesh)
-    if "Fractal Dimension" in features:
-        values["Fractal Dimension"] = _fractal_dimension(
-            mask, step, sigma, smooth_volume, pad, level_set
+    if at_sigma:
+        smooth_volume, pad = _padded_blur(mask, step, sigma)
+        level_set = _level_set(smooth_volume, step)
+        if level_set is None:
+            warnings.warn(
+                f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
+                f"curvature_sigma={sigma:g}; returning NaN for {at_sigma}.",
+                stacklevel=2,
+            )
+            values = dict.fromkeys(at_sigma, float("nan"))
+        elif any(name in _SMOOTHED_FEATURES for name in features):
+            smooth_mesh = _level_set_mesh(level_set, pad, step)
+    values.update(
+        extract_mesh_features(
+            mesh,
+            features=[name for name in on_mesh if name not in values],
+            smooth_mesh=smooth_mesh,
         )
+    )
+    if "Fractal Dimension" in features and "Fractal Dimension" not in values:
+        if window is not None:
+            low, high = window
+            top_volume, top_pad = _padded_blur(mask, step, high)
+            top_level_set = _level_set(top_volume, step)
+            values["Fractal Dimension"] = _fractal_dimension(
+                mask, step, low, high, top_volume, top_pad, top_level_set
+            )
+        elif sigma <= step.min():
+            warnings.warn(
+                f"Fractal Dimension needs curvature_sigma above the finest voxel "
+                f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
+                stacklevel=2,
+            )
+            values["Fractal Dimension"] = float("nan")
+        else:
+            values["Fractal Dimension"] = _fractal_dimension(
+                mask, step, float(step.min()), sigma, smooth_volume, pad, level_set
+            )
     return {name: values[name] for name in features}
+
+
+def _fractal_window(scales: Sequence[float] | None) -> tuple[float, float] | None:
+    """Return ``(lowest, highest)`` of ``fractal_scales``, or None for None.
+
+    Raises ``ValueError`` unless they are two finite numbers with
+    ``0 < lowest < highest``.
+    """
+    if scales is None:
+        return None
+    message = (
+        "fractal_scales must be two finite numbers (lowest, highest) with "
+        f"0 < lowest < highest; got {scales!r}"
+    )
+    if isinstance(scales, str):
+        raise ValueError(message)
+    try:
+        low, high = (float(s) for s in scales)
+    except (TypeError, ValueError) as e:
+        raise ValueError(message) from e
+    if not (np.isfinite(low) and np.isfinite(high) and 0 < low < high):
+        raise ValueError(message)
+    return low, high
 
 
 def _curvature_sigma(spacing: Sequence[float] | None, sigma: float | None) -> float:
@@ -608,52 +684,47 @@ def _smooth_twin(blurred: np.ndarray, pad: np.ndarray) -> np.ndarray:
 def _fractal_dimension(
     mask_3d: np.ndarray,
     step: np.ndarray,
-    sigma: float,
+    low: float,
+    high: float,
     blurred: np.ndarray,
     pad: np.ndarray,
-    level_set: tuple[np.ndarray, np.ndarray],
+    level_set: tuple[np.ndarray, np.ndarray] | None,
     n_levels: int = 5,
 ) -> float:
     """Return ``2 - slope`` of log area ratio against log blur scale.
 
     The area of a surface of fractal dimension ``D`` measured at resolution
     ``s`` scales as ``s^(2 - D)``. The mask is blurred at ``n_levels`` scales
-    from the finest voxel spacing up to ``sigma``, and the area of each blur's
-    0.5 level is divided by the same area for the mask's smooth twin, its blur
-    at ``sigma`` thresholded at 0.5. The twin shares the object's coarse shape
-    and voxel grid, so the shrinking of curved surfaces under blur and the voxel
-    staircase cancel in the ratio, which leaves the detail finer than ``sigma``.
+    from ``low`` up to ``high``, and the area of each blur's 0.5 level is
+    divided by the same area for the mask's smooth twin, its blur at ``high``
+    thresholded at 0.5. The twin shares the object's coarse shape and voxel
+    grid, so the shrinking of curved surfaces under blur and the voxel
+    staircase cancel in the ratio, which leaves the detail finer than ``high``.
     Without the twin, smooth ellipsoids of nucleus size measure 2.05-2.20.
-    Every step runs on the mask's device; NaN if any level vanishes.
+    Every step runs on the mask's device; NaN, with a warning, if any level
+    vanishes.
 
-    ``blurred`` is the mask's blur at ``sigma`` with its padding ``pad``, and
+    ``blurred`` is the mask's blur at ``high`` with its padding ``pad``, and
     ``level_set`` its 0.5 level from ``_level_set``, which the caller has
     already computed: the twin is thresholded from the first and cropped to the
     mask's frame, and the second is the mask's level at the last scale.
     """
-    if sigma <= step.min():
-        warnings.warn(
-            f"Fractal Dimension needs curvature_sigma above the finest voxel "
-            f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
-            stacklevel=3,
-        )
-        return float("nan")
     twin = _smooth_twin(blurred, pad)
 
     def area(volume: np.ndarray, scale: float) -> float:
         return _level_set_area(_level_set(_padded_blur(volume, step, scale)[0], step))
 
-    # geomspace returns ``sigma`` itself as the last scale, where the mask's
+    # geomspace returns ``high`` itself as the last scale, where the mask's
     # level set is the one already computed
-    scales = np.geomspace(step.min(), sigma, n_levels)
+    scales = np.geomspace(low, high, n_levels)
     mask_areas = [area(mask_3d, s) for s in scales[:-1]]
     mask_areas.append(_level_set_area(level_set))
     ratios = [a / area(twin, s) for a, s in zip(mask_areas, scales)]
     if not np.all(np.isfinite(ratios)):
         warnings.warn(
             f"Fractal Dimension: the mask or its smooth twin vanishes when blurred "
-            f"at a scale up to curvature_sigma={sigma:g} (an object thinner than the "
-            f"blur); returning NaN.",
+            f"at a scale up to {high:g} (an object thinner than the blur); "
+            f"returning NaN.",
             stacklevel=3,
         )
         return float("nan")
