@@ -71,6 +71,8 @@ def test_extract_features_excludes_background_label(surface_calls) -> None:
     filtering alone.
     """
     names = mesh.mesh_feature_list()
+    assert len(names) == 23
+    assert names[-2:] == ["Fractal Dimension", "Outline Fractal Dimension"]
     volume = np.zeros((12, 12, 12), dtype=np.int32)
     volume[2:6, 2:6, 2:6] = 1  # 64 voxels
     volume[7:11, 7:11, 7:11] = 2  # 64 voxels
@@ -304,8 +306,9 @@ def test_extract_surface_features_full_pipeline() -> None:
     The cube touches the volume border and is large enough to survive the
     default curvature blur.
     """
-    cube = np.zeros((14, 14, 14), dtype=bool)
-    cube[:10, :10, :10] = True
+    # 60 voxels wide, so the footprint survives the outline's 16-voxel blur.
+    cube = np.zeros((14, 64, 64), dtype=bool)
+    cube[:10, :60, :60] = True
     features = mesh.extract_surface_features(cube)
 
     assert set(features) == set(mesh.mesh_feature_list())
@@ -692,16 +695,183 @@ def test_thin_object_check_runs_only_for_fractal_dimension(monkeypatch) -> None:
     assert features["Volume"] > 0
 
 
-def test_fractal_dimension_needs_the_mask() -> None:
-    """extract_mesh_features refuses D and leaves it out of its defaults.
+@pytest.mark.parametrize("name", ["Fractal Dimension", "Outline Fractal Dimension"])
+def test_fractal_dimension_needs_the_mask(name: str) -> None:
+    """extract_mesh_features refuses either D and leaves it out of its defaults.
 
     A single mesh cannot be re-blurred.
     """
     ball = mesh.mask2mesh(_ball(8, 22))
 
-    with pytest.raises(ValueError, match="Fractal Dimension.*mask"):
-        mesh.extract_mesh_features(ball, ["Fractal Dimension"])
-    assert "Fractal Dimension" not in mesh.extract_mesh_features(ball)
+    with pytest.raises(ValueError, match=f"{name}.*mask"):
+        mesh.extract_mesh_features(ball, [name])
+    assert name not in mesh.extract_mesh_features(ball)
+
+
+_OUTLINE = "Outline Fractal Dimension"
+
+
+def _outline_fd(mask: np.ndarray, spacing=None, fractal_scales=None) -> float:
+    return mesh.extract_surface_features(
+        mask, spacing=spacing, features=[_OUTLINE], fractal_scales=fractal_scales
+    )[_OUTLINE]
+
+
+def _flat_ellipsoid(axes, spacing=None, rot_deg: float = 0.0) -> np.ndarray:
+    """Ellipsoid with semi-axes ``axes`` in units of ``spacing``, turned about z."""
+    step = (1.0, 1.0, 1.0) if spacing is None else spacing
+    shape = [2 * int(np.ceil((1.2 * a + 1) / s)) + 1 for a, s in zip(axes, step)]
+    z, y, x = (g * s for g, s in zip(_centred_grid(*shape), step))
+    t = np.deg2rad(rot_deg)
+    y, x = np.cos(t) * y + np.sin(t) * x, -np.sin(t) * y + np.cos(t) * x
+    return (z / axes[0]) ** 2 + (y / axes[1]) ** 2 + (x / axes[2]) ** 2 <= 1
+
+
+_FLAT_SPACING = (0.29, 0.108, 0.108)
+
+
+def _rough_cylinder(amplitude: float, radius: float = 6.0) -> np.ndarray:
+    """Return a 4-plane cylinder (radius in um) at ``_FLAT_SPACING``.
+
+    Its outline radius carries band-limited noise (0.5 um wavelength) of
+    standard deviation ``amplitude`` radii; 0 gives the smooth disc.
+    """
+    plane = _FLAT_SPACING[1:]
+    n = 2 * int(np.ceil(1.4 * radius / plane[0])) + 1
+    y, x = (g * s for g, s in zip(_centred_grid(n, n), plane))
+    r = np.sqrt(y**2 + x**2)
+    noise = ndimage.gaussian_filter(
+        np.random.default_rng(0).standard_normal(r.shape), [0.5 / s for s in plane]
+    )
+    footprint = np.pad(r + amplitude * radius * noise / noise.std() < radius, 2)
+    return np.repeat(footprint[None], 4, axis=0)
+
+
+@pytest.mark.parametrize(
+    ("spacing", "axes"),
+    [
+        (None, (6, 60, 80)),
+        (None, (10, 50, 50)),
+        (_NUCLEUS_SPACING, (2.0, 8.0, 10.0)),
+        (_FLAT_SPACING, (2.0, 6.0, 8.0)),
+        ((1.0, 0.2, 0.1), (3.0, 8.0, 10.0)),
+    ],
+)
+def test_outline_fractal_dimension_of_a_smooth_outline_is_one(spacing, axes) -> None:
+    """A smooth elliptical footprint gives 1, also on an anisotropic plane.
+
+    Measured: 0.992 for the (0.2, 0.1) plane, whose 16-voxel top scale is 0.4
+    of the minor semi-axis, and 0.995-0.999 for the others.
+    """
+    assert _outline_fd(_flat_ellipsoid(axes, spacing), spacing) == pytest.approx(
+        1, abs=0.01
+    )
+
+
+def test_outline_fractal_dimension_rises_with_outline_roughness() -> None:
+    """Outline roughness inside the window raises D, monotonically.
+
+    Measured 0.997, 1.008 and 1.054 for 0, 4% and 8% of the radius.
+    """
+    smooth, rough, rougher = (
+        _outline_fd(_rough_cylinder(amplitude), _FLAT_SPACING)
+        for amplitude in (0, 0.04, 0.08)
+    )
+
+    assert smooth == pytest.approx(1, abs=0.01)
+    assert smooth < rough < rougher
+    assert rougher > smooth + 0.03
+
+
+def test_outline_fractal_dimension_follows_turns_about_the_first_axis() -> None:
+    """Turning the object about the projection axis leaves D (nearly) as is.
+
+    A quarter turn maps the voxel grid onto itself, which leaves only the
+    rounding of float32 vertices (1e-8 here). Other angles revoxelize the
+    outline: 1.8e-4 at 45 degrees.
+    """
+    mask = _rough_cylinder(0.02)
+    upright = _outline_fd(mask, _FLAT_SPACING)
+
+    quarter = _outline_fd(np.rot90(mask, axes=(1, 2)), _FLAT_SPACING)
+    assert quarter == pytest.approx(upright, rel=1e-6)
+    for angle in (30, 45):
+        turned = ndimage.rotate(mask, angle, axes=(1, 2), order=0, reshape=True)
+        assert _outline_fd(turned, _FLAT_SPACING) == pytest.approx(upright, abs=2e-3)
+    for angle in (30, 45):
+        assert _outline_fd(
+            _flat_ellipsoid((2.0, 6.0, 8.0), _FLAT_SPACING, angle), _FLAT_SPACING
+        ) == pytest.approx(
+            _outline_fd(_flat_ellipsoid((2.0, 6.0, 8.0), _FLAT_SPACING), _FLAT_SPACING),
+            abs=2e-3,
+        )
+
+
+def test_outline_fractal_dimension_is_measured_along_the_first_axis() -> None:
+    """Lying the same rough cylinder on its side changes the footprint and D.
+
+    Seen from the side, the 3 um tall cylinder is a rectangle whose long edges
+    take the widest radius of each row, so its outline is nearly straight.
+    """
+    mask = np.repeat(_rough_cylinder(0.08)[:1], 28, axis=0)
+    spacing = (0.108, 0.108, 0.108)
+
+    upright = _outline_fd(mask, spacing)
+    on_its_side = _outline_fd(np.swapaxes(mask, 0, 1), spacing)
+
+    assert abs(upright - on_its_side) > 0.02
+
+
+def test_outline_fractal_window() -> None:
+    """The default window is 4 to 16 coarser in-plane voxels; fractal_scales moves it."""
+    mask = _rough_cylinder(0.04)
+    default = _outline_fd(mask, _FLAT_SPACING)
+
+    explicit = _outline_fd(mask, _FLAT_SPACING, (4 * 0.108, 16 * 0.108))
+    custom = _outline_fd(mask, _FLAT_SPACING, (0.3, 0.9))
+
+    assert explicit == default
+    assert np.isfinite(custom)
+    assert abs(custom - default) > 1e-3
+
+
+def test_outline_fractal_dimension_of_a_footprint_narrower_than_the_blur() -> None:
+    """A footprint that vanishes at the top scale gives NaN, with a warning.
+
+    The ball's footprint, 16 voxels across, vanishes under the default 16-voxel
+    blur; the other features stay finite.
+    """
+    names = [_OUTLINE, "Fractal Dimension", "Volume"]
+    with pytest.warns(UserWarning, match="Outline Fractal Dimension: the footprint"):
+        features = mesh.extract_surface_features(_ball(8, 22), features=names)
+
+    assert np.isnan(features[_OUTLINE])
+    assert np.isfinite(features["Fractal Dimension"])
+    assert features["Volume"] > 0
+
+
+def test_outline_fractal_dimension_of_a_sheet_too_thin_for_curvature_sigma() -> None:
+    """The outline does not depend on the 3D blur at curvature_sigma.
+
+    A one-plane sheet vanishes under that blur, which makes the curvature
+    features NaN, but its footprint is a plain square.
+    """
+    sheet = np.zeros((3, 64, 64), dtype=bool)
+    sheet[1, 2:62, 2:62] = True
+    names = [_OUTLINE, "Avg Curvedness", "Fractal Dimension"]
+
+    with pytest.warns(UserWarning, match="vanishes when blurred at curvature_sigma"):
+        features = mesh.extract_surface_features(sheet, _NUCLEUS_SPACING, names)
+
+    assert np.isnan(features["Avg Curvedness"])
+    assert np.isnan(features["Fractal Dimension"])
+    assert np.isfinite(features[_OUTLINE])
+
+
+def test_thin_object_warning_points_to_the_outline() -> None:
+    """The thin-object warning names Outline Fractal Dimension."""
+    with pytest.warns(UserWarning, match="see Outline Fractal Dimension"):
+        mesh.extract_surface_features(_slab(6), _NUCLEUS_SPACING, ["Fractal Dimension"])
 
 
 def test_fractal_dimension_of_a_sheet_thinner_than_the_blur() -> None:

@@ -312,6 +312,51 @@ def test_fractal_dimension_stays_on_the_gpu(
     assert on_gpu == pytest.approx(on_cpu, rel=1e-9)
 
 
+def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:
+    """Return a flat (2, 6, 8) um ellipsoid with a rough outline, at ``spacing``."""
+    shape = [
+        2 * int(np.ceil((1.2 * a + 1) / s)) + 1 for a, s in zip((2, 6, 8), spacing)
+    ]
+    z, y, x = np.meshgrid(
+        *[(np.arange(n) - (n - 1) / 2) * s for n, s in zip(shape, spacing)],
+        indexing="ij",
+    )
+    noise = ndimage.gaussian_filter(
+        np.random.default_rng(3).standard_normal(shape[1:]),
+        [0.5 / s for s in spacing[1:]],
+    )
+    radius = (z / 2) ** 2 + (y / 6) ** 2 + (x / 8) ** 2
+    return radius < 1 + 0.15 * noise / noise.std()
+
+
+@pytest.mark.parametrize("spacing", [(0.29, 0.108, 0.108), (0.5, 0.2, 0.1)])
+@pytest.mark.parametrize("fractal_scales", [None, (0.3, 1.2)])
+def test_outline_fractal_dimension_stays_on_the_gpu(
+    spacing: tuple, fractal_scales, gpu_available: bool, monkeypatch
+) -> None:
+    """Outline Fractal Dimension of a CuPy mask runs on the GPU and matches the CPU.
+
+    The 2D blur rounds like SciPy and the ribbon comes from the marching cubes
+    port, so only summation order differs.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+
+    def fail(self):
+        raise AssertionError("fell back to a host trimesh")
+
+    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
+    mask = _rough_flat_ellipsoid(spacing)
+    name = "Outline Fractal Dimension"
+    kwargs = {"spacing": spacing, "fractal_scales": fractal_scales}
+
+    on_gpu = mesh.extract_surface_features(ascupy(mask), features=[name], **kwargs)
+    on_cpu = mesh.extract_surface_features(mask, features=[name], **kwargs)
+
+    assert np.isfinite(on_cpu[name])
+    assert on_gpu[name] == pytest.approx(on_cpu[name], rel=1e-9)
+
+
 def test_mask2mesh_on_gpu(gpu_available: bool) -> None:
     """A CuPy mask is meshed on the GPU.
 

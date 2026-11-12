@@ -54,10 +54,11 @@ def mesh_feature_list() -> list[str]:
     """Return the names of the surface features of a label, in column order.
 
     ``extract_features`` and ``extract_surface_features`` return these. All but
-    ``Fractal Dimension``, which is measured on the mask, are measured on a mesh
-    of it.
+    ``Fractal Dimension`` and ``Outline Fractal Dimension``, which are measured
+    on the mask, are measured on a mesh of it.
 
-    No feature is defined on the image axes. The axis lengths are the full axes
+    No feature but ``Outline Fractal Dimension`` is defined on the image axes.
+    The axis lengths are the full axes
     of the ellipsoid with the same inertia, and ``Extent`` is the volume over the
     oriented bounding box volume. Voxelization still moves every feature a little
     with orientation, and the oriented box and bounding cylinder come from
@@ -85,8 +86,19 @@ def mesh_feature_list() -> list[str]:
     ``extract_surface_features``). It is about 2 for a surface without such
     detail, whatever its size and coarse shape, and rises with roughness, as
     long as the top scale is at most a quarter of the object's thickness
-    (``Min Axis Length``). Above that it reads low, and a warning says so. It is
-    measured on the mask, so ``extract_mesh_features`` cannot compute it.
+    (``Min Axis Length``). Above that it reads low, and a warning says so.
+
+    ``Outline Fractal Dimension`` is the same construction on the outline of the
+    mask's projection along the first axis: ``1 - slope`` of log contour length
+    of the blurred footprint against log blur scale, relative to the footprint's
+    smooth twin, with the blur isotropic in the in-plane spacing. Its scales run
+    from 4 to 16 times the coarser in-plane spacing, or over ``fractal_scales``.
+    It is about 1 for a smooth outline and rises with outline roughness, and it
+    does not read low for flat objects. It is the one feature defined on the
+    image axes, meant for adherent, flat objects imaged along the first axis:
+    turning an object about that axis leaves it nearly unchanged, tilting it
+    does not. Both fractal dimensions are measured on the mask, so
+    ``extract_mesh_features`` cannot compute them.
     """
     return [*_MESH_FEATURES, *_MASK_FEATURES]
 
@@ -223,10 +235,14 @@ def extract_surface_features(
         warning.
     fractal_scales : sequence of float, optional
         ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
-        fractal-dimension fit, which uses 5 geometric scales between them and
-        a smooth twin blurred at the highest. Both must be finite, with
-        ``0 < lowest < highest``. Defaults to the finest voxel spacing up to
-        ``curvature_sigma``. When the highest scale exceeds a quarter of the
+        fractal-dimension fits, applied to both ``Fractal Dimension`` and
+        ``Outline Fractal Dimension``. Each fit uses 5 geometric scales between
+        them and a smooth twin blurred at the highest. Both must be finite,
+        with ``0 < lowest < highest``. Without it, ``Fractal Dimension`` spans
+        the finest voxel spacing up to ``curvature_sigma``, and ``Outline
+        Fractal Dimension`` 4 to 16 times the coarser in-plane spacing. An
+        outline that vanishes at these scales gives NaN, with a warning. When
+        the highest scale of ``Fractal Dimension`` exceeds a quarter of the
         object's ``Min Axis Length``, the value is still returned, with a
         warning that it is biased low; the warning text is the same for every
         object, so Python's default filter shows it once.
@@ -276,6 +292,10 @@ def extract_surface_features(
             smooth_mesh=smooth_mesh,
         )
     )
+    if "Outline Fractal Dimension" in features:
+        values["Outline Fractal Dimension"] = _outline_fractal_dimension(
+            mask, step, window
+        )
     if "Fractal Dimension" in features and "Fractal Dimension" not in values:
         if window is not None:
             low, high = window
@@ -311,7 +331,8 @@ def extract_surface_features(
 _THIN_OBJECT_WARNING = (
     "Fractal Dimension: the 3D estimate is biased low for objects thinner than "
     "four times the top blur scale of its fit (curvature_sigma, or the highest "
-    "of fractal_scales); at least one object is that thin."
+    "of fractal_scales); at least one object is that thin. For flat objects "
+    "imaged along the first axis, see Outline Fractal Dimension."
 )
 
 
@@ -405,12 +426,13 @@ def _step(spacing: Sequence[float] | None) -> np.ndarray:
 
 
 def _padded_blur(
-    mask_3d: np.ndarray, step: np.ndarray, sigma: float
+    mask: np.ndarray, step: np.ndarray, sigma: float
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return the mask blurred at ``sigma`` (units of ``step``) and its padding.
 
-    The blur is isotropic in physical units, so its width in voxels differs per
-    axis on an anisotropic stack.
+    The mask may have any number of axes, one ``step`` per axis. The blur is
+    isotropic in physical units, so its width in voxels differs per axis on an
+    anisotropic grid.
     """
     sigma_voxels = sigma / step
     # Pad past the blur's reach so it neither clips at the crop nor touches the
@@ -418,7 +440,7 @@ def _padded_blur(
     pad = np.ceil(3 * sigma_voxels).astype(int) + 1
     # Rounds like SciPy on the GPU too, so both devices mesh the same volume.
     volume = gaussian_filter_like_scipy(
-        np.pad(mask_3d.astype(np.float32), [(p, p) for p in pad]), sigma_voxels
+        np.pad(mask.astype(np.float32), [(p, p) for p in pad]), sigma_voxels
     )
     return volume, pad
 
@@ -528,8 +550,8 @@ def extract_mesh_features(
         Closed surface of a single object.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()`` without
-        ``Fractal Dimension``, which is measured on the mask. Only these are
-        computed.
+        ``Fractal Dimension`` and ``Outline Fractal Dimension``, which are
+        measured on the mask. Only these are computed.
     smooth_mesh : trimesh.Trimesh, optional
         Smoothed surface of the same object (e.g. ``mask2mesh(mask, sigma=...)``)
         for the curvature-distribution features. Without it they are measured on
@@ -538,7 +560,8 @@ def extract_mesh_features(
     Raises
     ------
     ValueError
-        If a feature name is unknown or needs the mask (``Fractal Dimension``),
+        If a feature name is unknown or needs the mask (``Fractal Dimension``,
+        ``Outline Fractal Dimension``),
         or if the mesh volume or surface area is not finite and positive, which
         is what an open (non-watertight) surface reports.
     """
@@ -724,7 +747,7 @@ def _fractal_dimension(
     staircase cancel in the ratio, which leaves the detail finer than ``high``.
     Without the twin, smooth ellipsoids of nucleus size measure 2.05-2.20.
     Every step runs on the mask's device; NaN, with a warning, if any level
-    vanishes.
+    vanishes. ``_outline_fractal_dimension`` is the 2D form on the footprint.
 
     ``blurred`` is the mask's blur at ``high`` with its padding ``pad``, and
     ``level_set`` its 0.5 level from ``_level_set``, which the caller has
@@ -753,6 +776,65 @@ def _fractal_dimension(
     return 2 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])
 
 
+def _contour_length(field: np.ndarray, plane_step: np.ndarray) -> float:
+    """Return the length of the 0.5 contour of a 2D ``field``; NaN if it has none.
+
+    Marching cubes on the field stacked twice along a new first axis, one unit
+    apart, gives a ribbon whose area is the contour length times that unit, on
+    the field's device. It matches skimage's ``find_contours`` to 1e-7 relative
+    (float32 vertices), except in saddle cells, which marching cubes resolves
+    by the bilinear interpolant, like ``find_contours(fully_connected="high")``
+    when the saddle lies above 0.5.
+    """
+    ribbon = np.stack([field, field])
+    return _level_set_area(_level_set(ribbon, np.array([1.0, *plane_step])))
+
+
+def _outline_fractal_dimension(
+    mask_3d: np.ndarray,
+    step: np.ndarray,
+    window: tuple[float, float] | None,
+    n_levels: int = 5,
+) -> float:
+    """Return ``1 - slope`` of log contour-length ratio against log blur scale.
+
+    The 2D form of ``_fractal_dimension`` on the mask's footprint along the
+    first axis: the footprint is blurred at ``n_levels`` geometric scales over
+    ``window`` (4 to 16 times the coarser in-plane spacing by default), and the
+    length of each blur's 0.5 contour is divided by the same length for the
+    footprint's smooth twin, its blur at the top scale thresholded at 0.5.
+    Every step runs on the mask's device; NaN, with a warning, if any contour
+    vanishes.
+    """
+    footprint = mask_3d.any(axis=0)
+    plane_step = step[1:]
+    if window is None:
+        low, high = 4 * float(plane_step.max()), 16 * float(plane_step.max())
+    else:
+        low, high = window
+    top, pad = _padded_blur(footprint, plane_step, high)
+    twin = _smooth_twin(top, pad)
+
+    def length(image: np.ndarray, scale: float) -> float:
+        return _contour_length(_padded_blur(image, plane_step, scale)[0], plane_step)
+
+    # geomspace returns ``high`` itself as the last scale, where the footprint's
+    # blur is the one already computed
+    scales = np.geomspace(low, high, n_levels)
+    lengths = [length(footprint, s) for s in scales[:-1]]
+    lengths.append(_contour_length(top, plane_step))
+    ratios = [a / length(twin, s) for a, s in zip(lengths, scales)]
+    if not np.all(np.isfinite(ratios)):
+        warnings.warn(
+            f"Outline Fractal Dimension: the footprint or its smooth twin vanishes "
+            f"when blurred at a scale up to {high:g} (an outline narrower than the "
+            f"blur); returning NaN.",
+            stacklevel=3,
+        )
+        return float("nan")
+    return 1 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])
+
+
 # Measured on the smoothed mesh when one is available; see mesh_feature_list.
 _SMOOTHED_FEATURES = (
     "Total Absolute Gaussian Curvature",
@@ -761,7 +843,7 @@ _SMOOTHED_FEATURES = (
 )
 
 # Measured on the mask itself, at several blur scales; see mesh_feature_list.
-_MASK_FEATURES = ("Fractal Dimension",)
+_MASK_FEATURES = ("Fractal Dimension", "Outline Fractal Dimension")
 
 # Each feature is computed only when requested; the dict order is the default
 # column order of ``mesh_feature_list``.
