@@ -259,8 +259,10 @@ def extract_surface_features(
         ``curvature_sigma`` exceeds the finest spacing. When the highest scale
         exceeds a quarter of the
         object's ``Min Axis Length``, the value is still returned, with a
-        warning that it is biased low; the warning text is the same for every
-        object, so Python's default filter shows it once.
+        warning that it is biased low. Warnings are attributed to the line
+        that called this function; through ``extract_features`` that is one
+        line for every label, and the thin-object text is the same for every
+        object, so Python's default filter shows it once per label image.
     outline_fractal_scales : sequence of float, optional
         ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
         ``Outline Fractal Dimension`` fit, in the same form as
@@ -308,7 +310,7 @@ def extract_surface_features(
             warnings.warn(
                 f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
                 f"curvature_sigma={sigma:g}; returning NaN for {at_sigma}.",
-                stacklevel=2,
+                stacklevel=_CALLER,
             )
             values = dict.fromkeys(at_sigma, float("nan"))
         elif any(name in _SMOOTHED_FEATURES for name in features):
@@ -330,7 +332,7 @@ def extract_surface_features(
             warnings.warn(
                 f"Fractal Dimension needs curvature_sigma above the finest voxel "
                 f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
-                stacklevel=2,
+                stacklevel=_CALLER,
             )
             values["Fractal Dimension"] = float("nan")
         else:
@@ -350,8 +352,16 @@ def extract_surface_features(
         ):
             # One text for every object, so that the default filter reports a
             # label image of many thin objects once.
-            warnings.warn(_THIN_OBJECT_WARNING, stacklevel=2)
+            warnings.warn(_THIN_OBJECT_WARNING, stacklevel=_CALLER)
     return {name: values[name] for name in features}
+
+
+# stacklevel that attributes a warning raised in extract_surface_features to
+# the code that called it: the function itself, then the _require_trimesh
+# wrapper. Helpers it calls add their own frames. Through extract_features the
+# caller is extract_features' per-label loop, one line for every label, so the
+# default filter still shows a constant text once per label image.
+_CALLER = 3
 
 
 # Fractal Dimension reads low once the object's thickness (Min Axis Length) is
@@ -818,7 +828,8 @@ def _blur_ladder_dimension(
             f"{name}: the mask or its smooth twin vanishes when blurred at a "
             f"scale up to {high:g} (an object narrower than the blur); "
             f"returning NaN.",
-            stacklevel=4,
+            # this helper and the feature's estimator, then extract_surface_features
+            stacklevel=_CALLER + 2,
         )
         return float("nan")
     return mask.ndim - 1 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])

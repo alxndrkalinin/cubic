@@ -738,6 +738,53 @@ def test_fractal_dimension_warns_for_an_object_thinner_than_four_top_scales() ->
         assert np.isfinite(features["Fractal Dimension"])
 
 
+@pytest.mark.parametrize(
+    ("case", "match"),
+    [
+        ("thin slab", "biased low for objects thinner"),
+        ("outline narrower than the blur", "Outline Fractal Dimension: the mask"),
+        ("3D twin vanishes", "Fractal Dimension: the mask or its smooth twin"),
+        ("mask vanishes at curvature_sigma", "vanishes when blurred at curvature"),
+        ("empty default window", "needs curvature_sigma above"),
+    ],
+)
+def test_warnings_point_at_the_caller(case: str, match: str) -> None:
+    """A direct call's warnings are attributed to the calling line, not to cubic.
+
+    The _require_trimesh wrapper adds a frame; with stacklevel=2 every warning
+    landed on that wrapper in mesh.py. The outline and 3D-twin cases are raised
+    inside the shared blur-ladder estimator.
+    """
+    thin_sheet = np.zeros((9, 60, 60), dtype=bool)
+    thin_sheet[3:6, 10:50, 10:50] = True
+    calls = {
+        "thin slab": (_slab(6), _NUCLEUS_SPACING, ["Fractal Dimension"], {}),
+        "outline narrower than the blur": (_ball(8, 22), None, [_OUTLINE], {}),
+        "3D twin vanishes": (thin_sheet, _NUCLEUS_SPACING, ["Fractal Dimension"], {}),
+        "mask vanishes at curvature_sigma": (
+            np.ones((1, 1, 1), dtype=bool),
+            None,
+            ["Avg Curvedness"],
+            {},
+        ),
+        "empty default window": (
+            _ball(8, 22),
+            None,
+            ["Fractal Dimension"],
+            {"curvature_sigma": 1.0},
+        ),
+    }
+    mask, spacing, names, kwargs = calls[case]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mesh.extract_surface_features(mask, spacing, names, **kwargs)
+
+    matching = [w for w in caught if match in str(w.message)]
+    assert len(matching) == 1
+    assert matching[0].filename == __file__
+
+
 def test_thin_object_warning_is_shown_once_for_a_label_image() -> None:
     """Many thin labels give one warning under Python's default filter.
 
