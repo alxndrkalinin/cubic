@@ -76,8 +76,6 @@ def test_extract_features_excludes_background_label(surface_calls) -> None:
     filtering alone.
     """
     names = mesh.mesh_feature_list()
-    assert len(names) == 22
-    assert names[-1] == "Fractal Dimension"
     volume = np.zeros((12, 12, 12), dtype=np.int32)
     volume[2:6, 2:6, 2:6] = 1  # 64 voxels
     volume[7:11, 7:11, 7:11] = 2  # 64 voxels
@@ -141,16 +139,18 @@ def test_extract_features_rejects_unknown_feature_names(label: int) -> None:
 
 
 def test_outline_fractal_dimension_is_optional() -> None:
-    """The default features leave out the outline; the optional list ends with it.
+    """The optional list is the 22 default features followed by the outline.
 
-    The defaults are the 22 orientation-invariant features. Every entry point
-    computes the outline when it is named.
+    The defaults are the orientation-invariant features, ending in Fractal
+    Dimension. Every entry point computes the outline when it is named.
     """
     default = mesh.mesh_feature_list()
-    full = mesh.mesh_feature_list(optional=True)
 
-    assert len(default) == 22 and "Outline Fractal Dimension" not in default
-    assert full == [*default, "Outline Fractal Dimension"]
+    assert len(default) == 22 and default[-1] == "Fractal Dimension"
+    assert mesh.mesh_feature_list(optional=True) == [
+        *default,
+        "Outline Fractal Dimension",
+    ]
 
     labels = np.zeros((3, 80, 80), dtype=np.int32)
     labels[1, 2:78, 2:78] = 1
@@ -166,19 +166,20 @@ def test_outline_fractal_dimension_is_optional() -> None:
 
 
 def test_default_features_skip_the_outline(monkeypatch) -> None:
-    """features=None never computes the optional outline."""
+    """features=None returns the default list and never computes the outline."""
 
     def fail(*args, **kwargs):
         raise AssertionError("computed the outline")
 
     monkeypatch.setattr(mesh, "_outline_fractal_dimension", fail)
     labels = _ball(8, 22).astype(np.int32)
+    names = mesh.mesh_feature_list()
 
     _, values, columns = mesh.extract_features(labels)
     features = mesh.extract_surface_features(labels == 1)
 
-    assert values.shape == (1, 22) and columns == mesh.mesh_feature_list()
-    assert list(features) == mesh.mesh_feature_list()
+    assert values.shape == (1, len(names)) and columns == names
+    assert list(features) == names
 
 
 def test_extract_features_rejects_a_bare_feature_name() -> None:
@@ -710,6 +711,7 @@ def test_fractal_dimension_warns_for_an_object_thinner_than_four_top_scales() ->
 
     The 6-plane slab is 1.8 um thick, its Min Axis Length 2.3 um, below 4 x 0.6
     um; the ellipsoid's is 5 um. A window topping out at 0.5 um clears the slab.
+    The warning points to Outline Fractal Dimension.
     """
     names = ["Fractal Dimension", "Min Axis Length"]
     results = {}
@@ -723,15 +725,16 @@ def test_fractal_dimension_warns_for_an_object_thinner_than_four_top_scales() ->
             features = mesh.extract_surface_features(
                 mask, _NUCLEUS_SPACING, names, fractal_scales=scales
             )
-        results[name] = (len(_thin_warnings(caught)), features)
+        results[name] = (_thin_warnings(caught), features)
 
-    count, slab = results["slab"]
-    assert count == 1
+    thin, slab = results["slab"]
+    assert len(thin) == 1
+    assert "see Outline Fractal Dimension" in str(thin[0].message)
     assert slab["Min Axis Length"] < 4 * 0.6
     assert np.isfinite(slab["Fractal Dimension"])
     for name in ("ball", "slab, low window"):
-        count, features = results[name]
-        assert count == 0
+        thin, features = results[name]
+        assert thin == []
         assert np.isfinite(features["Fractal Dimension"])
 
 
@@ -872,13 +875,11 @@ def test_outline_fractal_dimension_follows_turns_about_the_first_axis() -> None:
     for angle in (30, 45):
         turned = ndimage.rotate(mask, angle, axes=(1, 2), order=0, reshape=True)
         assert _outline_fd(turned, _FLAT_SPACING) == pytest.approx(upright, abs=2e-3)
+    axes = (2.0, 6.0, 8.0)
+    ellipsoid = _outline_fd(_flat_ellipsoid(axes, _FLAT_SPACING), _FLAT_SPACING)
     for angle in (30, 45):
-        assert _outline_fd(
-            _flat_ellipsoid((2.0, 6.0, 8.0), _FLAT_SPACING, angle), _FLAT_SPACING
-        ) == pytest.approx(
-            _outline_fd(_flat_ellipsoid((2.0, 6.0, 8.0), _FLAT_SPACING), _FLAT_SPACING),
-            abs=2e-3,
-        )
+        turned = _flat_ellipsoid(axes, _FLAT_SPACING, angle)
+        assert _outline_fd(turned, _FLAT_SPACING) == pytest.approx(ellipsoid, abs=2e-3)
 
 
 def test_outline_fractal_dimension_is_measured_along_the_first_axis() -> None:
@@ -966,12 +967,6 @@ def test_outline_fractal_dimension_of_a_sheet_too_thin_for_curvature_sigma() -> 
     assert np.isnan(features["Avg Curvedness"])
     assert np.isnan(features["Fractal Dimension"])
     assert np.isfinite(features[_OUTLINE])
-
-
-def test_thin_object_warning_points_to_the_outline() -> None:
-    """The thin-object warning names Outline Fractal Dimension."""
-    with pytest.warns(UserWarning, match="see Outline Fractal Dimension"):
-        mesh.extract_surface_features(_slab(6), _NUCLEUS_SPACING, ["Fractal Dimension"])
 
 
 def test_fractal_dimension_of_a_sheet_thinner_than_the_blur() -> None:
