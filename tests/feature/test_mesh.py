@@ -896,6 +896,29 @@ def test_outline_fractal_dimension_is_measured_along_the_first_axis() -> None:
     assert abs(upright - on_its_side) > 0.02
 
 
+@pytest.mark.parametrize("plane", [(0.108, 0.108), (0.2, 0.1)])
+def test_tight_blur_matches_the_wide_one_on_the_frame(plane) -> None:
+    """The outline's one-voxel blur equals the wide blur on the frame and ring.
+
+    The footprints touch their crop on all four sides, where the ring is
+    highest; it stays below 0.5, so the contour closes inside the array.
+    """
+    step = np.asarray(plane)
+    box = np.ones((40, 30), dtype=bool)
+    rough = _rough_cylinder(0.08)[0]
+    rough = rough[np.ix_(rough.any(axis=1), rough.any(axis=0))]
+    for footprint in (box, rough):
+        for sigma in (4 * max(plane), 16 * max(plane)):
+            wide, pad = mesh._padded_blur(footprint, step, sigma)
+            tight, ring = mesh._padded_blur(footprint, step, sigma, tight=True)
+
+            assert ring.tolist() == [1, 1]
+            inner = wide[pad[0] - 1 : 1 - pad[0], pad[1] - 1 : 1 - pad[1]]
+            np.testing.assert_array_equal(tight, inner)
+            border = np.concatenate([tight[0], tight[-1], tight[:, 0], tight[:, -1]])
+            assert border.max() < 0.5
+
+
 def test_outline_fractal_window() -> None:
     """The default window is 4 to 16 coarser in-plane voxels.
 

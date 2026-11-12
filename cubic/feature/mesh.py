@@ -458,21 +458,32 @@ def _step(spacing: Sequence[float] | None) -> np.ndarray:
 
 
 def _padded_blur(
-    mask: np.ndarray, step: np.ndarray, sigma: float
+    mask: np.ndarray, step: np.ndarray, sigma: float, tight: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return the mask blurred at ``sigma`` (units of ``step``) and its padding.
 
     The mask may have any number of axes, one ``step`` per axis. The blur is
     isotropic in physical units, so its width in voxels differs per axis on an
     anisotropic grid.
+
+    ``tight`` pads by one voxel and blurs with zeros beyond it (``constant``
+    mode) instead of padding past the blur's reach: the values on the mask's
+    frame and that ring are bitwise the same, and every ring value is below
+    0.5 (see ``_smooth_twin``), so the 0.5 level still closes inside the
+    array, at a fraction of the cost of a wide blur.
     """
     sigma_voxels = sigma / step
-    # Pad past the blur's reach so it neither clips at the crop nor touches the
-    # border, which would leave the surface open.
-    pad = np.ceil(3 * sigma_voxels).astype(int) + 1
+    if tight:
+        pad = np.ones(mask.ndim, dtype=int)
+        mode = "constant"
+    else:
+        # Pad past the blur's reach so it neither clips at the crop nor touches
+        # the border, which would leave the surface open.
+        pad = np.ceil(3 * sigma_voxels).astype(int) + 1
+        mode = "reflect"
     # Rounds like SciPy on the GPU too, so both devices mesh the same volume.
     volume = gaussian_filter_like_scipy(
-        np.pad(mask.astype(np.float32), [(p, p) for p in pad]), sigma_voxels
+        np.pad(mask.astype(np.float32), [(p, p) for p in pad]), sigma_voxels, mode
     )
     return volume, pad
 
@@ -768,6 +779,7 @@ def _blur_ladder_dimension(
     top_blur: np.ndarray,
     top_pad: np.ndarray,
     top_measure: float,
+    tight: bool = False,
     n_levels: int = 5,
 ) -> float:
     """Return ``mask.ndim - 1 - slope`` of log measure ratio against log blur scale.
@@ -787,11 +799,13 @@ def _blur_ladder_dimension(
     and ``top_measure`` the measure of its 0.5 level, which the caller has
     already computed: the twin is thresholded from the first and cropped to
     the mask's frame, and the second is the mask's value at the last scale.
+    ``tight`` selects the one-voxel padding of ``_padded_blur`` for the other
+    blurs.
     """
     twin = _smooth_twin(top_blur, top_pad)
 
     def at(image: np.ndarray, scale: float) -> float:
-        return measure(_padded_blur(image, step, scale)[0])
+        return measure(_padded_blur(image, step, scale, tight)[0])
 
     # geomspace returns ``high`` itself as the last scale, where the mask's
     # measure is the one already computed
@@ -862,11 +876,14 @@ def _outline_fractal_dimension(
     """Return ``1 - slope`` of log contour-length ratio against log blur scale.
 
     ``_blur_ladder_dimension`` on the mask's footprint along the first axis,
-    with the length of each blur's 0.5 contour and the in-plane spacing.
+    with the length of each blur's 0.5 contour and the in-plane spacing. The
+    2D blurs use the one-voxel padding, whose field equals the wide one's on
+    the footprint's frame bit for bit; only the float32 contour vertices shift,
+    by an ulp, with the frame's offset in the array.
     """
     footprint = mask_3d.any(axis=0)
     plane_step = step[1:]
-    top, pad = _padded_blur(footprint, plane_step, high)
+    top, pad = _padded_blur(footprint, plane_step, high, tight=True)
 
     def length(field: np.ndarray) -> float:
         return _contour_length(field, plane_step)
@@ -881,6 +898,7 @@ def _outline_fractal_dimension(
         top,
         pad,
         length(top),
+        tight=True,
     )
 
 
