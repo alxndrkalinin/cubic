@@ -810,7 +810,6 @@ def _blur_ladder_dimension(
     top_blur: np.ndarray,
     top_pad: np.ndarray,
     top_measure: float,
-    tight: bool = False,
     n_levels: int = 5,
 ) -> float:
     """Return ``mask.ndim - 1 - slope`` of log measure ratio against log blur scale.
@@ -830,13 +829,16 @@ def _blur_ladder_dimension(
     and ``top_measure`` the measure of its 0.5 level, which the caller has
     already computed: the twin is thresholded from the first and cropped to
     the mask's frame, and the second is the mask's value at the last scale.
-    ``tight`` selects the one-voxel padding of ``_padded_blur`` for the other
-    blurs.
+    The other blurs of the ladder (the mask's below ``high``, the twin's at
+    every scale) use the one-voxel padding of ``_padded_blur``: their field
+    equals the wide blur's on the frame bit for bit, and only the float32
+    vertices of each level set move, by rounding, with the frame's offset in
+    the array.
     """
     twin = _smooth_twin(top_blur, top_pad)
 
     def at(image: np.ndarray, scale: float) -> float:
-        return measure(_padded_blur(image, step, scale, tight)[0])
+        return measure(_padded_blur(image, step, scale, tight=True)[0])
 
     # geomspace returns ``high`` itself as the last scale, where the mask's
     # measure is the one already computed
@@ -869,7 +871,9 @@ def _fractal_dimension(
 
     ``_blur_ladder_dimension`` on the 3D mask, with the area of each level set.
     ``blurred`` is the mask's blur at ``high`` with its padding ``pad``, and
-    ``level_set`` its 0.5 level from ``_level_set``.
+    ``level_set`` its 0.5 level from ``_level_set``; that top blur keeps the
+    wide padding, since it is shared with the curvature features' mesh, while
+    the ladder's other blurs are tight.
     """
 
     def area(volume: np.ndarray) -> float:
@@ -908,10 +912,8 @@ def _outline_fractal_dimension(
     """Return ``1 - slope`` of log contour-length ratio against log blur scale.
 
     ``_blur_ladder_dimension`` on the mask's footprint along the first axis,
-    with the length of each blur's 0.5 contour and the in-plane spacing. The
-    2D blurs use the one-voxel padding, whose field equals the wide one's on
-    the footprint's frame bit for bit; only the float32 contour vertices shift,
-    by an ulp, with the frame's offset in the array.
+    with the length of each blur's 0.5 contour and the in-plane spacing. All
+    its 2D blurs, the top one included, use the one-voxel padding.
     """
     footprint = mask_3d.any(axis=0)
     plane_step = step[1:]
@@ -930,7 +932,6 @@ def _outline_fractal_dimension(
         top,
         pad,
         length(top),
-        tight=True,
     )
 
 
