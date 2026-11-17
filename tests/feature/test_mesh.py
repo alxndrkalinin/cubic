@@ -394,3 +394,16 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
     )
     # A timeout turns a hung import (e.g. a CUDA probe) into a failure.
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
+
+
+@pytest.mark.parametrize("version", ["4.6.11", "4.6", "3.23.5"])
+def test_trimesh_older_than_the_signed_curvature_is_refused(version: str) -> None:
+    """A trimesh without signed dihedral angles fails at import, not in the values."""
+    with pytest.raises(ImportError, match=r"trimesh>=4\.6\.12; found"):
+        mesh._check_trimesh_version(version)
+
+
+@pytest.mark.parametrize("version", ["4.6.12", "4.11.2", "5.0.0rc1"])
+def test_supported_trimesh_is_accepted(version: str) -> None:
+    """The floor itself, later releases and uncomparable tags pass the check."""
+    mesh._check_trimesh_version(version)

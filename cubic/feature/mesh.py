@@ -29,6 +29,26 @@ from ..cuda import asnumpy
 
 F = TypeVar("F", bound=Callable[..., Any])
 
+# ``Trimesh.integral_mean_curvature`` signs its dihedral angles only from this
+# release on; older ones overstate the mean curvature of any concave surface.
+_MIN_TRIMESH = (4, 6, 12)
+
+
+def _check_trimesh_version(version: str) -> None:
+    """Raise ``ImportError`` for a trimesh release older than ``_MIN_TRIMESH``."""
+    parts = version.split(".")[:3]
+    # A part that is not a plain number (a pre-release tag) cannot be compared.
+    if all(part.isdigit() for part in parts) and tuple(map(int, parts)) < _MIN_TRIMESH:
+        raise ImportError(
+            f"cubic.feature.mesh requires trimesh>={'.'.join(map(str, _MIN_TRIMESH))}"
+            f"; found {version}. Install with 'cubic[mesh]'"
+        )
+
+
+# trimesh reports no version when its package metadata is missing.
+if trimesh is not None and trimesh.__version__ is not None:
+    _check_trimesh_version(trimesh.__version__)
+
 
 def _require_trimesh(func: F) -> F:
     """Ensure ``trimesh`` is available before calling ``func``."""
@@ -287,8 +307,7 @@ def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
     """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
 
     trimesh integrates it as half the sum of edge length times signed dihedral
-    angle over the edges (Cohen-Steiner and Morvan, 2003). Before trimesh 4.6.12
-    the angles were unsigned, which overstated it on any concave surface.
+    angle over the edges (Cohen-Steiner and Morvan, 2003).
     """
     return mesh.integral_mean_curvature / mesh.area
 
