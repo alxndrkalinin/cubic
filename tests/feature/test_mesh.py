@@ -132,6 +132,18 @@ def test_extract_features_rejects_a_bare_feature_name() -> None:
         mesh.extract_features(_cube_volume(4), "Volume")
 
 
+def test_extract_features_accepts_a_one_shot_iterable_of_names() -> None:
+    """A generator of names gives the same columns as the list of them."""
+    names = ["Volume", "Area"]
+    _, from_list, _ = mesh.extract_features(_cube_volume(4), names)
+    _, from_generator, columns = mesh.extract_features(
+        _cube_volume(4), (name for name in names)
+    )
+
+    assert columns == names
+    np.testing.assert_array_equal(from_generator, from_list)
+
+
 def test_extract_features_rejects_non_integer_labels() -> None:
     """A float label image raises instead of failing inside find_objects."""
     with pytest.raises(ValueError, match="integer dtype"):

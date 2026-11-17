@@ -90,12 +90,14 @@ def _resolve_features(features: Sequence[str] | None) -> list[str]:
         raise TypeError(
             f"features must be a sequence of names, not the string {features!r}"
         )
-    unknown = [name for name in features if name not in _MESH_FEATURES]
+    # Listed first: checking the names would exhaust a one-shot iterable.
+    names = list(features)
+    unknown = [name for name in names if name not in _MESH_FEATURES]
     if unknown:
         raise ValueError(
             f"Unknown mesh features {unknown}; available: {mesh_feature_list()}"
         )
-    return list(features)
+    return names
 
 
 @_require_trimesh
