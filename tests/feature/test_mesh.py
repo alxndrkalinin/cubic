@@ -277,8 +277,8 @@ def test_shape_features_do_not_depend_on_orientation(rot_deg: float) -> None:
 def test_extract_features_computes_only_requested(monkeypatch) -> None:
     """Features that were not requested are never computed.
 
-    Mean curvature took 15.4 s of a 15.8 s per-label total on a 13k-vertex
-    nucleus, and a ``["Volume"]`` request used to pay for it anyway.
+    A ``["Volume"]`` request used to compute every feature, mean curvature
+    included.
     """
 
     def fail(_mesh) -> float:
@@ -383,8 +383,8 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
     """``cubic.feature.mesh`` resolves on access, not on ``import cubic.feature``.
 
     It used to raise ``AttributeError`` unless the submodule had been imported
-    explicitly; importing it eagerly would add trimesh's 0.75-3 s import to
-    every user of the voxel and texture features.
+    explicitly; importing it eagerly would make every user of the voxel and
+    texture features pay for the trimesh import.
     """
     assert cubic.feature.__getattr__("mesh") is mesh
     # Only a fresh interpreter can show that the package import, star import
