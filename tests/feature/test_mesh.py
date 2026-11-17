@@ -52,7 +52,7 @@ def surface_calls(monkeypatch) -> list[dict]:
 
     def fake_surface_features(mask, spacing=None, features=None) -> dict[str, float]:
         calls.append({"mask": mask, "spacing": spacing})
-        return dict.fromkeys(features or mesh.mesh_feature_list(), 0.0)
+        return dict.fromkeys(features, 0.0)
 
     monkeypatch.setattr(mesh, "extract_surface_features", fake_surface_features)
     return calls
