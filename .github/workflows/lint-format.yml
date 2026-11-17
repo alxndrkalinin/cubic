@@ -15,8 +15,10 @@ jobs:
       - name: set up python
         run: uv python install 3.10
 
-      - name: install project with dev dependencies
-        run: uv sync --extra dev
+      # Without trimesh installed, mypy treats every trimesh type in
+      # cubic/feature/mesh.py as Any.
+      - name: install project with dev and mesh dependencies
+        run: uv sync --extra dev --extra mesh
 
       - name: run ruff linter
         run: uv run ruff check .
