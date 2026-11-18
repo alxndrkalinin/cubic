@@ -102,6 +102,9 @@ class ArrayMesh:
     faces : array
         ``(F, 3)`` vertex indices on the same device, wound outward, as
         ``mesh._marching_cubes`` returns them.
+    merge : bool, optional
+        ``False`` takes float64 vertices and int64 faces that are already
+        merged as they are, as ``scaled()`` does. The default merges.
 
     The faces are measured as given, as ``trimesh.Trimesh`` measures them: a
     mesh wound inward reports a negative volume. Equal and unreferenced
@@ -114,20 +117,11 @@ class ArrayMesh:
     and ``to_trimesh()`` for a mutable mesh.
     """
 
-    def __init__(self, vertices: Any, faces: Any) -> None:
-        self._init_merged(
-            *_merge_vertices(vertices.astype(np.float64), faces.astype(np.int64))
-        )
-
-    @classmethod
-    def _from_merged(cls, vertices: Any, faces: Any) -> ArrayMesh:
-        """Return a mesh of float64 vertices and int64 faces already merged."""
-        mesh = cls.__new__(cls)
-        mesh._init_merged(vertices, faces)
-        return mesh
-
-    def _init_merged(self, vertices: Any, faces: Any) -> None:
-        """Set the state of a new mesh from merged arrays; every instance runs it."""
+    def __init__(self, vertices: Any, faces: Any, *, merge: bool = True) -> None:
+        if merge:
+            vertices, faces = _merge_vertices(
+                vertices.astype(np.float64), faces.astype(np.int64)
+            )
         self.vertices, self.faces = vertices, faces
 
     def scaled(self, factor: float) -> ArrayMesh:
@@ -147,7 +141,7 @@ class ArrayMesh:
         factor = float(factor)
         if not np.isfinite(factor) or factor <= 0:
             raise ValueError(f"factor must be finite and positive; got {factor}")
-        return type(self)._from_merged(self.vertices * factor, self.faces)
+        return type(self)(self.vertices * factor, self.faces, merge=False)
 
     def __getattr__(self, name: str) -> Any:
         # Called for attributes not defined here, which go to trimesh, and also
