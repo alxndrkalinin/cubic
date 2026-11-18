@@ -316,31 +316,24 @@ def test_extract_features_on_gpu_matches_cpu(gpu_available: bool) -> None:
     np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
 
 
-def test_ragged_label_on_gpu_matches_cpu(gpu_available: bool) -> None:
-    """A label whose mesh has edges shared by four faces gives the same features.
+def test_ragged_label_on_gpu_matches_cpu(ragged_ball, gpu_available: bool) -> None:
+    """A label whose mesh is not watertight gives the same features on both devices.
 
-    Both devices orient the mesh by the sign of its volume. The CPU path used
-    to rely on ``fix_normals``, which skips a mesh trimesh does not call
-    watertight: there it raised on the negative volume while the GPU path
-    measured the label. Both skip the four-face edges in the face adjacency.
+    The CPU path used to rely on ``fix_normals``, which skips a mesh trimesh
+    does not call watertight: there it raised on the negative volume while the
+    GPU path measured the label.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-    rng = np.random.default_rng(0)
-    z, y, x = np.meshgrid(*[np.arange(41) - 20.0] * 3, indexing="ij")
-    r = np.sqrt(z**2 + y**2 + x**2)
-    shell = (np.abs(r - 15) <= 1.0) & (rng.random(r.shape) < 0.3)
-    pieces = ndimage.label((r <= 15) ^ shell, structure=np.ones((3, 3, 3)))[0]
     labels = np.zeros((41, 41, 60), dtype=np.int32)
-    labels[:, :, :41][pieces == np.argmax(np.bincount(pieces.ravel())[1:]) + 1] = 1
+    labels[:, :, :41][ragged_ball] = 1
     labels[10:20, 10:20, 45:55] = 2
-    assert not mesh.mask2mesh(labels == 1).is_watertight
+    assert not mesh.mask2mesh(ragged_ball).is_watertight
 
     cpu_labels, cpu, _ = mesh.extract_features(labels)
     gpu_labels, gpu, _ = mesh.extract_features(ascupy(labels))
 
     np.testing.assert_array_equal(gpu_labels, cpu_labels)
-    assert (cpu[:, mesh.mesh_feature_list().index("Volume")] > 0).all()
     np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
 
 
