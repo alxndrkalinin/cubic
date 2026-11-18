@@ -783,27 +783,39 @@ def _measure_mesh(
     # features sharing them do not recompute them.
     values = {name: float(measure(name)) for name in features}
     # Only the meshes that a requested approximate feature was measured on are
-    # checked, each once; both sides reuse the edge grouping cached above.
-    checked: list[Any] = []
-    for name in features:
-        if name in _SHARED_EDGE_FEATURES and not any(
-            measured_on(name) is m for m in checked
-        ):
-            checked.append(measured_on(name))
-    if any(_overshared_edge_count(m) for m in checked):
+    # checked, each once: keyed by identity, since a Trimesh hashes its content.
+    checked = {
+        id(measured_on(name)): measured_on(name)
+        for name in features
+        if name in _SHARED_EDGE_FEATURES
+    }
+    # The meshes whose face adjacency a requested feature has already built.
+    with_adjacency = {
+        id(measured_on(name)) for name in features if name in _ADJACENCY_FEATURES
+    }
+    if any(
+        _overshared_edge_count(m, adjacency_measured=key in with_adjacency)
+        for key, m in checked.items()
+    ):
         warnings.warn(_SHARED_EDGE_WARNING, stacklevel=_stacklevel_outside_module())
     return values
 
 
-def _overshared_edge_count(mesh: Any) -> int:
+def _overshared_edge_count(mesh: Any, adjacency_measured: bool = False) -> int:
     """Return the number of edges of ``mesh`` shared by more than two faces.
 
-    An ``ArrayMesh`` counts them from its own edge grouping, on its device; a
-    ``trimesh.Trimesh`` from ``edges_unique_inverse``, which ``euler_number``
-    caches.
+    An ``ArrayMesh`` counts them from its own edge grouping, on its device. A
+    ``trimesh.Trimesh`` counts them from ``edges_unique_inverse``, which its
+    ``euler_number`` caches. With ``adjacency_measured``, set when a feature
+    has built the mesh's face adjacency, that adjacency is tested first: it
+    pairs the two faces of each edge shared by exactly two, so it has 3 / 2
+    pairs per face exactly when every edge has two faces, and the count is
+    then 0.
     """
     if isinstance(mesh, ArrayMesh):
         return mesh.overshared_edge_count
+    if adjacency_measured and 2 * len(mesh.face_adjacency) == 3 * len(mesh.faces):
+        return 0
     return int((np.bincount(mesh.edges_unique_inverse) > 2).sum())
 
 
@@ -825,20 +837,6 @@ def _stacklevel_outside_module() -> int:
         frame = frame.f_back  # type: ignore[assignment]
         level += 1
     return level
-
-
-# Approximate on a mesh with edges shared by more than two faces: the Euler
-# number counts such an edge once, the face adjacency behind the mean curvature
-# (trimesh's ``group_rows(require_count=2)``, ArrayMesh's runs of two) leaves
-# it out, and the angle defect at each of its ends sums the corners of both
-# sheets that meet there.
-_SHARED_EDGE_WARNING = (
-    "At least one mesh has edges shared by more than two faces, which marching "
-    "cubes makes where voxels touch only along an edge. Euler Characteristic, "
-    "Avg Mean Curvature, Total Absolute Gaussian Curvature, Avg Shape Index and "
-    "Avg Curvedness are approximate on such a mesh; their values are returned "
-    "as computed."
-)
 
 
 def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
@@ -1123,11 +1121,22 @@ _SMOOTHED_FEATURES = (
 )
 
 # Approximate on a mesh with edges shared by more than two faces, with a
-# warning; see _SHARED_EDGE_WARNING.
+# warning: the Euler number counts such an edge once, the face adjacency behind
+# the mean curvature (trimesh's ``group_rows(require_count=2)``, ArrayMesh's
+# runs of two) leaves it out, and the angle defect at each of its ends sums the
+# corners of both sheets that meet there.
 _SHARED_EDGE_FEATURES = (
     "Euler Characteristic",
     "Avg Mean Curvature",
     *_SMOOTHED_FEATURES,
+)
+# Build trimesh's face adjacency on the mesh they are measured on.
+_ADJACENCY_FEATURES = ("Avg Mean Curvature", "Avg Shape Index", "Avg Curvedness")
+_SHARED_EDGE_WARNING = (
+    "At least one mesh has edges shared by more than two faces, which marching "
+    "cubes makes where voxels touch only along an edge. "
+    f"{', '.join(_SHARED_EDGE_FEATURES[:-1])} and {_SHARED_EDGE_FEATURES[-1]} "
+    "are approximate on such a mesh; their values are returned as computed."
 )
 
 # Measured on the mask itself, at several blur scales; see mesh_feature_list.

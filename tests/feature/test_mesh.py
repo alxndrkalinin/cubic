@@ -9,6 +9,7 @@ import subprocess
 import numpy as np
 import pytest
 from scipy import ndimage
+from skimage.measure import marching_cubes
 
 trimesh = pytest.importorskip("trimesh")
 
@@ -1040,6 +1041,45 @@ def test_shared_edges_are_counted_only_for_an_approximate_feature(
     features = mesh.extract_surface_features(ragged_ball, features=names)
 
     assert list(features) == names
+
+
+def test_shared_edge_count_tested_by_the_face_adjacency(
+    shared_edge_masks, ragged_ball_of
+) -> None:
+    """Testing the face adjacency first gives the full count on every mesh.
+
+    When a feature has built the face adjacency, the count starts from it: it
+    has 3 / 2 pairs per face exactly when every edge has two faces. An open
+    surface fails that test without a shared edge, and falls back to the count.
+    """
+    open_mask = np.zeros((6, 6, 6), dtype=bool)
+    open_mask[:3, :3, :3] = True
+    verts, faces, _, _ = marching_cubes(open_mask, 0.5)
+    builders = {
+        **{
+            name: lambda m=mask: mesh.mask2mesh(m)
+            for name, mask in shared_edge_masks.items()
+        },
+        "clean ball": lambda: mesh.mask2mesh(ragged_ball_of(0.0)),
+        "blurred ragged ball": lambda: mesh.mask2mesh(ragged_ball_of(0.3), sigma=2.0),
+        "open surface": lambda: trimesh.Trimesh(vertices=verts, faces=faces),
+    }
+    counts = {}
+    for name, build in builders.items():
+        full = mesh._overshared_edge_count(build())
+        assert mesh._overshared_edge_count(build(), adjacency_measured=True) == full
+        counts[name] = full
+
+    assert counts["ragged ball 30%"] == 33
+    assert counts["clean ball"] == counts["open surface"] == 0
+    # The mean curvature builds the adjacency, so the warning takes that path.
+    for name in ("ragged ball 30%", "clean ball"):
+        caught = _shared_edge_warnings(
+            lambda s=builders[name](): mesh.extract_mesh_features(
+                s, ["Avg Mean Curvature"]
+            )
+        )
+        assert len(caught) == (counts[name] > 0), name
 
 
 @pytest.mark.parametrize(
