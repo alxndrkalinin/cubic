@@ -226,7 +226,9 @@ def test_mask2mesh_pads_border_touching_mask() -> None:
     assert border.area == pytest.approx(interior.area)
 
 
-def test_extract_features_orients_a_ragged_label_outward(ragged_ball) -> None:
+def test_extract_features_orients_a_ragged_label_outward(
+    ragged_ball: np.ndarray,
+) -> None:
     """A label whose mesh is not watertight is measured, not rejected.
 
     ``fix_normals`` left such a mesh with marching cubes' inward winding, and
@@ -261,7 +263,7 @@ def test_mask2mesh_orients_random_masks_outward() -> None:
     assert all(s.volume > 0 for s in surfaces)
 
 
-def test_mask2mesh_orients_an_ascent_mesh_outward(ragged_ball) -> None:
+def test_mask2mesh_orients_an_ascent_mesh_outward(ragged_ball: np.ndarray) -> None:
     """With ``gradient_direction="ascent"`` the faces already wind outward.
 
     They must then be kept, so the volume equals the default direction's.

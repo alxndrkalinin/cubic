@@ -333,7 +333,9 @@ def test_extract_features_on_gpu_matches_cpu(gpu_available: bool) -> None:
     np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
 
 
-def test_ragged_label_on_gpu_matches_cpu(ragged_ball, gpu_available: bool) -> None:
+def test_ragged_label_on_gpu_matches_cpu(
+    ragged_ball: np.ndarray, gpu_available: bool
+) -> None:
     """A label whose mesh is not watertight gives the same features on both devices.
 
     The CPU path used to rely on ``fix_normals``, which skips a mesh trimesh
