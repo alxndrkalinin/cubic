@@ -13,6 +13,7 @@ trimesh = pytest.importorskip("trimesh")
 
 from cubic.cuda import ascupy, asnumpy, to_same_device  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
+from cubic.feature._array_mesh import ArrayMesh  # noqa: E402
 
 _SPACING_ERROR = re.escape(
     "spacing must be three finite, positive numbers (z, y, x); got "
@@ -394,3 +395,243 @@ def test_mask2mesh_is_covariant_with_the_unit(
         np.testing.assert_array_equal(faces, ref_faces, err_msg=f"c={c:g}")
         off = np.abs(verts - c * ref_verts) / (c * np.finfo(float).eps * padded)
         assert off.max() <= 4, (c, off.max())
+
+
+def _lobed() -> np.ndarray:
+    """Return a 20 x 44 x 44 mask of a flat ellipsoid turned in plane, with a lobe."""
+    z, y, x = np.meshgrid(
+        *[np.arange(n) - (n - 1) / 2 for n in (20, 44, 44)], indexing="ij"
+    )
+    turn = np.deg2rad(30)
+    u = y * np.cos(turn) + x * np.sin(turn)
+    v = -y * np.sin(turn) + x * np.cos(turn)
+    body = (u / 19) ** 2 + (v / 13) ** 2 + (z / 6) ** 2 <= 1
+    lobe = (z - 4) ** 2 + (y - 5) ** 2 + (x + 7) ** 2 <= 4**2
+    return body | lobe
+
+
+# Relative tolerance of extract_mesh_features against itself at another unit,
+# set from the largest change measured over UNIT_FACTORS and MESH_BASES on
+# either device (in brackets); 1e-13 for every other feature (1.1e-14). The
+# bounding cylinder comes from an approximate search. The mean-curvature sums
+# take arccos of dot products of face normals, which turns the last bit of a
+# dot product of two coplanar faces into an angle of up to 1.5e-8.
+_CONVERSION_RTOL = {
+    "Bounding Cylinder Volume": 1e-2,  # 4.3e-3
+    "Avg Mean Curvature": 2e-7,  # 6.3e-8
+    "Avg Curvedness": 2e-7,  # 9.5e-9
+    "Avg Shape Index": 1e-7,  # 5.9e-9, on the blurred mesh
+    "Total Absolute Gaussian Curvature": 1e-11,  # 1.1e-13
+}
+
+
+def _assert_close(
+    got: dict[str, float], expected: dict[str, float], rtol: dict[str, float]
+) -> None:
+    off = {
+        name: (got[name], value)
+        for name, value in expected.items()
+        if not abs(got[name] - value) <= rtol.get(name, 1e-13) * abs(value)
+    }
+    assert not off, off
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("base", list(MESH_BASES))
+@pytest.mark.parametrize("smooth", [False, True], ids=["raw", "smooth mesh"])
+def test_extract_mesh_features_convert_with_the_unit(
+    device: str, base: str, smooth: bool, gpu_available: bool
+) -> None:
+    """At spacing ``c * base``, each feature is ``c ** dimension`` times its value.
+
+    The features are measured on a copy of the mesh scaled to the square root
+    of its mean face area, so trimesh's absolute tolerances see the same
+    problem at every factor. Unscaled, Avg Mean Curvature came out 32 times
+    too high at 1e-7. ``smooth`` passes ``mask2mesh(..., sigma=...)`` for the
+    curvature-distribution features. Avg Shape Index on a raw voxel mesh is
+    left out: its flat vertices have mean and Gaussian curvature at rounding
+    level, and their shape index is the angle of that noise: it moved by up
+    to 14% between factors here, by 19% to 200% between spacings 1 and 0.108
+    before this change, and by up to 0.003 between three GPU runs on one mesh.
+    """
+    mask = _on(device, _lobed(), gpu_available)
+    spacing, sigma = MESH_BASES[base]
+    step = np.asarray(spacing)
+    names = [
+        name for name in mesh._MESH_FEATURES if smooth or name != "Avg Shape Index"
+    ]
+
+    def features_at(c: float) -> dict[str, float]:
+        surface = mesh.mask2mesh(mask, spacing=tuple(c * step))
+        smooth_mesh = (
+            mesh.mask2mesh(mask, spacing=tuple(c * step), sigma=c * sigma)
+            if smooth
+            else None
+        )
+        return mesh.extract_mesh_features(surface, names, smooth_mesh=smooth_mesh)
+
+    reference = features_at(1.0)
+    for c in UNIT_FACTORS:
+        expected = {n: c ** DIMENSIONS[n] * v for n, v in reference.items()}
+        _assert_close(features_at(c), expected, _CONVERSION_RTOL)
+
+
+# Relative tolerance of extract_mesh_features against extract_surface_features,
+# from the largest difference measured on either device (in brackets); 1e-13
+# for every other feature (6e-15). The pipeline measures in units of the finest
+# spacing, extract_mesh_features in units of the mesh's edges.
+_PIPELINE_RTOL = {
+    "Bounding Cylinder Volume": 1e-2,  # 1.2e-3
+    "Avg Mean Curvature": 1e-7,  # 2.1e-8
+    "Avg Shape Index": 1e-8,  # 4.9e-10
+    "Avg Curvedness": 1e-8,  # 1.2e-10
+    "Total Absolute Gaussian Curvature": 1e-11,  # 4.7e-15
+}
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("c", [1.0, 1e-8])
+def test_extract_mesh_features_matches_the_pipeline(
+    device: str, c: float, gpu_available: bool
+) -> None:
+    """The direct functions give ``extract_surface_features`` at any unit.
+
+    At spacing ``c * (0.29, 0.108, 0.108)``, the raw mesh measures the raw-mesh
+    features, and ``mask2mesh`` at the default ``curvature_sigma`` (twice the
+    coarsest spacing) the curvature-distribution ones.
+    """
+    mask = _on(device, _lobed(), gpu_available)
+    spacing = tuple(c * s for s in (0.29, 0.108, 0.108))
+    names = list(mesh._MESH_FEATURES)
+    surface = mesh.mask2mesh(mask, spacing=spacing)
+    smooth_mesh = mesh.mask2mesh(mask, spacing=spacing, sigma=2 * max(spacing))
+
+    direct = mesh.extract_mesh_features(surface, names, smooth_mesh=smooth_mesh)
+    pipeline = mesh.extract_surface_features(mask, spacing=spacing, features=names)
+
+    _assert_close(direct, pipeline, _PIPELINE_RTOL)
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+def test_tiny_units_keep_the_mesh_and_its_mean_curvature(
+    device: str, gpu_available: bool
+) -> None:
+    """The two failures reported at tiny spacings are gone.
+
+    On a 26^3 grid centred between voxels, a radius-10 ball's mesh built in
+    metres at spacing 1e-8 kept 1,402 of its 1,896 vertices, Euler number 566
+    and not watertight. At 1e-7 it was intact, but its Avg Mean Curvature came
+    out 32 times too high: the convexity test behind the signed dihedral
+    angles has an absolute tolerance of 1e-8.
+    """
+    grid = np.meshgrid(*[np.arange(26) - 12.5] * 3, indexing="ij")
+    ball = _on(device, sum(axis**2 for axis in grid) <= 10**2, gpu_available)
+    tiny = mesh.mask2mesh(ball, spacing=(1e-8,) * 3)
+    shape = (len(tiny.vertices), len(tiny.faces), tiny.euler_number)
+    assert shape == (1896, 3788, 2)
+    assert tiny.is_watertight
+
+    name = "Avg Mean Curvature"
+    at_one = mesh.extract_mesh_features(mesh.mask2mesh(ball), [name])[name]
+    surface = mesh.mask2mesh(ball, spacing=(1e-7,) * 3)
+    assert mesh.extract_mesh_features(surface, [name])[name] == pytest.approx(
+        1e7 * at_one, rel=_CONVERSION_RTOL[name]
+    )
+
+
+def _state(surface: Any) -> dict[str, Any]:
+    """Return what a call could change on a mesh: its arrays and its cache."""
+    vertices, faces = _arrays(surface)
+    if isinstance(surface, trimesh.Trimesh):
+        cached = surface._cache.cache
+    else:
+        cached = vars(surface)
+    return {
+        "vertices": vertices.copy(),
+        "faces": faces.copy(),
+        "cached": {key: id(value) for key, value in cached.items()},
+    }
+
+
+@pytest.mark.parametrize("kind", ["trimesh", "ArrayMesh, NumPy", "ArrayMesh, CuPy"])
+def test_extract_mesh_features_leaves_the_meshes_as_they_are(
+    kind: str, gpu_available: bool
+) -> None:
+    """Neither mesh is modified, and nothing is cached on either.
+
+    The features are measured on scaled copies. Measured on the meshes
+    themselves, a trimesh mesh kept its convex hull, mass properties and the
+    rest in its cache.
+    """
+    mask = _on("gpu" if kind.endswith("CuPy") else "cpu", _ball(10), gpu_available)
+    spacing = (0.29, 0.108, 0.108)
+    surface = mesh.mask2mesh(mask, spacing=spacing)
+    smooth_mesh = mesh.mask2mesh(mask, spacing=spacing, sigma=0.65)
+    if kind == "ArrayMesh, NumPy":
+        surface, smooth_mesh = (ArrayMesh(*_arrays(m)) for m in (surface, smooth_mesh))
+    before = [_state(m) for m in (surface, smooth_mesh)]
+
+    mesh.extract_mesh_features(surface, smooth_mesh=smooth_mesh)
+
+    for state, m in zip(before, (surface, smooth_mesh), strict=True):
+        after = _state(m)
+        np.testing.assert_array_equal(after["vertices"], state["vertices"])
+        np.testing.assert_array_equal(after["faces"], state["faces"])
+        assert after["cached"] == state["cached"]
+
+
+def test_extract_mesh_features_keeps_a_density_and_centre_of_mass() -> None:
+    """A density and centre of mass set on a trimesh mesh carry over to the copy.
+
+    The inertia features read both; the centre is a point, scaled with the
+    vertices. trimesh's own ``apply_scale`` is not used for the copy: it leaves
+    the vertices as they are for a factor within 1e-8 of 1.
+    """
+    surface = mesh.mask2mesh(_ball(10), spacing=(0.29, 0.108, 0.108))
+    surface.density = 2.0
+    surface.center_mass = np.asarray(surface.centroid) + (0.5, 0.0, 0.0)
+    names = ["Inertia PC1", "Inertia PC2", "Inertia PC3"]
+
+    got = mesh.extract_mesh_features(surface, names)
+
+    expected = surface.principal_inertia_components
+    assert [got[name] for name in names] == pytest.approx(list(expected), rel=1e-12)
+    for factor in (1 + 5e-9, 1e-9):
+        copy = mesh._scaled_copy(surface, factor)
+        np.testing.assert_array_equal(copy.vertices, surface.vertices * factor)
+        np.testing.assert_array_equal(copy.center_mass, surface.center_mass * factor)
+        assert copy.density == 2.0
+
+
+@pytest.mark.parametrize("c", [1.0, 1e-9])
+def test_extract_mesh_features_measures_a_primitive_as_its_triangles(c: float) -> None:
+    """A trimesh primitive gives the features of a mesh of its triangles.
+
+    A primitive refuses new vertices, so copying it and scaling the copy's
+    vertices raised. A box's triangles enclose its volume exactly; the plain mesh
+    is built unmerged, since trimesh merges vertices closer than 1e-8.
+    """
+    box = trimesh.primitives.Box(extents=(2 * c, 3 * c, 4 * c))
+    names = ["Area", "Volume", "Inertia PC1", "Euler Characteristic"]
+
+    got = mesh.extract_mesh_features(box, names)
+
+    plain = trimesh.Trimesh(box.vertices, box.faces, process=False)
+    assert got == mesh.extract_mesh_features(plain, names)
+    assert got["Volume"] == pytest.approx(24 * c**3, rel=1e-12)
+
+
+@pytest.mark.parametrize("c", [1.0, 1e-8])
+def test_extract_mesh_features_errors_print_the_callers_volume(c: float) -> None:
+    """The volume check prints the volume of the caller's mesh, in its units.
+
+    It is measured on a copy scaled to the mesh's edges and converted back.
+    """
+    spacing = tuple(c * s for s in (0.29, 0.108, 0.108))
+    inside_out = mesh.mask2mesh(_ball(10), spacing=spacing).invert()
+
+    with pytest.raises(ValueError, match="volume must be finite") as error:
+        mesh.extract_mesh_features(inside_out, ["Volume"])
+
+    got = float(re.search(r"got (\S+)\. ", str(error.value)).group(1))
+    assert got == pytest.approx(inside_out.volume, rel=1e-12)

@@ -653,6 +653,49 @@ def test_outline_fractal_dimension_stays_on_the_gpu(
     assert on_gpu[name] == pytest.approx(on_cpu[name], rel=1e-9)
 
 
+@pytest.mark.parametrize("c", [1.0, 1e-8])
+def test_extract_mesh_features_stays_on_the_gpu(
+    c: float, gpu_available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The features computed on the device never build a host trimesh.
+
+    ``extract_mesh_features`` measures scaled copies of both meshes; the copies
+    are ArrayMeshes too, at an ordinary spacing and at one in metres.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+
+    def fail(self: ArrayMesh) -> NoReturn:
+        raise AssertionError("fell back to a host trimesh")
+
+    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
+    on_device = [
+        "Area",
+        "Volume",
+        "Min Axis Length",
+        "Med Axis Length",
+        "Max Axis Length",
+        "Inertia PC1",
+        "Inertia PC2",
+        "Inertia PC3",
+        "Sphericity",
+        "Euler Characteristic",
+        "Avg Mean Curvature",
+        "Total Absolute Gaussian Curvature",
+        "Avg Shape Index",
+        "Avg Curvedness",
+    ]
+    mask = ascupy(_labels() == 1)
+    spacing = tuple(c * s for s in (0.3, 0.1, 0.1))
+    surface = mesh.mask2mesh(mask, spacing=spacing)
+    smooth = mesh.mask2mesh(mask, spacing=spacing, sigma=c * 0.31)
+
+    values = mesh.extract_mesh_features(surface, on_device, smooth_mesh=smooth)
+
+    assert isinstance(surface, ArrayMesh) and isinstance(smooth, ArrayMesh)
+    assert all(np.isfinite(v) for v in values.values()), values
+
+
 def test_mask2mesh_on_gpu(gpu_available: bool) -> None:
     """A CuPy mask is meshed on the GPU.
 

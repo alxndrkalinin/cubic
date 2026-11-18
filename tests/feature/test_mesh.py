@@ -1605,8 +1605,9 @@ def test_principal_curvatures_are_computed_once_per_call(
 ) -> None:
     """Avg Shape Index and Avg Curvedness share one per-vertex curvature pass.
 
-    Each used to compute it. One requested alone gives the registry's value,
-    and the caller's mesh is not kept alive by the call.
+    Each used to compute it. One requested alone gives the registry's value on
+    the copy that ``extract_mesh_features`` measures, scaled to its edge unit,
+    converted back; and the caller's mesh is not kept alive by the call.
     """
     calls = []
     principal_curvatures = mesh._principal_curvatures
@@ -1624,9 +1625,12 @@ def test_principal_curvatures_are_computed_once_per_call(
     assert len(calls) == 1
 
     surface = mesh.mask2mesh(mask, sigma=2.0)
+    unit = mesh._edge_unit(surface)
+    scaled = mesh._scaled_copy(surface, 1 / unit)
     for name in ("Avg Shape Index", "Avg Curvedness"):
         alone = mesh.extract_mesh_features(surface, [name])[name]
-        assert alone == float(mesh._MESH_FEATURES[name](surface))
+        registry = float(mesh._MESH_FEATURES[name](scaled))
+        assert alone == registry * unit ** mesh._FEATURE_DIMENSIONS[name]
     calls.clear()
     reference = weakref.ref(surface)
     mesh.extract_mesh_features(surface)
