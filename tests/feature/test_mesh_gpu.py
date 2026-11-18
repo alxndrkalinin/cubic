@@ -184,14 +184,32 @@ def test_array_mesh_matches_trimesh() -> None:
     )
     r2 = z**2 + y**2 + x**2
     hollow = np.pad((r2 <= 12**2) & ~(r2 <= 5**2), 1)
-    verts, faces, _, _ = marching_cubes(hollow, spacing=(2.0, 1.0, 1.0))
+    verts, faces = mesh._marching_cubes(hollow, spacing=(2.0, 1.0, 1.0))
     reference = trimesh.Trimesh(verts, faces)
-    trimesh.repair.fix_normals(reference)
 
     expected = mesh.extract_mesh_features(reference)
     got = mesh.extract_mesh_features(ArrayMesh(verts, faces))
 
     assert got == pytest.approx(expected, rel=1e-12)
+
+
+def test_array_mesh_measures_inward_faces_as_given(gpu_available: bool) -> None:
+    """Faces wound inward give minus the outward volume; they are not flipped.
+
+    ``trimesh.Trimesh`` measures its faces as given too, so an inside-out mesh
+    reaches the volume check on either device instead of being flipped on one.
+    """
+    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
+    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    arrays = [(verts, faces)]
+    if gpu_available:
+        arrays.append((ascupy(verts), ascupy(faces)))
+    for v, f in arrays:
+        outward = ArrayMesh(v, f).volume
+        inward = ArrayMesh(v, f[:, ::-1].copy()).volume
+
+        assert outward > 0
+        assert inward == pytest.approx(-outward, rel=1e-12)
 
 
 def _level_hit_mesh() -> tuple[np.ndarray, np.ndarray]:
@@ -201,8 +219,7 @@ def _level_hit_mesh() -> tuple[np.ndarray, np.ndarray]:
     """
     rng = np.random.default_rng(1)
     volume = np.pad(np.round(rng.random((16, 16, 16)) * 4) / 4, 1).astype(np.float32)
-    verts, faces, _, _ = marching_cubes(volume, 0.5, allow_degenerate=False)
-    return verts, faces
+    return mesh._marching_cubes(volume, 0.5, allow_degenerate=False)
 
 
 def test_array_mesh_merges_vertices_like_trimesh(gpu_available: bool) -> None:
@@ -251,7 +268,7 @@ def test_array_mesh_refuses_in_place_changes() -> None:
     and area describing a different mesh from the delegated attributes.
     """
     z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
-    verts, faces, _, _ = marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
     ball = ArrayMesh(verts, faces)
 
     with pytest.raises(TypeError, match="in place"):
