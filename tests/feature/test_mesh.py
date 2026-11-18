@@ -1703,6 +1703,26 @@ def test_mask2mesh_checks_its_sigma_and_refuses_ignored_keywords() -> None:
         )
 
 
+def test_small_object_does_not_fail_a_label_image() -> None:
+    """A tiny object next to a normal one gets NaN where it cannot be measured.
+
+    A ball of radius 3 survives the default blur as a 44-face mesh. With the
+    default features the call returns, with NaN only for the tiny object's
+    ``Fractal Dimension``.
+    """
+    labels = np.zeros((22, 22, 44), dtype=np.int32)
+    labels[:, :, :22][_ball(3, 22)] = 1
+    labels[:, :, 22:][_ball(8, 22)] = 2
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _, values, columns = mesh.extract_features(labels)
+
+    fractal = values[:, columns.index("Fractal Dimension")]
+    assert np.isnan(fractal[0]) and np.isfinite(fractal[1])
+    assert np.isfinite(np.delete(values, columns.index("Fractal Dimension"), 1)).all()
+
+
 def test_sphericity_is_one_for_a_sphere_only() -> None:
     """Wadell sphericity is 1 for a sphere and below 1 for a cube."""
     assert mesh.sphericity(4 / 3 * np.pi, 4 * np.pi) == pytest.approx(1)
