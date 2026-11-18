@@ -470,13 +470,18 @@ def _fractal_window(
     return low, high
 
 
-def _curvature_sigma(spacing: Sequence[float] | None, sigma: float | None) -> float:
-    """Return ``sigma``, or twice the coarsest voxel spacing for ``None``."""
+def _curvature_sigma(
+    spacing: Sequence[float] | None, sigma: float | None, name: str = "curvature_sigma"
+) -> float:
+    """Return ``sigma``, or twice the coarsest voxel spacing for ``None``.
+
+    ``name`` is the caller's parameter, for the error message.
+    """
     if sigma is None:
         return 2 * (1.0 if spacing is None else float(max(spacing)))
     sigma = float(sigma)
     if not np.isfinite(sigma) or sigma <= 0:
-        raise ValueError(f"curvature_sigma must be finite and positive; got {sigma}")
+        raise ValueError(f"{name} must be finite and positive; got {sigma}")
     return sigma
 
 
@@ -647,20 +652,29 @@ def mask2mesh(
     sigma : float, optional
         If given, mesh the mask blurred by a Gaussian of this width, in units of
         ``spacing``, instead of the voxel staircase. ``marching_cubes_kwargs``
-        is then not used.
+        is not used then and cannot be combined with it.
 
     Raises
     ------
     ValueError
         If ``sigma`` is given and the blurred mask never reaches 0.5, i.e. the
-        object is too small for that blur, or if the voxel spacing, given as
-        ``spacing`` or in ``marching_cubes_kwargs``, is not three finite,
-        positive numbers ``(z, y, x)``.
+        object is too small for that blur; if ``sigma`` is not finite and
+        positive, or is given together with ``marching_cubes_kwargs``; or if
+        the voxel spacing, given as ``spacing`` or in
+        ``marching_cubes_kwargs``, is not three finite, positive numbers
+        ``(z, y, x)``.
     """
     # A negative spacing would turn the mesh inside out, a zero one flatten it.
     _unit(spacing)
     if sigma is not None:
-        mesh = _smooth_mask2mesh(mask_3d, spacing, _curvature_sigma(spacing, sigma))
+        if marching_cubes_kwargs:
+            raise ValueError(
+                "marching_cubes_kwargs cannot be combined with sigma: the blurred "
+                "mask is meshed without them. Pass the voxel spacing as 'spacing'."
+            )
+        mesh = _smooth_mask2mesh(
+            mask_3d, spacing, _curvature_sigma(spacing, sigma, "sigma")
+        )
         if mesh is None:
             raise ValueError(f"The mask vanishes when blurred at sigma={sigma}.")
         return mesh
@@ -912,16 +926,10 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
     """
     corners = mesh.vertices[mesh.faces]
     angles = mesh.face_angles
-    # Squared length of the edge opposite each corner.
-    opposite = np.stack(
-        [
-            ((corners[:, (i + 1) % 3] - corners[:, (i + 2) % 3]) ** 2).sum(axis=1)
-            for i in range(3)
-        ],
-        axis=1,
-    )
-    cot = 1 / np.tan(angles)
     nxt, prv = [1, 2, 0], [2, 0, 1]
+    # Squared length of the edge opposite each corner.
+    opposite = ((corners[:, nxt] - corners[:, prv]) ** 2).sum(axis=-1)
+    cot = 1 / np.tan(angles)
     voronoi = (opposite[:, nxt] * cot[:, nxt] + opposite[:, prv] * cot[:, prv]) / 8
     face_area = mesh.area_faces[:, None]
     obtuse = angles > np.pi / 2
