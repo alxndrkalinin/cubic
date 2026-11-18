@@ -882,6 +882,157 @@ def test_thin_object_check_runs_only_for_fractal_dimension(monkeypatch) -> None:
     assert features["Volume"] > 0
 
 
+_SHARED_EDGE_TEXT = "edges shared by more than two faces"
+_RAW_CURVATURE = [
+    "Total Absolute Gaussian Curvature",
+    "Avg Shape Index",
+    "Avg Curvedness",
+]
+
+
+def _shared_edge_warnings(call, simplefilter: str = "always") -> list:
+    """Run ``call`` and return the shared-edge warnings it raised."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter(simplefilter)
+        call()
+    return [w for w in caught if _SHARED_EDGE_TEXT in str(w.message)]
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["Euler Characteristic"],
+        ["Avg Mean Curvature"],
+        *([name] for name in _RAW_CURVATURE),
+    ],
+)
+def test_shared_edge_warning_fires_on_a_ragged_ball_only(names, ragged_ball_of) -> None:
+    """Each approximate feature warns on the ragged ball's mesh, not a clean ball's.
+
+    The ragged ball's mesh has 33 edges shared by four faces. Measured on the
+    raw mesh, with no smooth mesh, so the three curvature-distribution features
+    see those edges too. The values are returned all the same.
+    """
+    for fraction, expected in [(0.3, 1), (0.0, 0)]:
+        surface = mesh.mask2mesh(ragged_ball_of(fraction))
+        values = {}
+
+        def call(surface=surface, values=values):
+            values.update(mesh.extract_mesh_features(surface, names))
+
+        assert len(_shared_edge_warnings(call)) == expected, fraction
+        assert np.isfinite(values[names[0]])
+
+
+def test_shared_edge_warning_comes_from_the_raw_mesh_features(ragged_ball) -> None:
+    """The default pipeline warns for Euler and mean curvature, not the blurred mesh.
+
+    The blurred mesh behind the curvature-distribution features has no edge on
+    more than two faces, so requesting only those does not warn, nor do
+    features that the shared edges do not affect.
+    """
+    assert mesh._overshared_edge_count(mesh.mask2mesh(ragged_ball)) == 33
+    assert mesh._overshared_edge_count(mesh.mask2mesh(ragged_ball, sigma=2.0)) == 0
+    assert mesh.mask2mesh(ragged_ball).euler_number == -477  # odd: not a surface
+
+    for names, expected in [
+        (None, 1),
+        (["Euler Characteristic", "Avg Mean Curvature"], 1),
+        (_RAW_CURVATURE, 0),
+        (["Volume", "Area"], 0),
+    ]:
+        caught = _shared_edge_warnings(
+            lambda names=names: mesh.extract_surface_features(
+                ragged_ball, features=names
+            )
+        )
+        assert len(caught) == expected, names
+
+
+def test_shared_edge_warning_follows_the_mesh_each_feature_is_measured_on(
+    ragged_ball_of,
+) -> None:
+    """The curvature-distribution features check the smooth mesh; the others ``mesh``.
+
+    The ragged mesh is passed as either one, with a clean mesh as the other.
+    """
+    ragged = mesh.mask2mesh(ragged_ball_of(0.3))
+    clean = mesh.mask2mesh(ragged_ball_of(0.0))
+
+    for surface, smooth, names, expected in [
+        (clean, ragged, ["Avg Curvedness"], 1),
+        (ragged, clean, ["Avg Curvedness"], 0),
+        (ragged, clean, ["Euler Characteristic", "Avg Curvedness"], 1),
+        (clean, ragged, ["Euler Characteristic", "Volume"], 0),
+    ]:
+        caught = _shared_edge_warnings(
+            lambda s=surface, m=smooth, n=names: mesh.extract_mesh_features(
+                s, n, smooth_mesh=m
+            )
+        )
+        assert len(caught) == expected, (names, surface is ragged)
+
+
+def test_shared_edges_are_counted_only_for_an_approximate_feature(
+    ragged_ball, monkeypatch
+) -> None:
+    """Without an approximate feature the shared edges are never counted."""
+
+    def fail(*args, **kwargs):
+        raise AssertionError("counted the shared edges")
+
+    monkeypatch.setattr(mesh, "_overshared_edge_count", fail)
+    names = [
+        name
+        for name in mesh.mesh_feature_list()
+        if name not in mesh._SHARED_EDGE_FEATURES
+    ]
+    features = mesh.extract_surface_features(ragged_ball, features=names)
+
+    assert list(features) == names
+
+
+@pytest.mark.parametrize(
+    "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
+)
+def test_shared_edge_warning_points_at_the_caller(entry: str, ragged_ball) -> None:
+    """The warning is attributed to the calling line through every public entry.
+
+    Through extract_features the existing warnings land on its per-label loop
+    in mesh.py; this one skips every frame of mesh.py.
+    """
+    names = ["Euler Characteristic"]
+    calls = {
+        "extract_features": lambda: mesh.extract_features(
+            ragged_ball.astype(np.int32), names
+        ),
+        "extract_surface_features": lambda: mesh.extract_surface_features(
+            ragged_ball, features=names
+        ),
+        "extract_mesh_features": lambda: mesh.extract_mesh_features(
+            mesh.mask2mesh(ragged_ball), names
+        ),
+    }
+
+    caught = _shared_edge_warnings(calls[entry])
+
+    assert len(caught) == 1
+    assert caught[0].filename == __file__
+
+
+def test_shared_edge_warning_is_shown_once_for_a_label_image(ragged_ball_of) -> None:
+    """Two labels with shared edges give one warning under the default filter."""
+    labels = np.zeros((41, 41, 82), dtype=np.int32)
+    labels[:, :, :41][ragged_ball_of(0.1)] = 1
+    labels[:, :, 41:][ragged_ball_of(0.3)] = 2
+
+    caught = _shared_edge_warnings(
+        lambda: mesh.extract_features(labels, ["Euler Characteristic"]), "default"
+    )
+
+    assert len(caught) == 1
+
+
 @pytest.mark.parametrize("name", ["Fractal Dimension", "Outline Fractal Dimension"])
 def test_fractal_dimension_needs_the_mask(name: str) -> None:
     """extract_mesh_features refuses either D and leaves it out of its defaults.

@@ -9,6 +9,7 @@ bounding primitives to trimesh on the host.
 
 from __future__ import annotations
 
+import sys
 import numbers
 import warnings
 from typing import Any, TypeVar, Callable, SupportsFloat
@@ -101,6 +102,10 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
     (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
     units of ``spacing``; both are averaged over the surface by area.
+    ``Euler Characteristic``, ``Avg Mean Curvature`` and these three are
+    approximate on a mesh with edges shared by more than two faces, which
+    marching cubes makes where voxels touch only along an edge, and a warning
+    says so when one is requested.
     ``Fractal Dimension`` describes the surface detail finer than
     ``curvature_sigma``, which those three leave out: ``2 - slope`` of log
     surface area against log blur scale, relative to the mask's smooth twin
@@ -416,7 +421,9 @@ def extract_surface_features(
 # the code that called it: the function itself, then the _require_trimesh
 # wrapper. Helpers it calls add their own frames. Through extract_features the
 # caller is extract_features' per-label loop, one line for every label, so the
-# default filter still shows a constant text once per label image.
+# default filter still shows a constant text once per label image. The
+# shared-edge warning of _measure_mesh uses _stacklevel_outside_module instead,
+# which reaches the user's line through extract_features too.
 _CALLER = 3
 
 
@@ -691,6 +698,11 @@ def extract_mesh_features(
 ) -> dict[str, float]:
     """Extract surface features from a ``trimesh`` object.
 
+    ``Euler Characteristic`` and the four curvature features are approximate
+    on a mesh with edges shared by more than two faces, and a warning is
+    raised when one of them is requested and the mesh it is measured on has
+    such edges.
+
     Parameters
     ----------
     mesh : trimesh.Trimesh
@@ -758,14 +770,66 @@ def _measure_mesh(
         )
 
     curvature_mesh = mesh if smooth_mesh is None else smooth_mesh
+
+    def measured_on(name: str) -> Any:
+        return curvature_mesh if name in _SMOOTHED_FEATURES else mesh
+
     # trimesh caches volume, convex hull and bounding primitives on the mesh, so
     # features sharing them do not recompute them.
-    return {
-        name: float(
-            _MESH_FEATURES[name](curvature_mesh if name in _SMOOTHED_FEATURES else mesh)
-        )
-        for name in features
-    }
+    values = {name: float(_MESH_FEATURES[name](measured_on(name))) for name in features}
+    # Only the meshes that a requested approximate feature was measured on are
+    # checked, each once; both sides reuse the edge grouping cached above.
+    checked: list[Any] = []
+    for name in features:
+        if name in _SHARED_EDGE_FEATURES and not any(
+            measured_on(name) is m for m in checked
+        ):
+            checked.append(measured_on(name))
+    if any(_overshared_edge_count(m) for m in checked):
+        warnings.warn(_SHARED_EDGE_WARNING, stacklevel=_stacklevel_outside_module())
+    return values
+
+
+def _overshared_edge_count(mesh: Any) -> int:
+    """Return the number of edges of ``mesh`` shared by more than two faces.
+
+    An ``ArrayMesh`` counts them from its own edge grouping, on its device; a
+    ``trimesh.Trimesh`` from ``edges_unique_inverse``, which ``euler_number``
+    caches.
+    """
+    if isinstance(mesh, ArrayMesh):
+        return mesh.overshared_edge_count
+    return int((np.bincount(mesh.edges_unique_inverse) > 2).sum())
+
+
+def _stacklevel_outside_module() -> int:
+    """Return the ``stacklevel`` that names the first caller outside this module.
+
+    For a ``warnings.warn`` in the function that calls this one: it skips that
+    function and every frame of this module above it (``_require_trimesh``'s
+    wrapper, ``extract_features``' per-label loop), so a warning reaches the
+    user's line through every public entry point.
+    """
+    frame = sys._getframe(1)
+    level = 1
+    while frame is not None and frame.f_globals.get("__name__") == __name__:
+        frame = frame.f_back  # type: ignore[assignment]
+        level += 1
+    return level
+
+
+# Approximate on a mesh with edges shared by more than two faces: the Euler
+# number counts such an edge once, the face adjacency behind the mean curvature
+# (trimesh's ``group_rows(require_count=2)``, ArrayMesh's runs of two) leaves
+# it out, and the angle defect at each of its ends sums the corners of both
+# sheets that meet there.
+_SHARED_EDGE_WARNING = (
+    "At least one mesh has edges shared by more than two faces, which marching "
+    "cubes makes where voxels touch only along an edge. Euler Characteristic, "
+    "Avg Mean Curvature, Total Absolute Gaussian Curvature, Avg Shape Index and "
+    "Avg Curvedness are approximate on such a mesh; their values are returned "
+    "as computed."
+)
 
 
 def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
@@ -1040,6 +1104,14 @@ _SMOOTHED_FEATURES = (
     "Total Absolute Gaussian Curvature",
     "Avg Shape Index",
     "Avg Curvedness",
+)
+
+# Approximate on a mesh with edges shared by more than two faces, with a
+# warning; see _SHARED_EDGE_WARNING.
+_SHARED_EDGE_FEATURES = (
+    "Euler Characteristic",
+    "Avg Mean Curvature",
+    *_SMOOTHED_FEATURES,
 )
 
 # Measured on the mask itself, at several blur scales; see mesh_feature_list.

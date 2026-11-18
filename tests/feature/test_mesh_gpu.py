@@ -1,5 +1,7 @@
 """GPU mesh features: CUDA marching cubes and ``ArrayMesh`` against the CPU path."""
 
+import warnings
+
 import numpy as np
 import pytest
 from scipy import ndimage
@@ -340,7 +342,8 @@ def test_ragged_label_on_gpu_matches_cpu(
 
     The CPU path used to rely on ``fix_normals``, which skips a mesh trimesh
     does not call watertight: there it raised on the negative volume while the
-    GPU path measured the label.
+    GPU path measured the label. Its edges shared by four faces make Euler
+    Characteristic and Avg Mean Curvature approximate, with a warning on both.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
@@ -349,11 +352,169 @@ def test_ragged_label_on_gpu_matches_cpu(
     labels[10:20, 10:20, 45:55] = 2
     assert not mesh.mask2mesh(ragged_ball).is_watertight
 
-    cpu_labels, cpu, _ = mesh.extract_features(labels)
-    gpu_labels, gpu, _ = mesh.extract_features(ascupy(labels))
+    with pytest.warns(UserWarning, match=_SHARED_EDGE_TEXT):
+        cpu_labels, cpu, _ = mesh.extract_features(labels)
+    with pytest.warns(UserWarning, match=_SHARED_EDGE_TEXT):
+        gpu_labels, gpu, _ = mesh.extract_features(ascupy(labels))
 
     np.testing.assert_array_equal(gpu_labels, cpu_labels)
     np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
+
+
+_SHARED_EDGE_TEXT = "edges shared by more than two faces"
+_SHARED_EDGE_FEATURES = [
+    "Volume",
+    "Area",
+    "Euler Characteristic",
+    "Avg Mean Curvature",
+    "Total Absolute Gaussian Curvature",
+    "Avg Shape Index",
+    "Avg Curvedness",
+]
+# Vary between GPU runs of the same code by about 1e-13 (atomic sums).
+_GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
+# On the raw mesh, without smooth_mesh. Avg Shape Index is left out: on a raw
+# CuPy mesh it differs from the CPU by up to 9% (0.0960 against 0.0888 on a
+# clean ball), with or without shared edges, which is not resolved here.
+_RAW_CURVATURE = ["Total Absolute Gaussian Curvature", "Avg Curvedness"]
+
+
+def _shared_edge_warnings(call) -> tuple[object, list]:
+    """Run ``call``; return its result and the shared-edge warnings it raised."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = call()
+    return result, [w for w in caught if _SHARED_EDGE_TEXT in str(w.message)]
+
+
+def test_shared_edges_are_counted_alike_on_every_mesh(
+    shared_edge_masks: dict[str, np.ndarray], gpu_available: bool
+) -> None:
+    """The trimesh and ArrayMesh paths, NumPy and CuPy, count the same shared edges.
+
+    Also on the level-hit mesh, whose vertices ArrayMesh merges itself.
+    """
+    meshes = {
+        name: mesh._marching_cubes(np.pad(mask, 1))
+        for name, mask in shared_edge_masks.items()
+    }
+    meshes["level hits, merged"] = _level_hit_mesh()
+    expected = {"ragged ball 10%": 3, "ragged ball 30%": 33}
+    for name, (verts, faces) in meshes.items():
+        reference = mesh._overshared_edge_count(trimesh.Trimesh(verts, faces))
+        counts = [mesh._overshared_edge_count(ArrayMesh(verts, faces))]
+        if gpu_available:
+            counts.append(
+                mesh._overshared_edge_count(ArrayMesh(ascupy(verts), ascupy(faces)))
+            )
+        assert counts == [reference] * len(counts), name
+        assert reference == expected.get(name, reference) and reference > 0, name
+
+
+@pytest.mark.parametrize(
+    "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
+)
+def test_shared_edge_warning_on_gpu(
+    entry: str, ragged_ball_of, gpu_available: bool, monkeypatch
+) -> None:
+    """A CuPy ragged ball warns, at the calling line; a clean one does not.
+
+    The edges are counted on the device: no host trimesh is built for the
+    GPU-native features.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+
+    def fail(self):
+        raise AssertionError("fell back to a host trimesh")
+
+    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
+    names = _SHARED_EDGE_FEATURES
+    for fraction, expected in [(0.3, 1), (0.0, 0)]:
+        mask = ascupy(ragged_ball_of(fraction))
+        calls = {
+            "extract_features": lambda m=mask: mesh.extract_features(
+                m.astype(np.int32), names
+            ),
+            "extract_surface_features": lambda m=mask: mesh.extract_surface_features(
+                m, features=names
+            ),
+            "extract_mesh_features": lambda m=mask: mesh.extract_mesh_features(
+                mesh.mask2mesh(m), names
+            ),
+        }
+        _, caught = _shared_edge_warnings(calls[entry])
+        assert len(caught) == expected, fraction
+        assert [w.filename for w in caught] == [__file__] * expected
+
+
+def test_shared_edge_masks_match_on_both_devices(
+    shared_edge_masks: dict[str, np.ndarray], gpu_available: bool, monkeypatch
+) -> None:
+    """Meshes with shared edges give the same values, count and warning everywhere.
+
+    Three ways through extract_surface_features: a NumPy mask (trimesh), a
+    NumPy mask meshed as an ArrayMesh on NumPy, and a CuPy mask. The random and
+    noise masks vanish under the default blur, so their curvature-distribution
+    features are NaN on every way, and no blurred mesh has a shared edge; the
+    raw meshes are measured by extract_mesh_features too, for the curvature
+    features on a mesh that has them.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    closed_mesh = mesh._closed_mesh
+
+    def numpy_array_mesh(mask):
+        monkeypatch.setattr(mesh, "_closed_mesh", ArrayMesh)
+        try:
+            return mesh.mask2mesh(mask), mesh.extract_surface_features(
+                mask, features=_SHARED_EDGE_FEATURES
+            )
+        finally:
+            monkeypatch.setattr(mesh, "_closed_mesh", closed_mesh)
+
+    for name, mask in shared_edge_masks.items():
+        ways = {
+            "trimesh": lambda m=mask: (
+                mesh.mask2mesh(m),
+                mesh.extract_surface_features(m, features=_SHARED_EDGE_FEATURES),
+            ),
+            "ArrayMesh, NumPy": lambda m=mask: numpy_array_mesh(m),
+            "ArrayMesh, CuPy": lambda m=mask: (
+                mesh.mask2mesh(ascupy(m)),
+                mesh.extract_surface_features(
+                    ascupy(m), features=_SHARED_EDGE_FEATURES
+                ),
+            ),
+        }
+        results = {way: _shared_edge_warnings(call) for way, call in ways.items()}
+        (surface, reference), _ = results["trimesh"]
+        count = mesh._overshared_edge_count(surface)
+        assert count > 0, name
+        with pytest.warns(UserWarning, match=_SHARED_EDGE_TEXT):
+            raw_reference = mesh.extract_mesh_features(surface, _RAW_CURVATURE)
+        for way, ((surface, values), caught) in results.items():
+            assert mesh._overshared_edge_count(surface) == count, (name, way)
+            assert len(caught) == 1, (name, way)
+            raw, raw_caught = _shared_edge_warnings(
+                lambda s=surface: mesh.extract_mesh_features(s, _RAW_CURVATURE)
+            )
+            assert len(raw_caught) == 1, (name, way)
+            values = {**values, **{f"raw {k}": v for k, v in raw.items()}}
+            reference = {
+                **reference,
+                **{f"raw {k}": v for k, v in raw_reference.items()},
+            }
+            for feature, value in values.items():
+                atol = 1e-7 if feature.removeprefix("raw ") in _GPU_JITTER else 0.0
+                np.testing.assert_allclose(
+                    value,
+                    reference[feature],
+                    rtol=1e-9,
+                    atol=atol,
+                    equal_nan=True,
+                    err_msg=f"{name}, {way}, {feature}",
+                )
 
 
 @pytest.mark.parametrize("fractal_scales", [None, (0.15, 0.45)])

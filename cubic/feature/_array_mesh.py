@@ -276,6 +276,16 @@ class ArrayMesh:
         return edges, order, starts, lengths
 
     @cached_property
+    def overshared_edge_count(self) -> int:
+        """Number of edges shared by more than two faces, from ``_edge_groups``.
+
+        Neither the Euler number (each counted once) nor the face adjacency
+        (left out) measures such an edge as a surface would.
+        """
+        _, _, _, lengths = self._edge_groups
+        return int((lengths > 2).sum())
+
+    @cached_property
     def euler_number(self) -> int:
         referenced = int(np.unique(self.faces).size)
         _, _, starts, _ = self._edge_groups
