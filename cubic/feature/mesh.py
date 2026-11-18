@@ -179,9 +179,10 @@ def extract_features(
         features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
         Dimension``) are computed only when named here.
     spacing : sequence of float, optional
-        Voxel spacing ``(z, y, x)`` forwarded to marching cubes. Without it an
-        anisotropic stack is meshed as if isotropic, scaling volumes and areas
-        by the spacing product.
+        Voxel spacing ``(z, y, x)``, finite and positive, in any length unit;
+        see ``extract_surface_features``. Without it an anisotropic stack is
+        meshed as if isotropic, scaling volumes and areas by the spacing
+        product.
     curvature_sigma : float, optional
         Blur scale, in units of ``spacing``, of the mesh behind the
         curvature-distribution features; see ``extract_surface_features``.
@@ -220,6 +221,7 @@ def extract_features(
     features = _resolve_features(features)
     _fractal_window(fractal_scales, "fractal_scales")
     _fractal_window(outline_fractal_scales, "outline_fractal_scales")
+    _unit(spacing)
     if not features:
         return labels, np.empty((len(labels), 0)), features
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
@@ -260,7 +262,10 @@ def extract_surface_features(
     mask : np.ndarray
         Boolean mask of a single object.
     spacing : sequence of float, optional
-        Voxel spacing ``(z, y, x)``.
+        Voxel spacing ``(z, y, x)``, finite and positive. The features are
+        computed in units of the finest spacing and converted back, so they are
+        in units of ``spacing`` and do not depend on which length unit it is
+        given in (metres or nanometres alike).
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()``. Optional
         features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
@@ -300,18 +305,34 @@ def extract_surface_features(
         of real numbers.
     ValueError
         If ``fractal_scales`` or ``outline_fractal_scales`` is not two finite
-        numbers with ``0 < lowest < highest``.
+        numbers with ``0 < lowest < highest``, or ``spacing`` is not finite
+        and positive.
     """
     features = _resolve_features(features)
     window = _fractal_window(fractal_scales, "fractal_scales")
     outline_window = _fractal_window(outline_fractal_scales, "outline_fractal_scales")
-    mesh = mask2mesh(mask, spacing=spacing)
+    # Everything below is meshed and measured in units of the finest spacing,
+    # and converted back to the caller's units at the end: trimesh compares
+    # lengths with absolute tolerances, so measured in the caller's units the
+    # features depended on the unit of ``spacing``. In these units the
+    # computation sees only the ratios of the spacings. Messages that print a
+    # length convert it back.
+    unit = _unit(spacing)
+    step = _step(spacing) / unit
+    if window is not None:
+        window = (window[0] / unit, window[1] / unit)
+    if outline_window is not None:
+        outline_window = (outline_window[0] / unit, outline_window[1] / unit)
+    mesh = mask2mesh(mask, spacing=None if spacing is None else tuple(step))
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
     if not blurred:
-        return extract_mesh_features(mesh, features=features)
+        return _to_caller_units(_measure_mesh(mesh, features, unit=unit), unit)
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
-    sigma = _curvature_sigma(spacing, curvature_sigma)
-    step = _step(spacing)
+    if curvature_sigma is not None:
+        # Validated in the caller's units, so that an error names their number.
+        curvature_sigma = _curvature_sigma(spacing, curvature_sigma) / unit
+    # The default, twice the coarsest spacing, from the normalised spacing.
+    sigma = _curvature_sigma(tuple(step), curvature_sigma)
     # Each fractal feature's (lowest, highest) blur scale, resolved once.
     fd_low, fd_high = (float(step.min()), sigma) if window is None else window
     in_plane = float(step[1:].max())
@@ -324,7 +345,7 @@ def extract_surface_features(
     if "Fractal Dimension" in features and fd_low >= fd_high:
         warnings.warn(
             f"Fractal Dimension needs curvature_sigma above the finest voxel "
-            f"spacing {step.min():g}; got {sigma:g}. Returning NaN.",
+            f"spacing {step.min() * unit:g}; got {sigma * unit:g}. Returning NaN.",
             stacklevel=_CALLER,
         )
         values["Fractal Dimension"] = float("nan")
@@ -357,26 +378,27 @@ def extract_surface_features(
         if level_set is None:
             warnings.warn(
                 f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
-                f"curvature_sigma={sigma:g}; returning NaN for {at_sigma}.",
+                f"curvature_sigma={sigma * unit:g}; returning NaN for {at_sigma}.",
                 stacklevel=_CALLER,
             )
             values.update(dict.fromkeys(at_sigma, float("nan")))
         elif any(name in _SMOOTHED_FEATURES for name in features):
             smooth_mesh = _level_set_mesh(level_set, pad, step)
     values.update(
-        extract_mesh_features(
+        _measure_mesh(
             mesh,
-            features=[name for name in on_mesh if name not in values],
+            [name for name in on_mesh if name not in values],
             smooth_mesh=smooth_mesh,
+            unit=unit,
         )
     )
     if "Outline Fractal Dimension" in features:
         values["Outline Fractal Dimension"] = _outline_fractal_dimension(
-            mask, step, outline_low, outline_high
+            mask, step, outline_low, outline_high, unit=unit
         )
     if "Fractal Dimension" in features and "Fractal Dimension" not in values:
         values["Fractal Dimension"] = _fractal_dimension(
-            mask, step, fd_low, fd_high, *blur_at(fd_high)
+            mask, step, fd_low, fd_high, *blur_at(fd_high), unit=unit
         )
         # Half the shortest axis of the same-inertia ellipsoid is the smallest
         # half-extent; the estimate is unbiased only while the top scale stays
@@ -387,7 +409,7 @@ def extract_surface_features(
             # One text for every object, so that the default filter reports a
             # label image of many thin objects once.
             warnings.warn(_THIN_OBJECT_WARNING, stacklevel=_CALLER)
-    return {name: values[name] for name in features}
+    return _to_caller_units({name: values[name] for name in features}, unit)
 
 
 # stacklevel that attributes a warning raised in extract_surface_features to
@@ -510,6 +532,25 @@ def _step(spacing: Sequence[float] | None) -> np.ndarray:
     return np.ones(3) if spacing is None else np.asarray(spacing, dtype=float)
 
 
+def _unit(spacing: Sequence[float] | None) -> float:
+    """Return the finest voxel spacing, the unit the features are measured in.
+
+    1 for ``None``. Raises ``ValueError`` unless every spacing is finite and
+    positive.
+    """
+    if spacing is None:
+        return 1.0
+    step = _step(spacing)
+    if step.size == 0 or not np.all(np.isfinite(step) & (step > 0)):
+        raise ValueError(f"spacing must be finite and positive; got {spacing!r}")
+    return float(step.min())
+
+
+def _to_caller_units(values: dict[str, float], unit: float) -> dict[str, float]:
+    """Convert features measured in units of ``unit`` to the caller's units."""
+    return {name: v * unit ** _FEATURE_DIMENSIONS[name] for name, v in values.items()}
+
+
 def _padded_blur(
     mask: np.ndarray, step: np.ndarray, sigma: float, tight: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -583,7 +624,11 @@ def mask2mesh(
         returned as an ``ArrayMesh``; a NumPy one as a ``trimesh.Trimesh``.
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)`` passed to marching cubes, so that lengths,
-        areas and volumes are in physical units.
+        areas and volumes are in physical units. trimesh compares lengths with
+        absolute tolerances of about 1e-8, so measure the mesh only in units
+        where its edges are far above that (micrometres, not metres);
+        ``extract_surface_features`` and ``extract_features`` do not have this
+        limit.
     marching_cubes_kwargs : dict, optional
         Extra keyword arguments for ``skimage.measure.marching_cubes``; on the
         GPU only ``level``, ``spacing`` and ``allow_degenerate`` are supported.
@@ -643,7 +688,11 @@ def extract_mesh_features(
     Parameters
     ----------
     mesh : trimesh.Trimesh
-        Closed surface of a single object.
+        Closed surface of a single object. trimesh compares lengths with
+        absolute tolerances of about 1e-8, so the mesh should be in units where
+        its edges are far above that (micrometres, not metres);
+        ``extract_surface_features`` and ``extract_features`` do not have this
+        limit.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()`` without
         ``Fractal Dimension`` and ``Outline Fractal Dimension``, which are
@@ -668,6 +717,20 @@ def extract_mesh_features(
             f"{from_mask} is measured on the mask at several blur scales, not on "
             "one mesh; use extract_surface_features or extract_features."
         )
+    return _measure_mesh(mesh, features, smooth_mesh=smooth_mesh)
+
+
+def _measure_mesh(
+    mesh: trimesh.Trimesh,
+    features: Sequence[str],
+    smooth_mesh: trimesh.Trimesh | None = None,
+    unit: float = 1.0,
+) -> dict[str, float]:
+    """Return ``features`` of a mesh whose lengths are in units of ``unit``.
+
+    The values stay in the mesh's units; ``unit`` only converts the volume or
+    area printed by the errors to the caller's units.
+    """
     # Validate the mesh before any feature: an open surface (e.g. a mask meshed
     # without a background border) reports a negative volume, which silently
     # propagates into a NaN sphericity and negative solidity and extent instead
@@ -676,12 +739,13 @@ def extract_mesh_features(
     surface_area = float(mesh.area)
     if not np.isfinite(volume) or volume <= 0:
         raise ValueError(
-            f"Mesh volume must be finite and positive; got {volume}. "
+            f"Mesh volume must be finite and positive; got {volume * unit**3}. "
             f"The mesh is likely not watertight (is_watertight={mesh.is_watertight})."
         )
     if not np.isfinite(surface_area) or surface_area <= 0:
         raise ValueError(
-            f"Mesh surface area must be finite and positive; got {surface_area}."
+            "Mesh surface area must be finite and positive; got "
+            f"{surface_area * unit**2}."
         )
 
     curvature_mesh = mesh if smooth_mesh is None else smooth_mesh
@@ -832,6 +896,7 @@ def _blur_ladder_dimension(
     top_pad: np.ndarray,
     top_measure: float,
     n_levels: int = 5,
+    unit: float = 1.0,
 ) -> float:
     """Return ``mask.ndim - 1 - slope`` of log measure ratio against log blur scale.
 
@@ -850,6 +915,8 @@ def _blur_ladder_dimension(
     and ``top_measure`` the measure of its 0.5 level, which the caller has
     already computed: the twin is thresholded from the first and cropped to
     the mask's frame, and the second is the mask's value at the last scale.
+    ``step``, ``low`` and ``high`` are multiples of ``unit``, a length in the
+    caller's units, which only converts the scale the warning prints.
     The other blurs of the ladder (the mask's below ``high``, the twin's at
     every scale) use the one-voxel padding of ``_padded_blur``: their field
     equals the wide blur's on the frame bit for bit, and only the float32
@@ -870,7 +937,7 @@ def _blur_ladder_dimension(
     if not np.all(np.isfinite(ratios)):
         warnings.warn(
             f"{name}: the mask or its smooth twin vanishes when blurred at a "
-            f"scale up to {high:g} (an object narrower than the blur); "
+            f"scale up to {high * unit:g} (an object narrower than the blur); "
             f"returning NaN.",
             # this helper and the feature's estimator, then extract_surface_features
             stacklevel=_CALLER + 2,
@@ -887,6 +954,7 @@ def _fractal_dimension(
     blurred: np.ndarray,
     pad: np.ndarray,
     level_set: tuple[np.ndarray, np.ndarray] | None,
+    unit: float = 1.0,
 ) -> float:
     """Return ``2 - slope`` of log surface-area ratio against log blur scale.
 
@@ -910,6 +978,7 @@ def _fractal_dimension(
         blurred,
         pad,
         _level_set_area(level_set),
+        unit=unit,
     )
 
 
@@ -928,7 +997,7 @@ def _contour_length(field: np.ndarray, plane_step: np.ndarray) -> float:
 
 
 def _outline_fractal_dimension(
-    mask_3d: np.ndarray, step: np.ndarray, low: float, high: float
+    mask_3d: np.ndarray, step: np.ndarray, low: float, high: float, unit: float = 1.0
 ) -> float:
     """Return ``1 - slope`` of log contour-length ratio against log blur scale.
 
@@ -953,6 +1022,7 @@ def _outline_fractal_dimension(
         top,
         pad,
         length(top),
+        unit=unit,
     )
 
 
@@ -998,4 +1068,34 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     ),
     "Avg Shape Index": _avg_shape_index,
     "Avg Curvedness": _avg_curvedness,
+}
+
+# Power of the length unit in each feature: a feature measured with ``spacing``
+# in units u is ``u ** dimension`` times the same feature measured in units 1.
+# extract_surface_features measures in units of the finest spacing and converts
+# back with these.
+_FEATURE_DIMENSIONS: dict[str, int] = {
+    "Area": 2,
+    "Volume": 3,
+    "Min Axis Length": 1,
+    "Med Axis Length": 1,
+    "Max Axis Length": 1,
+    "Inertia PC1": 5,
+    "Inertia PC2": 5,
+    "Inertia PC3": 5,
+    "Oriented Bounding Box Volume": 3,
+    "Bounding Cylinder Volume": 3,
+    "Bounding Sphere Volume": 3,
+    "Convex Hull Volume": 3,
+    "Convex Hull Area": 2,
+    "Sphericity": 0,
+    "Extent": 0,
+    "Solidity": 0,
+    "Euler Characteristic": 0,
+    "Avg Mean Curvature": -1,
+    "Total Absolute Gaussian Curvature": 0,
+    "Avg Shape Index": 0,
+    "Avg Curvedness": -1,
+    "Fractal Dimension": 0,
+    "Outline Fractal Dimension": 0,
 }
