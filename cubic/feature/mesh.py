@@ -227,6 +227,7 @@ def extract_features(
     _fractal_window(fractal_scales, "fractal_scales")
     _fractal_window(outline_fractal_scales, "outline_fractal_scales")
     _unit(spacing)
+    _curvature_sigma(spacing, curvature_sigma)
     if not features:
         return labels, np.empty((len(labels), 0)), features
     # ``find_objects`` returns the bounding box slices indexed by ``label - 1``,
@@ -310,8 +311,9 @@ def extract_surface_features(
         of real numbers.
     ValueError
         If ``fractal_scales`` or ``outline_fractal_scales`` is not two finite
-        numbers with ``0 < lowest < highest``, or ``spacing`` is not finite
-        and positive.
+        numbers with ``0 < lowest < highest``, or ``spacing`` or
+        ``curvature_sigma`` is not finite and positive, whichever features
+        are requested.
     """
     features = _resolve_features(features)
     window = _fractal_window(fractal_scales, "fractal_scales")
@@ -328,14 +330,15 @@ def extract_surface_features(
         window = (window[0] / unit, window[1] / unit)
     if outline_window is not None:
         outline_window = (outline_window[0] / unit, outline_window[1] / unit)
+    if curvature_sigma is not None:
+        # Validated in the caller's units, so that an error names their number,
+        # and before any meshing, so even when no feature uses it.
+        curvature_sigma = _curvature_sigma(spacing, curvature_sigma) / unit
     mesh = mask2mesh(mask, spacing=None if spacing is None else tuple(step))
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
     if not blurred:
         return _to_caller_units(_measure_mesh(mesh, features, unit=unit), unit)
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
-    if curvature_sigma is not None:
-        # Validated in the caller's units, so that an error names their number.
-        curvature_sigma = _curvature_sigma(spacing, curvature_sigma) / unit
     # The default, twice the coarsest spacing, from the normalised spacing.
     sigma = _curvature_sigma(tuple(step), curvature_sigma)
     # Each fractal feature's (lowest, highest) blur scale, resolved once.

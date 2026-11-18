@@ -1473,6 +1473,48 @@ def test_curvature_sigma_is_validated() -> None:
         mesh.mask2mesh(np.ones((1, 1, 1), dtype=bool), sigma=2.0)
 
 
+@pytest.mark.parametrize(
+    ("entry", "sigma", "labelled"),
+    [
+        ("extract_surface_features", -1.0, True),
+        ("extract_features", float("nan"), True),
+        ("extract_features", float("inf"), False),
+        ("extract_surface_features", 0.6, True),
+        ("extract_features", 0.6, True),
+        ("extract_features", 2.0, False),
+    ],
+)
+def test_curvature_sigma_is_validated_whichever_features(
+    entry: str, sigma: float, labelled: bool
+) -> None:
+    """curvature_sigma is checked at entry, like the windows and the spacing.
+
+    It used to be checked only when a smoothed feature was requested, so a bad
+    value passed with ``["Volume"]`` or on an image without labels. The error
+    names the caller's value, not the one divided by the finest spacing.
+    """
+    mask = _cube_volume(4) == 1 if labelled else np.zeros((6, 6, 6), dtype=bool)
+    spacing = (0.5, 0.25, 0.25)
+
+    def call():
+        if entry == "extract_features":
+            return mesh.extract_features(
+                mask.astype(np.int32), ["Volume"], spacing, curvature_sigma=sigma
+            )
+        return mesh.extract_surface_features(
+            mask, spacing, ["Volume"], curvature_sigma=sigma
+        )
+
+    if np.isfinite(sigma) and sigma > 0:
+        assert call() is not None
+    else:
+        with pytest.raises(
+            ValueError,
+            match=rf"curvature_sigma must be finite and positive; got {sigma}$",
+        ):
+            call()
+
+
 def test_sphericity_is_one_for_a_sphere_only() -> None:
     """Wadell sphericity is 1 for a sphere and below 1 for a cube."""
     assert mesh.sphericity(4 / 3 * np.pi, 4 * np.pi) == pytest.approx(1)
