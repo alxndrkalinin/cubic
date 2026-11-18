@@ -43,7 +43,22 @@ DIMENSIONS = {
 }
 
 FACTORS = (1e-9, 1e-6, 1e-3, 1.0, 1e3)
-BASES = {"isotropic": (1.0, 1.0, 1.0), "anisotropic": (2.685, 1.0, 1.0)}
+BASES = {
+    "isotropic": (1.0, 1.0, 1.0),
+    "anisotropic": (2.685, 1.0, 1.0),
+    # (0.2e-6 / 0.065e-6) is not 0.2 / 0.065 in floating point, one ulp apart.
+    "unit rounding": (0.2, 0.065, 0.065),
+}
+# (factor, base, explicit windows) of each covariance check.
+CELLS = [
+    *(
+        (c, base, explicit)
+        for c in FACTORS
+        for base in ("isotropic", "anisotropic")
+        for explicit in (False, True)
+    ),
+    (1e-6, "unit rounding", False),
+]
 
 # Features whose GPU value varies between runs of the same code (atomic sums).
 _GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
@@ -110,32 +125,40 @@ def _assert_covariant(device: str, base: str, c: float, explicit: bool) -> None:
     off = {}
     for name, value in actual.items():
         expected = c ** DIMENSIONS[name] * reference[name]
-        if device == "cpu":
-            rtol, atol = 1e-12, 0.0
+        if base == "unit rounding":
+            rtol = 5e-3 if name == "Bounding Cylinder Volume" else 1e-6
         else:
-            rtol = 1e-9
-            atol = 1e-7 * c ** DIMENSIONS[name] if name in _GPU_JITTER else 0.0
+            rtol = 1e-12 if device == "cpu" else 1e-9
+        atol = 0.0
+        if device == "gpu" and name in _GPU_JITTER:
+            atol = 1e-7 * c ** DIMENSIONS[name]
         if not abs(value - expected) <= atol + rtol * abs(expected):
             off[name] = (value, expected, abs(value - expected) / abs(expected))
     assert not off, f"not covariant at c={c:g}: {off}"
 
 
-@pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit"])
-@pytest.mark.parametrize("base", list(BASES))
-@pytest.mark.parametrize("c", FACTORS)
+def _cell_id(cell: tuple[float, str, bool]) -> str:
+    c, base, explicit = cell
+    return f"{c:g}-{base}-{'explicit' if explicit else 'default'}"
+
+
+@pytest.mark.parametrize(("c", "base", "explicit"), CELLS, ids=map(_cell_id, CELLS))
 def test_features_are_covariant_with_the_unit(c: float, base: str, explicit: bool):
     """Each feature at spacing ``c * base`` is ``c ** dimension`` times its value.
 
     The reference is the value at ``base``; the tolerance is the rounding of the
     final multiplication. ``explicit`` scales ``curvature_sigma`` and both fractal windows with the
     spacing; the default windows follow the spacing by themselves.
+
+    The ``unit rounding`` cell is looser: the ratio of its spacings rounds
+    differently in the two units, so the internal problem differs by one ulp,
+    which moved Avg Mean Curvature by 1e-8 relative; Bounding Cylinder Volume
+    comes from an approximate search and moved by 4e-4.
     """
     _assert_covariant("cpu", base, c, explicit)
 
 
-@pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit"])
-@pytest.mark.parametrize("base", list(BASES))
-@pytest.mark.parametrize("c", FACTORS)
+@pytest.mark.parametrize(("c", "base", "explicit"), CELLS, ids=map(_cell_id, CELLS))
 def test_gpu_features_are_covariant_with_the_unit(
     c: float, base: str, explicit: bool, gpu_available: bool
 ):

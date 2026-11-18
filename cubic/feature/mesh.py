@@ -185,9 +185,9 @@ def extract_features(
         Dimension``) are computed only when named here.
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)``, finite and positive, in any length unit;
-        see ``extract_surface_features``. Without it an anisotropic stack is
-        meshed as if isotropic, scaling volumes and areas by the spacing
-        product.
+        see ``extract_surface_features`` for how exactly the features convert
+        with it. Without it an anisotropic stack is meshed as if isotropic,
+        scaling volumes and areas by the spacing product.
     curvature_sigma : float, optional
         Blur scale, in units of ``spacing``, of the mesh behind the
         curvature-distribution features; see ``extract_surface_features``.
@@ -270,8 +270,11 @@ def extract_surface_features(
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)``, finite and positive. The features are
         computed in units of the finest spacing and converted back, so they are
-        in units of ``spacing`` and do not depend on which length unit it is
-        given in (metres or nanometres alike).
+        in units of ``spacing``, in metres or nanometres alike. Given in
+        another unit, they convert with it exactly (to the rounding of the
+        conversion) when the ratios of the spacings round alike in both units,
+        and otherwise to about 1e-8 relative; ``Bounding Cylinder Volume``
+        comes from an approximate search and can then move by a few 1e-4.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()``. Optional
         features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
