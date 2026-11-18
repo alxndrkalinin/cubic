@@ -872,6 +872,31 @@ def test_warnings_point_at_the_caller(case: str, match: str, entry: str) -> None
     assert matching[0].filename == __file__
 
 
+@pytest.mark.parametrize(
+    ("module", "skipped"), [("cubic.fake_caller", True), ("cubical", False)]
+)
+def test_warnings_skip_every_cubic_module(module: str, skipped: bool) -> None:
+    """A caller in another cubic module is skipped too, up to the user's line.
+
+    Only frames of mesh.py used to be skipped, so such a caller was named. A
+    module whose name merely starts with "cubic" is the user's own.
+    """
+    filename = f"<{module}>"
+    source = (
+        "def call(mask):\n"
+        "    return mesh.extract_surface_features(mask, None, ['Avg Curvedness'])\n"
+    )
+    namespace = {"__name__": module, "mesh": mesh}
+    exec(compile(source, filename, "exec"), namespace)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        namespace["call"](np.ones((1, 1, 1), dtype=bool))
+
+    matching = [w for w in caught if "vanishes when blurred" in str(w.message)]
+    assert [w.filename for w in matching] == [__file__ if skipped else filename]
+
+
 def _failing_bounding_cylinder(monkeypatch) -> None:
     """Make every trimesh bounding cylinder fail as a degenerate mesh's does."""
 
