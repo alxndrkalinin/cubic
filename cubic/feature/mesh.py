@@ -490,24 +490,32 @@ def _marching_cubes(
     is halfway between the volume's minimum and maximum. A CuPy volume is
     meshed on the GPU, which takes only ``level``, ``spacing`` and
     ``allow_degenerate``; other keywords go to skimage for a NumPy volume.
+
+    The faces wind outward from the region above ``level``, so a closed
+    surface encloses a positive volume. Both implementations wind them the
+    other way for skimage's default ``gradient_direction="descent"``, so their
+    columns are reversed; ``gradient_direction="ascent"`` (CPU only) already
+    winds them outward and is returned as is. All faces turn together, so the
+    shell of a cavity faces the material.
     """
     if get_device(volume) == "GPU":
         if kwargs:
             raise ValueError(f"GPU marching cubes does not support {sorted(kwargs)}.")
-        return _marching_cubes_gpu(volume, level, spacing, allow_degenerate)
-    verts, faces, _, _ = marching_cubes(
-        volume, level, spacing=spacing, allow_degenerate=allow_degenerate, **kwargs
-    )
-    return verts, faces
+        verts, faces = _marching_cubes_gpu(volume, level, spacing, allow_degenerate)
+    else:
+        verts, faces, _, _ = marching_cubes(
+            volume, level, spacing=spacing, allow_degenerate=allow_degenerate, **kwargs
+        )
+        if kwargs.get("gradient_direction") == "ascent":
+            return verts, faces
+    return verts, faces[:, ::-1].copy()
 
 
 def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
-    """Wrap marching-cubes output as an outward-oriented mesh on its device."""
+    """Wrap outward-wound marching-cubes output as a mesh on its device."""
     if get_device(verts) == "GPU":
         return ArrayMesh(verts, faces)
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-    trimesh.repair.fix_normals(mesh)
-    return mesh
+    return trimesh.Trimesh(vertices=verts, faces=faces)
 
 
 def _smooth_mask2mesh(
@@ -612,10 +620,8 @@ def mask2mesh(
 ) -> Any:
     """Convert 3D mask to a mesh using marching cubes.
 
-    The mask is padded with one voxel of background on every side. Without it a
-    label touching the volume border yields an open (non-watertight) surface,
-    whose ``volume`` is meaningless and often negative, which in turn makes
-    sphericity NaN and solidity and extent negative.
+    The mask is padded with one voxel of background on every side, which closes
+    the surface of a label touching the volume border.
 
     Parameters
     ----------
@@ -707,8 +713,10 @@ def extract_mesh_features(
     ValueError
         If a feature name is unknown or needs the mask (``Fractal Dimension``,
         ``Outline Fractal Dimension``),
-        or if the mesh volume or surface area is not finite and positive, which
-        is what an open (non-watertight) surface reports.
+        or if the mesh volume or surface area is not finite and positive. A
+        non-positive volume is what an inside-out mesh reports; an open surface
+        is not detected in general, since its signed volume depends on the
+        origin.
     """
     features = list(_MESH_FEATURES) if features is None else _resolve_features(features)
     from_mask = [name for name in features if name in _MASK_FEATURES]
@@ -731,16 +739,17 @@ def _measure_mesh(
     The values stay in the mesh's units; ``unit`` only converts the volume or
     area printed by the errors to the caller's units.
     """
-    # Validate the mesh before any feature: an open surface (e.g. a mask meshed
-    # without a background border) reports a negative volume, which silently
-    # propagates into a NaN sphericity and negative solidity and extent instead
-    # of failing.
+    # Validate the mesh before any feature: an inside-out mesh reports a
+    # negative volume, which would silently propagate into a NaN sphericity and
+    # negative solidity and extent instead of failing. An open surface is not
+    # detected in general: the sign of its volume depends on the origin.
     volume = float(mesh.volume)
     surface_area = float(mesh.area)
     if not np.isfinite(volume) or volume <= 0:
         raise ValueError(
             f"Mesh volume must be finite and positive; got {volume * unit**3}. "
-            f"The mesh is likely not watertight (is_watertight={mesh.is_watertight})."
+            "The mesh is inside out or its surface is open "
+            f"(is_watertight={mesh.is_watertight})."
         )
     if not np.isfinite(surface_area) or surface_area <= 0:
         raise ValueError(

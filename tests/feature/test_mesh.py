@@ -7,7 +7,6 @@ import subprocess
 import numpy as np
 import pytest
 from scipy import ndimage
-from skimage.measure import marching_cubes
 
 trimesh = pytest.importorskip("trimesh")
 
@@ -227,6 +226,56 @@ def test_mask2mesh_pads_border_touching_mask() -> None:
     assert border.area == pytest.approx(interior.area)
 
 
+def test_extract_features_orients_a_ragged_label_outward(
+    ragged_ball: np.ndarray,
+) -> None:
+    """A label whose mesh is not watertight is measured, not rejected.
+
+    ``fix_normals`` left such a mesh with marching cubes' inward winding, and
+    the volume check raised ``Mesh volume must be finite and positive; got
+    -14291.58`` for the whole label image.
+    """
+    assert not mesh.mask2mesh(ragged_ball).is_watertight
+    image = np.zeros((41, 41, 90), dtype=np.int32)
+    image[:, :, :41][ragged_ball] = 1
+    image[10:20, 10:20, 60:70] = 2  # a clean cube next to it
+
+    labels, values, _ = mesh.extract_features(image, ["Volume"])
+
+    np.testing.assert_array_equal(labels, [1, 2])
+    assert values.shape == (2, 1)
+    # Close to the voxel counts, 14224 and 1000 (14291.6 and 985.7: marching
+    # cubes cuts the cube's edges and corners).
+    voxels = [ragged_ball.sum(), 1000]
+    np.testing.assert_allclose(values[:, 0], voxels, rtol=0.02)
+
+
+def test_mask2mesh_orients_random_masks_outward() -> None:
+    """Random masks, whose meshes are mostly not watertight, all mesh outward.
+
+    With ``fix_normals``, the 44 of these 50 meshes that are not watertight
+    came out inside out.
+    """
+    rng = np.random.default_rng(0)
+    surfaces = [mesh.mask2mesh(rng.random((8, 8, 8)) < 0.35) for _ in range(50)]
+
+    assert sum(not s.is_watertight for s in surfaces) > 25
+    assert all(s.volume > 0 for s in surfaces)
+
+
+def test_mask2mesh_orients_an_ascent_mesh_outward(ragged_ball: np.ndarray) -> None:
+    """With ``gradient_direction="ascent"`` the faces already wind outward.
+
+    They must then be kept, so the volume equals the default direction's.
+    """
+    ascent = mesh.mask2mesh(
+        ragged_ball, marching_cubes_kwargs={"gradient_direction": "ascent"}
+    )
+
+    assert ascent.volume > 0
+    assert ascent.volume == pytest.approx(mesh.mask2mesh(ragged_ball).volume, rel=1e-12)
+
+
 @pytest.mark.parametrize("spacing", [None, (4.0, 1.0, 1.0)])
 def test_mask2mesh_vertices_stay_in_the_input_frame(
     spacing: tuple[float, float, float] | None,
@@ -274,39 +323,38 @@ def test_extract_features_forwards_spacing(surface_calls) -> None:
     assert [call["spacing"] for call in surface_calls] == [(4.0, 1.0, 1.0)]
 
 
-def _open_mesh() -> trimesh.Trimesh:
-    """Return the open surface of a border-touching mask meshed without padding."""
-    verts, faces, _, _ = marching_cubes(_cube_volume(0) == 1)
-    open_mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-    trimesh.repair.fix_normals(open_mesh)
-    return open_mesh
+def _inside_out_mesh() -> trimesh.Trimesh:
+    """Return the closed mesh of a cube with every face wound inward."""
+    return mesh.mask2mesh(_cube_volume(4) == 1).invert()
 
 
 def test_unknown_feature_names_are_reported_before_any_meshing(monkeypatch) -> None:
     """Every entry point names the unknown feature before meshing or validating.
 
     ``extract_surface_features`` used to mesh first, and ``extract_mesh_features``
-    rejected an open mesh before looking at the names.
+    rejected a mesh that fails its volume check before looking at the names.
     """
 
     def fail(*args, **kwargs):
         raise AssertionError("meshed before checking the feature names")
 
+    with pytest.raises(ValueError, match="volume must be finite and positive"):
+        mesh.extract_mesh_features(_inside_out_mesh())
     with pytest.raises(ValueError, match="Unknown mesh features"):
-        mesh.extract_mesh_features(_open_mesh(), ["Scale"])
+        mesh.extract_mesh_features(_inside_out_mesh(), ["Scale"])
     monkeypatch.setattr(mesh, "mask2mesh", fail)
     with pytest.raises(ValueError, match="Unknown mesh features"):
         mesh.extract_surface_features(_cube_volume(4) == 1, features=["Scale"])
 
 
-def test_extract_mesh_features_rejects_open_mesh() -> None:
-    """A non-watertight mesh raises instead of reporting a negative volume."""
-    # Reproduce the pre-padding behaviour: mesh a border-touching mask directly.
-    open_mesh = _open_mesh()
+def test_extract_mesh_features_rejects_an_inside_out_mesh() -> None:
+    """A closed mesh wound inward raises instead of reporting a negative volume."""
+    inside_out = _inside_out_mesh()
 
-    assert not open_mesh.is_watertight
-    with pytest.raises(ValueError, match="volume must be finite and positive"):
-        mesh.extract_mesh_features(open_mesh)
+    assert inside_out.is_watertight
+    assert inside_out.volume < 0
+    with pytest.raises(ValueError, match="positive; got -.*inside out"):
+        mesh.extract_mesh_features(inside_out)
 
 
 def test_extract_features_border_label_geometry() -> None:

@@ -100,11 +100,12 @@ class ArrayMesh:
     vertices : array
         ``(V, 3)`` vertex coordinates, NumPy or CuPy.
     faces : array
-        ``(F, 3)`` vertex indices on the same device.
+        ``(F, 3)`` vertex indices on the same device, wound outward, as
+        ``mesh._marching_cubes`` returns them.
 
-    The faces are flipped if the enclosed volume comes out negative, as
-    ``trimesh.repair.fix_normals`` does for a mesh with consistent winding, and
-    equal and unreferenced vertices are merged as trimesh's processing does.
+    The faces are measured as given, as ``trimesh.Trimesh`` measures them: a
+    mesh wound inward reports a negative volume. Equal and unreferenced
+    vertices are merged as trimesh's processing does.
 
     Attributes not computed here are read from a ``trimesh.Trimesh`` copy on the
     host. A delegated method that would change the mesh in place (e.g.
@@ -117,11 +118,6 @@ class ArrayMesh:
         self.vertices, self.faces = _merge_vertices(
             vertices.astype(np.float64), faces.astype(np.int64)
         )
-        if self.volume < 0:
-            self.faces = self.faces[:, ::-1].copy()
-            for name in list(vars(self)):
-                if name not in ("vertices", "faces"):
-                    delattr(self, name)
 
     def __getattr__(self, name: str) -> Any:
         # Called for attributes not defined here, which go to trimesh, and also

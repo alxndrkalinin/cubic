@@ -86,6 +86,35 @@ def test_gpu_marching_cubes_matches_skimage(name: str, gpu_available: bool) -> N
     _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
+@pytest.mark.parametrize("device", ["CPU", "GPU"])
+def test_marching_cubes_faces_wind_outward(device: str, gpu_available: bool) -> None:
+    """The faces from ``mesh._marching_cubes`` enclose a positive volume.
+
+    Both implementations wind faces inward for skimage's default gradient
+    direction, and ``_marching_cubes`` reverses them; the random mask's mesh is
+    not watertight, which does not matter to that rule.
+    """
+    if device == "GPU" and not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(0)
+    z, y, x = np.meshgrid(*[np.arange(24) - 11.5] * 3, indexing="ij")
+    r2 = z**2 + y**2 + x**2
+    volumes = {
+        "ball": (np.pad(r2 <= 9**2, 1), None),
+        "hollow ball": (np.pad((r2 <= 10**2) & (r2 > 4**2), 1), None),
+        "random mask": (np.pad(rng.random((12, 12, 12)) < 0.35, 1), None),
+        "blurred mask": (
+            mesh._padded_blur(r2 <= 6**2, np.ones(3), 2.0)[0],
+            0.5,
+        ),
+    }
+    for name, (volume, level) in volumes.items():
+        on_device = ascupy(volume) if device == "GPU" else volume
+        verts, faces = mesh._marching_cubes(on_device, level)
+        surface = trimesh.Trimesh(asnumpy(verts), asnumpy(faces), process=False)
+        assert surface.volume > 0, name
+
+
 def test_gpu_default_level_rounds_like_skimage(gpu_available: bool) -> None:
     """``level=None`` is skimage's midpoint, halved from the float32 sum of the extremes.
 
@@ -155,14 +184,32 @@ def test_array_mesh_matches_trimesh() -> None:
     )
     r2 = z**2 + y**2 + x**2
     hollow = np.pad((r2 <= 12**2) & ~(r2 <= 5**2), 1)
-    verts, faces, _, _ = marching_cubes(hollow, spacing=(2.0, 1.0, 1.0))
+    verts, faces = mesh._marching_cubes(hollow, spacing=(2.0, 1.0, 1.0))
     reference = trimesh.Trimesh(verts, faces)
-    trimesh.repair.fix_normals(reference)
 
     expected = mesh.extract_mesh_features(reference)
     got = mesh.extract_mesh_features(ArrayMesh(verts, faces))
 
     assert got == pytest.approx(expected, rel=1e-12)
+
+
+def test_array_mesh_measures_inward_faces_as_given(gpu_available: bool) -> None:
+    """Faces wound inward give minus the outward volume; they are not flipped.
+
+    ``trimesh.Trimesh`` measures its faces as given too, so an inside-out mesh
+    reaches the volume check on either device instead of being flipped on one.
+    """
+    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
+    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    arrays = [(verts, faces)]
+    if gpu_available:
+        arrays.append((ascupy(verts), ascupy(faces)))
+    for v, f in arrays:
+        outward = ArrayMesh(v, f).volume
+        inward = ArrayMesh(v, f[:, ::-1].copy()).volume
+
+        assert outward > 0
+        assert inward == pytest.approx(-outward, rel=1e-12)
 
 
 def _level_hit_mesh() -> tuple[np.ndarray, np.ndarray]:
@@ -172,8 +219,7 @@ def _level_hit_mesh() -> tuple[np.ndarray, np.ndarray]:
     """
     rng = np.random.default_rng(1)
     volume = np.pad(np.round(rng.random((16, 16, 16)) * 4) / 4, 1).astype(np.float32)
-    verts, faces, _, _ = marching_cubes(volume, 0.5, allow_degenerate=False)
-    return verts, faces
+    return mesh._marching_cubes(volume, 0.5, allow_degenerate=False)
 
 
 def test_array_mesh_merges_vertices_like_trimesh(gpu_available: bool) -> None:
@@ -222,7 +268,7 @@ def test_array_mesh_refuses_in_place_changes() -> None:
     and area describing a different mesh from the delegated attributes.
     """
     z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
-    verts, faces, _, _ = marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
     ball = ArrayMesh(verts, faces)
 
     with pytest.raises(TypeError, match="in place"):
@@ -282,6 +328,29 @@ def test_extract_features_on_gpu_matches_cpu(gpu_available: bool) -> None:
         cpu_labels, cpu, _ = mesh.extract_features(labels, spacing=spacing)
     with pytest.warns(UserWarning, match="vanishes"):
         gpu_labels, gpu, _ = mesh.extract_features(ascupy(labels), spacing=spacing)
+
+    np.testing.assert_array_equal(gpu_labels, cpu_labels)
+    np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
+
+
+def test_ragged_label_on_gpu_matches_cpu(
+    ragged_ball: np.ndarray, gpu_available: bool
+) -> None:
+    """A label whose mesh is not watertight gives the same features on both devices.
+
+    The CPU path used to rely on ``fix_normals``, which skips a mesh trimesh
+    does not call watertight: there it raised on the negative volume while the
+    GPU path measured the label.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    labels = np.zeros((41, 41, 60), dtype=np.int32)
+    labels[:, :, :41][ragged_ball] = 1
+    labels[10:20, 10:20, 45:55] = 2
+    assert not mesh.mask2mesh(ragged_ball).is_watertight
+
+    cpu_labels, cpu, _ = mesh.extract_features(labels)
+    gpu_labels, gpu, _ = mesh.extract_features(ascupy(labels))
 
     np.testing.assert_array_equal(gpu_labels, cpu_labels)
     np.testing.assert_allclose(gpu, cpu, rtol=1e-9, equal_nan=True)
