@@ -667,7 +667,7 @@ def extract_mesh_features(
         If a feature name is unknown or needs the mask (``Fractal Dimension``,
         ``Outline Fractal Dimension``),
         or if the mesh volume or surface area is not finite and positive, which
-        is what an open (non-watertight) surface reports.
+        is what an inside-out mesh, and often an open surface, reports.
     """
     features = list(_MESH_FEATURES) if features is None else _resolve_features(features)
     from_mask = [name for name in features if name in _MASK_FEATURES]
@@ -676,16 +676,17 @@ def extract_mesh_features(
             f"{from_mask} is measured on the mask at several blur scales, not on "
             "one mesh; use extract_surface_features or extract_features."
         )
-    # Validate the mesh before any feature: an open surface (e.g. a mask meshed
-    # without a background border) reports a negative volume, which silently
-    # propagates into a NaN sphericity and negative solidity and extent instead
-    # of failing.
+    # Validate the mesh before any feature: an inside-out mesh, and often an
+    # open surface (e.g. a mask meshed without a background border), reports a
+    # negative volume, which silently propagates into a NaN sphericity and
+    # negative solidity and extent instead of failing.
     volume = float(mesh.volume)
     surface_area = float(mesh.area)
     if not np.isfinite(volume) or volume <= 0:
         raise ValueError(
             f"Mesh volume must be finite and positive; got {volume}. "
-            f"The mesh is likely not watertight (is_watertight={mesh.is_watertight})."
+            "The mesh is inside out or its surface is open "
+            f"(is_watertight={mesh.is_watertight})."
         )
     if not np.isfinite(surface_area) or surface_area <= 0:
         raise ValueError(
