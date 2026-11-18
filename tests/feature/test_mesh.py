@@ -35,6 +35,24 @@ def _ball(radius: float, shape: int) -> np.ndarray:
     return sum(axis**2 for axis in _centred_grid(shape, shape, shape)) <= radius**2
 
 
+def _ragged_ball() -> np.ndarray:
+    """Return a 41^3 mask of a radius-15 ball with 30% of its boundary shell flipped.
+
+    Only the largest 26-connected piece is kept. Its mesh has 33 edges shared
+    by four faces, so trimesh does not call it watertight.
+    """
+    rng = np.random.default_rng(0)
+    r = np.sqrt(sum(axis**2 for axis in _centred_grid(41, 41, 41)))
+    shell = (np.abs(r - 15) <= 1.0) & (rng.random(r.shape) < 0.3)
+    pieces = ndimage.label((r <= 15) ^ shell, structure=np.ones((3, 3, 3)))[0]
+    return pieces == np.argmax(np.bincount(pieces.ravel())[1:]) + 1
+
+
+def _edge_multiplicities(surface: trimesh.Trimesh) -> np.ndarray:
+    """Return the number of faces sharing each distinct edge of ``surface``."""
+    return np.unique(surface.edges_sorted, axis=0, return_counts=True)[1]
+
+
 def _rotated_ellipsoid(rot_deg: float) -> np.ndarray:
     """Return a label image of an ellipsoid with full axes (12, 48, 16).
 
@@ -225,6 +243,61 @@ def test_mask2mesh_pads_border_touching_mask() -> None:
     # Translation-invariant: the corner cube measures like the interior one.
     assert border.volume == pytest.approx(interior.volume)
     assert border.area == pytest.approx(interior.area)
+
+
+def test_extract_features_orients_a_ragged_label_outward() -> None:
+    """A label whose mesh has edges shared by four faces is measured, not rejected.
+
+    trimesh does not call such a mesh watertight, so ``fix_normals`` left it
+    with marching cubes' inward winding, and the volume check raised
+    ``Mesh volume must be finite and positive; got -14291.58`` for the whole
+    label image.
+    """
+    ragged = _ragged_ball()
+    surface = mesh.mask2mesh(ragged)
+    assert (_edge_multiplicities(surface) == 4).any()
+    assert not surface.is_watertight
+    image = np.zeros((41, 41, 90), dtype=np.int32)
+    image[:, :, :41][ragged] = 1
+    image[10:20, 10:20, 60:70] = 2  # a clean cube next to it
+
+    labels, values, _ = mesh.extract_features(image, ["Volume"])
+
+    np.testing.assert_array_equal(labels, [1, 2])
+    assert values.shape == (2, 1)
+    # Close to the voxel counts, 14224 and 1000 (14291.6 and 985.7: marching
+    # cubes cuts the cube's edges and corners).
+    voxels = [ragged.sum(), 1000]
+    np.testing.assert_allclose(values[:, 0], voxels, rtol=0.02)
+
+
+def test_mask2mesh_orients_random_masks_outward() -> None:
+    """Random masks, whose meshes are mostly not watertight, all mesh outward.
+
+    Before the faces were oriented by the sign of the volume, the 44 of these
+    50 meshes that are not watertight came out inside out.
+    """
+    rng = np.random.default_rng(0)
+    surfaces = [mesh.mask2mesh(rng.random((8, 8, 8)) < 0.35) for _ in range(50)]
+
+    assert sum(not s.is_watertight for s in surfaces) > 25
+    assert all(s.volume > 0 for s in surfaces)
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_mask2mesh_orients_an_ascent_mesh_outward(ragged: bool) -> None:
+    """With ``gradient_direction="ascent"`` the faces already wind outward.
+
+    They must then be kept, so the volume equals the default direction's.
+    """
+    mask = _ragged_ball() if ragged else _ball(8, 22)
+
+    ascent = mesh.mask2mesh(
+        mask, marching_cubes_kwargs={"gradient_direction": "ascent"}
+    )
+
+    assert ascent.volume > 0
+    assert ascent.volume == pytest.approx(mesh.mask2mesh(mask).volume, rel=1e-12)
 
 
 @pytest.mark.parametrize("spacing", [None, (4.0, 1.0, 1.0)])
