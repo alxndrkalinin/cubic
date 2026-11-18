@@ -518,13 +518,17 @@ def _fractal_dimension(mesh: trimesh.Trimesh, n_levels: int = 6) -> float:
 
     The mesh is simplified by quadric error metrics to ``n_levels`` face counts
     from a sixteenth of its own up to all of it. Area scales as ``n^((D-2)/2)``
-    with the face count ``n`` for a surface of fractal dimension ``D``.
+    with the face count ``n`` for a surface of fractal dimension ``D``. A mesh
+    of fewer than 64 faces, the lowest target, is too small to decimate and
+    gets NaN.
     """
     if importlib.util.find_spec("fast_simplification") is None:
         raise RuntimeError(
             "Fractal Dimension needs fast-simplification. Install with 'cubic[mesh]'"
         )
     n_faces = len(mesh.faces)
+    if n_faces < 64:
+        return float("nan")
     counts = np.unique(
         np.geomspace(max(n_faces // 16, 64), n_faces, n_levels).astype(int)
     )

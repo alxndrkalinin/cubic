@@ -498,6 +498,26 @@ def test_fractal_dimension_of_a_smooth_surface_is_two() -> None:
     assert value == pytest.approx(2, abs=0.02)
 
 
+def test_fractal_dimension_of_a_mesh_too_small_to_decimate_is_nan() -> None:
+    """A small object gets NaN for it instead of failing the whole label image.
+
+    A ball of radius 3 survives the default blur as a 44-face mesh, below the
+    lowest decimation target of 64 faces.
+    """
+    pytest.importorskip("fast_simplification")
+    small = _ball(3, 22)
+    assert len(mesh.mask2mesh(small, sigma=2.0).faces) < 64
+    labels = np.zeros((22, 22, 44), dtype=np.int32)
+    labels[:, :, :22][small] = 1
+    labels[:, :, 22:][_ball(8, 22)] = 2
+
+    _, values, columns = mesh.extract_features(labels)
+
+    fractal = values[:, columns.index("Fractal Dimension")]
+    assert np.isnan(fractal[0]) and np.isfinite(fractal[1])
+    assert np.isfinite(np.delete(values, columns.index("Fractal Dimension"), 1)).all()
+
+
 def test_fractal_dimension_names_its_dependency(monkeypatch) -> None:
     """Without fast-simplification the error says what to install."""
     real_find_spec = mesh.importlib.util.find_spec
