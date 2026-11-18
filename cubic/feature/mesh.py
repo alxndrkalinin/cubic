@@ -816,7 +816,12 @@ def extract_mesh_features(
     # unit, and converted back. The copies leave the caller's meshes as they
     # are.
     unit = _edge_unit(mesh)
-    smooth = None if smooth_mesh is None else _scaled_copy(smooth_mesh, 1 / unit)
+    # The same object passed as both is measured once, as with no smooth mesh.
+    smooth = (
+        None
+        if smooth_mesh is None or smooth_mesh is mesh
+        else _scaled_copy(smooth_mesh, 1 / unit)
+    )
     values = _measure_mesh(
         _scaled_copy(mesh, 1 / unit), features, smooth_mesh=smooth, unit=unit
     )
