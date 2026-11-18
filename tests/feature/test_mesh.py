@@ -619,6 +619,18 @@ def test_total_absolute_gaussian_curvature_grows_with_saddles() -> None:
     assert peanut_k > 1.1
 
 
+def test_shape_index_tells_a_torus_from_a_ball() -> None:
+    """Saddles lower the area-averaged shape index: a torus reads well below a ball.
+
+    The ball is all cap (0.92 here); the inner half of the torus is saddle (0.50 here).
+    """
+    name = "Avg Shape Index"
+    ball = mesh.extract_surface_features(_ball(10, 26), features=[name])[name]
+    torus = mesh.extract_surface_features(_torus(), features=[name])[name]
+
+    assert torus < ball - 0.2
+
+
 @pytest.mark.parametrize("rot_deg", [30, 45])
 def test_curvature_distribution_does_not_depend_on_orientation(rot_deg: float) -> None:
     """Rotating an ellipsoid barely moves the curvature features.
