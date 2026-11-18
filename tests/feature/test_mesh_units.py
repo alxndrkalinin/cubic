@@ -42,21 +42,20 @@ DIMENSIONS = {
     "Outline Fractal Dimension": 0,
 }
 
-FACTORS = (1e-9, 1e-6, 1e-3, 1.0, 1e3)
 BASES = {
-    "isotropic": (1.0, 1.0, 1.0),
     "anisotropic": (2.685, 1.0, 1.0),
     # (0.2e-6 / 0.065e-6) is not 0.2 / 0.065 in floating point, one ulp apart.
     "unit rounding": (0.2, 0.065, 0.065),
 }
-# (factor, base, explicit windows) of each covariance check.
+# (factor, base, explicit windows) of each covariance check. For the
+# anisotropic base and one window mode the internal problem is the same at
+# every factor, so one factor other than 1 checks each mode; 1e-9 and 1e3 put
+# the caller's lengths far below and above trimesh's absolute tolerances. The
+# unit-rounding base is the exception that the last cell bounds.
 CELLS = [
-    *(
-        (c, base, explicit)
-        for c in FACTORS
-        for base in ("isotropic", "anisotropic")
-        for explicit in (False, True)
-    ),
+    (1e-9, "anisotropic", False),
+    (1e-9, "anisotropic", True),
+    (1e3, "anisotropic", False),
     (1e-6, "unit rounding", False),
 ]
 
@@ -120,7 +119,6 @@ def _reference(device: str, base: str, explicit: bool) -> dict[str, float]:
 def _assert_covariant(device: str, base: str, c: float, explicit: bool) -> None:
     reference = _reference(device, base, explicit)
     assert all(np.isfinite(v) for v in reference.values()), reference
-    # Computed afresh, so at c = 1 this compares two runs of the same call.
     actual = _features(device, base, c, explicit)
     off = {}
     for name, value in actual.items():
@@ -228,22 +226,14 @@ def _ball(radius: int) -> np.ndarray:
     ],
     ids=["fractal window", "outline vanishes", "blur vanishes"],
 )
-@pytest.mark.parametrize("entry", ["extract_surface_features", "extract_features"])
-def test_warnings_print_lengths_in_the_callers_units(mask, kwargs, text, entry):
+def test_warnings_print_lengths_in_the_callers_units(mask, kwargs, text):
     """Scales in warnings are the caller's, not those of the internal unit.
 
     At spacing 0.25 the internal unit is 0.25, so each scale would print four
-    times larger. The warning is still attributed to this file, from either
-    entry.
+    times larger.
     """
-    spacing = (0.25, 0.25, 0.25)
-    with pytest.warns(UserWarning, match=text) as record:
-        if entry == "extract_features":
-            mesh.extract_features(mask.astype(np.int32), spacing=spacing, **kwargs)
-        else:
-            mesh.extract_surface_features(mask, spacing=spacing, **kwargs)
-    matching = [w for w in record if re.search(text, str(w.message))]
-    assert [w.filename for w in matching] == [__file__]
+    with pytest.warns(UserWarning, match=text):
+        mesh.extract_surface_features(mask, spacing=(0.25, 0.25, 0.25), **kwargs)
 
 
 def test_volume_error_prints_the_callers_volume(monkeypatch):

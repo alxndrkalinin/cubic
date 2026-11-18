@@ -362,7 +362,9 @@ def test_ragged_label_on_gpu_matches_cpu(
 
 
 _SHARED_EDGE_TEXT = "edges shared by more than two faces"
-_SHARED_EDGE_FEATURES = [
+# Requested by the shared-edge tests: two exact features, then the five that
+# are approximate on such a mesh (the module's _SHARED_EDGE_FEATURES).
+_SHARED_EDGE_REQUEST = [
     "Volume",
     "Area",
     "Euler Characteristic",
@@ -376,7 +378,10 @@ _GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curv
 # On the raw mesh, without smooth_mesh. Avg Shape Index is left out: on a raw
 # CuPy mesh it differs from the CPU by up to 9% (0.0960 against 0.0888 on a
 # clean ball), with or without shared edges, which is not resolved here.
-_RAW_CURVATURE = ["Total Absolute Gaussian Curvature", "Avg Curvedness"]
+_RAW_CURVATURE_WITHOUT_SHAPE_INDEX = [
+    "Total Absolute Gaussian Curvature",
+    "Avg Curvedness",
+]
 
 
 def _shared_edge_warnings(call) -> tuple[object, list]:
@@ -429,7 +434,7 @@ def test_shared_edge_warning_on_gpu(
         raise AssertionError("fell back to a host trimesh")
 
     monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
-    names = _SHARED_EDGE_FEATURES
+    names = _SHARED_EDGE_REQUEST
     for fraction, expected in [(0.3, 1), (0.0, 0)]:
         mask = ascupy(ragged_ball_of(fraction))
         calls = {
@@ -468,7 +473,7 @@ def test_shared_edge_masks_match_on_both_devices(
         monkeypatch.setattr(mesh, "_closed_mesh", ArrayMesh)
         try:
             return mesh.mask2mesh(mask), mesh.extract_surface_features(
-                mask, features=_SHARED_EDGE_FEATURES
+                mask, features=_SHARED_EDGE_REQUEST
             )
         finally:
             monkeypatch.setattr(mesh, "_closed_mesh", closed_mesh)
@@ -477,14 +482,12 @@ def test_shared_edge_masks_match_on_both_devices(
         ways = {
             "trimesh": lambda m=mask: (
                 mesh.mask2mesh(m),
-                mesh.extract_surface_features(m, features=_SHARED_EDGE_FEATURES),
+                mesh.extract_surface_features(m, features=_SHARED_EDGE_REQUEST),
             ),
             "ArrayMesh, NumPy": lambda m=mask: numpy_array_mesh(m),
             "ArrayMesh, CuPy": lambda m=mask: (
                 mesh.mask2mesh(ascupy(m)),
-                mesh.extract_surface_features(
-                    ascupy(m), features=_SHARED_EDGE_FEATURES
-                ),
+                mesh.extract_surface_features(ascupy(m), features=_SHARED_EDGE_REQUEST),
             ),
         }
         results = {way: _shared_edge_warnings(call) for way, call in ways.items()}
@@ -492,12 +495,16 @@ def test_shared_edge_masks_match_on_both_devices(
         count = mesh._overshared_edge_count(surface)
         assert count > 0, name
         with pytest.warns(UserWarning, match=_SHARED_EDGE_TEXT):
-            raw_reference = mesh.extract_mesh_features(surface, _RAW_CURVATURE)
+            raw_reference = mesh.extract_mesh_features(
+                surface, _RAW_CURVATURE_WITHOUT_SHAPE_INDEX
+            )
         for way, ((surface, values), caught) in results.items():
             assert mesh._overshared_edge_count(surface) == count, (name, way)
             assert len(caught) == 1, (name, way)
             raw, raw_caught = _shared_edge_warnings(
-                lambda s=surface: mesh.extract_mesh_features(s, _RAW_CURVATURE)
+                lambda s=surface: mesh.extract_mesh_features(
+                    s, _RAW_CURVATURE_WITHOUT_SHAPE_INDEX
+                )
             )
             assert len(raw_caught) == 1, (name, way)
             values = {**values, **{f"raw {k}": v for k, v in raw.items()}}

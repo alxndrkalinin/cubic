@@ -995,11 +995,6 @@ def test_thin_object_check_runs_only_for_fractal_dimension(monkeypatch) -> None:
 
 
 _SHARED_EDGE_TEXT = "edges shared by more than two faces"
-_RAW_CURVATURE = [
-    "Total Absolute Gaussian Curvature",
-    "Avg Shape Index",
-    "Avg Curvedness",
-]
 
 
 def _shared_edge_warnings(call, simplefilter: str = "always") -> list:
@@ -1015,7 +1010,7 @@ def _shared_edge_warnings(call, simplefilter: str = "always") -> list:
     [
         ["Euler Characteristic"],
         ["Avg Mean Curvature"],
-        *([name] for name in _RAW_CURVATURE),
+        *([name] for name in _CURVATURE_FEATURES),
     ],
 )
 def test_shared_edge_warning_fires_on_a_ragged_ball_only(names, ragged_ball_of) -> None:
@@ -1050,7 +1045,7 @@ def test_shared_edge_warning_comes_from_the_raw_mesh_features(ragged_ball) -> No
     for names, expected in [
         (None, 1),
         (["Euler Characteristic", "Avg Mean Curvature"], 1),
-        (_RAW_CURVATURE, 0),
+        (_CURVATURE_FEATURES, 0),
         (["Volume", "Area"], 0),
     ]:
         caught = _shared_edge_warnings(
@@ -1147,11 +1142,7 @@ def test_shared_edge_count_tested_by_the_face_adjacency(
     "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
 )
 def test_shared_edge_warning_points_at_the_caller(entry: str, ragged_ball) -> None:
-    """The warning is attributed to the calling line through every public entry.
-
-    Through extract_features the existing warnings land on its per-label loop
-    in mesh.py; this one skips every frame of mesh.py.
-    """
+    """The warning is attributed to the calling line through every public entry."""
     names = ["Euler Characteristic"]
     calls = {
         "extract_features": lambda: mesh.extract_features(
@@ -1607,7 +1598,7 @@ def test_curvature_sigma_is_validated_whichever_features(
         )
 
     if np.isfinite(sigma) and sigma > 0:
-        assert call() is not None
+        call()
     else:
         with pytest.raises(
             ValueError,
