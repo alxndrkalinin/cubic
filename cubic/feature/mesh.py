@@ -314,9 +314,9 @@ def extract_surface_features(
         of real numbers.
     ValueError
         If ``fractal_scales`` or ``outline_fractal_scales`` is not two finite
-        numbers with ``0 < lowest < highest``, or ``spacing`` or
-        ``curvature_sigma`` is not finite and positive, whichever features
-        are requested.
+        numbers with ``0 < lowest < highest``, ``spacing`` is not three
+        finite, positive numbers ``(z, y, x)``, or ``curvature_sigma`` is not
+        finite and positive, whichever features are requested.
     """
     features = _resolve_features(features)
     window = _fractal_window(fractal_scales, "fractal_scales")
@@ -546,14 +546,16 @@ def _step(spacing: Sequence[float] | None) -> np.ndarray:
 def _unit(spacing: Sequence[float] | None) -> float:
     """Return the finest voxel spacing, the unit the features are measured in.
 
-    1 for ``None``. Raises ``ValueError`` unless every spacing is finite and
-    positive.
+    1 for ``None``. Raises ``ValueError`` unless ``spacing`` is exactly three
+    numbers ``(z, y, x)``, each finite and positive.
     """
     if spacing is None:
         return 1.0
     step = _step(spacing)
-    if step.size == 0 or not np.all(np.isfinite(step) & (step > 0)):
-        raise ValueError(f"spacing must be finite and positive; got {spacing!r}")
+    if step.shape != (3,) or not np.all(np.isfinite(step) & (step > 0)):
+        raise ValueError(
+            f"spacing must be three finite, positive numbers (z, y, x); got {spacing!r}"
+        )
     return float(step.min())
 
 
@@ -651,7 +653,8 @@ def mask2mesh(
     ValueError
         If ``sigma`` is given and the blurred mask never reaches 0.5, i.e. the
         object is too small for that blur, or if the voxel spacing, given as
-        ``spacing`` or in ``marching_cubes_kwargs``, is not finite and positive.
+        ``spacing`` or in ``marching_cubes_kwargs``, is not three finite,
+        positive numbers ``(z, y, x)``.
     """
     # A negative spacing would turn the mesh inside out, a zero one flatten it.
     _unit(spacing)

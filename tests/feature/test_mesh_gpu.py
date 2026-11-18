@@ -16,6 +16,8 @@ from cubic.feature._marching_cubes_cuda import (  # noqa: E402
     marching_cubes as marching_cubes_gpu,
 )
 
+_SPACING_ERROR = r"spacing must be three finite, positive numbers \(z, y, x\); got "
+
 
 def _canonical(verts: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Sorted unique vertices, and faces as sorted rows of vertex ranks.
@@ -144,6 +146,7 @@ def test_gpu_marching_cubes_rejects_spacing_of_other_lengths(
     """A spacing of other than three values raises skimage's error on the GPU too.
 
     Unchecked, one value scaled every axis and two failed to broadcast.
+    ``mask2mesh`` rejects it before meshing, with its own message.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
@@ -155,7 +158,7 @@ def test_gpu_marching_cubes_rejects_spacing_of_other_lengths(
         marching_cubes(volume, 0.5, spacing=spacing)
     with pytest.raises(ValueError, match=match):
         marching_cubes_gpu(ascupy(volume), 0.5, spacing)
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
         mesh.mask2mesh(ascupy(mask), spacing=spacing)
 
 
@@ -675,5 +678,5 @@ def test_mask2mesh_on_gpu_rejects_a_spacing_that_is_not_positive(
         "marching_cubes_kwargs": {"marching_cubes_kwargs": {"spacing": spacing}},
     }[source]
 
-    with pytest.raises(ValueError, match="spacing must be finite and positive"):
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
         mesh.mask2mesh(ascupy(_labels() == 1), **kwargs)

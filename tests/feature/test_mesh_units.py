@@ -2,6 +2,7 @@
 
 import re
 import warnings
+from typing import Any
 from functools import cache
 
 import numpy as np
@@ -12,6 +13,10 @@ trimesh = pytest.importorskip("trimesh")
 
 from cubic.cuda import ascupy  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
+
+_SPACING_ERROR = re.escape(
+    "spacing must be three finite, positive numbers (z, y, x); got "
+)
 
 # Power of the length unit in each feature, measured independently of the
 # module's table: log2 of each feature's ratio between isotropic spacings s and
@@ -176,21 +181,24 @@ def test_every_feature_has_a_dimension():
 @pytest.mark.parametrize(
     "spacing",
     [(0.0, 1.0, 1.0), (-1.0, 1.0, 1.0), (-1.0, -1.0, -1.0), (np.nan, 1.0, 1.0)]
-    + [(np.inf, 1.0, 1.0)],
+    + [(np.inf, 1.0, 1.0)]
+    + [0.5, (1.0,), (1.0, 1.0), (1.0, 1.0, 1.0, 1.0), np.ones((2, 3))],
 )
-def test_spacing_must_be_finite_and_positive(spacing: tuple):
+def test_spacing_must_be_three_finite_positive_numbers(spacing: Any) -> None:
     """Each entry rejects such a spacing, even for an image without labels.
 
     It used to fail deep in the blur, or for an all-negative spacing to return
     the features of the mirrored object, and an image without labels returned
-    an empty table.
+    an empty table. A scalar failed with a TypeError, a spacing of another
+    length with skimage's marching cubes error, and an image without labels
+    accepted a spacing of any length.
     """
     ball = np.pad(np.ones((5, 5, 5), dtype=bool), 2)
-    with pytest.raises(ValueError, match="spacing must be finite and positive"):
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
         mesh.extract_surface_features(ball, spacing=spacing)
-    with pytest.raises(ValueError, match="spacing must be finite and positive"):
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
         mesh.extract_features(ball.astype(np.int32), spacing=spacing)
-    with pytest.raises(ValueError, match="spacing must be finite and positive"):
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
         mesh.extract_features(np.zeros((4, 4, 4), dtype=np.int32), spacing=spacing)
 
 

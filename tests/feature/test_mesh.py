@@ -5,6 +5,7 @@ import sys
 import weakref
 import warnings
 import subprocess
+from typing import Any
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ import cubic.feature  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
 
 _CUBE_SIDE = 5
+_SPACING_ERROR = r"spacing must be three finite, positive numbers \(z, y, x\); got "
 
 
 def _cube_volume(origin: int, shape: int = 14) -> np.ndarray:
@@ -319,10 +321,14 @@ def test_mask2mesh_spacing_scales_geometry() -> None:
         )
 
 
-@pytest.mark.parametrize("spacing", [(-1.0, -1.0, -1.0), (0.0, 1.0, 1.0)])
+@pytest.mark.parametrize(
+    "spacing",
+    [(-1.0, -1.0, -1.0), (0.0, 1.0, 1.0)]
+    + [0.5, (1.0,), (1.0, 1.0), (1.0, 1.0, 1.0, 1.0)],
+)
 @pytest.mark.parametrize("source", ["spacing", "marching_cubes_kwargs", "sigma"])
-def test_mask2mesh_rejects_a_spacing_that_is_not_positive(
-    source: str, spacing: tuple
+def test_mask2mesh_rejects_a_spacing_that_is_not_three_positive_numbers(
+    source: str, spacing: Any
 ) -> None:
     """mask2mesh rejects such a spacing from either source, as extract_features does.
 
@@ -335,7 +341,7 @@ def test_mask2mesh_rejects_a_spacing_that_is_not_positive(
         "sigma": {"spacing": spacing, "sigma": 2.0},
     }[source]
 
-    with pytest.raises(ValueError, match="spacing must be finite and positive"):
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
         mesh.mask2mesh(_ball(8, 22), **kwargs)
 
 
