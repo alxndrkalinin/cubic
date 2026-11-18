@@ -2,6 +2,7 @@
 
 import gc
 import sys
+import _thread
 import weakref
 import warnings
 import subprocess
@@ -921,6 +922,41 @@ def test_warnings_skip_every_cubic_module(module: str, skipped: bool) -> None:
 
     matching = [w for w in caught if "vanishes when blurred" in str(w.message)]
     assert [w.filename for w in matching] == [__file__ if skipped else filename]
+
+
+def test_warnings_name_the_outermost_frame_when_every_frame_is_cubic() -> None:
+    """With only cubic frames on the stack, the warning names the outermost.
+
+    One level past it ``warnings`` attributes the warning to "sys". A thread
+    started with ``_thread.start_new_thread`` has no frame below its target, so
+    the code compiled here under a cubic module name is the whole stack.
+    """
+    filename = "<cubic.fake_entry>"
+    source = (
+        "def warn_here():\n"
+        "    level = mesh._stacklevel_outside_package()\n"
+        "    warnings.warn('probe', stacklevel=level)\n"
+        "    return level\n"
+        "def entry(result, done):\n"
+        "    try:\n"
+        "        with warnings.catch_warnings(record=True) as caught:\n"
+        "            warnings.simplefilter('always')\n"
+        "            result.append(warn_here())\n"
+        "        result.append(caught[0].filename)\n"
+        "    finally:\n"
+        "        done.release()\n"
+    )
+    namespace = {"__name__": "cubic.fake_entry", "mesh": mesh, "warnings": warnings}
+    exec(compile(source, filename, "exec"), namespace)
+    result: list[Any] = []
+    done = _thread.allocate_lock()
+    done.acquire()
+
+    _thread.start_new_thread(namespace["entry"], (result, done))
+
+    assert done.acquire(timeout=60)
+    # warn_here is level 1 and entry, the outermost frame, level 2.
+    assert result == [2, filename]
 
 
 def _failing_bounding_cylinder(monkeypatch) -> None:

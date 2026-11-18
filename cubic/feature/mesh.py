@@ -844,9 +844,10 @@ def _stacklevel_outside_package() -> int:
     point. Through ``extract_features`` that is one line for every label. The
     default filter keys a text by the calling line, so it shows a constant text
     once per calling line: once for a label image, and once for a loop over
-    images that calls ``extract_features`` on one line. Not for the
-    import-time warning: ``warnings`` skips importlib's frames there and this
-    count does not.
+    images that calls ``extract_features`` on one line. When every frame to the
+    top of the stack is a ``cubic`` frame, it is the level of the outermost one.
+    Not for the import-time warning: ``warnings`` skips importlib's frames there
+    and this count does not.
     """
     package = __name__.partition(".")[0]
     frame = sys._getframe(1)
@@ -858,7 +859,9 @@ def _stacklevel_outside_package() -> int:
     ):
         frame = frame.f_back  # type: ignore[assignment]
         level += 1
-    return level
+    # Off the top of the stack every frame is cubic's, and one level past the
+    # outermost would be attributed to "sys": name the outermost instead.
+    return level if frame is not None else level - 1
 
 
 def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
