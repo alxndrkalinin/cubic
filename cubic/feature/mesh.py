@@ -298,8 +298,11 @@ def extract_surface_features(
         object's ``Min Axis Length``, the value is still returned, with a
         warning that it is biased low. Warnings are attributed to the line
         that called this function, or ``extract_features``, which is one
-        line for every label; the thin-object text is the same for every
-        object, so Python's default filter shows it once per label image.
+        line for every label. The thin-object text is the same for every
+        object, and Python's default filter keys a text by the calling line,
+        so it shows the text once per calling line: once for a label image,
+        and once for a loop over images that calls ``extract_features`` on
+        one line.
     outline_fractal_scales : sequence of float, optional
         ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
         ``Outline Fractal Dimension`` fit, in the same form as
@@ -415,8 +418,10 @@ def extract_surface_features(
         if np.isfinite(values["Fractal Dimension"]) and fd_high > (
             float(_equivalent_ellipsoid_axes(mesh)[0]) / _THIN_OBJECT_RATIO
         ):
-            # One text for every object, so that the default filter reports a
-            # label image of many thin objects once.
+            # One text for every object. The default filter keys a text by the
+            # calling line, so it reports a label image of many thin objects
+            # once, and a loop over images that calls extract_features on one
+            # line once.
             warnings.warn(
                 _THIN_OBJECT_WARNING, stacklevel=_stacklevel_outside_package()
             )
@@ -840,8 +845,10 @@ def _stacklevel_outside_package() -> int:
     feature registry, ``_require_trimesh``'s wrapper, ``extract_features``'
     per-label loop, another ``cubic`` module calling this one), so every
     warning of this module reaches the user's line through every public entry
-    point. Through ``extract_features`` that is one line for every label, so
-    the default filter shows a constant text once per label image. Not for the
+    point. Through ``extract_features`` that is one line for every label. The
+    default filter keys a text by the calling line, so it shows a constant text
+    once per calling line: once for a label image, and once for a loop over
+    images that calls ``extract_features`` on one line. Not for the
     import-time warning: ``warnings`` skips importlib's frames there and this
     count does not.
     """

@@ -969,8 +969,10 @@ def test_bounding_cylinder_warning_points_at_the_caller(
 def test_thin_object_warning_is_shown_once_for_a_label_image() -> None:
     """Many thin labels give one warning under Python's default filter.
 
-    The slabs differ in thickness and width, so a text naming each object's
-    size would be shown once per label.
+    The filter keys a text by the calling line, so the warning is shown once
+    per calling line: once for this label image. The slabs differ in thickness
+    and width, so a text naming each object's size would be shown once per
+    label.
     """
     labels = np.zeros((12, 60, 180), dtype=np.int32)
     for i, (planes, width) in enumerate([(6, 40), (5, 34), (6, 28)]):
@@ -1169,7 +1171,11 @@ def test_shared_edge_warning_points_at_the_caller(entry: str, ragged_ball) -> No
 
 
 def test_shared_edge_warning_is_shown_once_for_a_label_image(ragged_ball_of) -> None:
-    """Two labels with shared edges give one warning under the default filter."""
+    """Two labels with shared edges give one warning under the default filter.
+
+    The filter keys a text by the calling line, so the warning is shown once
+    per calling line: once for this label image.
+    """
     labels = np.zeros((41, 41, 82), dtype=np.int32)
     labels[:, :, :41][ragged_ball_of(0.1)] = 1
     labels[:, :, 41:][ragged_ball_of(0.3)] = 2
