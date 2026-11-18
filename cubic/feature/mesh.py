@@ -229,13 +229,18 @@ def extract_surface_features(
     return {name: rest.get(name, float("nan")) for name in features}
 
 
-def _curvature_sigma(spacing: Sequence[float] | None, sigma: float | None) -> float:
-    """Return ``sigma``, or twice the coarsest voxel spacing for ``None``."""
+def _curvature_sigma(
+    spacing: Sequence[float] | None, sigma: float | None, name: str = "curvature_sigma"
+) -> float:
+    """Return ``sigma``, or twice the coarsest voxel spacing for ``None``.
+
+    ``name`` is the caller's parameter, for the error message.
+    """
     if sigma is None:
         return 2 * (1.0 if spacing is None else float(max(spacing)))
     sigma = float(sigma)
     if not np.isfinite(sigma) or sigma <= 0:
-        raise ValueError(f"curvature_sigma must be finite and positive; got {sigma}")
+        raise ValueError(f"{name} must be finite and positive; got {sigma}")
     return sigma
 
 
@@ -291,16 +296,25 @@ def mask2mesh(
     sigma : float, optional
         If given, mesh the mask blurred by a Gaussian of this width, in units of
         ``spacing``, instead of the voxel staircase. ``marching_cubes_kwargs``
-        is then not used.
+        is not used then and cannot be combined with it.
 
     Raises
     ------
     ValueError
         If ``sigma`` is given and the blurred mask never reaches 0.5, i.e. the
-        object is too small for that blur.
+        object is too small for that blur; if ``sigma`` is not finite and
+        positive; or if ``sigma`` is given together with
+        ``marching_cubes_kwargs``.
     """
     if sigma is not None:
-        mesh = _smooth_mask2mesh(mask_3d, spacing, _curvature_sigma(spacing, sigma))
+        if marching_cubes_kwargs:
+            raise ValueError(
+                "marching_cubes_kwargs cannot be combined with sigma: the blurred "
+                "mask is meshed without them. Pass the voxel spacing as 'spacing'."
+            )
+        mesh = _smooth_mask2mesh(
+            mask_3d, spacing, _curvature_sigma(spacing, sigma, "sigma")
+        )
         if mesh is None:
             raise ValueError(f"The mask vanishes when blurred at sigma={sigma}.")
         return mesh

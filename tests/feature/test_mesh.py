@@ -563,6 +563,22 @@ def test_curvature_sigma_is_validated() -> None:
         mesh.mask2mesh(np.ones((1, 1, 1), dtype=bool), sigma=2.0)
 
 
+def test_mask2mesh_checks_its_sigma_and_refuses_ignored_keywords() -> None:
+    """A bad ``sigma`` is named as such, and keywords it would ignore are refused.
+
+    With ``sigma`` the mask is blurred and meshed without
+    ``marching_cubes_kwargs``, so a ``spacing`` passed there would silently
+    leave the mesh in voxel units.
+    """
+    mask = _ball(8, 22)
+    with pytest.raises(ValueError, match="^sigma must be finite and positive"):
+        mesh.mask2mesh(mask, sigma=0)
+    with pytest.raises(ValueError, match="marching_cubes_kwargs cannot be combined"):
+        mesh.mask2mesh(
+            mask, marching_cubes_kwargs={"spacing": (2.0, 0.5, 0.5)}, sigma=1.0
+        )
+
+
 def test_sphericity_is_one_for_a_sphere_only() -> None:
     """Wadell sphericity is 1 for a sphere and below 1 for a cube."""
     assert mesh.sphericity(4 / 3 * np.pi, 4 * np.pi) == pytest.approx(1)
