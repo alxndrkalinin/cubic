@@ -86,6 +86,35 @@ def test_gpu_marching_cubes_matches_skimage(name: str, gpu_available: bool) -> N
     _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
+@pytest.mark.parametrize("device", ["CPU", "GPU"])
+def test_marching_cubes_faces_wind_outward(device: str, gpu_available: bool) -> None:
+    """The faces from ``mesh._marching_cubes`` enclose a positive volume.
+
+    Both implementations wind faces inward for skimage's default gradient
+    direction, and ``_marching_cubes`` reverses them; the random mask's mesh is
+    not watertight, which does not matter to that rule.
+    """
+    if device == "GPU" and not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(0)
+    z, y, x = np.meshgrid(*[np.arange(24) - 11.5] * 3, indexing="ij")
+    r2 = z**2 + y**2 + x**2
+    volumes = {
+        "ball": (np.pad(r2 <= 9**2, 1), None),
+        "hollow ball": (np.pad((r2 <= 10**2) & (r2 > 4**2), 1), None),
+        "random mask": (np.pad(rng.random((12, 12, 12)) < 0.35, 1), None),
+        "blurred mask": (
+            mesh._padded_blur(r2 <= 6**2, np.ones(3), 2.0)[0],
+            0.5,
+        ),
+    }
+    for name, (volume, level) in volumes.items():
+        on_device = ascupy(volume) if device == "GPU" else volume
+        verts, faces = mesh._marching_cubes(on_device, level)
+        surface = trimesh.Trimesh(asnumpy(verts), asnumpy(faces), process=False)
+        assert surface.volume > 0, name
+
+
 def test_gpu_default_level_rounds_like_skimage(gpu_available: bool) -> None:
     """``level=None`` is skimage's midpoint, halved from the float32 sum of the extremes.
 

@@ -103,8 +103,7 @@ class ArrayMesh:
         ``(F, 3)`` vertex indices on the same device.
 
     The faces are flipped all together if the enclosed volume comes out
-    negative, as the CPU path does before building its ``trimesh.Trimesh``,
-    whether or not trimesh would call the mesh watertight, and equal and
+    negative, so a mesh wound inward is still measured, and equal and
     unreferenced vertices are merged as trimesh's processing does.
 
     Attributes not computed here are read from a ``trimesh.Trimesh`` copy on the

@@ -468,41 +468,32 @@ def _marching_cubes(
     is halfway between the volume's minimum and maximum. A CuPy volume is
     meshed on the GPU, which takes only ``level``, ``spacing`` and
     ``allow_degenerate``; other keywords go to skimage for a NumPy volume.
+
+    The faces wind outward from the region above ``level``, so a closed
+    surface encloses a positive volume. Both implementations wind them the
+    other way for skimage's default ``gradient_direction="descent"``, so their
+    columns are reversed; ``gradient_direction="ascent"`` (CPU only) already
+    winds them outward and is returned as is. All faces turn together, so the
+    shell of a cavity faces the material.
     """
     if get_device(volume) == "GPU":
         if kwargs:
             raise ValueError(f"GPU marching cubes does not support {sorted(kwargs)}.")
-        return _marching_cubes_gpu(volume, level, spacing, allow_degenerate)
-    verts, faces, _, _ = marching_cubes(
-        volume, level, spacing=spacing, allow_degenerate=allow_degenerate, **kwargs
-    )
-    return verts, faces
+        verts, faces = _marching_cubes_gpu(volume, level, spacing, allow_degenerate)
+    else:
+        verts, faces, _, _ = marching_cubes(
+            volume, level, spacing=spacing, allow_degenerate=allow_degenerate, **kwargs
+        )
+        if kwargs.get("gradient_direction") == "ascent":
+            return verts, faces
+    return verts, faces[:, ::-1].copy()
 
 
 def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
-    """Wrap marching-cubes output as an outward-oriented mesh on its device.
-
-    Marching cubes winds every face the same way, inward for skimage's default
-    ``gradient_direction``, so the faces are reversed all together when the
-    enclosed volume is negative, as ``ArrayMesh`` does. The shell of a cavity
-    then keeps facing the material. ``trimesh.repair.fix_normals`` is not used:
-    it reverses only a mesh trimesh calls watertight, which excludes any mesh
-    with an edge shared by four faces, as ragged masks give, and left such
-    meshes inside out. Reversing before the ``Trimesh`` is built, rather than with
-    ``Trimesh.invert``, keeps the mass properties it caches on first use.
-    """
+    """Wrap outward-wound marching-cubes output as a mesh on its device."""
     if get_device(verts) == "GPU":
         return ArrayMesh(verts, faces)
-    if _signed_volume(verts, faces) < 0:
-        faces = np.ascontiguousarray(faces[:, ::-1])
     return trimesh.Trimesh(vertices=verts, faces=faces)
-
-
-def _signed_volume(verts: np.ndarray, faces: np.ndarray) -> float:
-    """Volume enclosed by a closed triangle mesh; negative if it winds inward."""
-    corners = verts.astype(np.float64)[faces]
-    triple = corners[:, 0] * np.cross(corners[:, 1], corners[:, 2])
-    return float(triple.sum()) / 6
 
 
 def _smooth_mask2mesh(
