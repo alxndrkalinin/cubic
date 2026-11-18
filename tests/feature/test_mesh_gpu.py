@@ -21,6 +21,16 @@ from cubic.feature._marching_cubes_cuda import (  # noqa: E402
 _SPACING_ERROR = r"spacing must be three finite, positive numbers \(z, y, x\); got "
 
 
+@pytest.fixture
+def no_host_trimesh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if an ``ArrayMesh`` builds a host trimesh."""
+
+    def fail(self: ArrayMesh) -> NoReturn:
+        raise AssertionError("fell back to a host trimesh")
+
+    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
+
+
 def _canonical(verts: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Sorted unique vertices, and faces as sorted rows of vertex ranks.
 
@@ -421,6 +431,7 @@ def test_shared_edges_are_counted_alike_on_every_mesh(
         assert reference == expected.get(name, reference) and reference > 0, name
 
 
+@pytest.mark.usefixtures("no_host_trimesh")
 @pytest.mark.parametrize(
     "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
 )
@@ -428,7 +439,6 @@ def test_shared_edge_warning_on_gpu(
     entry: str,
     ragged_ball_of: Callable[[float], np.ndarray],
     gpu_available: bool,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A CuPy ragged ball warns, at the calling line; a clean one does not.
 
@@ -437,11 +447,6 @@ def test_shared_edge_warning_on_gpu(
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-
-    def fail(self: ArrayMesh) -> NoReturn:
-        raise AssertionError("fell back to a host trimesh")
-
-    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
     names = _SHARED_EDGE_REQUEST
     for fraction, expected in [(0.3, 1), (0.0, 0)]:
         mask = ascupy(ragged_ball_of(fraction))
@@ -583,18 +588,14 @@ def test_gpu_warnings_point_at_the_caller(entry: str, gpu_available: bool) -> No
         assert [w.filename for w in matching] == [__file__], match
 
 
+@pytest.mark.usefixtures("no_host_trimesh")
 @pytest.mark.parametrize("fractal_scales", [None, (0.15, 0.45)])
 def test_fractal_dimension_stays_on_the_gpu(
-    fractal_scales, gpu_available: bool, monkeypatch
+    fractal_scales, gpu_available: bool
 ) -> None:
     """Fractal Dimension of a CuPy mask never builds a host trimesh."""
     if not gpu_available:
         pytest.skip("GPU not available")
-
-    def fail(self):
-        raise AssertionError("fell back to a host trimesh")
-
-    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
     mask = ascupy(_labels() == 1)
     name = "Fractal Dimension"
     kwargs = {"spacing": (0.3, 0.1, 0.1), "fractal_scales": fractal_scales}
@@ -625,10 +626,11 @@ def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:
     return radius < 1 + 0.15 * noise / noise.std()
 
 
+@pytest.mark.usefixtures("no_host_trimesh")
 @pytest.mark.parametrize("spacing", [(0.29, 0.108, 0.108), (0.5, 0.2, 0.1)])
 @pytest.mark.parametrize("outline_fractal_scales", [None, (0.3, 1.2)])
 def test_outline_fractal_dimension_stays_on_the_gpu(
-    spacing: tuple, outline_fractal_scales, gpu_available: bool, monkeypatch
+    spacing: tuple, outline_fractal_scales, gpu_available: bool
 ) -> None:
     """Outline Fractal Dimension of a CuPy mask runs on the GPU and matches the CPU.
 
@@ -637,11 +639,6 @@ def test_outline_fractal_dimension_stays_on_the_gpu(
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-
-    def fail(self):
-        raise AssertionError("fell back to a host trimesh")
-
-    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
     mask = _rough_flat_ellipsoid(spacing)
     name = "Outline Fractal Dimension"
     kwargs = {"spacing": spacing, "outline_fractal_scales": outline_fractal_scales}
@@ -653,10 +650,9 @@ def test_outline_fractal_dimension_stays_on_the_gpu(
     assert on_gpu[name] == pytest.approx(on_cpu[name], rel=1e-9)
 
 
+@pytest.mark.usefixtures("no_host_trimesh")
 @pytest.mark.parametrize("c", [1.0, 1e-8])
-def test_extract_mesh_features_stays_on_the_gpu(
-    c: float, gpu_available: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_extract_mesh_features_stays_on_the_gpu(c: float, gpu_available: bool) -> None:
     """The features computed on the device never build a host trimesh.
 
     ``extract_mesh_features`` measures scaled copies of both meshes; the copies
@@ -664,11 +660,6 @@ def test_extract_mesh_features_stays_on_the_gpu(
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-
-    def fail(self: ArrayMesh) -> NoReturn:
-        raise AssertionError("fell back to a host trimesh")
-
-    monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
     on_device = [
         "Area",
         "Volume",

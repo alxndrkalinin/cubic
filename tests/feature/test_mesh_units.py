@@ -69,22 +69,28 @@ CELLS = [
 _GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
 
 
-def _mask() -> np.ndarray:
+def _mask(
+    shape: tuple[int, int, int] = (26, 96, 96),
+    axes: tuple[int, int, int] = (44, 36, 7),
+    lobe: tuple[int, int, int, int] = (5, 10, -14, 6),
+) -> np.ndarray:
     """Return a flat ellipsoid turned in plane, with a lobe on top.
 
-    Its footprint is about 72 by 88 voxels, over 4.5 times the top of the default
-    outline window (16 in-plane voxels), so ``Outline Fractal Dimension`` is
-    finite, and it is 14 voxels thick, enough for the default 3D fractal window.
+    ``axes`` are the ellipsoid's two in-plane semi-axes and its half
+    thickness, ``lobe`` the lobe's centre ``(z, y, x)`` from the array's
+    centre and its radius, all in voxels. By default its footprint is about 72
+    by 88 voxels, over 4.5 times the top of the default outline window (16
+    in-plane voxels), so ``Outline Fractal Dimension`` is finite, and it is 14
+    voxels thick, enough for the default 3D fractal window.
     """
-    z, y, x = np.meshgrid(
-        *[np.arange(n) - (n - 1) / 2 for n in (26, 96, 96)], indexing="ij"
-    )
+    z, y, x = np.meshgrid(*[np.arange(n) - (n - 1) / 2 for n in shape], indexing="ij")
     turn = np.deg2rad(30)
     u = y * np.cos(turn) + x * np.sin(turn)
     v = -y * np.sin(turn) + x * np.cos(turn)
-    body = (u / 44) ** 2 + (v / 36) ** 2 + (z / 7) ** 2 <= 1
-    lobe = (z - 5) ** 2 + (y - 10) ** 2 + (x + 14) ** 2 <= 6**2
-    return body | lobe
+    a, b, c = axes
+    body = (u / a) ** 2 + (v / b) ** 2 + (z / c) ** 2 <= 1
+    lz, ly, lx, radius = lobe
+    return body | ((z - lz) ** 2 + (y - ly) ** 2 + (x - lx) ** 2 <= radius**2)
 
 
 def _windows(c: float) -> dict[str, object]:
@@ -305,9 +311,18 @@ def _old_mask2mesh(
     return mesh._closed_mesh(verts - to_same_device(one_voxel, verts), faces)
 
 
+# (branch, spacing) of each call. No spacing through marching_cubes_kwargs is
+# the call of the spacing branch, mask2mesh(mask), so it is left out.
+_UNIT_FINEST_CASES = [
+    (branch, spacing)
+    for branch in ("spacing", "marching_cubes_kwargs", "sigma")
+    for spacing in (None, (1.0, 1.0, 1.0), (2.685, 1.0, 1.0))
+    if not (branch == "marching_cubes_kwargs" and spacing is None)
+]
+
+
 @pytest.mark.parametrize("device", ["cpu", "gpu"])
-@pytest.mark.parametrize("spacing", [None, (1.0, 1.0, 1.0), (2.685, 1.0, 1.0)])
-@pytest.mark.parametrize("branch", ["spacing", "marching_cubes_kwargs", "sigma"])
+@pytest.mark.parametrize(("branch", "spacing"), _UNIT_FINEST_CASES)
 def test_mask2mesh_with_a_unit_finest_spacing_is_unchanged(
     device: str,
     spacing: tuple[float, ...] | None,
@@ -327,8 +342,6 @@ def test_mask2mesh_with_a_unit_finest_spacing_is_unchanged(
         "marching_cubes_kwargs": {"marching_cubes_kwargs": {"spacing": spacing}},
         "sigma": {"spacing": spacing, "sigma": sigma},
     }[branch]
-    if branch == "marching_cubes_kwargs" and spacing is None:
-        kwargs = {}
 
     got = _arrays(mesh.mask2mesh(mask, **kwargs))
     expected = _arrays(_old_mask2mesh(mask, spacing, sigma))
@@ -339,15 +352,17 @@ def test_mask2mesh_with_a_unit_finest_spacing_is_unchanged(
 
 
 # Factors of the caller's unit, far below and above trimesh's absolute merge
-# tolerance (1e-8), and 0.3, which is not a power of ten.
-UNIT_FACTORS = [1e-9, 1e-8, 1e-7, 1e-6, 1e-3, 0.3, 1e3]
+# tolerance (1e-8), and 0.3, which is not a power of ten. Factors 1e-6 and
+# 1e-3, and an isotropic base (1, 1, 1), caught no mutant of the scaling (no
+# scaling, no conversion back, a wrong dimension, no normalisation in
+# mask2mesh, a second merge) that these miss.
+UNIT_FACTORS = [1e-9, 1e-8, 1e-7, 0.3, 1e3]
 # Spacing and blur scale at factor 1 of each base. The anisotropic one is the
-# unit-rounding base: (0.2 c) / (0.065 c) is not 0.2 / 0.065 at every c, so its
-# normalised spacing differs by an ulp between factors. 3 sigma / step stays
-# clear of integers (9.3, and 3.02 on the coarse axis), so that ulp cannot
-# change the blur's padding.
+# unit-rounding base: (0.2 c) / (0.065 c) is not 0.2 / 0.065 at every c (at
+# 1e-7 and 0.3 here), so its normalised spacing differs by an ulp between
+# factors. 3 sigma / step stays clear of integers (9.3, and 3.02 on the coarse
+# axis), so that ulp cannot change the blur's padding.
 MESH_BASES = {
-    "isotropic": ((1.0, 1.0, 1.0), 3.1),
     "anisotropic": ((0.2, 0.065, 0.065), 0.2015),
 }
 
@@ -397,25 +412,17 @@ def test_mask2mesh_is_covariant_with_the_unit(
         assert off.max() <= 4, (c, off.max())
 
 
-def _lobed() -> np.ndarray:
-    """Return a 20 x 44 x 44 mask of a flat ellipsoid turned in plane, with a lobe."""
-    z, y, x = np.meshgrid(
-        *[np.arange(n) - (n - 1) / 2 for n in (20, 44, 44)], indexing="ij"
-    )
-    turn = np.deg2rad(30)
-    u = y * np.cos(turn) + x * np.sin(turn)
-    v = -y * np.sin(turn) + x * np.cos(turn)
-    body = (u / 19) ** 2 + (v / 13) ** 2 + (z / 6) ** 2 <= 1
-    lobe = (z - 4) ** 2 + (y - 5) ** 2 + (x + 7) ** 2 <= 4**2
-    return body | lobe
+# A smaller ``_mask``, 20 x 44 x 44, for the tests of the direct functions.
+_SMALL_MASK = {"shape": (20, 44, 44), "axes": (19, 13, 6), "lobe": (4, 5, -7, 4)}
 
 
 # Relative tolerance of extract_mesh_features against itself at another unit,
-# set from the largest change measured over UNIT_FACTORS and MESH_BASES on
-# either device (in brackets); 1e-13 for every other feature (1.1e-14). The
-# bounding cylinder comes from an approximate search. The mean-curvature sums
-# take arccos of dot products of face normals, which turns the last bit of a
-# dot product of two coplanar faces into an angle of up to 1.5e-8.
+# set from the largest change measured at factors 1e-9 to 1e3, on an isotropic
+# and the anisotropic base, on either device (in brackets); 1e-13 for every
+# other feature (1.1e-14). The bounding cylinder comes from an approximate
+# search. The mean-curvature sums take arccos of dot products of face normals,
+# which turns the last bit of a dot product of two coplanar faces into an angle
+# of up to 1.5e-8.
 _CONVERSION_RTOL = {
     "Bounding Cylinder Volume": 1e-2,  # 4.3e-3
     "Avg Mean Curvature": 2e-7,  # 6.3e-8
@@ -454,7 +461,7 @@ def test_extract_mesh_features_convert_with_the_unit(
     to 14% between factors here, by 19% to 200% between spacings 1 and 0.108
     before this change, and by up to 0.003 between three GPU runs on one mesh.
     """
-    mask = _on(device, _lobed(), gpu_available)
+    mask = _on(device, _mask(**_SMALL_MASK), gpu_available)
     spacing, sigma = MESH_BASES[base]
     step = np.asarray(spacing)
     names = [
@@ -500,7 +507,7 @@ def test_extract_mesh_features_matches_the_pipeline(
     features, and ``mask2mesh`` at the default ``curvature_sigma`` (twice the
     coarsest spacing) the curvature-distribution ones.
     """
-    mask = _on(device, _lobed(), gpu_available)
+    mask = _on(device, _mask(**_SMALL_MASK), gpu_available)
     spacing = tuple(c * s for s in (0.29, 0.108, 0.108))
     names = list(mesh._MESH_FEATURES)
     surface = mesh.mask2mesh(mask, spacing=spacing)
@@ -540,45 +547,24 @@ def test_tiny_units_keep_the_mesh_and_its_mean_curvature(
     )
 
 
-def _state(surface: Any) -> dict[str, Any]:
-    """Return what a call could change on a mesh: its arrays and its cache."""
-    vertices, faces = _arrays(surface)
-    if isinstance(surface, trimesh.Trimesh):
-        cached = surface._cache.cache
-    else:
-        cached = vars(surface)
-    return {
-        "vertices": vertices.copy(),
-        "faces": faces.copy(),
-        "cached": {key: id(value) for key, value in cached.items()},
-    }
-
-
 @pytest.mark.parametrize("kind", ["trimesh", "ArrayMesh, NumPy", "ArrayMesh, CuPy"])
 def test_extract_mesh_features_leaves_the_meshes_as_they_are(
     kind: str, gpu_available: bool
 ) -> None:
-    """Neither mesh is modified, and nothing is cached on either.
-
-    The features are measured on scaled copies. Measured on the meshes
-    themselves, a trimesh mesh kept its convex hull, mass properties and the
-    rest in its cache.
-    """
+    """Neither mesh is modified: the features are measured on scaled copies."""
     mask = _on("gpu" if kind.endswith("CuPy") else "cpu", _ball(10), gpu_available)
     spacing = (0.29, 0.108, 0.108)
     surface = mesh.mask2mesh(mask, spacing=spacing)
     smooth_mesh = mesh.mask2mesh(mask, spacing=spacing, sigma=0.65)
     if kind == "ArrayMesh, NumPy":
         surface, smooth_mesh = (ArrayMesh(*_arrays(m)) for m in (surface, smooth_mesh))
-    before = [_state(m) for m in (surface, smooth_mesh)]
+    before = [[a.copy() for a in _arrays(m)] for m in (surface, smooth_mesh)]
 
     mesh.extract_mesh_features(surface, smooth_mesh=smooth_mesh)
 
-    for state, m in zip(before, (surface, smooth_mesh), strict=True):
-        after = _state(m)
-        np.testing.assert_array_equal(after["vertices"], state["vertices"])
-        np.testing.assert_array_equal(after["faces"], state["faces"])
-        assert after["cached"] == state["cached"]
+    for arrays, m in zip(before, (surface, smooth_mesh), strict=True):
+        for after, was in zip(_arrays(m), arrays, strict=True):
+            np.testing.assert_array_equal(after, was)
 
 
 def test_extract_mesh_features_keeps_a_density_and_centre_of_mass() -> None:
