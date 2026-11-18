@@ -364,6 +364,28 @@ def test_curvature_converts_with_the_spacing_unit() -> None:
     assert fine["Avg Curvedness"] == pytest.approx(10 * coarse["Avg Curvedness"])
 
 
+def test_default_curvature_blur_is_twice_the_coarsest_spacing() -> None:
+    """The default blur is 2 * max(spacing), not twice the finest or the mean.
+
+    Only an anisotropic stack tells the three apart: here 8, 2 and 4.
+    """
+    z, y, x = _centred_grid(16, 64, 64)
+    mask = (z / 6) ** 2 + (y / 24) ** 2 + (x / 16) ** 2 <= 1
+    spacing = (4.0, 1.0, 1.0)
+
+    default = mesh.extract_surface_features(mask, spacing, _CURVATURE_FEATURES)
+    coarsest = mesh.extract_surface_features(
+        mask, spacing, _CURVATURE_FEATURES, curvature_sigma=8.0
+    )
+    finest = mesh.extract_surface_features(
+        mask, spacing, _CURVATURE_FEATURES, curvature_sigma=2.0
+    )
+
+    assert all(np.isfinite(value) for value in default.values())
+    assert default == coarsest
+    assert default["Avg Curvedness"] != finest["Avg Curvedness"]
+
+
 def test_cavity_counts_as_concave_in_the_mean_curvature() -> None:
     """A cavity's shell faces the material, so its curvature counts negative.
 
