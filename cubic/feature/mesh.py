@@ -293,8 +293,8 @@ def extract_surface_features(
         exceeds a quarter of the
         object's ``Min Axis Length``, the value is still returned, with a
         warning that it is biased low. Warnings are attributed to the line
-        that called this function; through ``extract_features`` that is one
-        line for every label, and the thin-object text is the same for every
+        that called this function, or ``extract_features``, which is one
+        line for every label; the thin-object text is the same for every
         object, so Python's default filter shows it once per label image.
     outline_fractal_scales : sequence of float, optional
         ``(lowest, highest)`` blur scale, in units of ``spacing``, of the
@@ -351,7 +351,7 @@ def extract_surface_features(
         warnings.warn(
             f"Fractal Dimension needs curvature_sigma above the finest voxel "
             f"spacing {step.min() * unit:g}; got {sigma * unit:g}. Returning NaN.",
-            stacklevel=_CALLER,
+            stacklevel=_stacklevel_outside_module(),
         )
         values["Fractal Dimension"] = float("nan")
 
@@ -384,7 +384,7 @@ def extract_surface_features(
             warnings.warn(
                 f"Mask of {int(mask.sum())} voxels vanishes when blurred at "
                 f"curvature_sigma={sigma * unit:g}; returning NaN for {at_sigma}.",
-                stacklevel=_CALLER,
+                stacklevel=_stacklevel_outside_module(),
             )
             values.update(dict.fromkeys(at_sigma, float("nan")))
         elif any(name in _SMOOTHED_FEATURES for name in features):
@@ -413,18 +413,8 @@ def extract_surface_features(
         ):
             # One text for every object, so that the default filter reports a
             # label image of many thin objects once.
-            warnings.warn(_THIN_OBJECT_WARNING, stacklevel=_CALLER)
+            warnings.warn(_THIN_OBJECT_WARNING, stacklevel=_stacklevel_outside_module())
     return _to_caller_units({name: values[name] for name in features}, unit)
-
-
-# stacklevel that attributes a warning raised in extract_surface_features to
-# the code that called it: the function itself, then the _require_trimesh
-# wrapper. Helpers it calls add their own frames. Through extract_features the
-# caller is extract_features' per-label loop, one line for every label, so the
-# default filter still shows a constant text once per label image. The
-# shared-edge warning of _measure_mesh uses _stacklevel_outside_module instead,
-# which reaches the user's line through extract_features too.
-_CALLER = 3
 
 
 # Fractal Dimension reads low once the object's thickness (Min Axis Length) is
@@ -806,9 +796,13 @@ def _stacklevel_outside_module() -> int:
     """Return the ``stacklevel`` that names the first caller outside this module.
 
     For a ``warnings.warn`` in the function that calls this one: it skips that
-    function and every frame of this module above it (``_require_trimesh``'s
-    wrapper, ``extract_features``' per-label loop), so a warning reaches the
-    user's line through every public entry point.
+    function and every frame of this module above it (helpers, the feature
+    registry, ``_require_trimesh``'s wrapper, ``extract_features``' per-label
+    loop), so every warning of this module reaches the user's line through
+    every public entry point. Through ``extract_features`` that is one line for
+    every label, so the default filter shows a constant text once per label
+    image. Not for the import-time warning: ``warnings`` skips importlib's
+    frames there and this count does not.
     """
     frame = sys._getframe(1)
     level = 1
@@ -841,7 +835,7 @@ def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
         # eigendecomposition of the inertia tensor (LinAlgError, a ValueError).
         warnings.warn(
             f"Unable extract bounding cylinder volume. Returning 0. Exception: {e}",
-            stacklevel=2,
+            stacklevel=_stacklevel_outside_module(),
         )
         return 0.0
 
@@ -1012,8 +1006,7 @@ def _blur_ladder_dimension(
             f"{name}: the mask or its smooth twin vanishes when blurred at a "
             f"scale up to {high * unit:g} (an object narrower than the blur); "
             f"returning NaN.",
-            # this helper and the feature's estimator, then extract_surface_features
-            stacklevel=_CALLER + 2,
+            stacklevel=_stacklevel_outside_module(),
         )
         return float("nan")
     return mask.ndim - 1 - float(np.polyfit(np.log(scales), np.log(ratios), 1)[0])

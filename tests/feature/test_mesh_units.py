@@ -205,14 +205,20 @@ def _ball(radius: int) -> np.ndarray:
     ],
     ids=["fractal window", "outline vanishes", "blur vanishes"],
 )
-def test_warnings_print_lengths_in_the_callers_units(mask, kwargs, text):
+@pytest.mark.parametrize("entry", ["extract_surface_features", "extract_features"])
+def test_warnings_print_lengths_in_the_callers_units(mask, kwargs, text, entry):
     """Scales in warnings are the caller's, not those of the internal unit.
 
     At spacing 0.25 the internal unit is 0.25, so each scale would print four
-    times larger. The warning is still attributed to this file.
+    times larger. The warning is still attributed to this file, from either
+    entry.
     """
+    spacing = (0.25, 0.25, 0.25)
     with pytest.warns(UserWarning, match=text) as record:
-        mesh.extract_surface_features(mask, spacing=(0.25, 0.25, 0.25), **kwargs)
+        if entry == "extract_features":
+            mesh.extract_features(mask.astype(np.int32), spacing=spacing, **kwargs)
+        else:
+            mesh.extract_surface_features(mask, spacing=spacing, **kwargs)
     matching = [w for w in record if re.search(text, str(w.message))]
     assert [w.filename for w in matching] == [__file__]
 

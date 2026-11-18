@@ -811,12 +811,14 @@ def test_fractal_dimension_warns_for_an_object_thinner_than_four_top_scales() ->
         ("empty default window", "needs curvature_sigma above"),
     ],
 )
-def test_warnings_point_at_the_caller(case: str, match: str) -> None:
-    """A direct call's warnings are attributed to the calling line, not to cubic.
+@pytest.mark.parametrize("entry", ["extract_surface_features", "extract_features"])
+def test_warnings_point_at_the_caller(case: str, match: str, entry: str) -> None:
+    """Warnings are attributed to the calling line, not to cubic, from either entry.
 
     The _require_trimesh wrapper adds a frame; with stacklevel=2 every warning
-    landed on that wrapper in mesh.py. The outline and 3D-twin cases are raised
-    inside the shared blur-ladder estimator.
+    landed on that wrapper in mesh.py, and through extract_features a fixed
+    stacklevel landed on its per-label loop. The outline and 3D-twin cases are
+    raised inside the shared blur-ladder estimator.
     """
     thin_sheet = np.zeros((9, 60, 60), dtype=bool)
     thin_sheet[3:6, 10:50, 10:50] = True
@@ -841,11 +843,57 @@ def test_warnings_point_at_the_caller(case: str, match: str) -> None:
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        mesh.extract_surface_features(mask, spacing, names, **kwargs)
+        if entry == "extract_features":
+            mesh.extract_features(mask.astype(np.int32), names, spacing, **kwargs)
+        else:
+            mesh.extract_surface_features(mask, spacing, names, **kwargs)
 
     matching = [w for w in caught if match in str(w.message)]
     assert len(matching) == 1
     assert matching[0].filename == __file__
+
+
+def _failing_bounding_cylinder(monkeypatch) -> None:
+    """Make every trimesh bounding cylinder fail as a degenerate mesh's does."""
+
+    def fail(self):
+        raise ValueError("degenerate")
+
+    monkeypatch.setattr(trimesh.Trimesh, "bounding_cylinder", property(fail))
+
+
+@pytest.mark.parametrize(
+    "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
+)
+def test_bounding_cylinder_warning_points_at_the_caller(
+    entry: str, monkeypatch
+) -> None:
+    """The bounding-cylinder fallback warns at the calling line and returns 0.
+
+    With stacklevel=2 it pointed at the feature registry in mesh.py.
+    """
+    _failing_bounding_cylinder(monkeypatch)
+    mask = _ball(6, 16)
+    names = ["Bounding Cylinder Volume"]
+    calls = {
+        "extract_features": lambda: mesh.extract_features(mask.astype(np.int32), names)[
+            1
+        ][0, 0],
+        "extract_surface_features": lambda: mesh.extract_surface_features(
+            mask, features=names
+        )[names[0]],
+        "extract_mesh_features": lambda: mesh.extract_mesh_features(
+            mesh.mask2mesh(mask), names
+        )[names[0]],
+    }
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        value = calls[entry]()
+
+    matching = [w for w in caught if "bounding cylinder" in str(w.message)]
+    assert value == 0.0
+    assert [w.filename for w in matching] == [__file__]
 
 
 def test_thin_object_warning_is_shown_once_for_a_label_image() -> None:

@@ -517,6 +517,32 @@ def test_shared_edge_masks_match_on_both_devices(
                 )
 
 
+@pytest.mark.parametrize("entry", ["extract_surface_features", "extract_features"])
+def test_gpu_warnings_point_at_the_caller(entry: str, gpu_available: bool) -> None:
+    """On the GPU too, the module's warnings are attributed to the calling line.
+
+    A slab too thin for its Fractal Dimension window, and a single voxel that
+    vanishes under the curvature blur.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    slab = np.zeros((12, 60, 60), dtype=bool)
+    slab[3:9, 10:50, 10:50] = True
+    cases = [
+        (slab, (0.3, 0.1, 0.1), ["Fractal Dimension"], "biased low"),
+        (np.ones((1, 1, 1), dtype=bool), None, ["Avg Curvedness"], "vanishes"),
+    ]
+    for mask, spacing, names, match in cases:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            if entry == "extract_features":
+                mesh.extract_features(ascupy(mask.astype(np.int32)), names, spacing)
+            else:
+                mesh.extract_surface_features(ascupy(mask), spacing, names)
+        matching = [w for w in caught if match in str(w.message)]
+        assert [w.filename for w in matching] == [__file__], match
+
+
 @pytest.mark.parametrize("fractal_scales", [None, (0.15, 0.45)])
 def test_fractal_dimension_stays_on_the_gpu(
     fractal_scales, gpu_available: bool, monkeypatch
