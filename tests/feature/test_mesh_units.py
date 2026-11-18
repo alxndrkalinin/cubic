@@ -521,8 +521,9 @@ def test_tiny_units_keep_the_mesh_and_its_mean_curvature(
     On a 26^3 grid centred between voxels, a radius-10 ball's mesh built in
     metres at spacing 1e-8 kept 1,402 of its 1,896 vertices, Euler number 566
     and not watertight. At 1e-7 it was intact, but its Avg Mean Curvature came
-    out 32 times too high: the convexity test behind the signed dihedral
-    angles has an absolute tolerance of 1e-8.
+    out 32 times too high: every face normal was zero, since trimesh zeroes a
+    face normal when the norm of the face's cross product is below 1e-13, as
+    it is for edges shorter than about 3e-7.
     """
     grid = np.meshgrid(*[np.arange(26) - 12.5] * 3, indexing="ij")
     ball = _on(device, sum(axis**2 for axis in grid) <= 10**2, gpu_available)

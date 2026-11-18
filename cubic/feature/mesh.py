@@ -5,6 +5,26 @@ with ``trimesh``. A CuPy label image or mask stays on the GPU: it is meshed by a
 CUDA port of the same marching cubes and measured as an ``ArrayMesh``, which
 computes the trimesh quantities on the device and hands the convex hull and
 bounding primitives to trimesh on the host.
+
+Units and trimesh tolerances. trimesh compares lengths, areas and cross
+products with absolute tolerances, so whether a result is right can depend on
+the length unit of ``spacing``. There are three levels:
+
+1. ``extract_features`` and ``extract_surface_features`` measure in units of
+   the finest voxel spacing and convert the values back, so they work in any
+   unit.
+2. ``mask2mesh`` builds its mesh in those units and returns it in the
+   caller's units, and ``extract_mesh_features`` measures a mesh at the scale
+   of its own edges and converts back. Both work in any unit, for meshes from
+   ``mask2mesh``.
+3. Attributes read straight off a returned mesh, and a mesh the caller builds
+   themselves, are subject to trimesh's absolute tolerances. trimesh sets a
+   face normal to zero when the norm of the face's cross product is below
+   1e-13, which happens once edges are shorter than about 3e-7, so face
+   normals and everything derived from them (adjacency angles, convexity,
+   ``integral_mean_curvature``) are then wrong. Separately, trimesh merges
+   vertices closer than 1e-8 when it builds a mesh. ``volume`` and ``area``
+   are right in any unit.
 """
 
 from __future__ import annotations
@@ -528,20 +548,19 @@ def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
 
 
 def _scaled_copy(surface: Any, factor: float) -> Any:
-    """Return a copy of ``surface`` with every vertex times ``factor``.
+    """Return a copy of ``surface`` with every vertex times ``factor``, unmerged.
 
-    The vertices are not merged again, since trimesh's merge tolerance is
-    absolute, and ``surface`` is left as it is. Any other mesh becomes a plain
-    ``trimesh.Trimesh`` of its vertices and faces, without cache or visuals,
-    keeping a density or centre of mass set on it, the centre scaled too; a
-    trimesh primitive (``Box``, ``Sphere``) is thus measured as its triangles,
-    since it refuses new vertices. trimesh's ``apply_scale`` is not used: it
-    leaves the vertices as they are for any factor within 1e-8 of 1.
+    See "Units and trimesh tolerances" in the module docstring. ``surface`` is
+    not modified. An ``ArrayMesh`` stays one; any other mesh, a trimesh
+    primitive included, becomes a plain ``trimesh.Trimesh`` of its vertices
+    and faces that keeps a density or centre of mass set on it.
     """
     if isinstance(surface, ArrayMesh):
         return surface.scaled(factor)
     # trimesh keeps a density or centre of mass set on a mesh apart from its
-    # cache, where reading them computes nothing on ``surface``.
+    # cache, where reading them computes nothing on ``surface``. A new mesh,
+    # since a primitive refuses new vertices, and not ``apply_scale``, which
+    # leaves the vertices as they are for any factor within 1e-8 of 1.
     overrides = surface._data.data
     copied = trimesh.Trimesh(
         vertices=np.asarray(surface.vertices) * factor,
@@ -670,14 +689,9 @@ def mask2mesh(
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)`` passed to marching cubes, so that lengths,
         areas and volumes are in physical units, in any length unit. The mesh
-        is built in units of the finest spacing and scaled back to these
-        without merging its vertices again, so trimesh's absolute merge
-        tolerance (1e-8) does not join vertices of a mesh in metres, and
-        ``extract_mesh_features`` measures it in any unit. Attributes read
-        straight off a mesh in such units are still bound by trimesh's other
-        absolute tolerances: ``volume`` and ``area`` are fine, anything that
-        compares a length with a tolerance (``integral_mean_curvature``,
-        convexity tests) is not.
+        is built in units of the finest spacing and returned in these; see
+        "Units and trimesh tolerances" in the module docstring for which of
+        its attributes are right in tiny units.
     marching_cubes_kwargs : dict, optional
         Extra keyword arguments for ``skimage.measure.marching_cubes``; on the
         GPU only ``level``, ``spacing`` and ``allow_degenerate`` are supported.
@@ -766,13 +780,11 @@ def extract_mesh_features(
     ----------
     mesh : trimesh.Trimesh
         Closed surface of a single object, in any length unit; the features
-        are in that unit. They are measured on a copy scaled so that the square
-        root of its mean face area is 1, where trimesh's absolute tolerances
-        (about 1e-8) see the shape and not the unit, and converted back. This
-        covers every mesh from ``mask2mesh``. A mesh built otherwise in tiny
-        units can already be damaged: trimesh merges vertices closer than 1e-8
-        when it builds a mesh, before this function sees it. ``mesh`` and
-        ``smooth_mesh`` are not modified, and nothing is cached on them.
+        are in that unit. It is measured at the scale of its own edges, so a
+        mesh from ``mask2mesh`` gives its features in any unit; see "Units and
+        trimesh tolerances" in the module docstring. A trimesh primitive
+        (``Sphere``, ``Box``) is measured as its triangles. ``mesh`` and
+        ``smooth_mesh`` are not modified.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()`` without
         ``Fractal Dimension`` and ``Outline Fractal Dimension``, which are
@@ -801,8 +813,8 @@ def extract_mesh_features(
         )
     # Measured on copies scaled by one factor so that the edges of ``mesh`` are
     # of order 1, where trimesh's absolute tolerances see the shape and not the
-    # unit, and converted back. The copies also keep the caller's meshes free
-    # of anything trimesh would cache on them.
+    # unit, and converted back. The copies leave the caller's meshes as they
+    # are.
     unit = _edge_unit(mesh)
     smooth = None if smooth_mesh is None else _scaled_copy(smooth_mesh, 1 / unit)
     values = _measure_mesh(
@@ -814,10 +826,10 @@ def extract_mesh_features(
 def _edge_unit(surface: Any) -> float:
     """Return the square root of the mean face area of ``surface``.
 
-    A length of the order of its edges, whatever the size of the object. It is
-    computed from the vertices and faces, so nothing is cached on ``surface``,
-    on its device. 1 for a mesh without faces or without a finite, positive
-    area, which the volume and area check of ``_measure_mesh`` then reports.
+    A length of the order of its edges, whatever the size of the object,
+    computed from the vertices and faces on their device. 1 for a mesh without
+    faces or without a finite, positive area, which the volume and area check
+    of ``_measure_mesh`` then reports.
     """
     faces = surface.faces
     area = float(face_areas(surface.vertices, faces).sum())
