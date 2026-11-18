@@ -1,6 +1,8 @@
 """Tests for mesh-based feature extraction."""
 
+import gc
 import sys
+import weakref
 import warnings
 import subprocess
 
@@ -1426,6 +1428,39 @@ def test_extract_mesh_features_measures_curvature_on_the_smooth_mesh() -> None:
     )
 
     assert from_meshes == pytest.approx(from_mask)
+
+
+def test_principal_curvatures_are_computed_once_per_call(monkeypatch) -> None:
+    """Avg Shape Index and Avg Curvedness share one per-vertex curvature pass.
+
+    Each used to compute it. One requested alone gives the registry's value,
+    and the caller's mesh is not kept alive by the call.
+    """
+    calls = []
+    principal_curvatures = mesh._principal_curvatures
+
+    def counted(surface):
+        calls.append(surface)
+        return principal_curvatures(surface)
+
+    monkeypatch.setattr(mesh, "_principal_curvatures", counted)
+    mask = _ball(8, 22)
+
+    mesh.extract_surface_features(mask)
+    assert len(calls) == 1
+
+    surface = mesh.mask2mesh(mask, sigma=2.0)
+    for name in ("Avg Shape Index", "Avg Curvedness"):
+        alone = mesh.extract_mesh_features(surface, [name])[name]
+        assert alone == float(mesh._MESH_FEATURES[name](surface))
+    calls.clear()
+    reference = weakref.ref(surface)
+    mesh.extract_mesh_features(surface)
+    assert len(calls) == 1
+    calls.clear()
+    del surface
+    gc.collect()
+    assert reference() is None
 
 
 def test_curvature_sigma_is_validated() -> None:

@@ -517,6 +517,29 @@ def test_shared_edge_masks_match_on_both_devices(
                 )
 
 
+def test_gpu_principal_curvatures_are_computed_once(
+    gpu_available: bool, monkeypatch
+) -> None:
+    """A CuPy mask computes the per-vertex curvatures once for both averages."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    calls = []
+    principal_curvatures = mesh._principal_curvatures
+
+    def counted(surface):
+        calls.append(type(surface))
+        return principal_curvatures(surface)
+
+    monkeypatch.setattr(mesh, "_principal_curvatures", counted)
+    mesh.extract_surface_features(
+        ascupy(_labels() == 1),
+        spacing=(0.3, 0.1, 0.1),
+        features=["Avg Shape Index", "Avg Curvedness"],
+    )
+
+    assert calls == [ArrayMesh]
+
+
 @pytest.mark.parametrize("entry", ["extract_surface_features", "extract_features"])
 def test_gpu_warnings_point_at_the_caller(entry: str, gpu_available: bool) -> None:
     """On the GPU too, the module's warnings are attributed to the calling line.
