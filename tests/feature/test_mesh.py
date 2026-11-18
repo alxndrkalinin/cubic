@@ -61,7 +61,7 @@ def surface_calls(monkeypatch) -> list[dict]:
         outline_fractal_scales=None,
     ) -> dict[str, float]:
         calls.append({"mask": mask, "spacing": spacing})
-        return dict.fromkeys(features or mesh.mesh_feature_list(), 0.0)
+        return dict.fromkeys(features, 0.0)
 
     monkeypatch.setattr(mesh, "extract_surface_features", fake_surface_features)
     return calls
@@ -189,6 +189,18 @@ def test_extract_features_rejects_a_bare_feature_name() -> None:
     """
     with pytest.raises(TypeError, match="not the string 'Volume'"):
         mesh.extract_features(_cube_volume(4), "Volume")
+
+
+def test_extract_features_accepts_a_one_shot_iterable_of_names() -> None:
+    """A generator of names gives the same columns as the list of them."""
+    names = ["Volume", "Area"]
+    _, from_list, _ = mesh.extract_features(_cube_volume(4), names)
+    _, from_generator, columns = mesh.extract_features(
+        _cube_volume(4), (name for name in names)
+    )
+
+    assert columns == names
+    np.testing.assert_array_equal(from_generator, from_list)
 
 
 def test_extract_features_rejects_non_integer_labels() -> None:
@@ -336,8 +348,8 @@ def test_shape_features_do_not_depend_on_orientation(rot_deg: float) -> None:
 def test_extract_features_computes_only_requested(monkeypatch) -> None:
     """Features that were not requested are never computed.
 
-    Mean curvature took 15.4 s of a 15.8 s per-label total on a 13k-vertex
-    nucleus, and a ``["Volume"]`` request used to pay for it anyway.
+    A ``["Volume"]`` request used to compute every feature, mean curvature
+    included.
     """
 
     def fail(_mesh) -> float:
@@ -1189,8 +1201,8 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
     """``cubic.feature.mesh`` resolves on access, not on ``import cubic.feature``.
 
     It used to raise ``AttributeError`` unless the submodule had been imported
-    explicitly; importing it eagerly would add trimesh's 0.75-3 s import to
-    every user of the voxel and texture features.
+    explicitly; importing it eagerly would make every user of the voxel and
+    texture features pay for the trimesh import.
     """
     assert cubic.feature.__getattr__("mesh") is mesh
     # Only a fresh interpreter can show that the package import, star import
@@ -1200,3 +1212,16 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
     )
     # A timeout turns a hung import (e.g. a CUDA probe) into a failure.
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
+
+
+@pytest.mark.parametrize("version", ["4.6.11", "4.6", "3.23.5"])
+def test_trimesh_older_than_the_signed_curvature_is_refused(version: str) -> None:
+    """A trimesh without signed dihedral angles fails at import, not in the values."""
+    with pytest.raises(ImportError, match=r"trimesh>=4\.6\.12; found"):
+        mesh._check_trimesh_version(version)
+
+
+@pytest.mark.parametrize("version", ["4.6.12", "4.11.2", "5.0.0rc1"])
+def test_supported_trimesh_is_accepted(version: str) -> None:
+    """The floor itself, later releases and uncomparable tags pass the check."""
+    mesh._check_trimesh_version(version)
