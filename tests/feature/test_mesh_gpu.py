@@ -653,3 +653,20 @@ def test_mask2mesh_on_gpu(gpu_available: bool) -> None:
     assert on_gpu.volume == pytest.approx(on_cpu.volume, rel=1e-12)
     with pytest.raises(ValueError, match="does not support"):
         mesh.mask2mesh(mask, marching_cubes_kwargs={"step_size": 2})
+
+
+@pytest.mark.parametrize("spacing", [(-1.0, -1.0, -1.0), (0.0, 1.0, 1.0)])
+@pytest.mark.parametrize("source", ["spacing", "marching_cubes_kwargs"])
+def test_mask2mesh_on_gpu_rejects_a_spacing_that_is_not_positive(
+    source: str, spacing: tuple, gpu_available: bool
+) -> None:
+    """A CuPy mask rejects such a spacing from either source, like a NumPy one."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    kwargs = {
+        "spacing": {"spacing": spacing},
+        "marching_cubes_kwargs": {"marching_cubes_kwargs": {"spacing": spacing}},
+    }[source]
+
+    with pytest.raises(ValueError, match="spacing must be finite and positive"):
+        mesh.mask2mesh(ascupy(_labels() == 1), **kwargs)

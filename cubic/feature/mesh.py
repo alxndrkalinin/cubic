@@ -650,8 +650,11 @@ def mask2mesh(
     ------
     ValueError
         If ``sigma`` is given and the blurred mask never reaches 0.5, i.e. the
-        object is too small for that blur.
+        object is too small for that blur, or if the voxel spacing, given as
+        ``spacing`` or in ``marching_cubes_kwargs``, is not finite and positive.
     """
+    # A negative spacing would turn the mesh inside out, a zero one flatten it.
+    _unit(spacing)
     if sigma is not None:
         mesh = _smooth_mask2mesh(mask_3d, spacing, _curvature_sigma(spacing, sigma))
         if mesh is None:
@@ -665,6 +668,8 @@ def mask2mesh(
                 "'marching_cubes_kwargs'; pass it only once."
             )
         marching_cubes_kwargs["spacing"] = tuple(float(s) for s in spacing)
+    else:
+        _unit(marching_cubes_kwargs.get("spacing"))
     verts, faces = _marching_cubes(np.pad(mask_3d, 1), **marching_cubes_kwargs)
     # Undo the 1-voxel pad so vertices stay in the input's coordinate frame.
     # Without this every vertex, and therefore ``bounds`` and ``centroid``, sits

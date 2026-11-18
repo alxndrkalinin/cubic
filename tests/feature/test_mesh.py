@@ -319,6 +319,26 @@ def test_mask2mesh_spacing_scales_geometry() -> None:
         )
 
 
+@pytest.mark.parametrize("spacing", [(-1.0, -1.0, -1.0), (0.0, 1.0, 1.0)])
+@pytest.mark.parametrize("source", ["spacing", "marching_cubes_kwargs", "sigma"])
+def test_mask2mesh_rejects_a_spacing_that_is_not_positive(
+    source: str, spacing: tuple
+) -> None:
+    """mask2mesh rejects such a spacing from either source, as extract_features does.
+
+    An all-negative spacing used to return an inside-out mesh and a zero one a
+    flat mesh; with ``sigma`` it failed deep in the blur.
+    """
+    kwargs = {
+        "spacing": {"spacing": spacing},
+        "marching_cubes_kwargs": {"marching_cubes_kwargs": {"spacing": spacing}},
+        "sigma": {"spacing": spacing, "sigma": 2.0},
+    }[source]
+
+    with pytest.raises(ValueError, match="spacing must be finite and positive"):
+        mesh.mask2mesh(_ball(8, 22), **kwargs)
+
+
 def test_extract_features_forwards_spacing(surface_calls) -> None:
     """``extract_features`` threads ``spacing`` down to the per-label mesh."""
     mesh.extract_features(_cube_volume(4), spacing=(4.0, 1.0, 1.0))
