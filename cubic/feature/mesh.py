@@ -318,34 +318,32 @@ def extract_surface_features(
     features = _resolve_features(features)
     window = _fractal_window(fractal_scales, "fractal_scales")
     outline_window = _fractal_window(outline_fractal_scales, "outline_fractal_scales")
-    # Everything below is meshed and measured in units of the finest spacing,
-    # and converted back to the caller's units at the end: trimesh compares
-    # lengths with absolute tolerances, so measured in the caller's units the
-    # features depended on the unit of ``spacing``. In these units the
-    # computation sees only the ratios of the spacings. Messages that print a
-    # length convert it back.
+    # Measured in units of the finest spacing, where trimesh's absolute
+    # tolerances see only the spacing ratios, and converted back at the end.
     unit = _unit(spacing)
     step = _step(spacing) / unit
-    if window is not None:
-        window = (window[0] / unit, window[1] / unit)
-    if outline_window is not None:
-        outline_window = (outline_window[0] / unit, outline_window[1] / unit)
-    if curvature_sigma is not None:
-        # Validated in the caller's units, so that an error names their number,
-        # and before any meshing, so even when no feature uses it.
-        curvature_sigma = _curvature_sigma(spacing, curvature_sigma) / unit
+    # Validated in the caller's units, so that an error names their number, and
+    # before any meshing; the default is twice the coarsest normalised spacing.
+    sigma = _curvature_sigma(
+        tuple(step),
+        None
+        if curvature_sigma is None
+        else _curvature_sigma(spacing, curvature_sigma) / unit,
+    )
     mesh = mask2mesh(mask, spacing=None if spacing is None else tuple(step))
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
-    if not blurred:
-        return _to_caller_units(_measure_mesh(mesh, features, unit=unit), unit)
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
-    # The default, twice the coarsest spacing, from the normalised spacing.
-    sigma = _curvature_sigma(tuple(step), curvature_sigma)
     # Each fractal feature's (lowest, highest) blur scale, resolved once.
-    fd_low, fd_high = (float(step.min()), sigma) if window is None else window
+    fd_low, fd_high = (
+        (float(step.min()), sigma)
+        if window is None
+        else (window[0] / unit, window[1] / unit)
+    )
     in_plane = float(step[1:].max())
     outline_low, outline_high = (
-        (4 * in_plane, 16 * in_plane) if outline_window is None else outline_window
+        (4 * in_plane, 16 * in_plane)
+        if outline_window is None
+        else (outline_window[0] / unit, outline_window[1] / unit)
     )
     values: dict[str, float] = {}
     # An explicit window is validated, so only the default can be empty; it is
@@ -975,8 +973,9 @@ def _blur_ladder_dimension(
     top_blur: np.ndarray,
     top_pad: np.ndarray,
     top_measure: float,
+    *,
+    unit: float,
     n_levels: int = 5,
-    unit: float = 1.0,
 ) -> float:
     """Return ``mask.ndim - 1 - slope`` of log measure ratio against log blur scale.
 
@@ -1033,7 +1032,7 @@ def _fractal_dimension(
     blurred: np.ndarray,
     pad: np.ndarray,
     level_set: tuple[np.ndarray, np.ndarray] | None,
-    unit: float = 1.0,
+    unit: float,
 ) -> float:
     """Return ``2 - slope`` of log surface-area ratio against log blur scale.
 
@@ -1076,7 +1075,7 @@ def _contour_length(field: np.ndarray, plane_step: np.ndarray) -> float:
 
 
 def _outline_fractal_dimension(
-    mask_3d: np.ndarray, step: np.ndarray, low: float, high: float, unit: float = 1.0
+    mask_3d: np.ndarray, step: np.ndarray, low: float, high: float, unit: float
 ) -> float:
     """Return ``1 - slope`` of log contour-length ratio against log blur scale.
 
