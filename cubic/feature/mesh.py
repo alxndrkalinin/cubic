@@ -437,16 +437,10 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
     """
     corners = mesh.vertices[mesh.faces]
     angles = mesh.face_angles
-    # Squared length of the edge opposite each corner.
-    opposite = np.stack(
-        [
-            ((corners[:, (i + 1) % 3] - corners[:, (i + 2) % 3]) ** 2).sum(axis=1)
-            for i in range(3)
-        ],
-        axis=1,
-    )
-    cot = 1 / np.tan(angles)
     nxt, prv = [1, 2, 0], [2, 0, 1]
+    # Squared length of the edge opposite each corner.
+    opposite = ((corners[:, nxt] - corners[:, prv]) ** 2).sum(axis=-1)
+    cot = 1 / np.tan(angles)
     voronoi = (opposite[:, nxt] * cot[:, nxt] + opposite[:, prv] * cot[:, prv]) / 8
     face_area = mesh.area_faces[:, None]
     obtuse = angles > np.pi / 2
