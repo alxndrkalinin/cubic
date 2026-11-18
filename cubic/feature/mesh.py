@@ -715,31 +715,28 @@ def mask2mesh(
         )
         if mesh is None:
             raise ValueError(f"The mask vanishes when blurred at sigma={sigma}.")
-        return mesh if unit == 1 else _scaled_copy(mesh, unit)
-    marching_cubes_kwargs = dict(marching_cubes_kwargs or {})
-    if spacing is not None:
-        if "spacing" in marching_cubes_kwargs:
+    else:
+        marching_cubes_kwargs = dict(marching_cubes_kwargs or {})
+        if spacing is None:
+            spacing = marching_cubes_kwargs.get("spacing")
+            unit = _unit(spacing)
+        elif "spacing" in marching_cubes_kwargs:
             raise ValueError(
                 "Voxel spacing given both as 'spacing' and in "
                 "'marching_cubes_kwargs'; pass it only once."
             )
-        marching_cubes_kwargs["spacing"] = tuple(float(s) for s in spacing)
-    else:
-        unit = _unit(marching_cubes_kwargs.get("spacing"))
-    if unit != 1:
-        marching_cubes_kwargs["spacing"] = tuple(
-            float(s) / unit for s in marching_cubes_kwargs["spacing"]
-        )
-    verts, faces = _marching_cubes(np.pad(mask_3d, 1), **marching_cubes_kwargs)
-    # Undo the 1-voxel pad so vertices stay in the input's coordinate frame.
-    # Without this every vertex, and therefore ``bounds`` and ``centroid``, sits
-    # one voxel high on each axis -- scaled by ``spacing``, so the offset is in
-    # physical units. Every feature in ``mesh_feature_list`` is
-    # translation-invariant, but ``mask2mesh`` is public and its mesh is
-    # expected to overlay the image.
-    one_voxel = np.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
-    verts = verts - to_same_device(one_voxel, verts)
-    mesh = _closed_mesh(verts, faces)
+        if spacing is not None:
+            marching_cubes_kwargs["spacing"] = tuple(_step(spacing) / unit)
+        verts, faces = _marching_cubes(np.pad(mask_3d, 1), **marching_cubes_kwargs)
+        # Undo the 1-voxel pad so vertices stay in the input's coordinate
+        # frame. Without this every vertex, and therefore ``bounds`` and
+        # ``centroid``, sits one voxel high on each axis -- scaled by
+        # ``spacing``, so the offset is in physical units. Every feature in
+        # ``mesh_feature_list`` is translation-invariant, but ``mask2mesh`` is
+        # public and its mesh is expected to overlay the image.
+        one_voxel = np.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
+        verts = verts - to_same_device(one_voxel, verts)
+        mesh = _closed_mesh(verts, faces)
     return mesh if unit == 1 else _scaled_copy(mesh, unit)
 
 
@@ -823,8 +820,6 @@ def _edge_unit(surface: Any) -> float:
     area, which the volume and area check of ``_measure_mesh`` then reports.
     """
     faces = surface.faces
-    if len(faces) == 0:
-        return 1.0
     area = float(face_areas(surface.vertices, faces).sum())
     if not np.isfinite(area) or area <= 0:
         return 1.0
@@ -866,8 +861,7 @@ def _measure_mesh(
         return curvature_mesh if name in _SMOOTHED_FEATURES else mesh
 
     # The per-vertex curvatures behind both curvature averages, computed once
-    # when either is requested. Kept by this call only, not on the mesh, which
-    # may be the caller's own.
+    # when either is requested.
     curvatures = (
         _principal_curvatures(curvature_mesh)
         if any(name in _CURVATURE_AVERAGES for name in features)
