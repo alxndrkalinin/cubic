@@ -289,7 +289,7 @@ def test_mask2mesh_orients_an_ascent_mesh_outward(ragged_ball: np.ndarray) -> No
     assert ascent.volume == pytest.approx(mesh.mask2mesh(ragged_ball).volume, rel=1e-12)
 
 
-@pytest.mark.parametrize("spacing", [None, (4.0, 1.0, 1.0)])
+@pytest.mark.parametrize("spacing", [None, (4.0, 1.0, 1.0), (4e-9, 1e-9, 1e-9)])
 def test_mask2mesh_vertices_stay_in_the_input_frame(
     spacing: tuple[float, float, float] | None,
 ) -> None:
@@ -299,6 +299,8 @@ def test_mask2mesh_vertices_stay_in_the_input_frame(
     subtracted again. Left in, every vertex sat one voxel high on each axis —
     scaled by ``spacing``, so a z-spacing of 4 displaced the mesh by 4.0
     physical units, and ``bounds``/``centroid`` no longer overlaid the image.
+    The nanometre spacing is built in units of its finest value and scaled
+    back; built in metres, trimesh merged vertices closer than 1e-8.
     """
     mask = np.zeros((6, 6, 6), dtype=bool)
     mask[2:4, 2:4, 2:4] = True  # voxel centres 2 and 3 on every axis

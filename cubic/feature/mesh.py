@@ -527,6 +527,25 @@ def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
     return trimesh.Trimesh(vertices=verts, faces=faces)
 
 
+def _scaled_copy(surface: Any, factor: float) -> Any:
+    """Return a copy of ``surface`` with every vertex times ``factor``.
+
+    The vertices are not merged again, since trimesh's merge tolerance is
+    absolute, and ``surface`` is left as it is. A ``trimesh.Trimesh`` is copied
+    without its cache or visuals, keeping any density or centre of mass set on
+    it, the centre scaled too; its ``apply_scale`` is not used because it leaves
+    the vertices as they are for any factor within 1e-8 of 1.
+    """
+    if isinstance(surface, ArrayMesh):
+        return surface.scaled(factor)
+    copied = surface.copy(include_visual=False)
+    copied.vertices = np.asarray(surface.vertices) * factor
+    # trimesh keeps a centre of mass set by the caller apart from its cache.
+    if "center_mass" in copied._data:
+        copied.center_mass = np.asarray(copied._data["center_mass"]) * factor
+    return copied
+
+
 def _smooth_mask2mesh(
     mask_3d: np.ndarray, spacing: Sequence[float] | None, sigma: float
 ) -> Any:
@@ -641,11 +660,14 @@ def mask2mesh(
         returned as an ``ArrayMesh``; a NumPy one as a ``trimesh.Trimesh``.
     spacing : sequence of float, optional
         Voxel spacing ``(z, y, x)`` passed to marching cubes, so that lengths,
-        areas and volumes are in physical units. trimesh compares lengths with
-        absolute tolerances of about 1e-8, so measure the mesh only in units
-        where its edges are far above that (micrometres, not metres);
-        ``extract_surface_features`` and ``extract_features`` do not have this
-        limit.
+        areas and volumes are in physical units, in any length unit. The mesh
+        is built in units of the finest spacing and scaled back to these
+        without merging its vertices again, so trimesh's absolute merge
+        tolerance (1e-8) does not join vertices of a mesh in metres. Its other
+        absolute tolerances still apply to what trimesh computes from such a
+        mesh: ``volume`` and ``area`` are fine, anything that compares a length
+        with a tolerance (``integral_mean_curvature``, convexity tests) is
+        not.
     marching_cubes_kwargs : dict, optional
         Extra keyword arguments for ``skimage.measure.marching_cubes``; on the
         GPU only ``level``, ``spacing`` and ``allow_degenerate`` are supported.
@@ -665,19 +687,25 @@ def mask2mesh(
         ``(z, y, x)``.
     """
     # A negative spacing would turn the mesh inside out, a zero one flatten it.
-    _unit(spacing)
+    # The mesh is built in units of the finest spacing, where trimesh's
+    # absolute merge tolerance sees only the spacing ratios, and then scaled
+    # back to the caller's units without merging again.
+    unit = _unit(spacing)
     if sigma is not None:
         if marching_cubes_kwargs:
             raise ValueError(
                 "marching_cubes_kwargs cannot be combined with sigma: the blurred "
                 "mask is meshed without them. Pass the voxel spacing as 'spacing'."
             )
+        # Validated in the caller's units, so that an error names their number.
         mesh = _smooth_mask2mesh(
-            mask_3d, spacing, _curvature_sigma(spacing, sigma, "sigma")
+            mask_3d,
+            None if spacing is None else tuple(_step(spacing) / unit),
+            _curvature_sigma(spacing, sigma, "sigma") / unit,
         )
         if mesh is None:
             raise ValueError(f"The mask vanishes when blurred at sigma={sigma}.")
-        return mesh
+        return mesh if unit == 1 else _scaled_copy(mesh, unit)
     marching_cubes_kwargs = dict(marching_cubes_kwargs or {})
     if spacing is not None:
         if "spacing" in marching_cubes_kwargs:
@@ -687,7 +715,11 @@ def mask2mesh(
             )
         marching_cubes_kwargs["spacing"] = tuple(float(s) for s in spacing)
     else:
-        _unit(marching_cubes_kwargs.get("spacing"))
+        unit = _unit(marching_cubes_kwargs.get("spacing"))
+    if unit != 1:
+        marching_cubes_kwargs["spacing"] = tuple(
+            float(s) / unit for s in marching_cubes_kwargs["spacing"]
+        )
     verts, faces = _marching_cubes(np.pad(mask_3d, 1), **marching_cubes_kwargs)
     # Undo the 1-voxel pad so vertices stay in the input's coordinate frame.
     # Without this every vertex, and therefore ``bounds`` and ``centroid``, sits
@@ -697,7 +729,8 @@ def mask2mesh(
     # expected to overlay the image.
     one_voxel = np.asarray(marching_cubes_kwargs.get("spacing", 1.0), dtype=float)
     verts = verts - to_same_device(one_voxel, verts)
-    return _closed_mesh(verts, faces)
+    mesh = _closed_mesh(verts, faces)
+    return mesh if unit == 1 else _scaled_copy(mesh, unit)
 
 
 def sphericity(v: float, sa: float) -> float:

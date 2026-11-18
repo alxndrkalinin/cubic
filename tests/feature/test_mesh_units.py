@@ -11,7 +11,7 @@ from skimage.measure import marching_cubes
 
 trimesh = pytest.importorskip("trimesh")
 
-from cubic.cuda import ascupy  # noqa: E402
+from cubic.cuda import ascupy, asnumpy, to_same_device  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
 
 _SPACING_ERROR = re.escape(
@@ -276,3 +276,121 @@ def test_volume_error_prints_the_callers_volume(
 
     got = float(re.search(r"got (\S+)\. ", str(error.value)).group(1))
     assert got == pytest.approx(expected, rel=1e-12)
+
+
+def _on(device: str, mask: np.ndarray, gpu_available: bool) -> Any:
+    """``mask`` on ``device``; skips the test for the GPU without one."""
+    if device == "cpu":
+        return mask
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    return ascupy(mask)
+
+
+def _arrays(surface: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices and faces of a mesh of either type, on the host."""
+    return np.asarray(asnumpy(surface.vertices)), np.asarray(asnumpy(surface.faces))
+
+
+def _old_mask2mesh(
+    mask: Any, spacing: tuple[float, ...] | None, sigma: float | None
+) -> Any:
+    """``mask2mesh`` as it was before it normalised the spacing, from its helpers."""
+    if sigma is not None:
+        return mesh._smooth_mask2mesh(mask, spacing, sigma)
+    step = (1.0, 1.0, 1.0) if spacing is None else spacing
+    verts, faces = mesh._marching_cubes(np.pad(mask, 1), spacing=step)
+    one_voxel = np.asarray(step, dtype=float)
+    return mesh._closed_mesh(verts - to_same_device(one_voxel, verts), faces)
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("spacing", [None, (1.0, 1.0, 1.0), (2.685, 1.0, 1.0)])
+@pytest.mark.parametrize("branch", ["spacing", "marching_cubes_kwargs", "sigma"])
+def test_mask2mesh_with_a_unit_finest_spacing_is_unchanged(
+    device: str,
+    spacing: tuple[float, ...] | None,
+    branch: str,
+    gpu_available: bool,
+) -> None:
+    """With a finest spacing of 1 (or none), the mesh is the one built before.
+
+    ``extract_surface_features`` meshes at such a spacing, so its values must
+    not move: the vertices and faces are bitwise those of the code before the
+    spacing was normalised, rebuilt here from the same helpers.
+    """
+    mask = _on(device, _ball(10), gpu_available)
+    sigma = 3.1 if branch == "sigma" else None
+    kwargs: dict[str, Any] = {
+        "spacing": {"spacing": spacing},
+        "marching_cubes_kwargs": {"marching_cubes_kwargs": {"spacing": spacing}},
+        "sigma": {"spacing": spacing, "sigma": sigma},
+    }[branch]
+    if branch == "marching_cubes_kwargs" and spacing is None:
+        kwargs = {}
+
+    got = _arrays(mesh.mask2mesh(mask, **kwargs))
+    expected = _arrays(_old_mask2mesh(mask, spacing, sigma))
+
+    for g, e in zip(got, expected, strict=True):
+        assert g.dtype == e.dtype
+        np.testing.assert_array_equal(g, e)
+
+
+# Factors of the caller's unit, far below and above trimesh's absolute merge
+# tolerance (1e-8), and 0.3, which is not a power of ten.
+UNIT_FACTORS = [1e-9, 1e-8, 1e-7, 1e-6, 1e-3, 0.3, 1e3]
+# Spacing and blur scale at factor 1 of each base. The anisotropic one is the
+# unit-rounding base: (0.2 c) / (0.065 c) is not 0.2 / 0.065 at every c, so its
+# normalised spacing differs by an ulp between factors. 3 sigma / step stays
+# clear of integers (9.3, and 3.02 on the coarse axis), so that ulp cannot
+# change the blur's padding.
+MESH_BASES = {
+    "isotropic": ((1.0, 1.0, 1.0), 3.1),
+    "anisotropic": ((0.2, 0.065, 0.065), 0.2015),
+}
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("base", list(MESH_BASES))
+@pytest.mark.parametrize("smooth", [False, True], ids=["plain", "sigma"])
+@pytest.mark.parametrize("shape", ["ball", "ragged ball"])
+def test_mask2mesh_is_covariant_with_the_unit(
+    device: str,
+    base: str,
+    smooth: bool,
+    shape: str,
+    ragged_ball: np.ndarray,
+    gpu_available: bool,
+) -> None:
+    """At spacing ``c * base``, the mesh is ``c`` times the mesh at ``base``.
+
+    Same vertex and face count, watertightness and Euler number, the same faces,
+    and vertices ``c`` times those at factor 1 to 4 float64 ulps of the
+    coordinate before the pad was removed: the mesh is scaled once by its unit
+    at each factor and the normalised spacing may differ by an ulp (measured
+    up to 1.8). Unnormalised, the ball at spacing 1e-8 came out with 1,402 of
+    its 1,896 vertices and Euler number 566, its vertices merged at trimesh's
+    absolute tolerance.
+    """
+    mask = _on(device, _ball(10) if shape == "ball" else ragged_ball, gpu_available)
+    spacing, sigma = MESH_BASES[base]
+    step = np.asarray(spacing)
+
+    def mesh_at(c: float) -> Any:
+        kwargs = {"sigma": c * sigma} if smooth else {}
+        return mesh.mask2mesh(mask, spacing=tuple(c * step), **kwargs)
+
+    reference = mesh_at(1.0)
+    ref_verts, ref_faces = _arrays(reference)
+    pad = (np.ceil(3 * sigma / step) + 1) if smooth else 1
+    padded = np.abs(ref_verts) + pad * step
+    for c in UNIT_FACTORS:
+        surface = mesh_at(c)
+        verts, faces = _arrays(surface)
+        topology = (len(verts), len(faces), surface.is_watertight)
+        assert topology == (len(ref_verts), len(ref_faces), reference.is_watertight), c
+        assert surface.euler_number == reference.euler_number, c
+        np.testing.assert_array_equal(faces, ref_faces, err_msg=f"c={c:g}")
+        off = np.abs(verts - c * ref_verts) / (c * np.finfo(float).eps * padded)
+        assert off.max() <= 4, (c, off.max())

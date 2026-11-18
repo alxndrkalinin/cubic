@@ -110,14 +110,35 @@ class ArrayMesh:
     Attributes not computed here are read from a ``trimesh.Trimesh`` copy on the
     host. A delegated method that would change the mesh in place (e.g.
     ``apply_scale``) raises ``TypeError``: the device arrays and cached
-    quantities would no longer describe it. Use ``to_trimesh()`` for a mutable
-    mesh.
+    quantities would no longer describe it. Use ``scaled()`` for a scaled copy,
+    and ``to_trimesh()`` for a mutable mesh.
     """
 
     def __init__(self, vertices: Any, faces: Any) -> None:
         self.vertices, self.faces = _merge_vertices(
             vertices.astype(np.float64), faces.astype(np.int64)
         )
+
+    def scaled(self, factor: float) -> ArrayMesh:
+        """Return a new mesh with every vertex times ``factor``, on the same device.
+
+        The vertices are not merged again: the merge tolerance is absolute, so
+        at a small enough ``factor`` it would join vertices this mesh keeps
+        apart. The faces are shared with this mesh, which never changes them;
+        the copy starts with no cached quantity and no host ``trimesh.Trimesh``.
+
+        Raises
+        ------
+        ValueError
+            If ``factor`` is not finite and positive, which would flatten the
+            mesh or turn it inside out.
+        """
+        factor = float(factor)
+        if not np.isfinite(factor) or factor <= 0:
+            raise ValueError(f"factor must be finite and positive; got {factor}")
+        copy = object.__new__(type(self))
+        copy.vertices, copy.faces = self.vertices * factor, self.faces
+        return copy
 
     def __getattr__(self, name: str) -> Any:
         # Called for attributes not defined here, which go to trimesh, and also
