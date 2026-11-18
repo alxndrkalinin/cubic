@@ -329,13 +329,9 @@ def extract_surface_features(
     unit = _unit(spacing)
     step = _step(spacing) / unit
     # Validated in the caller's units, so that an error names their number, and
-    # before any meshing; the default is twice the coarsest normalised spacing.
-    sigma = _curvature_sigma(
-        tuple(step),
-        None
-        if curvature_sigma is None
-        else _curvature_sigma(spacing, curvature_sigma) / unit,
-    )
+    # before any meshing, then normalised; the default, twice the coarsest
+    # spacing, normalises to twice the coarsest normalised spacing.
+    sigma = _curvature_sigma(spacing, curvature_sigma) / unit
     mesh = mask2mesh(mask, spacing=None if spacing is None else tuple(step))
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
@@ -1147,8 +1143,6 @@ _SHARED_EDGE_FEATURES = (
     "Avg Mean Curvature",
     *_SMOOTHED_FEATURES,
 )
-# Build trimesh's face adjacency on the mesh they are measured on.
-_ADJACENCY_FEATURES = ("Avg Mean Curvature", "Avg Shape Index", "Avg Curvedness")
 _SHARED_EDGE_WARNING = (
     "At least one mesh has edges shared by more than two faces, which marching "
     "cubes makes where voxels touch only along an edge. "
@@ -1202,6 +1196,8 @@ _CURVATURE_AVERAGES: dict[
     "Avg Shape Index": _shape_index,
     "Avg Curvedness": _curvedness,
 }
+# Build trimesh's face adjacency on the mesh they are measured on.
+_ADJACENCY_FEATURES = ("Avg Mean Curvature", *_CURVATURE_AVERAGES)
 
 # Power of the length unit in each feature: a feature measured with ``spacing``
 # in units u is ``u ** dimension`` times the same feature measured in units 1.
