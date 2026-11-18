@@ -400,20 +400,36 @@ def test_extract_features_computes_only_requested(monkeypatch) -> None:
     """Features that were not requested are never computed.
 
     A ``["Volume"]`` request used to compute every feature, mean curvature
-    included.
+    included. The curvature averages are computed apart from the registry, from
+    per-vertex curvatures shared between them, so those fail too, and with one
+    average requested the other fails.
     """
 
-    def fail(_mesh) -> float:
+    def fail(*_args) -> float:
         raise AssertionError("an unrequested feature was computed")
 
-    for name in mesh.mesh_feature_list():
-        if name not in ("Volume", "Area"):
-            monkeypatch.setitem(mesh._MESH_FEATURES, name, fail)
+    def fail_unrequested(patch, requested: list[str]) -> None:
+        for name in mesh.mesh_feature_list():
+            if name not in requested:
+                patch.setitem(mesh._MESH_FEATURES, name, fail)
+        for name in mesh._CURVATURE_AVERAGES:
+            if name not in requested:
+                patch.setitem(mesh._CURVATURE_AVERAGES, name, fail)
 
-    _, values, _ = mesh.extract_features(_cube_volume(4), ["Area", "Volume"])
+    with monkeypatch.context() as patch:
+        fail_unrequested(patch, ["Area", "Volume"])
+        patch.setattr(mesh, "_principal_curvatures", fail)
+        _, values, _ = mesh.extract_features(_cube_volume(4), ["Area", "Volume"])
 
     cube = mesh.mask2mesh(_cube_volume(4) == 1)
     np.testing.assert_allclose(values, [[cube.area, cube.volume]])
+
+    # A ball, which survives the curvature blur that the cube does not.
+    for name in mesh._CURVATURE_AVERAGES:
+        with monkeypatch.context() as patch:
+            fail_unrequested(patch, [name])
+            _, values, _ = mesh.extract_features(_ball(8, 22).astype(np.int32), [name])
+        assert np.isfinite(values).all(), name
 
 
 def test_extract_surface_features_full_pipeline() -> None:

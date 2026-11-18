@@ -13,7 +13,7 @@ import sys
 import numbers
 import warnings
 from typing import Any, TypeVar, Callable, SupportsFloat
-from functools import cache, wraps
+from functools import wraps
 from collections.abc import Sequence
 
 import numpy as np
@@ -767,16 +767,18 @@ def _measure_mesh(
     def measured_on(name: str) -> Any:
         return curvature_mesh if name in _SMOOTHED_FEATURES else mesh
 
-    # The per-vertex curvatures behind both curvature averages, computed at most
-    # once per call. Kept by this call only, not on the mesh, which may be the
-    # caller's own.
-    @cache
-    def curvatures() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        return _principal_curvatures(curvature_mesh)
+    # The per-vertex curvatures behind both curvature averages, computed once
+    # when either is requested. Kept by this call only, not on the mesh, which
+    # may be the caller's own.
+    curvatures = (
+        _principal_curvatures(curvature_mesh)
+        if any(name in _CURVATURE_AVERAGES for name in features)
+        else None
+    )
 
     def measure(name: str) -> SupportsFloat:
-        if name in _CURVATURE_AVERAGES:
-            return _CURVATURE_AVERAGES[name](*curvatures())
+        if curvatures is not None and name in _CURVATURE_AVERAGES:
+            return _CURVATURE_AVERAGES[name](*curvatures)
         return _MESH_FEATURES[name](measured_on(name))
 
     # trimesh caches volume, convex hull and bounding primitives on the mesh, so
@@ -951,16 +953,6 @@ def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
 def _curvedness(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
     """Return the area-weighted curvedness, ``1 / R`` on a sphere of radius R."""
     return _area_average(np.sqrt((k1**2 + k2**2) / 2), area)
-
-
-def _avg_shape_index(mesh: trimesh.Trimesh) -> float:
-    """Return ``_shape_index`` of the mesh's per-vertex curvatures."""
-    return _shape_index(*_principal_curvatures(mesh))
-
-
-def _avg_curvedness(mesh: trimesh.Trimesh) -> float:
-    """Return ``_curvedness`` of the mesh's per-vertex curvatures."""
-    return _curvedness(*_principal_curvatures(mesh))
 
 
 def _smooth_twin(blurred: np.ndarray, pad: np.ndarray) -> np.ndarray:
@@ -1172,8 +1164,8 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     "Total Absolute Gaussian Curvature": lambda m: (
         np.abs(m.vertex_defects).sum() / (4 * np.pi)
     ),
-    "Avg Shape Index": _avg_shape_index,
-    "Avg Curvedness": _avg_curvedness,
+    "Avg Shape Index": lambda m: _shape_index(*_principal_curvatures(m)),
+    "Avg Curvedness": lambda m: _curvedness(*_principal_curvatures(m)),
 }
 
 # Features that average the per-vertex principal curvatures ``(k1, k2, area)``;
