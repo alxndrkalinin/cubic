@@ -33,6 +33,12 @@ def _ball(radius: float, shape: int) -> np.ndarray:
     return sum(axis**2 for axis in _centred_grid(shape, shape, shape)) <= radius**2
 
 
+def _torus() -> np.ndarray:
+    """Return a 50^3 boolean mask of a centred torus, ring radius 14 and tube radius 6."""
+    z, y, x = _centred_grid(50, 50, 50)
+    return (np.sqrt(y**2 + x**2) - 14) ** 2 + z**2 <= 6**2
+
+
 def _rotated_ellipsoid(rot_deg: float) -> np.ndarray:
     """Return a label image of an ellipsoid with full axes (12, 48, 16).
 
@@ -343,15 +349,19 @@ def test_curvature_converts_with_the_spacing_unit() -> None:
 
     The vertex-averaged ball measure used before integrated over a radius of 1
     in the units of ``spacing``: spacing 0.1 instead of 1 changed it 11x rather
-    than 10x.
+    than 10x. The default blur follows the spacing, so the unitless curvature
+    features stay put and curvedness scales as 1 / length like the mean.
     """
-    names = ["Avg Mean Curvature", "Euler Characteristic"]
+    names = ["Avg Mean Curvature", "Euler Characteristic", *_CURVATURE_FEATURES]
     mask = _ball(8, 22)
     coarse = mesh.extract_surface_features(mask, (1.0, 1.0, 1.0), names)
     fine = mesh.extract_surface_features(mask, (0.1, 0.1, 0.1), names)
 
     assert fine[names[0]] / coarse[names[0]] == pytest.approx(10, rel=1e-6)
     assert fine[names[1]] == coarse[names[1]] == 2
+    for name in ("Total Absolute Gaussian Curvature", "Avg Shape Index"):
+        assert fine[name] == pytest.approx(coarse[name], rel=1e-6)
+    assert fine["Avg Curvedness"] == pytest.approx(10 * coarse["Avg Curvedness"])
 
 
 def test_cavity_counts_as_concave_in_the_mean_curvature() -> None:
@@ -375,14 +385,12 @@ def test_cavity_counts_as_concave_in_the_mean_curvature() -> None:
 
 def test_euler_characteristic_counts_topology() -> None:
     """Twice the pieces plus cavities, minus twice the handles."""
-    z, y, x = _centred_grid(50, 50, 50)
-    torus = (np.sqrt(y**2 + x**2) - 14) ** 2 + z**2 <= 6**2
     two_balls = np.concatenate([_ball(6, 16), _ball(6, 16)])
     shapes = {
         "ball": (_ball(8, 22), 2),
         "hollow ball": (_ball(12, 32) & ~_ball(6, 32), 4),
         "two balls": (two_balls, 4),
-        "torus": (torus, 0),
+        "torus": (_torus(), 0),
     }
     got = {
         name: mesh.extract_surface_features(mask, features=["Euler Characteristic"])
@@ -423,33 +431,17 @@ def test_total_absolute_gaussian_curvature_grows_with_saddles() -> None:
     A torus has as much negative as positive curvature, so 2; two overlapping
     balls have a saddle-shaped waist where they join.
     """
-    z, y, x = _centred_grid(50, 50, 50)
-    torus = (np.sqrt(y**2 + x**2) - 14) ** 2 + z**2 <= 6**2
     zz, yy, xx = _centred_grid(24, 24, 36)
     peanut = (zz**2 + yy**2 + (xx - 6) ** 2 <= 8**2) | (
         zz**2 + yy**2 + (xx + 6) ** 2 <= 8**2
     )
-    name = ["Total Absolute Gaussian Curvature"]
+    name = "Total Absolute Gaussian Curvature"
 
-    torus_k = mesh.extract_surface_features(torus, features=name)[name[0]]
-    peanut_k = mesh.extract_surface_features(peanut, features=name)[name[0]]
+    torus_k = mesh.extract_surface_features(_torus(), features=[name])[name]
+    peanut_k = mesh.extract_surface_features(peanut, features=[name])[name]
 
     assert torus_k == pytest.approx(2, rel=0.05)
     assert peanut_k > 1.1
-
-
-def test_curvature_distribution_converts_with_the_spacing_unit() -> None:
-    """The default blur follows the spacing, so a unit change only rescales.
-
-    Unitless features stay put and curvedness scales as 1 / length.
-    """
-    mask = _ball(8, 22)
-    coarse = mesh.extract_surface_features(mask, (1.0, 1.0, 1.0), _CURVATURE_FEATURES)
-    fine = mesh.extract_surface_features(mask, (0.1, 0.1, 0.1), _CURVATURE_FEATURES)
-
-    for name in ("Total Absolute Gaussian Curvature", "Avg Shape Index"):
-        assert fine[name] == pytest.approx(coarse[name], rel=1e-6)
-    assert fine["Avg Curvedness"] == pytest.approx(10 * coarse["Avg Curvedness"])
 
 
 @pytest.mark.parametrize("rot_deg", [30, 45])
