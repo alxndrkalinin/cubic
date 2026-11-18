@@ -579,10 +579,8 @@ def mask2mesh(
 ) -> Any:
     """Convert 3D mask to a mesh using marching cubes.
 
-    The mask is padded with one voxel of background on every side. Without it a
-    label touching the volume border yields an open (non-watertight) surface,
-    whose ``volume`` is meaningless and often negative, which in turn makes
-    sphericity NaN and solidity and extent negative.
+    The mask is padded with one voxel of background on every side, which closes
+    the surface of a label touching the volume border.
 
     Parameters
     ----------
@@ -666,8 +664,10 @@ def extract_mesh_features(
     ValueError
         If a feature name is unknown or needs the mask (``Fractal Dimension``,
         ``Outline Fractal Dimension``),
-        or if the mesh volume or surface area is not finite and positive, which
-        is what an inside-out mesh, and often an open surface, reports.
+        or if the mesh volume or surface area is not finite and positive. A
+        non-positive volume is what an inside-out mesh reports; an open surface
+        is not detected in general, since its signed volume depends on the
+        origin.
     """
     features = list(_MESH_FEATURES) if features is None else _resolve_features(features)
     from_mask = [name for name in features if name in _MASK_FEATURES]
@@ -676,10 +676,10 @@ def extract_mesh_features(
             f"{from_mask} is measured on the mask at several blur scales, not on "
             "one mesh; use extract_surface_features or extract_features."
         )
-    # Validate the mesh before any feature: an inside-out mesh, and often an
-    # open surface (e.g. a mask meshed without a background border), reports a
-    # negative volume, which silently propagates into a NaN sphericity and
-    # negative solidity and extent instead of failing.
+    # Validate the mesh before any feature: an inside-out mesh reports a
+    # negative volume, which would silently propagate into a NaN sphericity and
+    # negative solidity and extent instead of failing. An open surface is not
+    # detected in general: the sign of its volume depends on the origin.
     volume = float(mesh.volume)
     surface_area = float(mesh.area)
     if not np.isfinite(volume) or volume <= 0:
