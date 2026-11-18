@@ -1,6 +1,8 @@
 """GPU mesh features: CUDA marching cubes and ``ArrayMesh`` against the CPU path."""
 
 import warnings
+from typing import NoReturn
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -387,7 +389,7 @@ _RAW_CURVATURE_WITHOUT_SHAPE_INDEX = [
 ]
 
 
-def _shared_edge_warnings(call) -> tuple[object, list]:
+def _shared_edge_warnings(call: Callable[[], object]) -> tuple[object, list]:
     """Run ``call``; return its result and the shared-edge warnings it raised."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -423,7 +425,10 @@ def test_shared_edges_are_counted_alike_on_every_mesh(
     "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
 )
 def test_shared_edge_warning_on_gpu(
-    entry: str, ragged_ball_of, gpu_available: bool, monkeypatch
+    entry: str,
+    ragged_ball_of: Callable[[float], np.ndarray],
+    gpu_available: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A CuPy ragged ball warns, at the calling line; a clean one does not.
 
@@ -433,7 +438,7 @@ def test_shared_edge_warning_on_gpu(
     if not gpu_available:
         pytest.skip("GPU not available")
 
-    def fail(self):
+    def fail(self: ArrayMesh) -> NoReturn:
         raise AssertionError("fell back to a host trimesh")
 
     monkeypatch.setattr(ArrayMesh, "to_trimesh", fail)
@@ -457,7 +462,9 @@ def test_shared_edge_warning_on_gpu(
 
 
 def test_shared_edge_masks_match_on_both_devices(
-    shared_edge_masks: dict[str, np.ndarray], gpu_available: bool, monkeypatch
+    shared_edge_masks: dict[str, np.ndarray],
+    gpu_available: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Meshes with shared edges give the same values, count and warning everywhere.
 
@@ -472,7 +479,7 @@ def test_shared_edge_masks_match_on_both_devices(
         pytest.skip("GPU not available")
     closed_mesh = mesh._closed_mesh
 
-    def numpy_array_mesh(mask):
+    def numpy_array_mesh(mask: np.ndarray) -> tuple[ArrayMesh, dict[str, float]]:
         monkeypatch.setattr(mesh, "_closed_mesh", ArrayMesh)
         try:
             return mesh.mask2mesh(mask), mesh.extract_surface_features(
@@ -528,7 +535,7 @@ def test_shared_edge_masks_match_on_both_devices(
 
 
 def test_gpu_principal_curvatures_are_computed_once(
-    gpu_available: bool, monkeypatch
+    gpu_available: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A CuPy mask computes the per-vertex curvatures once for both averages."""
     if not gpu_available:
@@ -536,7 +543,7 @@ def test_gpu_principal_curvatures_are_computed_once(
     calls = []
     principal_curvatures = mesh._principal_curvatures
 
-    def counted(surface):
+    def counted(surface: ArrayMesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         calls.append(type(surface))
         return principal_curvatures(surface)
 

@@ -6,7 +6,8 @@ import _thread
 import weakref
 import warnings
 import subprocess
-from typing import Any
+from typing import Any, NoReturn
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -329,7 +330,7 @@ def test_mask2mesh_spacing_scales_geometry() -> None:
 )
 @pytest.mark.parametrize("source", ["spacing", "marching_cubes_kwargs", "sigma"])
 def test_mask2mesh_rejects_a_spacing_that_is_not_three_positive_numbers(
-    source: str, spacing: Any
+    source: str, spacing: float | tuple[float, ...]
 ) -> None:
     """mask2mesh rejects such a spacing from either source, as extract_features does.
 
@@ -432,10 +433,10 @@ def test_extract_features_computes_only_requested(monkeypatch) -> None:
     average requested the other fails.
     """
 
-    def fail(*_args) -> float:
+    def fail(*_args: Any) -> float:
         raise AssertionError("an unrequested feature was computed")
 
-    def fail_unrequested(patch, requested: list[str]) -> None:
+    def fail_unrequested(patch: pytest.MonkeyPatch, requested: list[str]) -> None:
         for name in mesh.mesh_feature_list():
             if name not in requested:
                 patch.setitem(mesh._MESH_FEATURES, name, fail)
@@ -959,10 +960,10 @@ def test_warnings_name_the_outermost_frame_when_every_frame_is_cubic() -> None:
     assert result == [2, filename]
 
 
-def _failing_bounding_cylinder(monkeypatch) -> None:
+def _failing_bounding_cylinder(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make every trimesh bounding cylinder fail as a degenerate mesh's does."""
 
-    def fail(self):
+    def fail(self: trimesh.Trimesh) -> NoReturn:
         raise ValueError("degenerate")
 
     monkeypatch.setattr(trimesh.Trimesh, "bounding_cylinder", property(fail))
@@ -972,7 +973,7 @@ def _failing_bounding_cylinder(monkeypatch) -> None:
     "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
 )
 def test_bounding_cylinder_warning_points_at_the_caller(
-    entry: str, monkeypatch
+    entry: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The bounding-cylinder fallback warns at the calling line and returns 0.
 
@@ -1041,7 +1042,9 @@ def test_thin_object_check_runs_only_for_fractal_dimension(monkeypatch) -> None:
 _SHARED_EDGE_TEXT = "edges shared by more than two faces"
 
 
-def _shared_edge_warnings(call, simplefilter: str = "always") -> list:
+def _shared_edge_warnings(
+    call: Callable[[], object], simplefilter: str = "always"
+) -> list:
     """Run ``call`` and return the shared-edge warnings it raised."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter(simplefilter)
@@ -1057,7 +1060,9 @@ def _shared_edge_warnings(call, simplefilter: str = "always") -> list:
         *([name] for name in _CURVATURE_FEATURES),
     ],
 )
-def test_shared_edge_warning_fires_on_a_ragged_ball_only(names, ragged_ball_of) -> None:
+def test_shared_edge_warning_fires_on_a_ragged_ball_only(
+    names: list[str], ragged_ball_of: Callable[[float], np.ndarray]
+) -> None:
     """Each approximate feature warns on the ragged ball's mesh, not a clean ball's.
 
     The ragged ball's mesh has 33 edges shared by four faces. Measured on the
@@ -1068,14 +1073,18 @@ def test_shared_edge_warning_fires_on_a_ragged_ball_only(names, ragged_ball_of) 
         surface = mesh.mask2mesh(ragged_ball_of(fraction))
         values = {}
 
-        def call(surface=surface, values=values):
+        def call(
+            surface: trimesh.Trimesh = surface, values: dict[str, float] = values
+        ) -> None:
             values.update(mesh.extract_mesh_features(surface, names))
 
         assert len(_shared_edge_warnings(call)) == expected, fraction
         assert np.isfinite(values[names[0]])
 
 
-def test_shared_edge_warning_comes_from_the_raw_mesh_features(ragged_ball) -> None:
+def test_shared_edge_warning_comes_from_the_raw_mesh_features(
+    ragged_ball: np.ndarray,
+) -> None:
     """The default pipeline warns for Euler and mean curvature, not the blurred mesh.
 
     The blurred mesh behind the curvature-distribution features has no edge on
@@ -1101,7 +1110,7 @@ def test_shared_edge_warning_comes_from_the_raw_mesh_features(ragged_ball) -> No
 
 
 def test_shared_edge_warning_follows_the_mesh_each_feature_is_measured_on(
-    ragged_ball_of,
+    ragged_ball_of: Callable[[float], np.ndarray],
 ) -> None:
     """The curvature-distribution features check the smooth mesh; the others ``mesh``.
 
@@ -1125,11 +1134,11 @@ def test_shared_edge_warning_follows_the_mesh_each_feature_is_measured_on(
 
 
 def test_shared_edges_are_counted_only_for_an_approximate_feature(
-    ragged_ball, monkeypatch
+    ragged_ball: np.ndarray, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Without an approximate feature the shared edges are never counted."""
 
-    def fail(*args, **kwargs):
+    def fail(*args: Any, **kwargs: Any) -> NoReturn:
         raise AssertionError("counted the shared edges")
 
     monkeypatch.setattr(mesh, "_overshared_edge_count", fail)
@@ -1144,7 +1153,8 @@ def test_shared_edges_are_counted_only_for_an_approximate_feature(
 
 
 def test_shared_edge_count_tested_by_the_face_adjacency(
-    shared_edge_masks, ragged_ball_of
+    shared_edge_masks: dict[str, np.ndarray],
+    ragged_ball_of: Callable[[float], np.ndarray],
 ) -> None:
     """Testing the face adjacency first gives the full count on every mesh.
 
@@ -1185,7 +1195,9 @@ def test_shared_edge_count_tested_by_the_face_adjacency(
 @pytest.mark.parametrize(
     "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
 )
-def test_shared_edge_warning_points_at_the_caller(entry: str, ragged_ball) -> None:
+def test_shared_edge_warning_points_at_the_caller(
+    entry: str, ragged_ball: np.ndarray
+) -> None:
     """The warning is attributed to the calling line through every public entry."""
     names = ["Euler Characteristic"]
     calls = {
@@ -1206,7 +1218,9 @@ def test_shared_edge_warning_points_at_the_caller(entry: str, ragged_ball) -> No
     assert caught[0].filename == __file__
 
 
-def test_shared_edge_warning_is_shown_once_for_a_label_image(ragged_ball_of) -> None:
+def test_shared_edge_warning_is_shown_once_for_a_label_image(
+    ragged_ball_of: Callable[[float], np.ndarray],
+) -> None:
     """Two labels with shared edges give one warning under the default filter.
 
     The filter keys a text by the calling line, so the warning is shown once
@@ -1570,7 +1584,9 @@ def test_extract_mesh_features_measures_curvature_on_the_smooth_mesh() -> None:
     assert from_meshes == pytest.approx(from_mask)
 
 
-def test_principal_curvatures_are_computed_once_per_call(monkeypatch) -> None:
+def test_principal_curvatures_are_computed_once_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Avg Shape Index and Avg Curvedness share one per-vertex curvature pass.
 
     Each used to compute it. One requested alone gives the registry's value,
@@ -1579,7 +1595,9 @@ def test_principal_curvatures_are_computed_once_per_call(monkeypatch) -> None:
     calls = []
     principal_curvatures = mesh._principal_curvatures
 
-    def counted(surface):
+    def counted(
+        surface: trimesh.Trimesh,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         calls.append(surface)
         return principal_curvatures(surface)
 
@@ -1636,7 +1654,7 @@ def test_curvature_sigma_is_validated_whichever_features(
     mask = _cube_volume(4) == 1 if labelled else np.zeros((6, 6, 6), dtype=bool)
     spacing = (0.5, 0.25, 0.25)
 
-    def call():
+    def call() -> object:
         if entry == "extract_features":
             return mesh.extract_features(
                 mask.astype(np.int32), ["Volume"], spacing, curvature_sigma=sigma

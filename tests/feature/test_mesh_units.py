@@ -146,7 +146,9 @@ def _cell_id(cell: tuple[float, str, bool]) -> str:
 
 
 @pytest.mark.parametrize(("c", "base", "explicit"), CELLS, ids=map(_cell_id, CELLS))
-def test_features_are_covariant_with_the_unit(c: float, base: str, explicit: bool):
+def test_features_are_covariant_with_the_unit(
+    c: float, base: str, explicit: bool
+) -> None:
     """Each feature at spacing ``c * base`` is ``c ** dimension`` times its value.
 
     The reference is the value at ``base``; the tolerance is the rounding of the
@@ -164,14 +166,14 @@ def test_features_are_covariant_with_the_unit(c: float, base: str, explicit: boo
 @pytest.mark.parametrize(("c", "base", "explicit"), CELLS, ids=map(_cell_id, CELLS))
 def test_gpu_features_are_covariant_with_the_unit(
     c: float, base: str, explicit: bool, gpu_available: bool
-):
+) -> None:
     """The covariance of the CPU test, for a CuPy mask meshed on the GPU."""
     if not gpu_available:
         pytest.skip("GPU not available")
     _assert_covariant("gpu", base, c, explicit)
 
 
-def test_every_feature_has_a_dimension():
+def test_every_feature_has_a_dimension() -> None:
     """The module's dimension table covers every feature, as measured here."""
     names = mesh.mesh_feature_list(optional=True)
     assert set(mesh._FEATURE_DIMENSIONS) == set(names)
@@ -184,7 +186,9 @@ def test_every_feature_has_a_dimension():
     + [(np.inf, 1.0, 1.0)]
     + [0.5, (1.0,), (1.0, 1.0), (1.0, 1.0, 1.0, 1.0), np.ones((2, 3))],
 )
-def test_spacing_must_be_three_finite_positive_numbers(spacing: Any) -> None:
+def test_spacing_must_be_three_finite_positive_numbers(
+    spacing: float | tuple[float, ...] | np.ndarray,
+) -> None:
     """Each entry rejects such a spacing, even for an image without labels.
 
     It used to fail deep in the blur, or for an all-negative spacing to return
@@ -234,7 +238,9 @@ def _ball(radius: int) -> np.ndarray:
     ],
     ids=["fractal window", "outline vanishes", "blur vanishes"],
 )
-def test_warnings_print_lengths_in_the_callers_units(mask, kwargs, text):
+def test_warnings_print_lengths_in_the_callers_units(
+    mask: np.ndarray, kwargs: dict[str, Any], text: str
+) -> None:
     """Scales in warnings are the caller's, not those of the internal unit.
 
     At spacing 0.25 the internal unit is 0.25, so each scale would print four
@@ -244,14 +250,18 @@ def test_warnings_print_lengths_in_the_callers_units(mask, kwargs, text):
         mesh.extract_surface_features(mask, spacing=(0.25, 0.25, 0.25), **kwargs)
 
 
-def test_volume_error_prints_the_callers_volume(monkeypatch):
+def test_volume_error_prints_the_callers_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The open-mesh error names the volume in the caller's units.
 
     ``mask2mesh`` is replaced by one that leaves the surface open, which the
     padding otherwise prevents.
     """
 
-    def open_mask2mesh(mask, spacing=None):
+    def open_mask2mesh(
+        mask: np.ndarray, spacing: tuple[float, ...] | None = None
+    ) -> trimesh.Trimesh:
         verts, faces, _, _ = marching_cubes(mask, 0.5, spacing=spacing)
         return trimesh.Trimesh(vertices=verts, faces=faces)
 
