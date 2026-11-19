@@ -632,6 +632,26 @@ def test_shape_index_tells_a_torus_from_a_ball() -> None:
     assert torus < ball - 0.2
 
 
+def test_flat_residues_leave_real_curvature_as_it_is(monkeypatch) -> None:
+    """On a blurred flat ellipsoid no real angle defect or edge sum is set to 0.
+
+    The terraces that the blur leaves on its shallow slopes have angle defects
+    down to 4.6e-13 radians and edge sums down to 1.3e-13 of their terms, above
+    the residue threshold, so the curvature features are the same with the
+    threshold at 0. A threshold of 1e-12 moves Avg Shape Index by 7e-5.
+    """
+    z, y, x = _centred_grid(20, 132, 132)
+    flat = (z / 6) ** 2 + (y / 60) ** 2 + (x / 60) ** 2 <= 1
+    smooth = mesh.mask2mesh(flat, sigma=2.0)
+    names = ["Avg Shape Index", "Avg Curvedness"]
+
+    snapped = mesh.extract_mesh_features(smooth, names)
+    monkeypatch.setattr(mesh, "_FLAT_RESIDUE", 0.0)
+    exact = mesh.extract_mesh_features(smooth, names)
+
+    assert snapped == exact
+
+
 @pytest.mark.parametrize("rot_deg", [30, 45])
 def test_curvature_distribution_does_not_depend_on_orientation(rot_deg: float) -> None:
     """Rotating an ellipsoid barely moves the curvature features.

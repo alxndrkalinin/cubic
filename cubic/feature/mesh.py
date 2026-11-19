@@ -1110,6 +1110,12 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
     )
 
 
+# Relative size of a rounding residue in ``_principal_curvatures``: an angle
+# defect (radians) or an edge sum (relative to the sum of its absolute terms)
+# at most this large is set to 0.
+_FLAT_RESIDUE = 1e-14
+
+
 def _principal_curvatures(
     mesh: trimesh.Trimesh,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1119,19 +1125,33 @@ def _principal_curvatures(
     length times signed dihedral angle over four times the vertex area, as in
     LONI ShapeTools; ``k1, k2 = H -+ sqrt(H^2 - K)``, clamped to ``H`` where
     discretisation makes ``H^2 < K``.
+
+    At a flat vertex both sums are rounding residues, and the shape index
+    there would be the arctangent of two residues, which differ between NumPy
+    and CuPy. The angle defect is set to 0 where its absolute value is at most
+    ``_FLAT_RESIDUE`` radians, and the edge sum where its absolute value is
+    at most ``_FLAT_RESIDUE`` times the sum of the absolute values of its
+    terms.
     """
     area = _mixed_area(mesh)
-    gaussian = mesh.vertex_defects / area
+    defects = mesh.vertex_defects
+    defects = np.where(np.abs(defects) <= _FLAT_RESIDUE, 0.0, defects)
+    gaussian = defects / area
     edges = mesh.face_adjacency_edges
     lengths = np.linalg.norm(
         mesh.vertices[edges[:, 1]] - mesh.vertices[edges[:, 0]], axis=1
     )
     signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
+    terms = lengths * mesh.face_adjacency_angles * signs
     edge_sum = np.bincount(
+        edges.ravel(), weights=np.repeat(terms, 2), minlength=len(mesh.vertices)
+    )
+    term_sum = np.bincount(
         edges.ravel(),
-        weights=np.repeat(lengths * mesh.face_adjacency_angles * signs, 2),
+        weights=np.repeat(np.abs(terms), 2),
         minlength=len(mesh.vertices),
     )
+    edge_sum = np.where(np.abs(edge_sum) <= _FLAT_RESIDUE * term_sum, 0.0, edge_sum)
     mean = edge_sum / (4 * area)
     spread = np.sqrt(np.maximum(mean**2 - gaussian, 0))
     return mean - spread, mean + spread, area

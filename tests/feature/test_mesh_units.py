@@ -456,10 +456,7 @@ def test_extract_mesh_features_convert_with_the_unit(
     problem at every factor. Unscaled, Avg Mean Curvature came out 32 times
     too high at 1e-7. ``smooth`` passes ``mask2mesh(..., sigma=...)`` for the
     curvature-distribution features. Avg Shape Index on a raw voxel mesh is
-    left out: its flat vertices have mean and Gaussian curvature at rounding
-    level, and their shape index is the angle of that noise: it moved by up
-    to 14% between factors here, by 19% to 200% between spacings 1 and 0.108
-    before this change, and by up to 0.003 between three GPU runs on one mesh.
+    left out: it moved by up to 6.8% between factors here (5.5% on the GPU).
     """
     mask = _on(device, _mask(**_SMALL_MASK), gpu_available)
     spacing, sigma = MESH_BASES[base]

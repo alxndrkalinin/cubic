@@ -390,12 +390,14 @@ _SHARED_EDGE_REQUEST = [
 ]
 # Vary between GPU runs of the same code by about 1e-13 (atomic sums).
 _GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
-# On the raw mesh, without smooth_mesh. Avg Shape Index is left out: on a raw
-# CuPy mesh it differs from the CPU by up to 9% (0.0960 against 0.0888 on a
-# clean ball), with or without shared edges, which is not resolved here.
-_RAW_CURVATURE_WITHOUT_SHAPE_INDEX = [
+# On the raw mesh, without smooth_mesh. Avg Shape Index agrees across devices
+# there because _principal_curvatures sets the rounding residues of flat
+# vertices to 0; without that, CuPy and the CPU differ by 2.9% on the 10%
+# ragged ball.
+_RAW_CURVATURE = [
     "Total Absolute Gaussian Curvature",
     "Avg Curvedness",
+    "Avg Shape Index",
 ]
 
 
@@ -510,16 +512,12 @@ def test_shared_edge_masks_match_on_both_devices(
         count = mesh._overshared_edge_count(surface)
         assert count > 0, name
         with pytest.warns(UserWarning, match=_SHARED_EDGE_TEXT):
-            raw_reference = mesh.extract_mesh_features(
-                surface, _RAW_CURVATURE_WITHOUT_SHAPE_INDEX
-            )
+            raw_reference = mesh.extract_mesh_features(surface, _RAW_CURVATURE)
         for way, ((surface, values), caught) in results.items():
             assert mesh._overshared_edge_count(surface) == count, (name, way)
             assert len(caught) == 1, (name, way)
             raw, raw_caught = _shared_edge_warnings(
-                lambda s=surface: mesh.extract_mesh_features(
-                    s, _RAW_CURVATURE_WITHOUT_SHAPE_INDEX
-                )
+                lambda s=surface: mesh.extract_mesh_features(s, _RAW_CURVATURE)
             )
             assert len(raw_caught) == 1, (name, way)
             values = {**values, **{f"raw {k}": v for k, v in raw.items()}}
@@ -631,6 +629,25 @@ def test_gpu_blur_that_provably_vanishes_does_not_run(
         assert pad.tolist() == [1, 1, 1]
     with pytest.raises(ValueError, match="vanishes when blurred"):
         mesh.mask2mesh(mask, sigma=1e4)
+
+
+def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> None:
+    """A raw voxel mesh's shape index agrees between NumPy and CuPy to rounding.
+
+    Its flat vertices have angle defects that are rounding residues, which the
+    two devices sum in different orders; set to 0, they no longer move the
+    shape index, which differed by about 1e-3 between the devices.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    grid = np.indices((36, 36, 36)) - 17.5
+    ball = (grid**2).sum(axis=0) <= 15**2
+    name = "Avg Shape Index"
+
+    on_cpu = mesh.extract_mesh_features(mesh.mask2mesh(ball), [name])[name]
+    on_gpu = mesh.extract_mesh_features(mesh.mask2mesh(ascupy(ball)), [name])[name]
+
+    assert abs(on_gpu - on_cpu) <= 1e-12
 
 
 def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:
