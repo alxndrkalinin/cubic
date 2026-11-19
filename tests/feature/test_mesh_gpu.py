@@ -774,6 +774,29 @@ def test_gpu_bounding_cylinder_matches_numpy(
         assert gpu[names[0]] == pytest.approx(cpu[names[0]], rel=1e-14), seed
 
 
+def test_gpu_oriented_bounding_box_matches_numpy(
+    lumpy_nucleus_of: Callable[[int], np.ndarray], gpu_available: bool
+) -> None:
+    """The oriented bounding box of a CuPy mesh is that of the NumPy mesh, to rounding.
+
+    Both are measured on the host, from trimesh's convex hull of the same
+    vertices, which the CuPy mesh lists in another order. trimesh's box
+    search, used before, depends on that order: it put the box of this mesh
+    1.7% apart between the devices, and that of 10 of 240 nuclei up to 9.4%.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    names = ["Oriented Bounding Box Volume", "Extent"]
+    spacing = (2.685, 1.0, 1.0)
+    mask = lumpy_nucleus_of(6)
+    cpu = mesh.extract_mesh_features(mesh.mask2mesh(mask, spacing=spacing), names)
+    gpu = mesh.extract_mesh_features(
+        mesh.mask2mesh(ascupy(mask), spacing=spacing), names
+    )
+    for name in names:
+        assert gpu[name] == pytest.approx(cpu[name], rel=1e-12), name
+
+
 @pytest.mark.parametrize("smoothed", [False, True], ids=["raw", "smooth_mesh"])
 def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
     noise_blob_of: Callable[[int], np.ndarray], smoothed: bool, gpu_available: bool

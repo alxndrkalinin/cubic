@@ -67,6 +67,26 @@ def noise_blob_of() -> Callable[[int], np.ndarray]:
     return _noise_blob
 
 
+def _lumpy_nucleus(seed: int) -> np.ndarray:
+    """Return a 40 x 64 x 64 mask of an ellipsoid with lumps, the size of a nucleus.
+
+    The ellipsoid has semi-axes (14, 26, 20) voxels; its normalized radius is
+    perturbed by 0.25 times normal noise from ``default_rng(seed)`` blurred at
+    sigma 4 and scaled to unit deviation.
+    """
+    shape, semi_axes = (40, 64, 64), (14, 26, 20)
+    grid = np.meshgrid(*[np.arange(n) - (n - 1) / 2 for n in shape], indexing="ij")
+    radius = np.sqrt(sum((g / a) ** 2 for g, a in zip(grid, semi_axes)))
+    noise = ndimage.gaussian_filter(np.random.default_rng(seed).normal(size=shape), 4.0)
+    return radius + 0.25 * noise / noise.std() <= 1
+
+
+@pytest.fixture
+def lumpy_nucleus_of() -> Callable[[int], np.ndarray]:
+    """Return ``_lumpy_nucleus``: a lumpy ellipsoid mask of a given seed."""
+    return _lumpy_nucleus
+
+
 def _flat_vertices(surface: object) -> np.ndarray:
     """Return which vertices of ``surface`` have all their face normals equal to 1e-9.
 

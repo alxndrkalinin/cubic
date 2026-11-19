@@ -4,7 +4,8 @@ Each label is converted into a surface mesh with marching cubes and measured
 with ``trimesh``. A CuPy label image or mask stays on the GPU: it is meshed by a
 CUDA port of the same marching cubes and measured as an ``ArrayMesh``, which
 computes the trimesh quantities on the device and hands the convex hull and
-bounding primitives to trimesh on the host.
+bounding sphere to trimesh on the host; the bounding box and cylinder are
+measured on the host from that hull.
 
 Units and trimesh tolerances. trimesh compares lengths, areas and cross
 products with absolute tolerances, so whether a result is right can depend on
@@ -64,7 +65,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 # reads changed in 4.6.12, so the floor is no longer needed by cubic and is
 # left where it was. On 4.6.11 and on 4.6.12 the tests fail only where
 # they use the return value of ``Trimesh.invert``, the mesh only from 4.10;
-# on 4.0.0 cubic's oriented bounding box fails.
+# on 4.0.0 trimesh's oriented bounding box, which cubic no longer uses, failed.
 _MIN_TRIMESH = (4, 6, 12)
 
 
@@ -111,9 +112,16 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     No default feature is defined on the image axes. The axis lengths are the
     full axes of the ellipsoid with the same inertia, and ``Extent`` is the
     volume over the oriented bounding box volume. Voxelization still moves
-    every feature a little with orientation, and the oriented box comes from
-    trimesh's approximate minimum search, so it moves more: ``Extent`` spans
-    0.50-0.55 for one ellipsoid turned by 0, 30 and 45 degrees.
+    every feature a little with orientation, and the box more than most:
+    ``Extent`` spans 0.50-0.55 for one ellipsoid turned by 0, 30 and 45
+    degrees. ``Oriented Bounding Box Volume`` is the smallest volume of the
+    boxes that enclose the mesh with a face on a face of its convex hull,
+    each with the exact minimum-area rectangle across that face's normal; it
+    turns, scales and reorders with the mesh to rounding. It is an upper bound
+    of the minimum enclosing box, which can instead have two adjacent faces
+    each on a hull edge: it is twice the minimum for a regular tetrahedron,
+    and for 60 nuclei it was as small as the smallest box a dense search over
+    axes found for 51 and at most 1.1% above it for the rest.
     ``Bounding Cylinder Volume`` is the smallest volume of the cylinders that
     enclose the mesh about the normals of its convex hull faces and its three
     principal axes of inertia, each with the exact minimum enclosing circle
@@ -1031,7 +1039,8 @@ def _measure_mesh(
         return _MESH_FEATURES[name](measured_on(name))
 
     # trimesh caches volume, convex hull and bounding primitives on the mesh, so
-    # features sharing them do not recompute them.
+    # features sharing them do not recompute them. The oriented box is cubic's
+    # and is computed for each of its two features, from the cached hull.
     values = {name: float(measure(name)) for name in features}
     # Only the meshes that a requested approximate feature was measured on are
     # checked, each once: keyed by identity, since a Trimesh hashes its content.
@@ -1118,27 +1127,115 @@ def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
     ``Convex Hull Volume``; 0, with a warning, for a mesh whose hull cannot be
     built.
     """
+    found = _hull_and_normals(mesh, "bounding cylinder volume")
+    if found is None:
+        return 0.0
+    hull, normals = found
+    inertia_axes = np.linalg.eigh(np.asarray(mesh.moment_inertia, dtype=np.float64))[1]
+    return _min_cylinder_volume(
+        np.asarray(hull.vertices, dtype=np.float64),
+        np.vstack([normals, inertia_axes.T]),
+    )
+
+
+def _hull_and_normals(
+    mesh: trimesh.Trimesh, name: str
+) -> tuple[Any, np.ndarray] | None:
+    """Return the convex hull of ``mesh`` and the distinct axes of its face normals.
+
+    The hull is the one trimesh caches for ``Convex Hull Volume``, on the host.
+    None, with a warning naming the feature ``name``, for a mesh whose hull
+    cannot be built.
+    """
     try:
         hull = mesh.convex_hull
     except (ValueError, QhullError) as e:
         warnings.warn(
-            f"Unable extract bounding cylinder volume. Returning 0. Exception: {e}",
+            f"Unable extract {name}. Returning 0. Exception: {e}",
             stacklevel=_stacklevel_outside_package(),
         )
-        return 0.0
+        return None
     normals = np.asarray(hull.face_normals, dtype=np.float64)
     # trimesh gives a face too small for a normal a zero one.
     normals = normals[(normals * normals).sum(axis=1) > 0.5]
-    # An axis and its reverse give the same cylinder, and the faces of one
-    # flat side of the hull share a normal to rounding: keep one of each.
+    # An axis and its reverse give the same cylinder or box, and the faces of
+    # one flat side of the hull share a normal to rounding: keep one of each.
     largest = np.abs(normals).argmax(axis=1)
     normals *= np.sign(normals[np.arange(len(normals)), largest])[:, None]
     _, first = np.unique(normals.round(9), axis=0, return_index=True)
+    return hull, normals[np.sort(first)]
+
+
+def _oriented_bounding_box_volume(mesh: trimesh.Trimesh) -> float:
+    """Return the smallest volume of the enclosing boxes with a face on a hull face.
+
+    The candidate axes are the normals of the faces of the convex hull. About
+    each axis the box is exact: its height is the extent of the hull vertices
+    along the axis and its base the minimum-area rectangle of their
+    projection, which has a side on an edge of the projection's convex hull
+    (Freeman and Shapira, 1975). The volume is the smallest of these, so it
+    turns and scales with the mesh to rounding. A minimum-volume box has a
+    face on a hull face or two adjacent faces each on a hull edge
+    (O'Rourke, 1985); only the first kind is searched, so this is an upper
+    bound of the minimum, exact for a box and twice it for a regular
+    tetrahedron. Measured on the host from the hull that trimesh caches for
+    ``Convex Hull Volume``; 0, with a warning, for a mesh whose hull cannot be
+    built.
+    """
+    found = _hull_and_normals(mesh, "oriented bounding box volume")
+    if found is None:
+        return 0.0
+    return _min_box_volume(*found)
+
+
+def _extent(mesh: trimesh.Trimesh) -> float:
+    """Return the volume over the oriented bounding box volume; 0 without a box."""
+    box = _oriented_bounding_box_volume(mesh)
+    return float(mesh.volume) / box if box > 0 else 0.0
+
+
+def _min_box_volume(hull: trimesh.Trimesh, axes: np.ndarray) -> float:
+    """Return the smallest volume of the boxes about unit ``axes`` enclosing ``hull``.
+
+    Each box spans the extent of the hull vertices along its axis, and its base
+    is the minimum-area rectangle of their projection across it. Its sides run
+    along the projection of a silhouette edge, one between a hull face that
+    faces along the axis and one that does not; every edge of the projection's
+    hull is one, and any other direction gives a larger rectangle. Exact: an
+    axis is skipped only when a lower bound of its volume, from the area of the
+    projection, exceeds a volume already found, and axes are tried in
+    increasing order of that bound.
+    """
     points = np.asarray(hull.vertices, dtype=np.float64)
-    inertia_axes = np.linalg.eigh(np.asarray(mesh.moment_inertia, dtype=np.float64))[1]
-    return _min_cylinder_volume(
-        points, np.vstack([normals[np.sort(first)], inertia_axes.T])
-    )
+    normals = np.asarray(hull.face_normals, dtype=np.float64)
+    areas = np.asarray(hull.area_faces, dtype=np.float64)
+    pairs = np.asarray(hull.face_adjacency)
+    edges = np.asarray(hull.face_adjacency_edges)
+    # In chunks of axes, to bound the memory to 256 times the points or faces.
+    chunks = np.array_split(np.arange(len(axes)), -(-len(axes) // 256))
+    height = np.concatenate([np.ptp(points @ axes[c].T, axis=0) for c in chunks])
+    # The hull covers its projection twice, so this is the projection's area.
+    shadow = np.concatenate([areas @ np.abs(normals @ axes[c].T) / 2 for c in chunks])
+    lower = shadow * height
+    best = math.inf
+    for a in np.argsort(lower, kind="stable"):
+        if lower[a] * (1 - _ENCLOSING_SLACK) > best:
+            break
+        facing = normals @ axes[a]
+        # A face across the axis, of either sign, counts on both sides.
+        silhouette = facing[pairs[:, 0]] * facing[pairs[:, 1]] <= 0
+        # The projection, in two unit vectors across the axis, so that each
+        # rectangle is exactly a rectangle even for an edge along the axis,
+        # whose projection points anywhere.
+        plane = _axis_frames(axes[a][None])[0, 1:]
+        flat = points @ plane.T
+        sides = flat[edges[silhouette, 1]] - flat[edges[silhouette, 0]]
+        length = np.sqrt((sides * sides).sum(axis=1))
+        sides = sides[length > 0] / length[length > 0, None]
+        normal_sides = sides[:, ::-1] * np.array([-1.0, 1.0])
+        base = np.ptp(sides @ flat.T, axis=1) * np.ptp(normal_sides @ flat.T, axis=1)
+        best = min(best, float(base.min()) * height[a])
+    return best
 
 
 # Relative slack of the enclosing tests, against the rounding of distances, and
@@ -1146,6 +1243,18 @@ def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
 # most 8 measured for 71,556 hull face normals of 204 meshes.
 _ENCLOSING_SLACK = 1e-12
 _ENCLOSING_STEPS = 1000
+
+
+def _axis_frames(axes: np.ndarray) -> np.ndarray:
+    """Return ``(k, 3, 3)`` orthonormal frames whose first row is each unit axis.
+
+    The two unit vectors across each axis come from its cross product with the
+    coordinate axis it is least aligned with.
+    """
+    helper = np.eye(3)[np.abs(axes).argmin(axis=1)]
+    across = np.cross(axes, helper)
+    across /= np.sqrt((across * across).sum(axis=1))[:, None]
+    return np.stack([axes, across, np.cross(axes, across)], axis=1)
 
 
 def _min_cylinder_volume(points: np.ndarray, axes: np.ndarray) -> float:
@@ -1157,12 +1266,7 @@ def _min_cylinder_volume(points: np.ndarray, axes: np.ndarray) -> float:
     least half the larger width of the projection, exceeds a volume already
     found, and axes are tried in increasing order of that bound.
     """
-    # Two unit vectors across each axis, from its cross product with the
-    # coordinate axis it is least aligned with.
-    helper = np.eye(3)[np.abs(axes).argmin(axis=1)]
-    across = np.cross(axes, helper)
-    across /= np.sqrt((across * across).sum(axis=1))[:, None]
-    frames = np.stack([axes, across, np.cross(axes, across)], axis=1)
+    frames = _axis_frames(axes)
 
     def coords(batch: np.ndarray) -> np.ndarray:
         # (axes, 3, points): each point along and across each axis of batch.
@@ -1616,13 +1720,13 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     "Inertia PC1": lambda m: m.principal_inertia_components[0],
     "Inertia PC2": lambda m: m.principal_inertia_components[1],
     "Inertia PC3": lambda m: m.principal_inertia_components[2],
-    "Oriented Bounding Box Volume": lambda m: m.bounding_box_oriented.volume,
+    "Oriented Bounding Box Volume": _oriented_bounding_box_volume,
     "Bounding Cylinder Volume": _bounding_cylinder_volume,
     "Bounding Sphere Volume": lambda m: m.bounding_sphere.volume,
     "Convex Hull Volume": lambda m: m.convex_hull.volume,
     "Convex Hull Area": lambda m: m.convex_hull.area,
     "Sphericity": lambda m: sphericity(float(m.volume), float(m.area)),
-    "Extent": lambda m: m.volume / m.bounding_box_oriented.volume,
+    "Extent": _extent,
     "Solidity": lambda m: m.volume / m.convex_hull.volume,
     # The surface average of the Gaussian curvature would be exactly
     # 2 pi * euler_number / area (Gauss-Bonnet), so it adds nothing to Area

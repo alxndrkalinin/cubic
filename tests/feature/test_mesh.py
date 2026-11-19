@@ -1254,18 +1254,27 @@ def _failing_bounding_cylinder(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        ("Bounding Cylinder Volume", "bounding cylinder"),
+        ("Oriented Bounding Box Volume", "oriented bounding box"),
+        ("Extent", "oriented bounding box"),
+    ],
+)
+@pytest.mark.parametrize(
     "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
 )
 def test_bounding_cylinder_warning_points_at_the_caller(
-    entry: str, monkeypatch: pytest.MonkeyPatch
+    entry: str, name: str, message: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bounding-cylinder fallback warns at the calling line and returns 0.
+    """The bounding-cylinder and box fallbacks warn at the calling line and return 0.
 
-    With stacklevel=2 it pointed at the feature registry in mesh.py.
+    With stacklevel=2 the cylinder's pointed at the feature registry in
+    mesh.py. trimesh's box search, used before, raised instead.
     """
     _failing_bounding_cylinder(monkeypatch)
     mask = _ball(6, 16)
-    names = ["Bounding Cylinder Volume"]
+    names = [name]
     calls = {
         "extract_features": lambda: mesh.extract_features(mask.astype(np.int32), names)[
             1
@@ -1282,7 +1291,7 @@ def test_bounding_cylinder_warning_points_at_the_caller(
         warnings.simplefilter("always")
         value = calls[entry]()
 
-    matching = [w for w in caught if "bounding cylinder" in str(w.message)]
+    matching = [w for w in caught if message in str(w.message)]
     assert value == 0.0
     assert [w.filename for w in matching] == [__file__]
 
@@ -1390,6 +1399,75 @@ def test_bounding_cylinder_turns_and_scales_with_the_mesh(
         assert _cylinder_volume(_turned(surface, rotation)) == pytest.approx(
             reference, rel=1e-12
         )
+
+
+def _box_volume(surface: Any) -> float:
+    names = ["Oriented Bounding Box Volume"]
+    return mesh.extract_mesh_features(surface, names)[names[0]]
+
+
+@pytest.mark.parametrize(
+    "extents", [(2, 3, 5), (1, 3, 4), (1, 1, 1)], ids=["2x3x5", "1x3x4", "cube"]
+)
+def test_oriented_bounding_box_of_a_turned_box(extents: tuple) -> None:
+    """A box is its own oriented bounding box at any turn, and fills it."""
+    box = trimesh.creation.box(extents=extents)
+    names = ["Oriented Bounding Box Volume", "Extent"]
+    for rotation in _TURNS:
+        values = mesh.extract_mesh_features(_turned(box, rotation), names)
+        assert values[names[0]] == pytest.approx(np.prod(extents), rel=1e-12)
+        assert values[names[1]] == pytest.approx(1.0, rel=1e-12)
+
+
+def test_oriented_bounding_box_of_a_regular_tetrahedron() -> None:
+    """A regular tetrahedron gets twice its smallest box, at any turn.
+
+    The smallest box is the cube whose corners it shares, side 2 here, with
+    no face on a face of the tetrahedron. Only boxes with a face on a hull
+    face are searched, and the best of them, on a face of the tetrahedron, is
+    its height times the smallest rectangle around that face (an edge by the
+    triangle's height): 4 / sqrt(3) times 4 sqrt(3), 16.
+    """
+    corners = np.array([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], float)
+    tetrahedron = trimesh.convex.convex_hull(corners)
+    for rotation in _TURNS:
+        assert _box_volume(_turned(tetrahedron, rotation)) == pytest.approx(
+            2 * 2.0**3, rel=1e-12
+        )
+
+
+def test_oriented_bounding_box_turns_scales_and_reorders_with_the_mesh(
+    lumpy_nucleus_of: Callable[[int], np.ndarray],
+) -> None:
+    """The box of a lumpy nucleus is the same, to rounding, turned, rescaled or reordered.
+
+    trimesh's box search, used before, gave this mesh volumes 8.8% apart over
+    these turns, and 8.1% apart for its vertices listed in reverse: the CPU
+    and GPU meshes list the same vertices in different orders. The box
+    encloses the convex hull, and is at most the box trimesh finds, which
+    also has a face on a hull face.
+    """
+    surface = mesh.mask2mesh(lumpy_nucleus_of(5), spacing=(2.685, 1.0, 1.0))
+    vertices, faces = np.asarray(surface.vertices), np.asarray(surface.faces)
+    reference = _box_volume(surface)
+    assert surface.convex_hull.volume <= reference
+    assert reference <= surface.bounding_box_oriented.volume * (1 + 1e-12)
+    extent = mesh.extract_mesh_features(surface, ["Extent"])["Extent"]
+    assert extent == pytest.approx(surface.volume / reference, rel=1e-12)
+    reordered = trimesh.Trimesh(
+        vertices[::-1].copy(), len(vertices) - 1 - faces, process=False
+    )
+    moved = [(reordered, 1.0)]
+    moved += [
+        (trimesh.Trimesh(vertices * factor, faces, process=False), factor)
+        for factor in (0.95, 1.1, 1.25, 1.4)
+    ]
+    moved += [(_turned(surface, rotation), 1.0) for rotation in _TURNS[1:]]
+    names = ["Oriented Bounding Box Volume", "Extent"]
+    for other, factor in moved:
+        values = mesh.extract_mesh_features(other, names)
+        assert values[names[0]] == pytest.approx(factor**3 * reference, rel=1e-12)
+        assert values[names[1]] == pytest.approx(extent, rel=1e-12)
 
 
 def _brute_force_radius(points: np.ndarray) -> float:
