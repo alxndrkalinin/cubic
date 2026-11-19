@@ -801,6 +801,45 @@ def test_rotated_cube_has_the_mean_curvature_of_its_edges(
     assert (k2[inside] == 0).all()
 
 
+def test_shape_index_leaves_out_planar_vertices(
+    flat_vertices_of: Callable[[object], np.ndarray],
+) -> None:
+    """The shape index of a cube averages its edges and corners, not its faces.
+
+    It is undefined where ``k1 = k2 = 0``. On the cube's edges ``k1 = 0 < k2``,
+    a shape index of 0.5, and its corners read more, so the average is at
+    least 0.5 (0.509 here); counting the 1350 face-interior vertices as 0 gave
+    0.062.
+    """
+    side = 2.0
+    box = trimesh.creation.box(extents=(side, side, side))
+    for _ in range(4):
+        box = box.subdivide()
+    turn = Rotation.random(1, random_state=2).as_matrix()[0]
+    cube = trimesh.Trimesh(box.vertices @ turn.T, box.faces, process=False)
+    measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube))
+    k1, k2, area = mesh._principal_curvatures(measured)
+    curved = ~flat_vertices_of(measured)
+    shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
+
+    name = "Avg Shape Index"
+    value = mesh.extract_mesh_features(cube, [name])[name]
+
+    assert 0.5 <= value <= 1
+    expected = (shape_index * area)[curved].sum() / area[curved].sum()
+    assert value == pytest.approx(expected, rel=1e-12)
+
+
+def test_shape_index_of_a_mesh_without_curvature_is_nan() -> None:
+    """With every vertex planar there is no shape index to average: NaN, warned."""
+    zeros = np.zeros(4)
+
+    with pytest.warns(UserWarning, match="Avg Shape Index is undefined"):
+        value = mesh._shape_index(zeros, zeros, np.ones(4))
+
+    assert np.isnan(value)
+
+
 def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
     """On a fine mesh of an ellipsoid the curvature averages are the analytic ones.
 

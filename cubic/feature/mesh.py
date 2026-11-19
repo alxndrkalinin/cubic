@@ -130,7 +130,10 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     region (grooves, waists, the necks of lobes), unitless. ``Avg Shape Index``
     (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
     (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
-    units of ``spacing``; both are averaged over the surface by area.
+    units of ``spacing``; both are averaged over the surface by area, the shape
+    index over its curved part only: it is undefined where the surface is
+    planar (``k1 = k2 = 0``), and NaN, with a warning, on a mesh without a
+    curved vertex.
     ``Euler Characteristic``, ``Avg Mean Curvature`` and these three are
     approximate on a mesh with edges shared by more than two faces, which
     marching cubes makes where voxels touch only along an edge, and a warning
@@ -1394,8 +1397,22 @@ def _area_average(values: np.ndarray, area: np.ndarray) -> float:
 
 
 def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
-    """Return the area-weighted shape index, 1 on a sphere and 0 on a saddle."""
-    return _area_average((2 / np.pi) * np.arctan2(k1 + k2, k2 - k1), area)
+    """Return the area-weighted shape index, 1 on a sphere and 0 on a saddle.
+
+    The shape index is undefined at a planar point, ``k1 = k2 = 0``, so the
+    vertices of curvedness 0 are left out of the average; NaN, with a warning,
+    when no vertex is curved.
+    """
+    curved = (k1 != 0) | (k2 != 0)
+    if not bool(curved.any()):
+        warnings.warn(
+            "Avg Shape Index is undefined on a mesh whose vertices are all "
+            "planar (k1 = k2 = 0); returning NaN.",
+            stacklevel=_stacklevel_outside_package(),
+        )
+        return float("nan")
+    shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
+    return _area_average(shape_index, np.where(curved, area, 0.0))
 
 
 def _curvedness(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
