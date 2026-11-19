@@ -1345,7 +1345,9 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
     nxt, prv = [1, 2, 0], [2, 0, 1]
     # Squared length of the edge opposite each corner.
     opposite = ((corners[:, nxt] - corners[:, prv]) ** 2).sum(axis=-1)
-    cot = 1 / np.tan(angles)
+    # cos / sin, not 1 / tan: with glibc 2.28, np.tan took 2.4e-4 s per angle
+    # at pi / 2, the right angles of every voxel mesh, and 1e-8 s elsewhere.
+    cot = np.cos(angles) / np.sin(angles)
     voronoi = (opposite[:, nxt] * cot[:, nxt] + opposite[:, prv] * cot[:, prv]) / 8
     face_area = mesh.area_faces[:, None]
     obtuse = angles > np.pi / 2
