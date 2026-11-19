@@ -1668,6 +1668,57 @@ def test_minimum_enclosing_circle_matches_brute_force() -> None:
     assert mesh._enclosing_radii(trio)[0] == pytest.approx(np.hypot(1, k), rel=1e-14)
 
 
+# Trios on which rounding leaves no circle through two or three of them that
+# encloses the rest within the slack: nearly collinear 3e3 from the origin, and
+# a few thousandths apart 1e4 and 1e6 from it.
+_ROUNDED_TRIOS = np.array(
+    [
+        [
+            [-2952.87199483942, 686.399972346957],
+            [-2953.16086059936, 686.3999723469553],
+            [-2952.621891998906, 686.3999723469544],
+        ],
+        [
+            [-6931.6712982201225, -12499.190901735376],
+            [-6931.668089571302, -12499.19037612065],
+            [-6931.671386516651, -12499.192265558253],
+        ],
+        [
+            [120132.30006175049, 1012089.336767032],
+            [120132.29418622523, 1012089.3411817536],
+            [120132.3082654888, 1012089.3451983955],
+        ],
+    ]
+)
+
+
+def test_minimum_enclosing_circle_stops_enclosing_where_growth_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A circle whose growth fails or is cut short still encloses every point.
+
+    The growth raised on ``_ROUNDED_TRIOS`` and at the step cap, which would
+    have aborted ``extract_features`` for a whole label image. The radius is
+    now that of the last circle's centre to the farthest point: at least the
+    smallest radius, found by brute force on the trios centred, where they
+    round finely.
+    """
+    radii = mesh._enclosing_radii(_ROUNDED_TRIOS)
+    smallest = np.array(
+        [_brute_force_radius(trio - trio.mean(axis=0)) for trio in _ROUNDED_TRIOS]
+    )
+    assert (radii >= smallest * (1 - 1e-9)).all()
+    assert (radii <= smallest * (1 + 1e-8)).all()
+
+    points = np.random.default_rng(0).normal(size=(1, 50, 2))
+    grown = mesh._enclosing_radii(points)
+    monkeypatch.setattr(mesh, "_ENCLOSING_STEPS", 1)
+    capped = mesh._enclosing_radii(points)
+    # The centre is within the smallest radius of a point of the set, so the
+    # set is within three times it of the centre.
+    assert grown[0] < capped[0] <= 3 * grown[0]
+
+
 def test_thin_object_warning_is_shown_once_for_a_label_image() -> None:
     """Many thin labels give one warning under Python's default filter.
 

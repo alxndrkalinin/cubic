@@ -1565,9 +1565,12 @@ def _enclosing_radii(points: np.ndarray) -> np.ndarray:
     every point, which makes it the minimum enclosing circle, unique for any
     point set. Rounding can end the growth early on nearly cocircular points:
     the circle through another three of them comes out an ulp smaller while
-    the farthest point is still up to 3e-11 outside. The radius returned is
+    the farthest point is still up to 3e-11 outside. Far from the origin, or
+    on nearly collinear points, rounding can also leave no circle that
+    encloses the four within the slack; the growth of that set then stops
+    there, as it does after ``_ENCLOSING_STEPS`` steps. The radius returned is
     the distance from the last centre to the farthest point, so the circle
-    encloses every point.
+    encloses every point, and the cylinder about it stays an upper bound.
     """
     rows = np.arange(len(points))
     first = points[rows, ((points - points[:, :1]) ** 2).sum(axis=2).argmax(axis=1)]
@@ -1585,7 +1588,7 @@ def _enclosing_radii(points: np.ndarray) -> np.ndarray:
         farthest = d2.argmax(axis=1)
         growing &= d2[rows, farthest] > r2 * slack
         if not growing.any():
-            return np.sqrt(d2.max(axis=1))
+            break
         four = np.concatenate([support, points[rows, farthest][:, None]], axis=1)
         new_r2 = np.full_like(r2, np.inf)
         new_center, new_support = center, support
@@ -1600,15 +1603,11 @@ def _enclosing_radii(points: np.ndarray) -> np.ndarray:
             new_r2 = np.where(take, c_r2, new_r2)
             new_center = np.where(take[:, None], c, new_center)
             new_support = np.where(take[:, None, None], trio, new_support)
-        if not np.isfinite(new_r2[growing]).all():
-            raise RuntimeError(
-                "minimum enclosing circle: no circle encloses four points"
-            )
-        growing &= new_r2 > r2
+        growing &= np.isfinite(new_r2) & (new_r2 > r2)
         r2 = np.where(growing, new_r2, r2)
         center = np.where(growing[:, None], new_center, center)
         support = np.where(growing[:, None, None], new_support, support)
-    raise RuntimeError("minimum enclosing circle did not converge")
+    return np.sqrt(((points - center[:, None]) ** 2).sum(axis=2).max(axis=1))
 
 
 def _circle_center(trio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
