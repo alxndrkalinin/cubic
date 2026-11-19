@@ -546,9 +546,11 @@ def test_gpu_principal_curvatures_are_computed_once(
     calls = []
     principal_curvatures = mesh._principal_curvatures
 
-    def counted(surface: ArrayMesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def counted(
+        surface: ArrayMesh, *args: object
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         calls.append(type(surface))
-        return principal_curvatures(surface)
+        return principal_curvatures(surface, *args)
 
     monkeypatch.setattr(mesh, "_principal_curvatures", counted)
     mesh.extract_surface_features(

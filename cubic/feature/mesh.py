@@ -1059,22 +1059,40 @@ def _measure_mesh(
     def measured_on(name: str) -> Any:
         return curvature_mesh if name in _SMOOTHED_FEATURES else mesh
 
-    # The per-vertex curvatures behind both curvature averages, computed once
-    # when either is requested.
+    # What several features share is computed at most once per call: the edge
+    # terms of each mesh, behind Avg Mean Curvature and the per-vertex
+    # curvatures, which are one mesh without a smooth mesh; the per-vertex
+    # curvatures behind both curvature averages; and the oriented box behind
+    # its volume and Extent. trimesh caches the volume, convex hull and
+    # bounding primitives on the mesh itself.
+    edge_terms: dict[int, tuple[Any, Any]] = {}
+
+    def edge_curvatures_of(surface: Any) -> tuple[Any, Any]:
+        if id(surface) not in edge_terms:
+            edge_terms[id(surface)] = _edge_curvatures(surface)
+        return edge_terms[id(surface)]
+
     curvatures = (
-        _principal_curvatures(curvature_mesh)
+        _principal_curvatures(curvature_mesh, edge_curvatures_of(curvature_mesh))
         if any(name in _CURVATURE_AVERAGES for name in features)
         else None
     )
 
+    @cache
+    def box() -> float:
+        return _oriented_bounding_box_volume(mesh)
+
     def measure(name: str) -> SupportsFloat:
         if curvatures is not None and name in _CURVATURE_AVERAGES:
             return _CURVATURE_AVERAGES[name](*curvatures)
+        if name == "Avg Mean Curvature":
+            return _avg_mean_curvature(mesh, edge_curvatures_of(mesh))
+        if name == "Oriented Bounding Box Volume":
+            return box()
+        if name == "Extent":
+            return _extent(mesh, box())
         return _MESH_FEATURES[name](measured_on(name))
 
-    # trimesh caches volume, convex hull and bounding primitives on the mesh, so
-    # features sharing them do not recompute them. The oriented box is cubic's
-    # and is computed for each of its two features, from the cached hull.
     values = {name: float(measure(name)) for name in features}
     # Only the meshes that a requested approximate feature was measured on are
     # checked, each once: keyed by identity, since a Trimesh hashes its content.
@@ -1222,9 +1240,13 @@ def _oriented_bounding_box_volume(mesh: trimesh.Trimesh) -> float:
     return _min_box_volume(*found)
 
 
-def _extent(mesh: trimesh.Trimesh) -> float:
-    """Return the volume over the oriented bounding box volume; 0 without a box."""
-    box = _oriented_bounding_box_volume(mesh)
+def _extent(mesh: trimesh.Trimesh, box: float | None = None) -> float:
+    """Return the volume over the oriented bounding box volume; 0 without a box.
+
+    ``box`` is that volume when already computed.
+    """
+    if box is None:
+        box = _oriented_bounding_box_volume(mesh)
     return float(mesh.volume) / box if box > 0 else 0.0
 
 
@@ -1235,40 +1257,92 @@ def _min_box_volume(hull: trimesh.Trimesh, axes: np.ndarray) -> float:
     is the minimum-area rectangle of their projection across it. Its sides run
     along the projection of a silhouette edge, one between a hull face that
     faces along the axis and one that does not; every edge of the projection's
-    hull is one, and any other direction gives a larger rectangle. Exact: an
-    axis is skipped only when a lower bound of its volume, from the area of the
-    projection, exceeds a volume already found, and axes are tried in
-    increasing order of that bound.
+    hull is one, and any other direction gives a larger rectangle. The
+    projection's hull is that of the silhouette edges' ends, so only they are
+    projected. Exact: an axis is skipped only when a lower bound of its
+    volume, from the area of the projection, exceeds a volume already found
+    (``_smallest_over_axes``).
     """
     points = np.asarray(hull.vertices, dtype=np.float64)
     normals = np.asarray(hull.face_normals, dtype=np.float64)
     areas = np.asarray(hull.area_faces, dtype=np.float64)
     pairs = np.asarray(hull.face_adjacency)
     edges = np.asarray(hull.face_adjacency_edges)
-    # In chunks of axes, to bound the memory to 256 times the points or faces.
-    chunks = np.array_split(np.arange(len(axes)), -(-len(axes) // 256))
-    height = np.concatenate([np.ptp(points @ axes[c].T, axis=0) for c in chunks])
+    frames = _axis_frames(axes)
+    height = np.concatenate(
+        [np.ptp(points @ axes[c].T, axis=0) for c in _axis_chunks(len(axes))]
+    )
     # The hull covers its projection twice, so this is the projection's area.
-    shadow = np.concatenate([areas @ np.abs(normals @ axes[c].T) / 2 for c in chunks])
-    lower = shadow * height
-    best = math.inf
-    for a in np.argsort(lower, kind="stable"):
-        if lower[a] * (1 - _ENCLOSING_SLACK) > best:
-            break
-        facing = normals @ axes[a]
+    shadow = np.concatenate(
+        [areas @ np.abs(normals @ axes[c].T) / 2 for c in _axis_chunks(len(axes))]
+    )
+
+    def volumes(batch: np.ndarray) -> np.ndarray:
+        facing = normals @ axes[batch].T
+        ahead, behind = facing > 0, facing < 0
         # A face across the axis, of either sign, counts on both sides.
-        silhouette = facing[pairs[:, 0]] * facing[pairs[:, 1]] <= 0
-        # The projection, in two unit vectors across the axis, so that each
+        silhouette = ~(
+            (ahead[pairs[:, 0]] & ahead[pairs[:, 1]])
+            | (behind[pairs[:, 0]] & behind[pairs[:, 1]])
+        )
+        # (axes, sides, 2): the ends of each axis's silhouette edges, padded
+        # with repeats of its first edge, which change no extent.
+        ends = edges[_padded_rows(np.ascontiguousarray(silhouette.T))]
+        # The projection, in two unit vectors across each axis, so that each
         # rectangle is exactly a rectangle even for an edge along the axis,
         # whose projection points anywhere.
-        plane = _axis_frames(axes[a][None])[0, 1:]
-        flat = points @ plane.T
-        sides = flat[edges[silhouette, 1]] - flat[edges[silhouette, 0]]
-        length = np.sqrt((sides * sides).sum(axis=1))
-        sides = sides[length > 0] / length[length > 0, None]
-        normal_sides = sides[:, ::-1] * np.array([-1.0, 1.0])
-        base = np.ptp(sides @ flat.T, axis=1) * np.ptp(normal_sides @ flat.T, axis=1)
-        best = min(best, float(base.min()) * height[a])
+        flat = points[ends.reshape(len(batch), -1)] @ frames[batch, 1:].transpose(
+            0, 2, 1
+        )
+        sides = flat[:, 1::2] - flat[:, 0::2]
+        length = np.sqrt((sides * sides).sum(axis=2))
+        sides /= np.where(length > 0, length, 1.0)[..., None]
+        both = np.concatenate([sides, sides[..., ::-1] * np.array([-1.0, 1.0])], 1)
+        reach = both @ flat.transpose(0, 2, 1)
+        width = reach.max(axis=2) - reach.min(axis=2)
+        count = sides.shape[1]
+        base = np.where(length > 0, width[:, :count] * width[:, count:], np.inf)
+        return base.min(axis=1) * height[batch]
+
+    return _smallest_over_axes(shadow * height, volumes)
+
+
+def _padded_rows(mask: np.ndarray) -> np.ndarray:
+    """Return the column indices of the True entries of each row of ``mask``.
+
+    As a ``(rows, most per row)`` array, each row padded with its first index;
+    every row needs one True entry.
+    """
+    rows, columns = np.nonzero(mask)
+    counts = np.bincount(rows, minlength=len(mask))
+    starts = np.cumsum(counts) - counts
+    padded = np.repeat(columns[starts][:, None], int(counts.max()), axis=1)
+    padded[rows, np.arange(len(columns)) - starts[rows]] = columns
+    return padded
+
+
+def _axis_chunks(count: int) -> list[np.ndarray]:
+    """Split ``range(count)`` into chunks of at most 256 axes, to bound the memory."""
+    return np.array_split(np.arange(count), -(-count // 256))
+
+
+def _smallest_over_axes(
+    lower: np.ndarray, volumes: Callable[[np.ndarray], np.ndarray]
+) -> float:
+    """Return the smallest of ``volumes(batch)`` over all axes, exactly.
+
+    The axes are tried in batches of 32 in increasing order of ``lower``, a
+    lower bound of each axis's volume, and those whose bound exceeds the
+    smallest volume found are skipped.
+    """
+    order = np.argsort(lower, kind="stable")
+    best = math.inf
+    for start in range(0, len(order), 32):
+        batch = order[start : start + 32]
+        batch = batch[lower[batch] * (1 - _ENCLOSING_SLACK) <= best]
+        if len(batch) == 0:
+            break
+        best = min(best, float(volumes(batch).min()))
     return best
 
 
@@ -1298,29 +1372,21 @@ def _min_cylinder_volume(points: np.ndarray, axes: np.ndarray) -> float:
     radius of their minimum enclosing circle across it. Exact: an axis is
     skipped only when a lower bound of its volume, from the radius of at
     least half the larger width of the projection, exceeds a volume already
-    found, and axes are tried in increasing order of that bound.
+    found (``_smallest_over_axes``).
     """
     frames = _axis_frames(axes)
-
-    def coords(batch: np.ndarray) -> np.ndarray:
-        # (axes, 3, points): each point along and across each axis of batch.
-        return np.einsum("pd,afd->afp", points, frames[batch])
-
-    # In chunks of axes, to bound the memory to 256 times the points.
-    chunks = np.array_split(np.arange(len(axes)), -(-len(axes) // 256))
-    extent = np.concatenate([np.ptp(coords(chunk), axis=2) for chunk in chunks])
+    # (axes, 3, points): each point along and across each axis.
+    extent = np.concatenate(
+        [np.ptp(frames[c] @ points.T, axis=2) for c in _axis_chunks(len(axes))]
+    )
     height = extent[:, 0]
+
+    def volumes(batch: np.ndarray) -> np.ndarray:
+        across = (frames[batch, 1:] @ points.T).transpose(0, 2, 1)
+        return np.pi * _enclosing_radii(across) ** 2 * height[batch]
+
     lower = np.pi * (extent[:, 1:].max(axis=1) / 2) ** 2 * height
-    order = np.argsort(lower, kind="stable")
-    best = math.inf
-    for start in range(0, len(axes), 32):
-        batch = order[start : start + 32]
-        batch = batch[lower[batch] <= best]
-        if len(batch) == 0:
-            break
-        radius = _enclosing_radii(coords(batch)[:, 1:].transpose(0, 2, 1))
-        best = min(best, float((np.pi * radius**2 * height[batch]).min()))
-    return best
+    return _smallest_over_axes(lower, volumes)
 
 
 def _enclosing_radii(points: np.ndarray) -> np.ndarray:
@@ -1465,9 +1531,14 @@ def _edge_curvatures(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
     return edges, lengths * _dihedral_angles(mesh) * signs
 
 
-def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
-    """Return the surface average of the mean curvature, ``1 / R`` on a sphere."""
-    _, terms = _edge_curvatures(mesh)
+def _avg_mean_curvature(
+    mesh: trimesh.Trimesh, edge_curvatures: tuple[Any, Any] | None = None
+) -> float:
+    """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
+
+    ``edge_curvatures`` is ``_edge_curvatures(mesh)`` when already computed.
+    """
+    _, terms = _edge_curvatures(mesh) if edge_curvatures is None else edge_curvatures
     return float(terms.sum()) / (2 * float(mesh.area))
 
 
@@ -1498,7 +1569,7 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
 
 
 def _principal_curvatures(
-    mesh: trimesh.Trimesh,
+    mesh: trimesh.Trimesh, edge_curvatures: tuple[Any, Any] | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return the per-vertex principal curvatures ``k1 <= k2`` and vertex areas.
 
@@ -1519,12 +1590,16 @@ def _principal_curvatures(
     raw voxel meshes measured at five scales from 1e-8 to 1e3 varied by at
     most 2.2e-16, and of 7 more, each also turned three ways, by at most
     6.1e-16; with trimesh's arccos angles, by 0.044 and 0.11.
+
+    ``edge_curvatures`` is ``_edge_curvatures(mesh)`` when already computed.
     """
     area = _mixed_area(mesh)
     defects = mesh.vertex_defects
     defects = np.where(np.abs(defects) <= _FLAT_DEFECT, 0.0, defects)
     gaussian = defects / area
-    edges, terms = _edge_curvatures(mesh)
+    edges, terms = (
+        _edge_curvatures(mesh) if edge_curvatures is None else edge_curvatures
+    )
     edge_sum = ordered_bincount(edges.ravel(), np.repeat(terms, 2), len(mesh.vertices))
     mean = edge_sum / (4 * area)
     spread = np.sqrt(np.maximum(mean**2 - gaussian, 0))

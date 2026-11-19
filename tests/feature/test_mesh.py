@@ -2213,10 +2213,10 @@ def test_principal_curvatures_are_computed_once_per_call(
     principal_curvatures = mesh._principal_curvatures
 
     def counted(
-        surface: trimesh.Trimesh,
+        surface: trimesh.Trimesh, *args: object
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         calls.append(surface)
-        return principal_curvatures(surface)
+        return principal_curvatures(surface, *args)
 
     monkeypatch.setattr(mesh, "_principal_curvatures", counted)
     mask = _ball(8, 22)
@@ -2236,6 +2236,50 @@ def test_principal_curvatures_are_computed_once_per_call(
     del surface
     gc.collect()
     assert reference() is None
+
+
+@pytest.mark.parametrize("smoothed", [False, True], ids=["one mesh", "smooth_mesh"])
+def test_shared_quantities_are_computed_once(
+    monkeypatch: pytest.MonkeyPatch, smoothed: bool
+) -> None:
+    """The oriented box and each mesh's edge terms are computed once per call.
+
+    ``Oriented Bounding Box Volume`` and ``Extent`` share one box, and Avg Mean
+    Curvature and the per-vertex curvatures one ``_edge_curvatures`` of a mesh
+    when they are measured on the same one; with a smooth mesh they are not.
+    The values are those of each feature measured alone.
+    """
+    counts = {"box": 0, "edges": 0}
+    box, edges = mesh._min_box_volume, mesh._edge_curvatures
+
+    def counted_box(hull, axes):
+        counts["box"] += 1
+        return box(hull, axes)
+
+    def counted_edges(surface):
+        counts["edges"] += 1
+        return edges(surface)
+
+    surface = mesh.mask2mesh(_ball(8, 22))
+    smooth = mesh.mask2mesh(_ball(8, 22), sigma=1.0) if smoothed else None
+    names = [
+        "Oriented Bounding Box Volume",
+        "Extent",
+        "Avg Mean Curvature",
+        "Avg Shape Index",
+        "Avg Curvedness",
+    ]
+    alone = {
+        name: mesh.extract_mesh_features(surface, [name], smooth_mesh=smooth)[name]
+        for name in names
+    }
+    monkeypatch.setattr(mesh, "_min_box_volume", counted_box)
+    monkeypatch.setattr(mesh, "_edge_curvatures", counted_edges)
+
+    together = mesh.extract_mesh_features(surface, names, smooth_mesh=smooth)
+
+    assert counts == {"box": 1, "edges": 2 if smoothed else 1}
+    assert together == alone
 
 
 def test_curvature_sigma_is_validated() -> None:
