@@ -136,7 +136,7 @@ def _assert_covariant(device: str, base: str, c: float, explicit: bool) -> None:
     for name, value in actual.items():
         expected = c ** DIMENSIONS[name] * reference[name]
         if base == "unit rounding":
-            rtol = 5e-3 if name == "Bounding Cylinder Volume" else 1e-6
+            rtol = 1e-6
         else:
             rtol = 1e-12 if device == "cpu" else 1e-9
         atol = 0.0
@@ -164,8 +164,7 @@ def test_features_are_covariant_with_the_unit(
 
     The ``unit rounding`` cell is looser: the ratio of its spacings rounds
     differently in the two units, so the internal problem differs by one ulp,
-    which moved Avg Mean Curvature by 1e-8 relative; Bounding Cylinder Volume
-    comes from an approximate search and moved by 4e-4.
+    which moved Avg Mean Curvature by 1e-8 relative.
     """
     _assert_covariant("cpu", base, c, explicit)
 
@@ -419,12 +418,10 @@ _SMALL_MASK = {"shape": (20, 44, 44), "axes": (19, 13, 6), "lobe": (4, 5, -7, 4)
 # Relative tolerance of extract_mesh_features against itself at another unit,
 # set from the largest change measured at factors 1e-9 to 1e3, on an isotropic
 # and the anisotropic base, on either device (in brackets); 1e-13 for every
-# other feature (1.1e-14). The bounding cylinder comes from an approximate
-# search. The mean-curvature sums take arccos of dot products of face normals,
-# which turns the last bit of a dot product of two coplanar faces into an angle
-# of up to 1.5e-8.
+# other feature (1.1e-14). The mean-curvature sums take arccos of dot products
+# of face normals, which turns the last bit of a dot product of two coplanar
+# faces into an angle of up to 1.5e-8.
 _CONVERSION_RTOL = {
-    "Bounding Cylinder Volume": 1e-2,  # 4.3e-3
     "Avg Mean Curvature": 2e-7,  # 6.3e-8
     "Avg Curvedness": 2e-7,  # 9.5e-9
     "Avg Shape Index": 1e-7,  # 5.9e-9, on the blurred mesh
@@ -485,7 +482,6 @@ def test_extract_mesh_features_convert_with_the_unit(
 # for every other feature (6e-15). The pipeline measures in units of the finest
 # spacing, extract_mesh_features in units of the mesh's edges.
 _PIPELINE_RTOL = {
-    "Bounding Cylinder Volume": 1e-2,  # 1.2e-3
     "Avg Mean Curvature": 1e-7,  # 2.1e-8
     "Avg Shape Index": 1e-8,  # 4.9e-10
     "Avg Curvedness": 1e-8,  # 1.2e-10

@@ -106,10 +106,18 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     No default feature is defined on the image axes. The axis lengths are the
     full axes of the ellipsoid with the same inertia, and ``Extent`` is the
     volume over the oriented bounding box volume. Voxelization still moves
-    every feature a little with orientation, and the oriented box and bounding
-    cylinder come from trimesh's approximate minimum searches, so they move
-    more: ``Extent`` spans 0.50-0.55 for one ellipsoid turned by 0, 30 and 45
-    degrees. The mean curvature is averaged over the surface, in inverse units
+    every feature a little with orientation, and the oriented box comes from
+    trimesh's approximate minimum search, so it moves more: ``Extent`` spans
+    0.50-0.55 for one ellipsoid turned by 0, 30 and 45 degrees.
+    ``Bounding Cylinder Volume`` is the smallest volume of the cylinders that
+    enclose the mesh about the normals of its convex hull faces and its three
+    principal axes of inertia, each with the exact minimum enclosing circle
+    across its axis; it turns and scales with the mesh to rounding. It is an
+    upper bound of the minimum enclosing cylinder. It matched a dense search
+    over axes for three boxes and a cylinder mesh, and for 60 nuclei it was
+    as small as the smallest that search found for 52 and at most 2.4% above
+    it for the rest.
+    The mean curvature is averaged over the surface, in inverse units
     of ``spacing``. ``Euler Characteristic`` is twice the number of separate
     pieces plus cavities, minus twice the number of handles: 2 for a ball, 4
     for a hollow ball, 0 for a torus.
@@ -294,8 +302,7 @@ def extract_surface_features(
         in units of ``spacing``, in metres or nanometres alike. Given in
         another unit, they convert with it exactly (to the rounding of the
         conversion) when the ratios of the spacings round alike in both units,
-        and otherwise to about 1e-8 relative; ``Bounding Cylinder Volume``
-        comes from an approximate search and can then move by a few 1e-4.
+        and otherwise to about 1e-8 relative.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()``. Optional
         features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
@@ -946,7 +953,7 @@ def _edge_unit(surface: Any) -> float:
     with the same vertices get the same unit however their faces are listed. A
     unit from the face areas does not: CuPy 14.0.1 computes some face areas an
     ulp away from NumPy, and units an ulp apart move the raw-mesh
-    ``Avg Shape Index`` and ``Bounding Cylinder Volume`` by percents. 1 for a
+    ``Avg Shape Index`` by percents. 1 for a
     mesh without faces or whose box has no finite, positive area, which the
     volume and area check of ``_measure_mesh`` then reports.
     """
@@ -1087,17 +1094,167 @@ def _stacklevel_outside_package() -> int:
 
 
 def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
-    """Return the minimum bounding cylinder volume, 0 for degenerate meshes."""
+    """Return the smallest enclosing cylinder volume about a hull normal or inertia axis.
+
+    The candidate axes are the normals of the faces of the convex hull and the
+    three principal axes of inertia. About each axis the cylinder is exact:
+    its height is the extent of the hull vertices along the axis and its
+    radius that of the minimum enclosing circle of their projection. The
+    volume is the smallest of these, so it turns and scales with the mesh.
+    The hull normals give a box the smallest of the cylinders about its edges
+    and a cylinder mesh itself. An elongated body with rounded or pointed ends
+    can have no hull face normal to its long axis, which the inertia axes
+    supply: from the hull normals alone, an icosphere stretched to a 1:1:3
+    spheroid came out 1.44 times the smallest cylinder a dense search found.
+    Measured on the host from the hull that trimesh caches for
+    ``Convex Hull Volume``; 0, with a warning, for a mesh whose hull cannot be
+    built.
+    """
     try:
-        return mesh.bounding_cylinder.volume
+        hull = mesh.convex_hull
     except (ValueError, QhullError) as e:
-        # Degenerate meshes fail in the convex hull (QhullError) or in the
-        # eigendecomposition of the inertia tensor (LinAlgError, a ValueError).
         warnings.warn(
             f"Unable extract bounding cylinder volume. Returning 0. Exception: {e}",
             stacklevel=_stacklevel_outside_package(),
         )
         return 0.0
+    normals = np.asarray(hull.face_normals, dtype=np.float64)
+    # trimesh gives a face too small for a normal a zero one.
+    normals = normals[(normals * normals).sum(axis=1) > 0.5]
+    # An axis and its reverse give the same cylinder, and the faces of one
+    # flat side of the hull share a normal to rounding: keep one of each.
+    largest = np.abs(normals).argmax(axis=1)
+    normals *= np.sign(normals[np.arange(len(normals)), largest])[:, None]
+    _, first = np.unique(normals.round(9), axis=0, return_index=True)
+    points = np.asarray(hull.vertices, dtype=np.float64)
+    inertia_axes = np.linalg.eigh(np.asarray(mesh.moment_inertia, dtype=np.float64))[1]
+    return _min_cylinder_volume(
+        points, np.vstack([normals[np.sort(first)], inertia_axes.T])
+    )
+
+
+# Relative slack of the enclosing tests, against the rounding of distances, and
+# a bound on the growth steps of a minimum enclosing circle, far above the at
+# most 8 measured for 71,556 hull face normals of 204 meshes.
+_ENCLOSING_SLACK = 1e-12
+_ENCLOSING_STEPS = 1000
+
+
+def _min_cylinder_volume(points: np.ndarray, axes: np.ndarray) -> float:
+    """Return the smallest volume of the cylinders about unit ``axes`` enclosing ``points``.
+
+    Each cylinder spans the extent of the points along its axis and has the
+    radius of their minimum enclosing circle across it. Exact: an axis is
+    skipped only when a lower bound of its volume, from the radius of at
+    least half the larger width of the projection, exceeds a volume already
+    found, and axes are tried in increasing order of that bound.
+    """
+    # Two unit vectors across each axis, from its cross product with the
+    # coordinate axis it is least aligned with.
+    helper = np.eye(3)[np.abs(axes).argmin(axis=1)]
+    across = np.cross(axes, helper)
+    across /= np.sqrt((across * across).sum(axis=1))[:, None]
+    frames = np.stack([axes, across, np.cross(axes, across)], axis=1)
+
+    def coords(batch: np.ndarray) -> np.ndarray:
+        # (axes, 3, points): each point along and across each axis of batch.
+        return np.einsum("pd,afd->afp", points, frames[batch])
+
+    # In chunks of axes, to bound the memory to 256 times the points.
+    chunks = np.array_split(np.arange(len(axes)), -(-len(axes) // 256))
+    extent = np.concatenate([np.ptp(coords(chunk), axis=2) for chunk in chunks])
+    height = extent[:, 0]
+    lower = np.pi * (extent[:, 1:].max(axis=1) / 2) ** 2 * height
+    order = np.argsort(lower, kind="stable")
+    best = math.inf
+    for start in range(0, len(axes), 32):
+        batch = order[start : start + 32]
+        batch = batch[lower[batch] <= best]
+        if len(batch) == 0:
+            break
+        radius = _enclosing_radii(coords(batch)[:, 1:].transpose(0, 2, 1))
+        best = min(best, float((np.pi * radius**2 * height[batch]).min()))
+    return best
+
+
+def _enclosing_radii(points: np.ndarray) -> np.ndarray:
+    """Return the radius of the minimum enclosing circle of each set ``(k, n, 2)``.
+
+    The circle of a support set of at most three points grows by the point
+    farthest outside it: the new support set is the smallest circle through
+    two or three of the four that encloses all four. The radius grows at
+    every step, so no support set returns, and the circle reached encloses
+    every point, which makes it the minimum enclosing circle, unique for any
+    point set. Rounding can end the growth early on nearly cocircular points:
+    the circle through another three of them comes out an ulp smaller while
+    the farthest point is still up to 3e-11 outside. The radius returned is
+    the distance from the last centre to the farthest point, so the circle
+    encloses every point. On the one such set met, the projection of a noise
+    blob along a direction of a dense search, it was 1.2e-11 above the
+    minimum; no hull normal of 204 meshes, each in 15 turns and rescalings,
+    met one.
+    """
+    rows = np.arange(len(points))
+    first = points[rows, ((points - points[:, :1]) ** 2).sum(axis=2).argmax(axis=1)]
+    second = points[rows, ((points - first[:, None]) ** 2).sum(axis=2).argmax(axis=1)]
+    support = np.stack([first, second, second], axis=1)
+    center = (first + second) / 2
+    r2 = ((first - center) ** 2).sum(axis=1)
+    slack = (1 + _ENCLOSING_SLACK) ** 2
+    # Pairs (a third index repeating the second) and triples of the four points.
+    subsets = [(0, 1, 1), (0, 2, 2), (0, 3, 3), (1, 2, 2), (1, 3, 3), (2, 3, 3)]
+    subsets += [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+    growing = np.ones(len(points), dtype=bool)
+    for _ in range(_ENCLOSING_STEPS):
+        d2 = ((points - center[:, None]) ** 2).sum(axis=2)
+        farthest = d2.argmax(axis=1)
+        growing &= d2[rows, farthest] > r2 * slack
+        if not growing.any():
+            return np.sqrt(d2.max(axis=1))
+        four = np.concatenate([support, points[rows, farthest][:, None]], axis=1)
+        new_r2 = np.full_like(r2, np.inf)
+        new_center, new_support = center, support
+        for subset in subsets:
+            trio = four[:, list(subset)]
+            c, ok = _circle_center(trio)
+            c_r2 = ((trio[:, 0] - c) ** 2).sum(axis=1)
+            encloses = (
+                ((four - c[:, None]) ** 2).sum(axis=2) <= c_r2[:, None] * slack
+            ).all(axis=1)
+            take = growing & ok & encloses & (c_r2 < new_r2)
+            new_r2 = np.where(take, c_r2, new_r2)
+            new_center = np.where(take[:, None], c, new_center)
+            new_support = np.where(take[:, None, None], trio, new_support)
+        if not np.isfinite(new_r2[growing]).all():
+            raise RuntimeError(
+                "minimum enclosing circle: no circle encloses four points"
+            )
+        growing &= new_r2 > r2
+        r2 = np.where(growing, new_r2, r2)
+        center = np.where(growing[:, None], new_center, center)
+        support = np.where(growing[:, None, None], new_support, support)
+    raise RuntimeError("minimum enclosing circle did not converge")
+
+
+def _circle_center(trio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the center of the circle through each ``(k, 3, 2)`` trio, and where it exists.
+
+    A trio whose last two points coincide stands for the pair of its first
+    two, whose circle has them as a diameter. Three collinear points have no
+    circle through them.
+    """
+    a, b, c = trio[:, 0], trio[:, 1], trio[:, 2]
+    pair = (b == c).all(axis=1)
+    ab, ac = b - a, c - a
+    det = 2 * (ab[:, 0] * ac[:, 1] - ab[:, 1] * ac[:, 0])
+    ab2, ac2 = (ab * ab).sum(axis=1), (ac * ac).sum(axis=1)
+    ok = pair | (np.abs(det) > _ENCLOSING_SLACK * np.sqrt(ab2 * ac2))
+    det = np.where(pair | ~ok, 1.0, det)
+    offset = np.stack(
+        [ac[:, 1] * ab2 - ab[:, 1] * ac2, ab[:, 0] * ac2 - ac[:, 0] * ab2], axis=1
+    )
+    center = np.where(pair[:, None], (a + b) / 2, a + offset / det[:, None])
+    return center, ok
 
 
 def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:

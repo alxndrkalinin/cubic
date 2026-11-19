@@ -12,7 +12,9 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 from scipy import ndimage
+from scipy.spatial import QhullError
 from skimage.measure import marching_cubes
+from scipy.spatial.transform import Rotation
 
 trimesh = pytest.importorskip("trimesh")
 
@@ -1058,12 +1060,12 @@ def test_warnings_name_the_outermost_frame_when_every_frame_is_cubic() -> None:
 
 
 def _failing_bounding_cylinder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make every trimesh bounding cylinder fail as a degenerate mesh's does."""
+    """Make every trimesh convex hull fail as a degenerate mesh's does."""
 
     def fail(self: trimesh.Trimesh) -> NoReturn:
-        raise ValueError("degenerate")
+        raise QhullError("degenerate")
 
-    monkeypatch.setattr(trimesh.Trimesh, "bounding_cylinder", property(fail))
+    monkeypatch.setattr(trimesh.Trimesh, "convex_hull", property(fail))
 
 
 @pytest.mark.parametrize(
@@ -1098,6 +1100,156 @@ def test_bounding_cylinder_warning_points_at_the_caller(
     matching = [w for w in caught if "bounding cylinder" in str(w.message)]
     assert value == 0.0
     assert [w.filename for w in matching] == [__file__]
+
+
+def _cylinder_volume(surface: Any) -> float:
+    names = ["Bounding Cylinder Volume"]
+    return mesh.extract_mesh_features(surface, names)[names[0]]
+
+
+def _turned(surface: Any, rotation: np.ndarray) -> trimesh.Trimesh:
+    """Return a mesh of ``surface``'s vertices turned by ``rotation``."""
+    vertices = np.asarray(surface.vertices) @ rotation.T
+    return trimesh.Trimesh(vertices, np.asarray(surface.faces), process=False)
+
+
+_TURNS = [np.eye(3), *Rotation.random(5, random_state=1).as_matrix()]
+
+
+@pytest.mark.parametrize(
+    ("shape", "volume"),
+    [
+        # Enclosed best about the longest edge, since 3^2 < 2 * 5.
+        (trimesh.creation.box(extents=(2, 3, 5)), np.pi * (2**2 + 3**2) / 4 * 5),
+        # About the shortest edge, since 3^2 > 1 * 4.
+        (trimesh.creation.box(extents=(1, 3, 4)), np.pi * (3**2 + 4**2) / 4 * 1),
+        (trimesh.creation.box(extents=(1, 1, 1)), np.pi / 2),
+        # Every vertex lies on the circle of radius 1.5.
+        (trimesh.creation.cylinder(radius=1.5, height=4, sections=64), np.pi * 9),
+    ],
+    ids=["box 2x3x5", "box 1x3x4", "cube", "cylinder"],
+)
+def test_bounding_cylinder_of_a_turned_box_and_cylinder(
+    shape: trimesh.Trimesh, volume: float
+) -> None:
+    """A box gives its smallest cylinder about an edge, a cylinder itself, at any turn.
+
+    The inertia of a cube is the same about every axis, so a cylinder about
+    its principal axes would follow the arbitrary eigenvectors: 1.17 to 2.13
+    times the volume at these turns. trimesh's search gave 1.34 times it
+    for the 2 x 3 x 5 box at one of them.
+    """
+    for rotation in _TURNS:
+        assert _cylinder_volume(_turned(shape, rotation)) == pytest.approx(
+            volume, rel=1e-12
+        )
+
+
+def test_bounding_cylinder_of_a_polyhedral_sphere() -> None:
+    """An icosphere's cylinder lies between those of its inner and outer balls.
+
+    A cylinder enclosing the mesh encloses its inscribed ball, so it is at
+    least ``2 pi r_in^3``; the cylinder about any axis of the circumscribed
+    ball, ``2 pi r^3``, encloses the mesh. The value is the same at every turn.
+    """
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=2.0)
+    inner = np.abs((sphere.face_normals * sphere.triangles_center).sum(axis=1)).min()
+    values = [_cylinder_volume(_turned(sphere, rotation)) for rotation in _TURNS]
+    assert 2 * np.pi * inner**3 <= min(values)
+    assert max(values) <= 2 * np.pi * 2.0**3
+    np.testing.assert_allclose(values, values[0], rtol=1e-12)
+
+
+@pytest.mark.parametrize("semi_axes", [(1, 1, 3), (3, 3, 1)], ids=["prolate", "oblate"])
+def test_bounding_cylinder_of_a_polyhedral_spheroid(semi_axes: tuple) -> None:
+    """A spheroid mesh's cylinder is at most the one about its symmetry axis.
+
+    The vertices of an icosphere stretched to the spheroid lie on it, inside
+    the cylinder of radius ``a`` and height ``2 c`` about the symmetry axis. No
+    hull face is normal to the long axis of the prolate one: from the hull
+    normals alone the cylinder came out 1.44 times the smallest found by a
+    dense search over axes.
+    """
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    spheroid = trimesh.Trimesh(
+        np.asarray(sphere.vertices) * np.array(semi_axes, dtype=float),
+        sphere.faces,
+        process=False,
+    )
+    a, _, c = semi_axes
+    values = [_cylinder_volume(_turned(spheroid, rotation)) for rotation in _TURNS]
+    assert spheroid.convex_hull.volume <= min(values)
+    assert max(values) <= 2 * np.pi * a**2 * c * (1 + 1e-12)
+    np.testing.assert_allclose(values, values[0], rtol=1e-12)
+
+
+def test_bounding_cylinder_turns_and_scales_with_the_mesh(
+    noise_blob_of: Callable[[int], np.ndarray],
+) -> None:
+    """The cylinder of a lobed blob is the same, to rounding, turned or rescaled.
+
+    trimesh's minimum search, used before, gave this mesh volumes 43% apart
+    over the same rescalings, and up to 98% apart over turns of noise blobs.
+    The cylinder encloses the convex hull, so it is at least its volume.
+    """
+    surface = mesh.mask2mesh(noise_blob_of(2), spacing=(2.685, 1.0, 1.0))
+    vertices, faces = np.asarray(surface.vertices), np.asarray(surface.faces)
+    reference = _cylinder_volume(surface)
+    assert reference >= surface.convex_hull.volume
+    for factor in (0.95, 1.1, 1.25, 1.4):
+        scaled = trimesh.Trimesh(vertices * factor, faces, process=False)
+        assert _cylinder_volume(scaled) == pytest.approx(
+            factor**3 * reference, rel=1e-12
+        )
+    for rotation in _TURNS[1:]:
+        assert _cylinder_volume(_turned(surface, rotation)) == pytest.approx(
+            reference, rel=1e-12
+        )
+
+
+def _brute_force_radius(points: np.ndarray) -> float:
+    """Smallest circle through two or three of ``points`` enclosing them all."""
+    radii = []
+    n = len(points)
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in [j, *range(j + 1, n)]:
+                trio = points[[i, j, k]][None]
+                center, ok = mesh._circle_center(trio)
+                if not ok[0]:
+                    continue
+                radius = np.sqrt(((points[i] - center[0]) ** 2).sum())
+                if (
+                    np.sqrt(((points - center[0]) ** 2).sum(axis=1))
+                    <= radius * (1 + 1e-9)
+                ).all():
+                    radii.append(radius)
+    return min(radii)
+
+
+def test_minimum_enclosing_circle_matches_brute_force() -> None:
+    """The growing circle reaches the smallest of all circles through 2 or 3 points.
+
+    Rounded and repeated points give the ties of voxel coordinates: collinear
+    trios, cocircular quads and coincident points. Sets of several sizes go
+    through one call, as the axes of a mesh do.
+    """
+    rng = np.random.default_rng(0)
+    for trial in range(60):
+        points = rng.normal(size=(2, 11, 2)) * rng.uniform(0.1, 10, size=2)
+        if trial % 3 == 0:
+            points = np.round(points)
+        if trial % 5 == 0:
+            points = np.concatenate([points, points[:, ::-1]], axis=1)
+        radii = mesh._enclosing_radii(points)
+        expected = [_brute_force_radius(p) for p in points]
+        np.testing.assert_allclose(radii, expected, rtol=1e-12)
+    # A point 1e-4 outside the circle on the farthest pair: the circle through
+    # all three has radius sqrt(1 + k^2), k = (h^2 - 1) / (2 h), not h.
+    height = 1 + 1e-4
+    trio = np.array([[[-1.0, 0.0], [1.0, 0.0], [0.0, height]]])
+    k = (height**2 - 1) / (2 * height)
+    assert mesh._enclosing_radii(trio)[0] == pytest.approx(np.hypot(1, k), rel=1e-14)
 
 
 def test_thin_object_warning_is_shown_once_for_a_label_image() -> None:

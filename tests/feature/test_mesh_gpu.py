@@ -679,8 +679,8 @@ def test_gpu_edge_unit_matches_numpy(
     ``extract_mesh_features`` measures scaled copies of the meshes at the unit
     ``_edge_unit`` returns. Units an ulp apart move the coplanar dihedral
     angles of the copies between 0 and 1.5e-8 rad, and with them the raw
-    ``Avg Shape Index`` and ``Bounding Cylinder Volume`` by up to 11% and 8.7%
-    over 40 such masks at three spacings. The CuPy meshes have bitwise the same vertices and
+    ``Avg Shape Index`` by up to 11% over 40 such masks at three spacings.
+    The CuPy meshes have bitwise the same vertices and
     triangles as the NumPy ones; seed 2's is also given with each face rotated
     to start at its next vertex. The test asserts that some face areas differ
     between the devices, as CuPy 14.0.1 computes them for seeds 5, 7 and 11
@@ -711,6 +711,30 @@ def test_gpu_edge_unit_matches_numpy(
     assert differing > 0
 
 
+def test_gpu_bounding_cylinder_matches_numpy(
+    noise_blob_of: Callable[[int], np.ndarray], gpu_available: bool
+) -> None:
+    """The bounding cylinder of a CuPy mesh is that of the NumPy mesh, to rounding.
+
+    Both are measured on the host, from trimesh's convex hull of bitwise the
+    same vertices and the inertia tensor. The hull of a CuPy mesh can list or
+    triangulate its faces otherwise, and its inertia tensor is summed on the
+    device; together they moved the volume by at most 9.8e-16 relative over
+    144 masks under CuPy 14.0.1 and 14.2.0, and left 128 of them bitwise
+    equal, but not these two (5.1e-16 and 4.4e-16 apart under 14.0.1).
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    names = ["Bounding Cylinder Volume"]
+    for seed, spacing in [(3, (0.29, 0.108, 0.108)), (23, (1.0, 1.0, 1.0))]:
+        mask = noise_blob_of(seed)
+        cpu = mesh.extract_mesh_features(mesh.mask2mesh(mask, spacing=spacing), names)
+        gpu = mesh.extract_mesh_features(
+            mesh.mask2mesh(ascupy(mask), spacing=spacing), names
+        )
+        assert gpu[names[0]] == pytest.approx(cpu[names[0]], rel=1e-14), seed
+
+
 @pytest.mark.parametrize("smoothed", [False, True], ids=["raw", "smooth_mesh"])
 def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
     noise_blob_of: Callable[[int], np.ndarray], smoothed: bool, gpu_available: bool
@@ -718,8 +742,9 @@ def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
     """Every mesh feature agrees between NumPy and CuPy for a lobed anisotropic mask.
 
     The mesh of this mask (seed 7, spacing (2.685, 1, 1)) is one where a unit
-    an ulp apart moves ``Bounding Cylinder Volume`` by 8.7% between the
-    devices. Under CuPy 14.0.1 its face areas differ from NumPy's at 2873 of
+    an ulp apart moved trimesh's bounding cylinder search, which
+    ``Bounding Cylinder Volume`` used before, by 8.7% between the devices.
+    Under CuPy 14.0.1 its face areas differ from NumPy's at 2873 of
     16568 faces, and a unit computed from them differs by an ulp; under CuPy
     14.2.0 they are equal, and this test passes with either unit, which
     ``test_gpu_edge_unit_matches_numpy`` covers instead.
