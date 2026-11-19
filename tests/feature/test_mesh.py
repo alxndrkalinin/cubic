@@ -1571,7 +1571,10 @@ def test_box_calipers_match_a_search_of_every_end(
     The hulls have flat sides along the axes (voxel meshes and a cube, whose
     faces across an axis count on both sides), repeated and collinear points
     (rounded points), and edges along an axis, whose projection is a point.
+    Each axis is checked alone, and the calipers are also run on all the axes
+    at once, in batches of several, which must give the smallest of them.
     """
+    calipers = mesh._projection_support
     rng = np.random.default_rng(3)
     voxel = mesh.mask2mesh(lumpy_nucleus_of(5), spacing=(2.685, 1.0, 1.0))
     hulls = [
@@ -1594,6 +1597,9 @@ def test_box_calipers_match_a_search_of_every_end(
             volumes = [mesh._min_box_volume(hull, axes[[i]]) for i in range(len(axes))]
             searched.append(np.array(volumes))
         np.testing.assert_allclose(searched[0], searched[1], rtol=1e-13, atol=0)
+        monkeypatch.setattr(mesh, "_projection_support", calipers)
+        batched = mesh._min_box_volume(hull, axes)
+        np.testing.assert_allclose(batched, searched[1].min(), rtol=1e-13, atol=0)
 
 
 @pytest.mark.parametrize(
