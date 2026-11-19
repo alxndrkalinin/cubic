@@ -273,3 +273,26 @@ def test_ordered_bincount_adds_in_input_order(
     )
     assert get_device(empty) == device
     np.testing.assert_array_equal(asnumpy(empty), np.zeros(5))
+
+
+def test_ordered_bincount_runs_on_the_input_device(gpu_available: bool) -> None:
+    """Weights on GPU 1 are added on GPU 1 while GPU 0 is current."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    cp = CUDAManager().get_cp()
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, 50, 2_000)
+    weights = rng.standard_normal(2_000)
+    with cp.cuda.Device(1):
+        ids_1, weights_1 = cp.asarray(ids), cp.asarray(weights)
+
+    with cp.cuda.Device(0):
+        got = ordered_bincount(ids_1, weights_1, 60)
+        empty = ordered_bincount(ids_1[:0], weights_1[:0], 5)
+
+    assert got.device.id == 1 and empty.device.id == 1
+    np.testing.assert_array_equal(
+        asnumpy(got), np.bincount(ids, weights=weights, minlength=60)
+    )

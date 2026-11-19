@@ -288,18 +288,20 @@ def ordered_bincount(ids: Any, weights: Any, minlength: int) -> Any:
         return np.bincount(ids, weights=weights, minlength=minlength)
     xp = get_array_module(ids)
     n = len(ids)
-    if n == 0:  # CuPy 14.0.1's bincount raises on an empty array
-        return xp.zeros(minlength, dtype=np.float64)
-    # The position breaks ties, so the order within a bin is the input order
-    # whether or not the sort is stable.
-    order = np.argsort(
-        ids.astype(np.int64, copy=False) * n + xp.arange(n, dtype=np.int64)
-    )
-    values = xp.ascontiguousarray(weights.astype(np.float64, copy=False)[order])
-    counts = np.bincount(ids, minlength=minlength).astype(np.int64, copy=False)
-    starts = np.cumsum(counts) - counts
-    out = xp.empty(len(counts), dtype=np.float64)
+    # Every temporary and the launch on the input's device, which need not be
+    # the current one.
     with ids.device:
+        if n == 0:  # CuPy 14.0.1's bincount raises on an empty array
+            return xp.zeros(minlength, dtype=np.float64)
+        # The position breaks ties, so the order within a bin is the input
+        # order whether or not the sort is stable.
+        order = np.argsort(
+            ids.astype(np.int64, copy=False) * n + xp.arange(n, dtype=np.int64)
+        )
+        values = xp.ascontiguousarray(weights.astype(np.float64, copy=False)[order])
+        counts = np.bincount(ids, minlength=minlength).astype(np.int64, copy=False)
+        starts = np.cumsum(counts) - counts
+        out = xp.empty(len(counts), dtype=np.float64)
         (kernel,) = _cuda_functions(
             _ORDERED_BINCOUNT_CUDA, ("ordered_bincount",), ids.device.id
         )
