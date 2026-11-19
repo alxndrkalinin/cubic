@@ -45,21 +45,24 @@ def ragged_ball_of() -> Callable[[float], np.ndarray]:
     return _ragged_ball
 
 
-@pytest.fixture
-def noise_blob() -> np.ndarray:
+def _noise_blob(seed: int) -> np.ndarray:
     """Return a lobed mask: blurred noise cut at its top 30%, as one thick piece.
 
-    32^3 normal noise (seed 8) blurred at sigma 4, thresholded at its 70th
-    percentile, the largest 26-connected piece cropped to its bounding box:
-    about 8800 voxels and 4400 mesh vertices, thick enough to survive the
-    default curvature blur at the spacing (0.29, 0.108, 0.108). At that spacing
-    the sum of its face areas differs by an ulp between NumPy and CuPy.
+    32^3 normal noise from ``default_rng(seed)`` blurred at sigma 3,
+    thresholded at its 70th percentile, the largest 26-connected piece cropped
+    to its bounding box.
     """
     noise = ndimage.gaussian_filter(
-        np.random.default_rng(8).normal(size=(32, 32, 32)), 4.0
+        np.random.default_rng(seed).normal(size=(32, 32, 32)), 3.0
     )
     blob = _largest_piece(noise > np.quantile(noise, 0.7))
     return blob[ndimage.find_objects(blob.astype(int))[0]]
+
+
+@pytest.fixture
+def noise_blob_of() -> Callable[[int], np.ndarray]:
+    """Return ``_noise_blob``: a lobed mask cut from blurred noise of a given seed."""
+    return _noise_blob
 
 
 @pytest.fixture

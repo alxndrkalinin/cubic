@@ -397,24 +397,30 @@ def test_extract_mesh_features_rejects_an_inside_out_mesh() -> None:
         mesh.extract_mesh_features(inside_out)
 
 
-def test_edge_unit_does_not_depend_on_the_order_of_the_faces(
-    noise_blob: np.ndarray,
+def test_edge_unit_does_not_depend_on_how_the_mesh_is_listed(
+    noise_blob_of: Callable[[int], np.ndarray],
 ) -> None:
-    """A mesh is measured at the same unit whatever order its faces are listed in.
+    """A mesh is measured at the same unit however its vertices and faces are listed.
 
-    A NumPy mesh and a CuPy mesh of one mask list the same faces in different
-    orders, and a floating-point sum of the same areas in two orders can differ
-    by an ulp, which the test asserts for this mesh and permutation. The unit,
-    the square root of the mean face area, must still be bitwise equal.
+    The vertices are permuted, the faces permuted, and each face rotated to
+    start at its next vertex, which keeps its orientation. The rotation changes
+    the operand order of the cross product, so some face areas change by an
+    ulp, which the test asserts; for this mesh the square root of the exactly
+    summed mean face area then changes too. The unit must be bitwise equal.
     """
-    surface = mesh.mask2mesh(noise_blob, spacing=(0.29, 0.108, 0.108))
-    order = np.random.default_rng(0).permutation(len(surface.faces))
-    shuffled = trimesh.Trimesh(surface.vertices, surface.faces[order], process=False)
-    areas = face_areas(surface.vertices, surface.faces)
-    reordered = face_areas(shuffled.vertices, shuffled.faces)
+    surface = mesh.mask2mesh(noise_blob_of(2), spacing=(0.29, 0.108, 0.108))
+    vertices, faces = np.asarray(surface.vertices), np.asarray(surface.faces)
+    perm = np.random.default_rng(0).permutation(len(vertices))
+    new_index = np.empty_like(perm)
+    new_index[perm] = np.arange(len(perm))
+    order = np.random.default_rng(1).permutation(len(faces))
+    rotated = np.roll(new_index[faces], -1, axis=1)
+    relisted = trimesh.Trimesh(vertices[perm], rotated[order], process=False)
+    areas = face_areas(vertices, faces)
+    relisted_areas = face_areas(vertices[perm], rotated)  # in the order of ``faces``
 
-    assert float(areas.sum()) != float(reordered.sum())
-    assert mesh._edge_unit(shuffled) == mesh._edge_unit(surface)
+    assert (relisted_areas != areas).any()
+    assert mesh._edge_unit(relisted) == mesh._edge_unit(surface)
 
 
 def test_extract_features_border_label_geometry() -> None:
@@ -652,24 +658,37 @@ def test_shape_index_tells_a_torus_from_a_ball() -> None:
     assert torus < ball - 0.2
 
 
-def test_flat_residues_leave_real_curvature_as_it_is(monkeypatch) -> None:
-    """On a blurred flat ellipsoid no real angle defect or edge sum is set to 0.
+def test_flat_residues_leave_real_curvature_as_it_is() -> None:
+    """On a blurred flat ellipsoid only rounding residues are set to 0.
 
     The terraces that the blur leaves on its shallow slopes have angle defects
-    down to 4.6e-13 radians and edge sums down to 1.3e-13 of their terms, above
-    the residue threshold, so the curvature features are the same with the
-    threshold at 0. A threshold of 1e-12 moves Avg Shape Index by 7e-5.
+    down to 4.5e-13 radians and edge sums down to 1.3e-13 of their terms, and
+    no angle defect lies between 1e-14 and 1e-13. What the threshold
+    sets to 0 on the copy that ``extract_mesh_features`` measures are residues
+    of at most four ulps: at the unit of ``_edge_unit``, 260 angle defects of
+    8.9e-16 (one ulp of 2 pi), which moves Avg Shape Index by 3.6e-9.
     """
     z, y, x = _centred_grid(20, 132, 132)
     flat = (z / 6) ** 2 + (y / 60) ** 2 + (x / 60) ** 2 <= 1
     smooth = mesh.mask2mesh(flat, sigma=2.0)
-    names = ["Avg Shape Index", "Avg Curvedness"]
+    measured = mesh._scaled_copy(smooth, 1 / mesh._edge_unit(smooth))
+    defects = np.abs(measured.vertex_defects)
+    edges = measured.face_adjacency_edges
+    lengths = np.linalg.norm(
+        measured.vertices[edges[:, 1]] - measured.vertices[edges[:, 0]], axis=1
+    )
+    terms = np.repeat(lengths * measured.face_adjacency_angles, 2)
+    terms *= np.repeat(np.where(measured.face_adjacency_convex, 1.0, -1.0), 2)
+    n = len(measured.vertices)
+    edge_sum = np.abs(np.bincount(edges.ravel(), weights=terms, minlength=n))
+    term_sum = np.bincount(edges.ravel(), weights=np.abs(terms), minlength=n)
+    ratio = edge_sum / np.where(term_sum > 0, term_sum, np.inf)
 
-    snapped = mesh.extract_mesh_features(smooth, names)
-    monkeypatch.setattr(mesh, "_FLAT_RESIDUE", 0.0)
-    exact = mesh.extract_mesh_features(smooth, names)
-
-    assert snapped == exact
+    zeroed_defects = defects[(defects > 0) & (defects <= mesh._FLAT_RESIDUE)]
+    zeroed_ratios = ratio[(edge_sum > 0) & (edge_sum <= mesh._FLAT_RESIDUE * term_sum)]
+    assert (zeroed_defects <= 4 * np.spacing(2 * np.pi)).all(), zeroed_defects.max()
+    assert (zeroed_ratios <= 4 * np.finfo(float).eps).all(), zeroed_ratios.max()
+    assert not ((defects > 1e-14) & (defects <= 1e-13)).any()
 
 
 @pytest.mark.parametrize("rot_deg", [30, 45])

@@ -451,8 +451,8 @@ def test_extract_mesh_features_convert_with_the_unit(
 ) -> None:
     """At spacing ``c * base``, each feature is ``c ** dimension`` times its value.
 
-    The features are measured on a copy of the mesh scaled to the square root
-    of its mean face area, so trimesh's absolute tolerances see the same
+    The features are measured on a copy of the mesh scaled to its edge unit
+    (``_edge_unit``), so trimesh's absolute tolerances see the same
     problem at every factor. Unscaled, Avg Mean Curvature came out 32 times
     too high at 1e-7. ``smooth`` passes ``mask2mesh(..., sigma=...)`` for the
     curvature-distribution features. Avg Shape Index on a raw voxel mesh is

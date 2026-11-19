@@ -390,11 +390,13 @@ _SHARED_EDGE_REQUEST = [
 ]
 # Vary between GPU runs of the same code by about 1e-13 (atomic sums).
 _GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
-# On the raw mesh, without smooth_mesh. Avg Shape Index agrees across devices
-# there because _principal_curvatures sets an angle defect of at most
-# _FLAT_RESIDUE radians to 0 and both devices measure at the same unit
-# (_edge_unit sums the face areas exactly, on the host); without the first,
-# CuPy and the CPU differ by 2.9% on the 10% ragged ball.
+# On the raw mesh, without smooth_mesh. With _principal_curvatures' flat-residue
+# tests and both devices measuring at one unit (_edge_unit), Avg Shape Index of
+# the 2%, 10% and 30% ragged balls differed between CuPy and NumPy by at most
+# 5.6e-17 at spacing None and (0.29, 0.108, 0.108), one CuPy run each with
+# CuPy 14.0.1 and with 14.2.0; with _FLAT_RESIDUE at 0, by up to 2.9e-3 (the
+# 2% ball at spacing None, 14.2.0), and by up to 8.9% relative (the 30% ball at
+# (0.29, 0.108, 0.108), 14.0.1).
 _RAW_CURVATURE = [
     "Total Absolute Gaussian Curvature",
     "Avg Curvedness",
@@ -641,7 +643,7 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
     differed by about 1e-3 between the devices, then agrees to 1e-12. This ball
     is at the default spacing; the same agreement at an anisotropic spacing
     needs both devices to measure at one unit, which
-    ``test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing`` covers.
+    ``test_gpu_edge_unit_matches_numpy`` covers.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
@@ -655,24 +657,78 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
     assert abs(on_gpu - on_cpu) <= 1e-12
 
 
-@pytest.mark.parametrize("smoothed", [False, True], ids=["raw", "smooth_mesh"])
-def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
-    noise_blob: np.ndarray, smoothed: bool, gpu_available: bool
+def _areas_by_face(vertices, faces) -> tuple[np.ndarray, np.ndarray]:
+    """Faces as sorted rows of sorted vertex ranks, and their areas in that order.
+
+    The areas are computed on the device of the arrays. Two meshes with the
+    same vertices and triangles give the same rows, whatever order and rotation
+    their faces are listed in, so their areas compare face by face.
+    """
+    host_vertices, host_faces = asnumpy(vertices), asnumpy(faces)
+    rank = np.unique(host_vertices, axis=0, return_inverse=True)[1].reshape(-1)
+    rows = np.sort(rank[host_faces], axis=1)
+    order = np.lexsort(rows.T[::-1])
+    return rows[order], asnumpy(face_areas(vertices, faces))[order]
+
+
+def test_gpu_edge_unit_matches_numpy(
+    noise_blob_of: Callable[[int], np.ndarray], gpu_available: bool
 ) -> None:
-    """Every mesh feature agrees between NumPy and CuPy for a lobed anisotropic mask.
+    """A NumPy and a CuPy mesh of one mask are measured at bitwise the same unit.
 
     ``extract_mesh_features`` measures scaled copies of the meshes at the unit
-    ``_edge_unit`` returns, the square root of the mean face area. Units an ulp
-    apart move the coplanar dihedral angles of the copies between 0 and 1.5e-8
-    rad, and with them ``Avg Shape Index`` and ``Bounding Cylinder Volume``.
-    The face areas of this mask sum to a different float under ``cupy.sum``
-    than under NumPy, which the test asserts: with equal sums the devices share
-    a unit and the test passes whether or not ``_edge_unit`` sums on the host.
+    ``_edge_unit`` returns. Units an ulp apart move the coplanar dihedral
+    angles of the copies between 0 and 1.5e-8 rad, and with them the raw
+    ``Avg Shape Index`` and ``Bounding Cylinder Volume`` by up to 11% and 8.7%
+    over 40 such masks at three spacings. The CuPy meshes have bitwise the same vertices and
+    triangles as the NumPy ones; seed 2's is also given with each face rotated
+    to start at its next vertex. The test asserts that some face areas differ
+    between the devices, as CuPy 14.0.1 computes them for seeds 5, 7 and 11
+    and the rotation does on any version, so that a unit computed from the
+    face areas would fail it.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-    spacing = (0.29, 0.108, 0.108)
+    cases = [
+        (2, (0.29, 0.108, 0.108), True),
+        (5, (0.29, 0.108, 0.108), False),
+        (7, (2.685, 1.0, 1.0), False),
+        (11, (0.29, 0.108, 0.108), False),
+    ]
+    differing = 0
+    for seed, spacing, rotate in cases:
+        mask = noise_blob_of(seed)
+        cpu = mesh.mask2mesh(mask, spacing=spacing)
+        gpu = mesh.mask2mesh(ascupy(mask), spacing=spacing)
+        if rotate:
+            gpu = ArrayMesh(gpu.vertices, np.roll(gpu.faces, -1, axis=1), merge=False)
+        cpu_rows, cpu_areas = _areas_by_face(cpu.vertices, cpu.faces)
+        gpu_rows, gpu_areas = _areas_by_face(gpu.vertices, gpu.faces)
+        np.testing.assert_array_equal(gpu_rows, cpu_rows)
+        differing += int((gpu_areas != cpu_areas).sum())
+
+        assert mesh._edge_unit(gpu) == mesh._edge_unit(cpu), (seed, spacing)
+    assert differing > 0
+
+
+@pytest.mark.parametrize("smoothed", [False, True], ids=["raw", "smooth_mesh"])
+def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
+    noise_blob_of: Callable[[int], np.ndarray], smoothed: bool, gpu_available: bool
+) -> None:
+    """Every mesh feature agrees between NumPy and CuPy for a lobed anisotropic mask.
+
+    The mesh of this mask (seed 7, spacing (2.685, 1, 1)) is one where a unit
+    an ulp apart moves ``Bounding Cylinder Volume`` by 8.7% between the
+    devices. Under CuPy 14.0.1 its face areas differ from NumPy's at 2873 of
+    16568 faces, and a unit computed from them differs by an ulp; under CuPy
+    14.2.0 they are equal, and this test passes with either unit, which
+    ``test_gpu_edge_unit_matches_numpy`` covers instead.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    spacing = (2.685, 1.0, 1.0)
     sigma = mesh._curvature_sigma(spacing, None)
+    mask = noise_blob_of(7)
 
     def features(mask: np.ndarray) -> dict[str, float]:
         raw = mesh.mask2mesh(mask, spacing=spacing)
@@ -681,12 +737,8 @@ def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
         )
         return mesh.extract_mesh_features(raw, smooth_mesh=smooth)
 
-    gpu_mesh = mesh.mask2mesh(ascupy(noise_blob), spacing=spacing)
-    areas = face_areas(gpu_mesh.vertices, gpu_mesh.faces)
-    assert float(areas.sum()) != float(asnumpy(areas).sum())
-
-    on_cpu = features(noise_blob)
-    on_gpu = features(ascupy(noise_blob))
+    on_cpu = features(mask)
+    on_gpu = features(ascupy(mask))
 
     assert on_gpu.keys() == on_cpu.keys()
     for name, value in on_gpu.items():

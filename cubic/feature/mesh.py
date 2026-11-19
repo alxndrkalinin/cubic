@@ -934,24 +934,38 @@ def extract_mesh_features(
 
 
 def _edge_unit(surface: Any) -> float:
-    """Return the square root of the mean face area of ``surface``.
+    """Return a length of the order of the edges of ``surface``.
 
-    A length of the order of its edges, whatever the size of the object. The
-    face areas are computed from the vertices and faces on their device and
-    summed on the host with ``math.fsum``, which is exact, so the sum does not
-    depend on the order of the faces or on the device. A floating-point sum
-    does: NumPy's and CuPy's sums of the same areas, or one sum of two
-    orderings of the faces (a NumPy and a CuPy mesh list the same faces in
-    different orders), can land an ulp apart, and the two copies would then be
-    measured at units an ulp apart. 1 for a mesh without faces or without a
-    finite, positive area, which the volume and area check of
-    ``_measure_mesh`` then reports.
+    The square root of the area of the axis-aligned bounding box of the
+    vertices of its faces per face: it scales with the unit of the vertices,
+    and on 144 voxel meshes it was 0.95 to 1.4 times the square root of the
+    mean face area.
+
+    It uses only the per-axis extremes of those vertices, which are exact on
+    any device and in any order, and the face count, so a NumPy and a CuPy mesh
+    with the same vertices get the same unit however their faces are listed. A
+    unit from the face areas does not: CuPy 14.0.1 computes some face areas an
+    ulp away from NumPy, and units an ulp apart move the raw-mesh
+    ``Avg Shape Index`` and ``Bounding Cylinder Volume`` by percents. 1 for a
+    mesh without faces or whose box has no finite, positive area, which the
+    volume and area check of ``_measure_mesh`` then reports.
     """
     faces = surface.faces
-    area = math.fsum(asnumpy(face_areas(surface.vertices, faces)).tolist())
-    if not np.isfinite(area) or area <= 0:
+    if len(faces) == 0:
         return 1.0
-    return float(np.sqrt(area / len(faces)))
+    vertices = surface.vertices
+    used = np.zeros_like(vertices[:, 0], dtype=bool)
+    used[faces.ravel()] = True
+    corners = vertices[used]
+    # One axis at a time: NumPy reduces a (V, 3) array along axis 0 ten times
+    # slower than its columns.
+    a, b, c = (
+        float(corners[:, i].max()) - float(corners[:, i].min()) for i in range(3)
+    )
+    area = 2 * (a * b + b * c + c * a)
+    if not math.isfinite(area) or area <= 0:
+        return 1.0
+    return math.sqrt(area / len(faces))
 
 
 def _measure_mesh(
@@ -1140,10 +1154,10 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
 # Threshold of the two tests in ``_principal_curvatures`` that set the rounding
 # residues of flat vertices to 0: an angle defect of at most this many radians,
 # and an edge sum of at most this fraction of the sum of the absolute values of
-# its terms. The angle-defect test is what makes the Avg Shape Index of a raw
-# voxel mesh agree between NumPy and CuPy, given a common measuring unit
-# (``_edge_unit``). The edge-sum test only catches sums whose terms cancel; at a
-# flat vertex of a raw voxel mesh they do not.
+# its terms. With both tests the Avg Shape Index of a raw voxel mesh differed
+# between NumPy and CuPy by at most 1.1e-16 on 128 meshes; with this threshold
+# at 0, by up to 1.0e-2. The edge-sum test only catches sums whose terms
+# cancel; at a flat vertex of a raw voxel mesh they do not.
 _FLAT_RESIDUE = 1e-14
 
 
@@ -1160,23 +1174,22 @@ def _principal_curvatures(
     At a flat vertex both sums should be 0 and are rounding residues, and the
     shape index there would be the arctangent of two residues, which differ
     between NumPy and CuPy. Two tests set them to 0. The angle defect is set to
-    0 where its absolute value is at most ``_FLAT_RESIDUE`` radians; with that,
-    and both devices measuring the mesh at the same unit (``_edge_unit``), the
-    ``Avg Shape Index`` of a raw voxel mesh differs between NumPy and CuPy by
-    less than 1e-15 (a ball, a ragged ball and a noise blob, at spacing
-    ``None`` and ``(0.29, 0.108, 0.108)``). The edge sum is set to 0 where its absolute
-    value is at most ``_FLAT_RESIDUE`` times the sum of the absolute values of
-    its terms; this catches only sums whose terms cancel, and on the blurred
-    mesh of a real nucleus it fires at 0 to 27 vertices.
+    0 where its absolute value is at most ``_FLAT_RESIDUE`` radians. The edge
+    sum is set to 0 where its absolute value is at most ``_FLAT_RESIDUE`` times
+    the sum of the absolute values of its terms; this catches only sums whose
+    terms cancel. How many residues either test meets depends on the measuring
+    unit. With both tests, and both devices' meshes measured at one unit
+    (``_edge_unit``), the ``Avg Shape Index`` of a raw voxel mesh agrees between
+    NumPy and CuPy to rounding.
 
     At a flat vertex of a raw voxel mesh the terms do not cancel. The dihedral
     angle of two coplanar faces is an arccos of a dot product within four ulps
     of 1, which reads 1.5e-8 to 3e-8 rad, and these edges are all convex, so
     the vertex keeps a mean curvature of that size and a shape index of 0.5.
     The ``Avg Shape Index`` of a raw voxel mesh therefore still depends on the
-    scale at which the mesh is measured, and two devices that measure at units
-    an ulp apart differ in it. On the blurred meshes of 240 real nuclei the two
-    tests move it by at most 1.1e-6.
+    scale at which the mesh is measured: on 144 voxel meshes, a unit 0.95 to
+    1.4 times another moved it by up to 57%. On the blurred meshes of 240 real
+    nuclei the two tests moved it by at most 1.1e-6.
     """
     area = _mixed_area(mesh)
     defects = mesh.vertex_defects
