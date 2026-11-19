@@ -18,7 +18,6 @@ trimesh = pytest.importorskip("trimesh")
 
 import cubic.feature  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
-from cubic.image_utils import gaussian_filter_like_scipy  # noqa: E402
 
 _CUBE_SIDE = 5
 _SPACING_ERROR = r"spacing must be three finite, positive numbers \(z, y, x\); got "
@@ -1598,7 +1597,8 @@ def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
 def test_a_blur_that_provably_vanishes_does_not_run(monkeypatch) -> None:
     """A blur 1000 times the spacing gives the outcome of a vanished mask unblurred.
 
-    Its wide padding alone would be a 3 TB array; the bound shows the blur
+    Its wide padding alone would be a 6.3 TB array (6026 x 16136 x 16136
+    float32 voxels); the bound shows the blur
     stays below 0.5, so the curvature features and Fractal Dimension are NaN
     with the usual warning and ``mask2mesh`` raises, without blurring.
     """
@@ -1640,16 +1640,6 @@ def test_a_fractal_window_far_wider_than_the_object(keyword: str, name: str) -> 
     assert np.isnan(features[name])
 
 
-def _real_blur(mask: np.ndarray, sigma_voxels: np.ndarray, tight: bool) -> np.ndarray:
-    """Blur ``mask`` as ``_padded_blur`` does, without its guard."""
-    if tight:
-        pad, mode = np.ones(mask.ndim, dtype=int), "constant"
-    else:
-        pad, mode = np.ceil(3 * sigma_voxels).astype(int) + 1, "reflect"
-    padded = np.pad(mask.astype(np.float32), [(p, p) for p in pad])
-    return gaussian_filter_like_scipy(padded, sigma_voxels, mode)
-
-
 def _sigma_with_bound(mask: np.ndarray, step: np.ndarray, target: float) -> float:
     """Return the blur scale at which ``_blur_bound`` of ``mask`` is ``target``."""
     low, high = 1e-3, 1e3
@@ -1668,36 +1658,40 @@ def _sigma_with_bound(mask: np.ndarray, step: np.ndarray, target: float) -> floa
     [(1.0, 1.0, 1.0), (2.685, 1.0, 1.0), (0.29, 0.108, 0.108), (1.0, 1.0), (1.0, 0.4)],
     ids=str,
 )
-def test_the_blur_guard_fires_only_on_masks_that_vanish(step, tight: bool) -> None:
+def test_the_blur_guard_fires_only_on_masks_that_vanish(
+    step, tight: bool, monkeypatch
+) -> None:
     """Where the bound is just under the guard's threshold, the real blur is below 0.5.
 
-    Seeded random masks of 1 to 64 voxels, with the blur scale chosen so that
-    the bound is 0.9 to 1 times the threshold. For one or two voxels the bound
-    is nearly the real maximum, so the largest real maximum comes close to
-    the threshold: a bound that is too small is caught.
+    One voxel, two voxels along each axis, then seeded random masks of up to
+    64 voxels, with the blur scale chosen so that the bound is 0.9 to 1 times
+    the threshold; the guard is off, so ``_padded_blur`` runs the blur. For
+    one or two voxels the bound is nearly the real maximum, so the largest
+    real maximum comes close to the threshold: a bound that is too small is
+    caught.
     """
     step = np.asarray(step)
     rng = np.random.default_rng(0)
     threshold = mesh._VANISHING_BOUND
-    largest = 0.0
-    for case in range(30):
-        shape = [int(n) for n in rng.integers(1, 5, size=step.size)]
-        if case < 3:  # one voxel, then two along each axis
-            shape = [1] * step.size
-        elif case < 3 + step.size:
-            shape = [1] * step.size
-            shape[case - 3] = 2
-        mask = rng.random(shape) < rng.uniform(0.2, 1.0)
-        if case < 3 + step.size:
-            mask[...] = True
+    monkeypatch.setattr(mesh, "_VANISHING_BOUND", 0.0)
+    ndim = step.size
+    fixed = [(1,) * ndim] + [
+        tuple(2 if a == axis else 1 for a in range(ndim)) for axis in range(ndim)
+    ]
+    masks = [np.ones(shape, dtype=bool) for shape in fixed]
+    for _ in range(30 - len(masks)):
+        mask = rng.random(rng.integers(1, 5, size=ndim)) < rng.uniform(0.2, 1.0)
         mask.flat[0] = True
+        masks.append(mask)
+    largest = 0.0
+    for case, mask in enumerate(masks):
         sigma = _sigma_with_bound(mask, step, rng.uniform(0.9, 1.0) * threshold)
         bound = mesh._blur_bound(mask, sigma / step)
         assert 0.9 * threshold <= bound < threshold, (case, bound)
 
-        real = float(_real_blur(mask, sigma / step, tight).max())
+        real = float(mesh._padded_blur(mask, step, sigma, tight=tight)[0].max())
 
-        assert real <= 0.5, (case, shape, sigma, real, bound)
+        assert real <= 0.5, (case, mask.shape, sigma, real, bound)
         largest = max(largest, real)
     assert largest > 0.4, largest
 
