@@ -936,13 +936,19 @@ def extract_mesh_features(
 def _edge_unit(surface: Any) -> float:
     """Return the square root of the mean face area of ``surface``.
 
-    A length of the order of its edges, whatever the size of the object,
-    computed from the vertices and faces on their device. 1 for a mesh without
-    faces or without a finite, positive area, which the volume and area check
-    of ``_measure_mesh`` then reports.
+    A length of the order of its edges, whatever the size of the object. The
+    face areas are computed from the vertices and faces on their device and
+    summed on the host with ``math.fsum``, which is exact, so the sum does not
+    depend on the order of the faces or on the device. A floating-point sum
+    does: NumPy's and CuPy's sums of the same areas, or one sum of two
+    orderings of the faces (a NumPy and a CuPy mesh list the same faces in
+    different orders), can land an ulp apart, and the two copies would then be
+    measured at units an ulp apart. 1 for a mesh without faces or without a
+    finite, positive area, which the volume and area check of
+    ``_measure_mesh`` then reports.
     """
     faces = surface.faces
-    area = float(face_areas(surface.vertices, faces).sum())
+    area = math.fsum(asnumpy(face_areas(surface.vertices, faces)).tolist())
     if not np.isfinite(area) or area <= 0:
         return 1.0
     return float(np.sqrt(area / len(faces)))

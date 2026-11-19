@@ -13,7 +13,7 @@ trimesh = pytest.importorskip("trimesh")
 
 from cubic.cuda import ascupy, asnumpy, get_device  # noqa: E402
 from cubic.feature import mesh, _marching_cubes_cuda  # noqa: E402
-from cubic.feature._array_mesh import ArrayMesh  # noqa: E402
+from cubic.feature._array_mesh import ArrayMesh, face_areas  # noqa: E402
 from cubic.feature._marching_cubes_cuda import (  # noqa: E402
     marching_cubes as marching_cubes_gpu,
 )
@@ -648,6 +648,50 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
     on_gpu = mesh.extract_mesh_features(mesh.mask2mesh(ascupy(ball)), [name])[name]
 
     assert abs(on_gpu - on_cpu) <= 1e-12
+
+
+@pytest.mark.parametrize("smoothed", [False, True], ids=["raw", "smooth_mesh"])
+def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
+    noise_blob: np.ndarray, smoothed: bool, gpu_available: bool
+) -> None:
+    """Every mesh feature agrees between NumPy and CuPy for a lobed anisotropic mask.
+
+    ``extract_mesh_features`` measures scaled copies of the meshes at the unit
+    ``_edge_unit`` returns, the square root of the mean face area. Units an ulp
+    apart move the coplanar dihedral angles of the copies between 0 and 1.5e-8
+    rad, and with them ``Avg Shape Index`` and ``Bounding Cylinder Volume``.
+    The face areas of this mask sum to a different float under ``cupy.sum``
+    than under NumPy, which the test asserts: with equal sums the devices share
+    a unit and the test passes whether or not ``_edge_unit`` sums on the host.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    spacing = (0.29, 0.108, 0.108)
+    sigma = mesh._curvature_sigma(spacing, None)
+
+    def features(mask: np.ndarray) -> dict[str, float]:
+        raw = mesh.mask2mesh(mask, spacing=spacing)
+        smooth = (
+            mesh.mask2mesh(mask, spacing=spacing, sigma=sigma) if smoothed else None
+        )
+        return mesh.extract_mesh_features(raw, smooth_mesh=smooth)
+
+    gpu_mesh = mesh.mask2mesh(ascupy(noise_blob), spacing=spacing)
+    areas = face_areas(gpu_mesh.vertices, gpu_mesh.faces)
+    assert float(areas.sum()) != float(asnumpy(areas).sum())
+
+    on_cpu = features(noise_blob)
+    on_gpu = features(ascupy(noise_blob))
+
+    assert on_gpu.keys() == on_cpu.keys()
+    for name, value in on_gpu.items():
+        np.testing.assert_allclose(
+            value,
+            on_cpu[name],
+            rtol=1e-9,
+            atol=1e-7 if name in _GPU_JITTER else 0.0,
+            err_msg=name,
+        )
 
 
 def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:

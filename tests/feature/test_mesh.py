@@ -18,6 +18,7 @@ trimesh = pytest.importorskip("trimesh")
 
 import cubic.feature  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
+from cubic.feature._array_mesh import face_areas  # noqa: E402
 
 _CUBE_SIDE = 5
 _SPACING_ERROR = r"spacing must be three finite, positive numbers \(z, y, x\); got "
@@ -394,6 +395,26 @@ def test_extract_mesh_features_rejects_an_inside_out_mesh() -> None:
     assert inside_out.volume < 0
     with pytest.raises(ValueError, match="positive; got -.*inside out"):
         mesh.extract_mesh_features(inside_out)
+
+
+def test_edge_unit_does_not_depend_on_the_order_of_the_faces(
+    noise_blob: np.ndarray,
+) -> None:
+    """A mesh is measured at the same unit whatever order its faces are listed in.
+
+    A NumPy mesh and a CuPy mesh of one mask list the same faces in different
+    orders, and a floating-point sum of the same areas in two orders can differ
+    by an ulp, which the test asserts for this mesh and permutation. The unit,
+    the square root of the mean face area, must still be bitwise equal.
+    """
+    surface = mesh.mask2mesh(noise_blob, spacing=(0.29, 0.108, 0.108))
+    order = np.random.default_rng(0).permutation(len(surface.faces))
+    shuffled = trimesh.Trimesh(surface.vertices, surface.faces[order], process=False)
+    areas = face_areas(surface.vertices, surface.faces)
+    reordered = face_areas(shuffled.vertices, shuffled.faces)
+
+    assert float(areas.sum()) != float(reordered.sum())
+    assert mesh._edge_unit(shuffled) == mesh._edge_unit(surface)
 
 
 def test_extract_features_border_label_geometry() -> None:
