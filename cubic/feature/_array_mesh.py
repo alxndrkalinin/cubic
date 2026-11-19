@@ -334,12 +334,6 @@ class ArrayMesh:
         return self._face_adjacency[1]
 
     @cached_property
-    def face_adjacency_angles(self) -> Any:
-        normals = self.face_normals[self.face_adjacency]
-        dots = np.clip((normals[:, 0] * normals[:, 1]).sum(axis=1), -1.0, 1.0)
-        return np.abs(np.arccos(dots))
-
-    @cached_property
     def face_adjacency_unshared(self) -> Any:
         edges = self.face_adjacency_edges
         out = []
@@ -358,12 +352,3 @@ class ArrayMesh:
         origins = self.vertices[self.face_adjacency_edges[:, 0]]
         other = self.vertices[self.face_adjacency_unshared[:, 1]] - origins
         return (other * normals).sum(axis=1) < _TOL_MERGE
-
-    @cached_property
-    def integral_mean_curvature(self) -> float:
-        edges = self.face_adjacency_edges
-        lengths = np.linalg.norm(
-            self.vertices[edges[:, 0]] - self.vertices[edges[:, 1]], axis=1
-        )
-        signs = np.where(self.face_adjacency_convex, 1.0, -1.0)
-        return float((self.face_adjacency_angles * signs * lengths).sum() * 0.5)

@@ -1273,13 +1273,56 @@ def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
     return np.sort(2 * np.sqrt(5 * second_moments / mesh.mass))
 
 
-def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
-    """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
+# Dihedral angles of at most this many radians are set to 0: they are the
+# rounding residues of coplanar faces. On the copies that
+# ``extract_mesh_features`` measures, in units of their edges, the residues
+# reached 1.7e-13 rad on the raw meshes of 60 nuclei, and the smallest other
+# angle on the blurred meshes of 240 nuclei was 1.6e-9 rad; this is about the
+# geometric middle. The residues are a few ulps of the largest vertex
+# coordinate (up to 4.7 times eps times it, in edge lengths), so they pass
+# this floor only on a mesh some 1e4 edges from the origin.
+_FLAT_ANGLE = 1e-11
+# Angle defects of at most this many radians are set to 0: at a flat vertex
+# the defect is 2 pi minus a sum of face angles, a few ulps of 2 pi.
+_FLAT_DEFECT = 1e-14
 
-    trimesh integrates it as half the sum of edge length times signed dihedral
-    angle over the edges (Cohen-Steiner and Morvan, 2003).
+
+def _dihedral_angles(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Return the angle between the normals of each pair of adjacent faces.
+
+    ``arctan2(|n0 x n1|, n0 . n1)``, which is accurate to rounding at every
+    angle, set to 0 at or below ``_FLAT_ANGLE``. trimesh's
+    ``face_adjacency_angles`` is ``arccos(n0 . n1)``, which cannot resolve
+    angles below 1.5e-8: coplanar faces read 0 or 1.5e-8 to 3e-8 depending on
+    the rounding of their normals, so which of them did changed with the scale,
+    orientation and position at which a mesh was measured.
     """
-    return mesh.integral_mean_curvature / mesh.area
+    normals = mesh.face_normals[mesh.face_adjacency]
+    n0, n1 = normals[:, 0], normals[:, 1]
+    angles = np.arctan2(np.linalg.norm(np.cross(n0, n1), axis=1), (n0 * n1).sum(axis=1))
+    return np.where(angles <= _FLAT_ANGLE, 0.0, angles)
+
+
+def _edge_curvatures(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """Return the edges shared by two faces and their length times signed angle.
+
+    The angle is ``_dihedral_angles``, positive on convex edges. Half the sum
+    over the edges is the integral of the mean curvature (Cohen-Steiner and
+    Morvan, 2003). Every curvature feature reads its dihedral angles from
+    here, on a ``trimesh.Trimesh`` and an ``ArrayMesh`` alike.
+    """
+    edges = mesh.face_adjacency_edges
+    lengths = np.linalg.norm(
+        mesh.vertices[edges[:, 1]] - mesh.vertices[edges[:, 0]], axis=1
+    )
+    signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
+    return edges, lengths * _dihedral_angles(mesh) * signs
+
+
+def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
+    """Return the surface average of the mean curvature, ``1 / R`` on a sphere."""
+    _, terms = _edge_curvatures(mesh)
+    return float(terms.sum()) / (2 * float(mesh.area))
 
 
 def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
@@ -1308,65 +1351,37 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
     )
 
 
-# Threshold of the two tests in ``_principal_curvatures`` that set the rounding
-# residues of flat vertices to 0: an angle defect of at most this many radians,
-# and an edge sum of at most this fraction of the sum of the absolute values of
-# its terms. With both tests the Avg Shape Index of a raw voxel mesh differed
-# between NumPy and CuPy by at most 1.1e-16 on 128 meshes; with this threshold
-# at 0, by up to 1.0e-2. The edge-sum test only catches sums whose terms
-# cancel; at a flat vertex of a raw voxel mesh they do not.
-_FLAT_RESIDUE = 1e-14
-
-
 def _principal_curvatures(
     mesh: trimesh.Trimesh,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return the per-vertex principal curvatures ``k1 <= k2`` and vertex areas.
 
     Gaussian curvature is the angle defect and mean curvature the edge sum of
-    length times signed dihedral angle over four times the vertex area, as in
-    LONI ShapeTools; ``k1, k2 = H -+ sqrt(H^2 - K)``, clamped to ``H`` where
+    ``_edge_curvatures`` over four times the vertex area, as in LONI
+    ShapeTools; ``k1, k2 = H -+ sqrt(H^2 - K)``, clamped to ``H`` where
     discretisation makes ``H^2 < K``.
 
-    At a flat vertex both sums should be 0 and are rounding residues, and the
-    shape index there would be the arctangent of two residues, which differ
-    between NumPy and CuPy. Two tests set them to 0. The angle defect is set to
-    0 where its absolute value is at most ``_FLAT_RESIDUE`` radians. The edge
-    sum is set to 0 where its absolute value is at most ``_FLAT_RESIDUE`` times
-    the sum of the absolute values of its terms; this catches only sums whose
-    terms cancel. How many residues either test meets depends on the measuring
-    unit. With both tests, and both devices' meshes measured at one unit
-    (``_edge_unit``), the ``Avg Shape Index`` of a raw voxel mesh agrees between
-    NumPy and CuPy to rounding.
-
-    At a flat vertex of a raw voxel mesh the terms do not cancel. The dihedral
-    angle of two coplanar faces is an arccos of a dot product within four ulps
-    of 1, which reads 1.5e-8 to 3e-8 rad, and these edges are all convex, so
-    the vertex keeps a mean curvature of that size and a shape index of 0.5.
-    The ``Avg Shape Index`` of a raw voxel mesh therefore still depends on the
-    scale at which the mesh is measured: on 144 voxel meshes, a unit 0.95 to
-    1.4 times another moved it by up to 57%. On the blurred meshes of 240 real
-    nuclei the two tests moved it by at most 1.1e-6.
+    At a flat vertex both sums are rounding residues. Its dihedral angles are
+    0 (``_FLAT_ANGLE``), so its edge sum is exactly 0, and its angle defect is
+    set to 0 where its absolute value is at most ``_FLAT_DEFECT`` radians, so
+    ``k1 = k2 = 0`` there on either device and at any scale and orientation.
+    The defect test matters at the nearly flat vertices of a blurred mesh,
+    where dihedral angles of 1e-9 rad give a mean curvature whose square is
+    below a defect residue's curvature, so the residue would decide the shape
+    index; on 240 nuclei it moved ``Avg Shape Index``, then averaged over
+    every vertex, by at most 4.2e-10. With both, the ``Avg Shape Index`` of 34
+    raw voxel meshes measured at five scales from 1e-8 to 1e3 varied by at
+    most 2.2e-16, and of 7 more, each also turned three ways, by at most
+    6.1e-16; with trimesh's arccos angles, by 0.044 and 0.11.
     """
     area = _mixed_area(mesh)
     defects = mesh.vertex_defects
-    defects = np.where(np.abs(defects) <= _FLAT_RESIDUE, 0.0, defects)
+    defects = np.where(np.abs(defects) <= _FLAT_DEFECT, 0.0, defects)
     gaussian = defects / area
-    edges = mesh.face_adjacency_edges
-    lengths = np.linalg.norm(
-        mesh.vertices[edges[:, 1]] - mesh.vertices[edges[:, 0]], axis=1
-    )
-    signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
-    terms = lengths * mesh.face_adjacency_angles * signs
+    edges, terms = _edge_curvatures(mesh)
     edge_sum = np.bincount(
         edges.ravel(), weights=np.repeat(terms, 2), minlength=len(mesh.vertices)
     )
-    term_sum = np.bincount(
-        edges.ravel(),
-        weights=np.repeat(np.abs(terms), 2),
-        minlength=len(mesh.vertices),
-    )
-    edge_sum = np.where(np.abs(edge_sum) <= _FLAT_RESIDUE * term_sum, 0.0, edge_sum)
     mean = edge_sum / (4 * area)
     spread = np.sqrt(np.maximum(mean**2 - gaussian, 0))
     return mean - spread, mean + spread, area

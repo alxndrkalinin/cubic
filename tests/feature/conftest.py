@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 from scipy import ndimage
 
+from cubic.cuda import asnumpy
+
 
 def _largest_piece(mask: np.ndarray) -> np.ndarray:
     """Return the largest 26-connected piece of ``mask``."""
@@ -63,6 +65,28 @@ def _noise_blob(seed: int) -> np.ndarray:
 def noise_blob_of() -> Callable[[int], np.ndarray]:
     """Return ``_noise_blob``: a lobed mask cut from blurred noise of a given seed."""
     return _noise_blob
+
+
+def _flat_vertices(surface: object) -> np.ndarray:
+    """Return which vertices of ``surface`` have all their face normals equal to 1e-9.
+
+    Computed on the host from ``face_normals`` and ``faces``, of a
+    ``trimesh.Trimesh`` or an ``ArrayMesh`` on either device.
+    """
+    normals = np.asarray(asnumpy(surface.face_normals))
+    faces = np.asarray(asnumpy(surface.faces))
+    low = np.full((len(surface.vertices), 3), np.inf)
+    high = -low
+    for corner in range(3):
+        np.minimum.at(low, faces[:, corner], normals)
+        np.maximum.at(high, faces[:, corner], normals)
+    return (high - low).max(axis=1) <= 1e-9
+
+
+@pytest.fixture
+def flat_vertices_of() -> Callable[[object], np.ndarray]:
+    """Return ``_flat_vertices``: which vertices of a mesh lie on a flat patch."""
+    return _flat_vertices
 
 
 @pytest.fixture

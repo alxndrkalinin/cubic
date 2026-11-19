@@ -193,8 +193,9 @@ def test_array_mesh_matches_trimesh() -> None:
     """On NumPy arrays, ArrayMesh reproduces trimesh's features to rounding.
 
     It recomputes the trimesh quantities the features read (mass properties,
-    adjacency, dihedral angles, angle defects) with trimesh's formulas, and
-    hands hull-based features to trimesh itself.
+    adjacency, convexity, angle defects) with trimesh's formulas, and hands
+    hull-based features to trimesh itself. The dihedral angles of both come
+    from mesh._dihedral_angles.
     """
     z, y, x = np.meshgrid(
         *[np.arange(n) - (n - 1) / 2 for n in (30, 30, 30)], indexing="ij"
@@ -390,13 +391,13 @@ _SHARED_EDGE_REQUEST = [
 ]
 # Vary between GPU runs of the same code by about 1e-13 (atomic sums).
 _GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
-# On the raw mesh, without smooth_mesh. With _principal_curvatures' flat-residue
-# tests and both devices measuring at one unit (_edge_unit), Avg Shape Index of
-# the 2%, 10% and 30% ragged balls differed between CuPy and NumPy by at most
-# 5.6e-17 at spacing None and (0.29, 0.108, 0.108), one CuPy run each with
-# CuPy 14.0.1 and with 14.2.0; with _FLAT_RESIDUE at 0, by up to 2.9e-3 (the
-# 2% ball at spacing None, 14.2.0), and by up to 8.9% relative (the 30% ball at
-# (0.29, 0.108, 0.108), 14.0.1).
+# On the raw mesh, without smooth_mesh. With _principal_curvatures' floors
+# (_FLAT_ANGLE, _FLAT_DEFECT) and both devices measuring at one unit
+# (_edge_unit), Avg Shape Index of 275 raw meshes (noise blobs, balls and
+# ragged balls at five scales, some also turned) differed between CuPy and
+# NumPy by at most 1.8e-16, one CuPy 14.0.1 run and two 14.2.0 runs; with
+# trimesh's arccos angles and no floors, 365 such meshes differed by up to
+# 7.6e-3.
 _RAW_CURVATURE = [
     "Total Absolute Gaussian Curvature",
     "Avg Curvedness",
@@ -637,9 +638,9 @@ def test_gpu_blur_that_provably_vanishes_does_not_run(
 def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> None:
     """A raw voxel mesh's shape index agrees between NumPy and CuPy to rounding.
 
-    Its flat vertices have angle defects that are rounding residues, which the
-    two devices sum in different orders; ``_principal_curvatures`` sets those
-    of at most ``_FLAT_RESIDUE`` radians to 0, and the shape index, which
+    Its flat vertices have dihedral angles and angle defects that are rounding
+    residues, which differ between the devices; ``_principal_curvatures`` sets
+    them to 0 (``_FLAT_ANGLE``, ``_FLAT_DEFECT``), and the shape index, which
     differed by about 1e-3 between the devices, then agrees to 1e-12. This ball
     is at the default spacing; the same agreement at an anisotropic spacing
     needs both devices to measure at one unit, which
@@ -655,6 +656,48 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
     on_gpu = mesh.extract_mesh_features(mesh.mask2mesh(ascupy(ball)), [name])[name]
 
     assert abs(on_gpu - on_cpu) <= 1e-12
+
+
+@pytest.mark.parametrize("angle", [1e-9, np.pi - 1e-9])
+def test_gpu_dihedral_angle_of_a_hinge_is_exact(
+    angle: float, gpu_available: bool
+) -> None:
+    """On CuPy arrays too, two triangles at ``angle`` give that angle to rounding."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [0.5, 1, 0], [0.5, -np.cos(angle), np.sin(angle)]]
+    )
+    faces = np.array([[0, 1, 2], [1, 0, 3]])
+    hinge = ArrayMesh(ascupy(vertices), ascupy(faces), merge=False)
+
+    measured = mesh._dihedral_angles(hinge)
+
+    assert get_device(measured) == "GPU"
+    assert float(measured[0]) == pytest.approx(angle, rel=1e-12)
+
+
+def test_gpu_flat_vertices_of_a_raw_mesh_have_no_curvature(
+    flat_vertices_of: Callable[[object], np.ndarray], gpu_available: bool
+) -> None:
+    """On the GPU too, ``k1 = k2 = 0`` exactly where all faces of a vertex are coplanar.
+
+    The raw anisotropic ball of the CPU test, meshed and measured on the GPU.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    grid = np.indices((36, 36, 36)) - 17.5
+    ball = (grid**2).sum(axis=0) <= 15**2
+    raw = mesh.mask2mesh(ascupy(ball), spacing=(2.117, 0.7884, 0.7884))
+    measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw))
+    flat = flat_vertices_of(measured)
+
+    k1, k2, _ = mesh._principal_curvatures(measured)
+
+    assert get_device(k1) == "GPU"
+    assert flat.sum() == 1872
+    assert (asnumpy(k1)[flat] == 0).all()
+    assert (asnumpy(k2)[flat] == 0).all()
 
 
 def _areas_by_face(vertices, faces) -> tuple[np.ndarray, np.ndarray]:

@@ -20,7 +20,7 @@ trimesh = pytest.importorskip("trimesh")
 
 import cubic.feature  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
-from cubic.feature._array_mesh import face_areas  # noqa: E402
+from cubic.feature._array_mesh import ArrayMesh, face_areas  # noqa: E402
 
 _CUBE_SIDE = 5
 _SPACING_ERROR = r"spacing must be three finite, positive numbers \(z, y, x\); got "
@@ -669,37 +669,183 @@ def test_shape_index_tells_a_torus_from_a_ball() -> None:
     assert torus < ball - 0.2
 
 
-def test_flat_residues_leave_real_curvature_as_it_is() -> None:
+def test_flat_residues_leave_real_curvature_as_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """On a blurred flat ellipsoid only rounding residues are set to 0.
 
     The terraces that the blur leaves on its shallow slopes have angle defects
-    down to 4.5e-13 radians and edge sums down to 1.3e-13 of their terms, and
-    no angle defect lies between 1e-14 and 1e-13. What the threshold
-    sets to 0 on the copy that ``extract_mesh_features`` measures are residues
-    of at most four ulps: at the unit of ``_edge_unit``, 260 angle defects of
-    8.9e-16 (one ulp of 2 pi), which moves Avg Shape Index by 3.6e-9.
+    down to 4.5e-13 radians, and no angle defect lies between 1e-14 and 1e-13.
+    No dihedral angle lies between 1e-13 and 1e-9 either, so ``_FLAT_ANGLE``
+    sits in an empty band. What the two floors set to 0 on the copy that
+    ``extract_mesh_features`` measures are residues: 57 dihedral angles of at
+    most 1e-13 and 260 angle defects of 8.9e-16 (one ulp of 2 pi).
     """
     z, y, x = _centred_grid(20, 132, 132)
     flat = (z / 6) ** 2 + (y / 60) ** 2 + (x / 60) ** 2 <= 1
     smooth = mesh.mask2mesh(flat, sigma=2.0)
     measured = mesh._scaled_copy(smooth, 1 / mesh._edge_unit(smooth))
     defects = np.abs(measured.vertex_defects)
-    edges = measured.face_adjacency_edges
-    lengths = np.linalg.norm(
-        measured.vertices[edges[:, 1]] - measured.vertices[edges[:, 0]], axis=1
-    )
-    terms = np.repeat(lengths * measured.face_adjacency_angles, 2)
-    terms *= np.repeat(np.where(measured.face_adjacency_convex, 1.0, -1.0), 2)
-    n = len(measured.vertices)
-    edge_sum = np.abs(np.bincount(edges.ravel(), weights=terms, minlength=n))
-    term_sum = np.bincount(edges.ravel(), weights=np.abs(terms), minlength=n)
-    ratio = edge_sum / np.where(term_sum > 0, term_sum, np.inf)
+    monkeypatch.setattr(mesh, "_FLAT_ANGLE", 0.0)
+    angles = mesh._dihedral_angles(measured)
 
-    zeroed_defects = defects[(defects > 0) & (defects <= mesh._FLAT_RESIDUE)]
-    zeroed_ratios = ratio[(edge_sum > 0) & (edge_sum <= mesh._FLAT_RESIDUE * term_sum)]
+    zeroed_defects = defects[(defects > 0) & (defects <= mesh._FLAT_DEFECT)]
     assert (zeroed_defects <= 4 * np.spacing(2 * np.pi)).all(), zeroed_defects.max()
-    assert (zeroed_ratios <= 4 * np.finfo(float).eps).all(), zeroed_ratios.max()
     assert not ((defects > 1e-14) & (defects <= 1e-13)).any()
+    assert ((angles > 0) & (angles <= 1e-13)).sum() > 0
+    assert not ((angles > 1e-13) & (angles <= 1e-9)).any()
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda v, f: trimesh.Trimesh(v, f, process=False),
+        lambda v, f: ArrayMesh(v, f, merge=False),
+    ],
+    ids=["trimesh", "ArrayMesh"],
+)
+@pytest.mark.parametrize("angle", [1e-9, 1e-6, np.pi / 2, np.pi - 1e-9])
+def test_dihedral_angle_of_a_hinge_is_exact(angle: float, build: Callable) -> None:
+    """Two triangles at ``angle`` to each other give that angle to rounding.
+
+    trimesh's ``arccos`` of the dot product of the normals reads 1e-9 rad as 0
+    or 1.5e-8 and pi - 1e-9 as pi; 1e-9 is also above ``_FLAT_ANGLE``.
+    """
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [0.5, 1, 0], [0.5, -np.cos(angle), np.sin(angle)]]
+    )
+    faces = np.array([[0, 1, 2], [1, 0, 3]])
+
+    measured = mesh._dihedral_angles(build(vertices, faces))
+
+    assert measured.shape == (1,)
+    assert float(measured[0]) == pytest.approx(angle, rel=1e-12)
+
+
+def test_flat_vertices_of_a_raw_mesh_have_no_curvature(
+    flat_vertices_of: Callable[[object], np.ndarray],
+) -> None:
+    """Where all the faces of a vertex are coplanar, ``k1 = k2 = 0`` exactly.
+
+    On this raw anisotropic ball, measured as ``extract_mesh_features`` does,
+    1872 of 4296 vertices are flat. Their dihedral angles read up to 1.9e-14
+    rad as arctangents and up to 3e-8 as trimesh's arccos; with
+    ``_FLAT_ANGLE`` at 1e-14, 175 of them kept a curvature, at 0, 1497, and
+    with arccos angles, 974.
+    """
+    raw = mesh.mask2mesh(_ball(15, 36), spacing=(2.117, 0.7884, 0.7884))
+    measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw))
+    flat = flat_vertices_of(measured)
+
+    k1, k2, _ = mesh._principal_curvatures(measured)
+
+    assert flat.sum() == 1872
+    assert (k1[flat] == 0).all()
+    assert (k2[flat] == 0).all()
+
+
+def test_raw_shape_index_does_not_depend_on_scale_or_orientation(
+    ragged_ball_of: Callable[[float], np.ndarray],
+) -> None:
+    """A raw mesh's Avg Shape Index agrees to rounding at any scale and orientation.
+
+    Over spacings 1e-8 to 1e3 times (0.29, 0.108, 0.108) and three
+    orientations, the 30% ragged ball's varied by 2.0e-16; with
+    ``_FLAT_ANGLE`` at 1e-14 by 1.0e-2, at 3e-14 by 1.0e-3, and with trimesh's
+    arccos angles by 3.0e-3.
+    """
+    mask = ragged_ball_of(0.3)
+    turns = Rotation.random(2, random_state=1).as_matrix()
+    name = "Avg Shape Index"
+    values = []
+    for factor in (1.0, 1e-8, 0.3, 7.3, 1e3):
+        raw = mesh.mask2mesh(
+            mask, spacing=(0.29 * factor, 0.108 * factor, 0.108 * factor)
+        )
+        for vertices in [raw.vertices, *(raw.vertices @ turn.T for turn in turns)]:
+            surface = trimesh.Trimesh(vertices, raw.faces, process=False)
+            values.append(mesh.extract_mesh_features(surface, [name])[name])
+
+    assert max(values) - min(values) <= 1e-12
+
+
+def test_rotated_cube_has_the_mean_curvature_of_its_edges(
+    flat_vertices_of: Callable[[object], np.ndarray],
+) -> None:
+    """A cube of side ``a`` has Avg Mean Curvature ``pi / (2 a)``, none in its faces.
+
+    Its 12 edges of dihedral angle pi / 2 integrate to ``3 pi a`` over the area
+    ``6 a^2``. The cube is subdivided four times, turned and moved off the
+    origin. Its 1350 vertices inside the faces then had a curvature with
+    ``_FLAT_ANGLE`` at 0, and with trimesh's arccos angles 1206 of them did,
+    and Avg Mean Curvature was 1.3e-7 too high.
+    """
+    side = 2.0
+    box = trimesh.creation.box(extents=(side, side, side))
+    for _ in range(4):
+        box = box.subdivide()
+    turn = Rotation.random(1, random_state=2).as_matrix()[0]
+    cube = trimesh.Trimesh(
+        box.vertices @ turn.T + np.array([0.3, -0.2, 0.1]), box.faces, process=False
+    )
+    measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube))
+    inside = flat_vertices_of(measured)
+
+    name = "Avg Mean Curvature"
+    value = mesh.extract_mesh_features(cube, [name])[name]
+    k1, k2, _ = mesh._principal_curvatures(measured)
+
+    assert value == pytest.approx(np.pi / (2 * side), rel=1e-12)
+    assert inside.sum() == 6 * 15**2
+    assert (k1[inside] == 0).all()
+    assert (k2[inside] == 0).all()
+
+
+def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
+    """On a fine mesh of an ellipsoid the curvature averages are the analytic ones.
+
+    For the ellipsoid of semi-axes (3, 2, 1.5), with
+    ``h = |(x / a^2, y / b^2, z / c^2)|``, ``K = 1 / (abc h^2)^2`` and
+    ``H = (a^2 + b^2 + c^2 - |x|^2) / (2 (abc)^2 h^3)``, integrated over the
+    surface by the midpoint rule in the two angles (the integral of ``K`` is
+    ``4 pi`` to 2e-7). The icosphere of subdivision 5 stretched to it reads
+    within 2.0e-4 (mean curvature), 3.8e-5 (shape index) and 2.1e-4
+    (curvedness) of them. trimesh's arccos angles give the same to 8 digits
+    here: this checks the formulas, not the rounding of angles near 0.
+    """
+    a, b, c = 3.0, 2.0, 1.5
+    n = 1000
+    theta = (np.arange(n) + 0.5) * np.pi / n
+    phi = (np.arange(2 * n) + 0.5) * np.pi / n
+    t, p = np.meshgrid(theta, phi, indexing="ij")
+    x, y, z = a * np.sin(t) * np.cos(p), b * np.sin(t) * np.sin(p), c * np.cos(t)
+    d_theta = np.stack(
+        [a * np.cos(t) * np.cos(p), b * np.cos(t) * np.sin(p), -c * np.sin(t)], -1
+    )
+    d_phi = np.stack([-a * np.sin(t) * np.sin(p), b * np.sin(t) * np.cos(p), 0 * t], -1)
+    dA = np.linalg.norm(np.cross(d_theta, d_phi), axis=-1) * (np.pi / n) ** 2
+    h = np.sqrt(x**2 / a**4 + y**2 / b**4 + z**2 / c**4)
+    gaussian = 1 / (a * b * c * h**2) ** 2
+    mean = (a**2 + b**2 + c**2 - (x**2 + y**2 + z**2)) / (2 * (a * b * c) ** 2 * h**3)
+    spread = np.sqrt(np.maximum(mean**2 - gaussian, 0))
+    k1, k2 = mean - spread, mean + spread
+
+    def average(values: np.ndarray) -> float:
+        return float((values * dA).sum() / dA.sum())
+
+    sphere = trimesh.creation.icosphere(subdivisions=5)
+    ellipsoid = trimesh.Trimesh(
+        sphere.vertices * [a, b, c], sphere.faces, process=False
+    )
+    names = ["Avg Mean Curvature", "Avg Shape Index", "Avg Curvedness"]
+    got = mesh.extract_mesh_features(ellipsoid, names)
+
+    assert average(gaussian) * dA.sum() / (4 * np.pi) == pytest.approx(1, abs=1e-6)
+    assert got["Avg Mean Curvature"] == pytest.approx(average(mean), rel=1e-3)
+    shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
+    assert got["Avg Shape Index"] == pytest.approx(average(shape_index), abs=1e-3)
+    curvedness = np.sqrt((k1**2 + k2**2) / 2)
+    assert got["Avg Curvedness"] == pytest.approx(average(curvedness), rel=1e-3)
 
 
 @pytest.mark.parametrize("rot_deg", [30, 45])
