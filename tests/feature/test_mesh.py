@@ -1360,6 +1360,36 @@ def test_convex_hull_failure_warning_points_at_the_caller(
     assert [w.filename for w in matching] == [__file__]
 
 
+def test_box_of_a_hull_without_face_normals_is_zero_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
+    """A hull none of whose faces has a normal gives no axis: the box is 0, warned.
+
+    trimesh gives a face too small for a normal a zero one, and those are not
+    axes. Extent, the volume over the box, is then 0 too, and the cylinder
+    still has the axes of inertia.
+    """
+    axes_of = mesh._hull_axes
+
+    def without_normals(surface: Any) -> Any:
+        hull, axes = axes_of(surface)
+        return hull, axes[:0]
+
+    monkeypatch.setattr(mesh, "_hull_axes", without_normals)
+    names = ["Oriented Bounding Box Volume", "Extent", "Bounding Cylinder Volume"]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        values = mesh.extract_mesh_features(mesh.mask2mesh(ball_of(6, 16)), names)
+
+    assert values["Oriented Bounding Box Volume"] == 0.0
+    assert values["Extent"] == 0.0
+    assert values["Bounding Cylinder Volume"] > 0
+    matching = [w for w in caught if "has a normal" in str(w.message)]
+    assert [w.filename for w in matching] == [__file__]
+
+
 def _feature(surface: Any, name: str) -> float:
     """Return ``name`` of ``surface`` as ``extract_mesh_features`` measures it."""
     return mesh.extract_mesh_features(surface, [name])[name]
@@ -1552,8 +1582,8 @@ def test_box_calipers_match_a_search_of_every_end(
         trimesh.convex.convex_hull(np.round(rng.normal(size=(400, 3)) * 4)),
     ]
     for surface in hulls:
-        found = mesh._hull_and_normals(surface, "box")
-        assert found is not None
+        found = mesh._hull_axes(surface)
+        assert not isinstance(found, Exception)
         hull, axes = found
         searched = []
         # Every hull through the calipers, however few its sides.
@@ -2471,15 +2501,20 @@ def test_shared_quantities_are_computed_once(
     smoothed: bool,
     ball_of: Callable[[float, int], np.ndarray],
 ) -> None:
-    """The oriented box and each mesh's edge terms are computed once per call.
+    """The hull axes, the oriented box and each mesh's edge terms are computed once.
 
-    ``Oriented Bounding Box Volume`` and ``Extent`` share one box, and Avg Mean
-    Curvature and the per-vertex curvatures one ``_edge_curvatures`` of a mesh
-    when they are measured on the same one; with a smooth mesh they are not.
-    The values are those of each feature measured alone.
+    ``Oriented Bounding Box Volume`` and ``Extent`` share one box, the box and
+    ``Bounding Cylinder Volume`` one set of hull axes, and Avg Mean Curvature
+    and the per-vertex curvatures one ``_edge_curvatures`` of a mesh when they
+    are measured on the same one; with a smooth mesh they are not. The values
+    are those of each feature measured alone.
     """
-    counts = {"box": 0, "edges": 0}
-    box, edges = mesh._min_box_volume, mesh._edge_curvatures
+    counts = {"axes": 0, "box": 0, "edges": 0}
+    axes_of, box, edges = mesh._hull_axes, mesh._min_box_volume, mesh._edge_curvatures
+
+    def counted_axes(surface):
+        counts["axes"] += 1
+        return axes_of(surface)
 
     def counted_box(hull, axes):
         counts["box"] += 1
@@ -2494,6 +2529,7 @@ def test_shared_quantities_are_computed_once(
     names = [
         "Oriented Bounding Box Volume",
         "Extent",
+        "Bounding Cylinder Volume",
         "Avg Mean Curvature",
         "Avg Shape Index",
         "Avg Curvedness",
@@ -2502,12 +2538,13 @@ def test_shared_quantities_are_computed_once(
         name: mesh.extract_mesh_features(surface, [name], smooth_mesh=smooth)[name]
         for name in names
     }
+    monkeypatch.setattr(mesh, "_hull_axes", counted_axes)
     monkeypatch.setattr(mesh, "_min_box_volume", counted_box)
     monkeypatch.setattr(mesh, "_edge_curvatures", counted_edges)
 
     together = mesh.extract_mesh_features(surface, names, smooth_mesh=smooth)
 
-    assert counts == {"box": 1, "edges": 2 if smoothed else 1}
+    assert counts == {"axes": 1, "box": 1, "edges": 2 if smoothed else 1}
     assert together == alone
 
 

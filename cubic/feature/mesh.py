@@ -35,7 +35,7 @@ import sys
 import math
 import numbers
 import warnings
-from typing import Any, TypeVar, Callable, SupportsFloat
+from typing import Any, TypeVar, Callable, TypeAlias, SupportsFloat
 from functools import cache, wraps
 from collections.abc import Sequence
 
@@ -1065,7 +1065,8 @@ def _measure_mesh(
     # What several features share is computed at most once per call: the edge
     # terms of each mesh, behind Avg Mean Curvature and the per-vertex
     # curvatures, which are one mesh without a smooth mesh; the per-vertex
-    # curvatures behind both curvature averages; and the oriented box behind
+    # curvatures behind both curvature averages; the convex hull's distinct
+    # face normals behind the box and the cylinder; and the oriented box behind
     # its volume and Extent. trimesh caches the volume, convex hull and
     # bounding primitives on the mesh itself.
     edge_terms: dict[int, tuple[Any, Any]] = {}
@@ -1082,8 +1083,12 @@ def _measure_mesh(
     )
 
     @cache
+    def hull_axes() -> _HullAxes:
+        return _hull_axes(mesh)
+
+    @cache
     def box() -> float:
-        return _oriented_bounding_box_volume(mesh)
+        return _oriented_bounding_box_volume(mesh, hull_axes())
 
     def measure(name: str) -> SupportsFloat:
         if curvatures is not None and name in _CURVATURE_AVERAGES:
@@ -1094,6 +1099,8 @@ def _measure_mesh(
             return box()
         if name == "Extent":
             return _extent(mesh, box())
+        if name == "Bounding Cylinder Volume":
+            return _bounding_cylinder_volume(mesh, hull_axes())
         return _MESH_FEATURES[name](measured_on(name))
 
     values = {name: float(measure(name)) for name in features}
@@ -1165,7 +1172,14 @@ def _stacklevel_outside_package() -> int:
     return level if frame is not None else level - 1
 
 
-def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
+# The convex hull of a mesh and the distinct axes of its face normals, or the
+# error building the hull raised (``_hull_axes``).
+_HullAxes: TypeAlias = tuple[Any, np.ndarray] | ValueError | QhullError
+
+
+def _bounding_cylinder_volume(
+    mesh: trimesh.Trimesh, found: _HullAxes | None = None
+) -> float:
     """Return the smallest enclosing cylinder volume about a hull normal or inertia axis.
 
     The candidate axes are the normals of the faces of the convex hull and the
@@ -1177,12 +1191,15 @@ def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
     rounded or pointed ends can have no hull face normal to its long axis,
     which the inertia axes supply. Measured on the host from the hull that
     trimesh caches for ``Convex Hull Volume``; 0, with a warning, for a mesh
-    whose hull cannot be built.
+    whose hull cannot be built. ``found`` is ``_hull_axes(mesh)`` when
+    already computed.
     """
-    found = _hull_and_normals(mesh, "bounding cylinder volume")
-    if found is None:
+    usable = _usable_hull(
+        _hull_axes(mesh) if found is None else found, "bounding cylinder volume"
+    )
+    if usable is None:
         return 0.0
-    hull, normals = found
+    hull, normals = usable
     inertia_axes = np.linalg.eigh(np.asarray(mesh.moment_inertia, dtype=np.float64))[1]
     return _min_cylinder_volume(
         np.asarray(hull.vertices, dtype=np.float64),
@@ -1190,23 +1207,17 @@ def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
     )
 
 
-def _hull_and_normals(
-    mesh: trimesh.Trimesh, name: str
-) -> tuple[Any, np.ndarray] | None:
+def _hull_axes(mesh: trimesh.Trimesh) -> _HullAxes:
     """Return the convex hull of ``mesh`` and the distinct axes of its face normals.
 
     The hull is the one trimesh caches for ``Convex Hull Volume``, on the host.
-    None, with a warning naming the feature ``name``, for a mesh whose hull
-    cannot be built.
+    For a mesh whose hull cannot be built, the error trimesh raised instead,
+    which ``_usable_hull`` reports for each feature that needs the hull.
     """
     try:
         hull = mesh.convex_hull
     except (ValueError, QhullError) as e:
-        warnings.warn(
-            f"Unable extract {name}. Returning 0. Exception: {e}",
-            stacklevel=_stacklevel_outside_package(),
-        )
-        return None
+        return e
     normals = np.asarray(hull.face_normals, dtype=np.float64)
     # trimesh gives a face too small for a normal a zero one.
     normals = normals[(normals * normals).sum(axis=1) > 0.5]
@@ -1218,7 +1229,23 @@ def _hull_and_normals(
     return hull, normals[np.sort(first)]
 
 
-def _oriented_bounding_box_volume(mesh: trimesh.Trimesh) -> float:
+def _usable_hull(found: _HullAxes, name: str) -> tuple[Any, np.ndarray] | None:
+    """Return the hull and axes ``found``, or None, warning, for a failed hull.
+
+    The warning names the feature ``name``, which is then 0.
+    """
+    if isinstance(found, Exception):
+        warnings.warn(
+            f"Unable extract {name}. Returning 0. Exception: {found}",
+            stacklevel=_stacklevel_outside_package(),
+        )
+        return None
+    return found
+
+
+def _oriented_bounding_box_volume(
+    mesh: trimesh.Trimesh, found: _HullAxes | None = None
+) -> float:
     """Return the smallest volume of the enclosing boxes with a face on a hull face.
 
     The candidate axes are the normals of the faces of the convex hull. About
@@ -1232,12 +1259,21 @@ def _oriented_bounding_box_volume(mesh: trimesh.Trimesh) -> float:
     bound of the minimum, exact for a box and twice it for a regular
     tetrahedron. Measured on the host from the hull that trimesh caches for
     ``Convex Hull Volume``; 0, with a warning, for a mesh whose hull cannot be
-    built.
+    built or has no face with a normal. ``found`` is ``_hull_axes(mesh)``
+    when already computed.
     """
-    found = _hull_and_normals(mesh, "oriented bounding box volume")
-    if found is None:
+    name = "oriented bounding box volume"
+    usable = _usable_hull(_hull_axes(mesh) if found is None else found, name)
+    if usable is None:
         return 0.0
-    return _min_box_volume(*found)
+    if len(usable[1]) == 0:
+        warnings.warn(
+            f"Unable extract {name}. Returning 0. No face of the convex hull has "
+            "a normal.",
+            stacklevel=_stacklevel_outside_package(),
+        )
+        return 0.0
+    return _min_box_volume(*usable)
 
 
 def _extent(mesh: trimesh.Trimesh, box: float | None = None) -> float:
@@ -1436,8 +1472,11 @@ def _padded_rows(mask: np.ndarray) -> np.ndarray:
 
 
 def _axis_chunks(count: int) -> list[np.ndarray]:
-    """Split ``range(count)`` into chunks of at most 256 axes, to bound the memory."""
-    return np.array_split(np.arange(count), -(-count // 256))
+    """Split ``range(count)`` into chunks of at most 256 axes, to bound the memory.
+
+    One empty chunk for no axes.
+    """
+    return np.array_split(np.arange(count), max(1, -(-count // 256)))
 
 
 def _smallest_over_axes(
