@@ -423,6 +423,15 @@ def test_edge_unit_does_not_depend_on_how_the_mesh_is_listed(
     assert mesh._edge_unit(relisted) == mesh._edge_unit(surface)
 
 
+def test_edge_unit_ignores_vertices_no_face_uses() -> None:
+    """A vertex that no face uses does not change the unit a mesh is measured at."""
+    box = trimesh.creation.box()
+    stray = np.vstack([box.vertices, [1e6, 1e6, 1e6]])
+    with_stray = trimesh.Trimesh(stray, box.faces, process=False)
+
+    assert mesh._edge_unit(with_stray) == mesh._edge_unit(box)
+
+
 def test_extract_features_border_label_geometry() -> None:
     """A border-touching label yields the same valid geometry as an interior one.
 
