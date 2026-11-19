@@ -15,6 +15,7 @@ from cubic.cuda import (
     get_device,
     is_gpu_array,
     to_same_device,
+    ordered_bincount,
     check_same_device,
 )
 
@@ -238,3 +239,37 @@ def test_metrics_do_not_mutate_input(gpu_available: bool) -> None:
 
     cp = CUDAManager().get_cp()
     assert cp.array_equal(gpu, baseline), "ascupy view was mutated by a metric call"
+
+
+@pytest.mark.parametrize("device", ["CPU", "GPU"])
+@pytest.mark.parametrize("dtype", [np.int64, np.int32])
+def test_ordered_bincount_adds_in_input_order(
+    device: str, dtype: type, gpu_available: bool
+) -> None:
+    """It is ``np.bincount`` on either device, to the bit and the same every run.
+
+    The weights span 16 orders of magnitude, so a sum in any other order
+    differs in the last bits.
+    """
+    if device == "GPU" and not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, 50, 20_000).astype(dtype)
+    weights = rng.standard_normal(20_000) * 10.0 ** rng.integers(-8, 8, 20_000)
+    expected = np.bincount(ids, weights=weights, minlength=60)
+
+    runs = [
+        asnumpy(
+            ordered_bincount(to_device(ids, device), to_device(weights, device), 60)
+        )
+        for _ in range(2)
+    ]
+
+    for got in runs:
+        assert got.dtype == np.float64
+        np.testing.assert_array_equal(got, expected)
+    empty = ordered_bincount(
+        to_device(ids[:0], device), to_device(weights[:0], device), 5
+    )
+    assert get_device(empty) == device
+    np.testing.assert_array_equal(asnumpy(empty), np.zeros(5))

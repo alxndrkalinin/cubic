@@ -21,11 +21,8 @@ except ImportError:  # pragma: no cover - import failure path
 
 from ..cuda import (
     asnumpy,
-    get_device,
-    _launch_config,
     to_same_device,
-    _cuda_functions,
-    get_array_module,
+    ordered_bincount,
 )
 
 # trimesh.constants.tol: zero for unitize, merge for angles and convexity.
@@ -97,55 +94,6 @@ def face_areas(vertices: Any, faces: Any) -> Any:
     Needs neither merging nor orientation, so it is cheaper than an ArrayMesh.
     """
     return np.sqrt((_triangles_cross(vertices[faces]) ** 2).sum(axis=1)) / 2.0
-
-
-_ORDERED_BINCOUNT_CUDA = r"""
-extern "C" __global__ void ordered_bincount(
-    const double* values, const long long* starts, const long long* counts,
-    double* out, const long long n_bins) {
-  for (long long b = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-       b < n_bins; b += (long long)blockDim.x * gridDim.x) {
-    double sum = 0.0;
-    const double* v = values + starts[b];
-    for (long long i = 0; i < counts[b]; ++i) sum += v[i];
-    out[b] = sum;
-  }
-}
-"""
-
-
-def ordered_bincount(ids: Any, weights: Any, minlength: int) -> Any:
-    """``np.bincount(ids, weights, minlength)`` that adds in input order on either device.
-
-    CuPy's weighted ``bincount`` adds with atomics, in an order that changes
-    from run to run, so its sums do too. On CuPy this sorts the weights by bin,
-    keeping their input order within each bin, and one thread per bin adds
-    them from 0 in that order, as NumPy does: the sums are the same on every
-    run and equal NumPy's to the bit for equal inputs. NumPy arrays go to
-    ``np.bincount``.
-    """
-    if get_device(ids) == "CPU":
-        return np.bincount(ids, weights=weights, minlength=minlength)
-    xp = get_array_module(ids)
-    n = len(ids)
-    if n == 0:  # CuPy 14.0.1's bincount raises on an empty array
-        return xp.zeros(minlength, dtype=np.float64)
-    # The position breaks ties, so the order within a bin is the input order
-    # whether or not the sort is stable.
-    order = np.argsort(ids.astype(np.int64) * n + xp.arange(n, dtype=np.int64))
-    values = xp.ascontiguousarray(weights.astype(np.float64)[order])
-    counts = np.bincount(ids, minlength=minlength).astype(np.int64)
-    starts = np.cumsum(counts) - counts
-    out = xp.empty(len(counts), dtype=np.float64)
-    with ids.device:
-        (kernel,) = _cuda_functions(
-            _ORDERED_BINCOUNT_CUDA, ("ordered_bincount",), ids.device.id
-        )
-        kernel(
-            *_launch_config(len(counts)),
-            (values, starts, counts, out, np.int64(len(counts))),
-        )
-    return out
 
 
 class ArrayMesh:

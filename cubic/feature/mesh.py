@@ -53,8 +53,8 @@ except ImportError:  # pragma: no cover - import failure path
         stacklevel=2,
     )
 
-from ..cuda import asnumpy, get_device, to_same_device
-from ._array_mesh import ArrayMesh, face_areas, ordered_bincount
+from ..cuda import asnumpy, get_device, to_same_device, ordered_bincount
+from ._array_mesh import ArrayMesh, face_areas
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
 
