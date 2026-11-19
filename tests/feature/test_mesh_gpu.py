@@ -391,9 +391,10 @@ _SHARED_EDGE_REQUEST = [
 # Vary between GPU runs of the same code by about 1e-13 (atomic sums).
 _GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
 # On the raw mesh, without smooth_mesh. Avg Shape Index agrees across devices
-# there because _principal_curvatures sets the rounding residues of flat
-# vertices to 0; without that, CuPy and the CPU differ by 2.9% on the 10%
-# ragged ball.
+# there because _principal_curvatures sets an angle defect of at most
+# _FLAT_RESIDUE radians to 0 and both devices measure at the same unit
+# (_edge_unit sums the face areas exactly, on the host); without the first,
+# CuPy and the CPU differ by 2.9% on the 10% ragged ball.
 _RAW_CURVATURE = [
     "Total Absolute Gaussian Curvature",
     "Avg Curvedness",
@@ -635,8 +636,12 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
     """A raw voxel mesh's shape index agrees between NumPy and CuPy to rounding.
 
     Its flat vertices have angle defects that are rounding residues, which the
-    two devices sum in different orders; set to 0, they no longer move the
-    shape index, which differed by about 1e-3 between the devices.
+    two devices sum in different orders; ``_principal_curvatures`` sets those
+    of at most ``_FLAT_RESIDUE`` radians to 0, and the shape index, which
+    differed by about 1e-3 between the devices, then agrees to 1e-12. This ball
+    is at the default spacing; the same agreement at an anisotropic spacing
+    needs both devices to measure at one unit, which
+    ``test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing`` covers.
     """
     if not gpu_available:
         pytest.skip("GPU not available")

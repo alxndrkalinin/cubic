@@ -1137,9 +1137,13 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
     )
 
 
-# Relative size of a rounding residue in ``_principal_curvatures``: an angle
-# defect (radians) or an edge sum (relative to the sum of its absolute terms)
-# at most this large is set to 0.
+# Threshold of the two tests in ``_principal_curvatures`` that set the rounding
+# residues of flat vertices to 0: an angle defect of at most this many radians,
+# and an edge sum of at most this fraction of the sum of the absolute values of
+# its terms. The angle-defect test is what makes the Avg Shape Index of a raw
+# voxel mesh agree between NumPy and CuPy, given a common measuring unit
+# (``_edge_unit``). The edge-sum test only catches sums whose terms cancel; at a
+# flat vertex of a raw voxel mesh they do not.
 _FLAT_RESIDUE = 1e-14
 
 
@@ -1153,12 +1157,26 @@ def _principal_curvatures(
     LONI ShapeTools; ``k1, k2 = H -+ sqrt(H^2 - K)``, clamped to ``H`` where
     discretisation makes ``H^2 < K``.
 
-    At a flat vertex both sums are rounding residues, and the shape index
-    there would be the arctangent of two residues, which differ between NumPy
-    and CuPy. The angle defect is set to 0 where its absolute value is at most
-    ``_FLAT_RESIDUE`` radians, and the edge sum where its absolute value is
-    at most ``_FLAT_RESIDUE`` times the sum of the absolute values of its
-    terms.
+    At a flat vertex both sums should be 0 and are rounding residues, and the
+    shape index there would be the arctangent of two residues, which differ
+    between NumPy and CuPy. Two tests set them to 0. The angle defect is set to
+    0 where its absolute value is at most ``_FLAT_RESIDUE`` radians; with that,
+    and both devices measuring the mesh at the same unit (``_edge_unit``), the
+    ``Avg Shape Index`` of a raw voxel mesh differs between NumPy and CuPy by
+    less than 1e-15 (a ball, a ragged ball and a noise blob, at spacing
+    ``None`` and ``(0.29, 0.108, 0.108)``). The edge sum is set to 0 where its absolute
+    value is at most ``_FLAT_RESIDUE`` times the sum of the absolute values of
+    its terms; this catches only sums whose terms cancel, and on the blurred
+    mesh of a real nucleus it fires at 0 to 27 vertices.
+
+    At a flat vertex of a raw voxel mesh the terms do not cancel. The dihedral
+    angle of two coplanar faces is an arccos of a dot product within four ulps
+    of 1, which reads 1.5e-8 to 3e-8 rad, and these edges are all convex, so
+    the vertex keeps a mean curvature of that size and a shape index of 0.5.
+    The ``Avg Shape Index`` of a raw voxel mesh therefore still depends on the
+    scale at which the mesh is measured, and two devices that measure at units
+    an ulp apart differ in it. On the blurred meshes of 240 real nuclei the two
+    tests move it by at most 1.1e-6.
     """
     area = _mixed_area(mesh)
     defects = mesh.vertex_defects
