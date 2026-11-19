@@ -34,7 +34,7 @@ import math
 import numbers
 import warnings
 from typing import Any, TypeVar, Callable, SupportsFloat
-from functools import wraps
+from functools import cache, wraps
 from collections.abc import Sequence
 
 import numpy as np
@@ -384,9 +384,13 @@ def extract_surface_features(
     # share it when both are curvature_sigma.
     blurs: dict[float, tuple[np.ndarray, np.ndarray, Any]] = {}
 
+    @cache  # the mask's mass, counted once for every scale
+    def mass() -> float:
+        return _mask_mass(mask)
+
     def blur_at(scale: float) -> tuple[np.ndarray, np.ndarray, Any]:
         if scale not in blurs:
-            volume, pad = _padded_blur(mask, step, scale)
+            volume, pad = _padded_blur(mask, step, scale, mass=mass())
             blurs[scale] = (volume, pad, _level_set(volume, step))
         return blurs[scale]
 
@@ -619,7 +623,11 @@ def _to_caller_units(values: dict[str, float], unit: float) -> dict[str, float]:
 
 
 def _padded_blur(
-    mask: np.ndarray, step: np.ndarray, sigma: float, tight: bool = False
+    mask: np.ndarray,
+    step: np.ndarray,
+    sigma: float,
+    tight: bool = False,
+    mass: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return the mask blurred at ``sigma`` (units of ``step``) and its padding.
 
@@ -638,10 +646,12 @@ def _padded_blur(
     of zeros, shaped like the mask padded by one voxel and on the mask's
     device, stands in for the blur, with a padding of ones. Every caller only
     takes the 0.5 level of the blur or thresholds it at 0.5, and both are
-    empty for the stand-in as for the real blur.
+    empty for the stand-in as for the real blur. ``mass`` is the mask's
+    ``_mask_mass``, for a caller that blurs one mask at several scales; it is
+    computed here when not given.
     """
     sigma_voxels = sigma / step
-    if _blur_bound(mask, sigma_voxels) < _VANISHING_BOUND:
+    if _blur_bound(mask, sigma_voxels, mass) < _VANISHING_BOUND:
         shape = tuple(n + 2 for n in mask.shape)
         return np.zeros_like(mask, dtype=np.float32, shape=shape), np.ones(
             mask.ndim, dtype=int
@@ -704,10 +714,20 @@ def _largest_kernel_weight(sigma: float) -> float:
     return 1.0 / total
 
 
-def _blur_bound(mask: np.ndarray, sigma_voxels: np.ndarray) -> float:
+def _mask_mass(mask: np.ndarray) -> float:
+    """Return the sum of the positive values of ``mask``, its voxel count if boolean."""
+    if mask.dtype == bool:
+        return float(np.count_nonzero(mask))
+    return float(np.maximum(mask, 0).sum(dtype=np.float64))
+
+
+def _blur_bound(
+    mask: np.ndarray, sigma_voxels: np.ndarray, mass: float | None = None
+) -> float:
     """Return an upper bound on every value of ``_padded_blur`` of ``mask``.
 
-    ``sigma_voxels`` is the blur width per axis, in voxels. The separable blur
+    ``sigma_voxels`` is the blur width per axis, in voxels, and ``mass`` the
+    mask's ``_mask_mass``, computed here when not given. The separable blur
     of a voxel is the product of one weight of each axis's kernel, so a
     blurred value is at most the sum of the mask's positive values times the
     product over axes of ``_largest_kernel_weight``.
@@ -727,8 +747,7 @@ def _blur_bound(mask: np.ndarray, sigma_voxels: np.ndarray) -> float:
     then at most ``exp(-2) / S``, and their sum is below the centre weight
     ``1 / S``.
     """
-    positive = mask if mask.dtype == bool else np.maximum(mask, 0)
-    weight = float(positive.sum(dtype=np.float64))
+    weight = _mask_mass(mask) if mass is None else mass
     for s in sigma_voxels:
         weight *= _largest_kernel_weight(float(s))
     return weight
@@ -1226,15 +1245,16 @@ def _blur_ladder_dimension(
     """
     twin = _smooth_twin(top_blur, top_pad)
 
-    def at(image: np.ndarray, scale: float) -> float:
-        return measure(_padded_blur(image, step, scale, tight=True)[0])
+    def at(image: np.ndarray, scale: float, mass: float) -> float:
+        return measure(_padded_blur(image, step, scale, tight=True, mass=mass)[0])
 
     # geomspace returns ``high`` itself as the last scale, where the mask's
-    # measure is the one already computed
+    # measure is the one already computed; each image's mass is counted once
     scales = np.geomspace(low, high, n_levels)
-    mask_values = [at(mask, s) for s in scales[:-1]]
+    mask_mass, twin_mass = _mask_mass(mask), _mask_mass(twin)
+    mask_values = [at(mask, s, mask_mass) for s in scales[:-1]]
     mask_values.append(top_measure)
-    ratios = [v / at(twin, s) for v, s in zip(mask_values, scales)]
+    ratios = [v / at(twin, s, twin_mass) for v, s in zip(mask_values, scales)]
     if not np.all(np.isfinite(ratios)):
         warnings.warn(
             f"{name}: the mask or its smooth twin vanishes when blurred at a "
