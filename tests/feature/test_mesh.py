@@ -18,6 +18,7 @@ trimesh = pytest.importorskip("trimesh")
 
 import cubic.feature  # noqa: E402
 from cubic.feature import mesh  # noqa: E402
+from cubic.image_utils import gaussian_filter_like_scipy  # noqa: E402
 
 _CUBE_SIDE = 5
 _SPACING_ERROR = r"spacing must be three finite, positive numbers \(z, y, x\); got "
@@ -1391,12 +1392,16 @@ def test_outline_fractal_dimension_is_measured_along_the_first_axis() -> None:
 
 
 @pytest.mark.parametrize("plane", [(0.108, 0.108), (0.2, 0.1)])
-def test_tight_blur_matches_the_wide_one_on_the_frame(plane) -> None:
+def test_tight_blur_matches_the_wide_one_on_the_frame(plane, monkeypatch) -> None:
     """The outline's one-voxel blur equals the wide blur on the frame and ring.
 
     The footprints touch their crop on all four sides, where the ring is
-    highest; it stays below 0.5, so the contour closes inside the array.
+    highest; it stays below 0.5, so the contour closes inside the array. The
+    guard of ``_padded_blur`` is off, so the real blurs are compared also
+    where it would skip them (the box at the larger scale on the coarser
+    plane, whose blur peaks at 0.28).
     """
+    monkeypatch.setattr(mesh, "_VANISHING_BOUND", 0.0)
     step = np.asarray(plane)
     box = np.ones((40, 30), dtype=bool)
     rough = _rough_cylinder(0.08)[0]
@@ -1568,6 +1573,113 @@ def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
     assert np.isnan(features["Total Absolute Gaussian Curvature"])
     assert np.isnan(features["Avg Shape Index"])
     assert np.isnan(features["Fractal Dimension"])
+
+
+def test_a_blur_that_provably_vanishes_does_not_run(monkeypatch) -> None:
+    """A blur 1000 times the spacing gives the outcome of a vanished mask unblurred.
+
+    Its wide padding alone would be a 3 TB array; the bound shows the blur
+    stays below 0.5, so the curvature features and Fractal Dimension are NaN
+    with the usual warning and ``mask2mesh`` raises, without blurring.
+    """
+    ball = _ball(8, 22)
+    spacing = (0.29, 0.108, 0.108)
+    sigma = 1000 * max(spacing)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("ran the blur")
+
+    monkeypatch.setattr(mesh, "gaussian_filter_like_scipy", fail)
+    with pytest.warns(UserWarning, match="vanishes when blurred at curvature_sigma"):
+        features = mesh.extract_surface_features(
+            ball, spacing=spacing, curvature_sigma=sigma
+        )
+    with pytest.raises(ValueError, match="vanishes when blurred"):
+        mesh.mask2mesh(ball, spacing=spacing, sigma=sigma)
+
+    vanished = [*mesh._SMOOTHED_FEATURES, "Fractal Dimension"]
+    assert all(np.isnan(features[name]) for name in vanished)
+    assert all(np.isfinite(v) for n, v in features.items() if n not in vanished)
+
+
+@pytest.mark.parametrize(
+    ("keyword", "name"),
+    [
+        ("fractal_scales", "Fractal Dimension"),
+        ("outline_fractal_scales", "Outline Fractal Dimension"),
+    ],
+)
+def test_a_fractal_window_far_wider_than_the_object(keyword: str, name: str) -> None:
+    """A top scale of 1e6 voxels gives NaN with a warning; only the low rungs blur."""
+    low = 1 if keyword == "fractal_scales" else 4
+    with pytest.warns(UserWarning, match=f"{name}: the mask or its smooth twin"):
+        features = mesh.extract_surface_features(
+            _ball(8, 22), features=[name], **{keyword: (low, 1e6)}
+        )
+
+    assert np.isnan(features[name])
+
+
+def _real_blur(mask: np.ndarray, sigma_voxels: np.ndarray, tight: bool) -> np.ndarray:
+    """Blur ``mask`` as ``_padded_blur`` does, without its guard."""
+    if tight:
+        pad, mode = np.ones(mask.ndim, dtype=int), "constant"
+    else:
+        pad, mode = np.ceil(3 * sigma_voxels).astype(int) + 1, "reflect"
+    padded = np.pad(mask.astype(np.float32), [(p, p) for p in pad])
+    return gaussian_filter_like_scipy(padded, sigma_voxels, mode)
+
+
+def _sigma_with_bound(mask: np.ndarray, step: np.ndarray, target: float) -> float:
+    """Return the blur scale at which ``_blur_bound`` of ``mask`` is ``target``."""
+    low, high = 1e-3, 1e3
+    for _ in range(80):
+        mid = np.sqrt(low * high)
+        if mesh._blur_bound(mask, mid / step) > target:
+            low = mid
+        else:
+            high = mid
+    return high
+
+
+@pytest.mark.parametrize("tight", [False, True], ids=["wide", "tight"])
+@pytest.mark.parametrize(
+    "step",
+    [(1.0, 1.0, 1.0), (2.685, 1.0, 1.0), (0.29, 0.108, 0.108), (1.0, 1.0), (1.0, 0.4)],
+    ids=str,
+)
+def test_the_blur_guard_fires_only_on_masks_that_vanish(step, tight: bool) -> None:
+    """Where the bound is just under the guard's threshold, the real blur is below 0.5.
+
+    Seeded random masks of 1 to 64 voxels, with the blur scale chosen so that
+    the bound is 0.9 to 1 times the threshold. For one or two voxels the bound
+    is nearly the real maximum, so the largest real maximum comes close to
+    the threshold: a bound that is too small is caught.
+    """
+    step = np.asarray(step)
+    rng = np.random.default_rng(0)
+    threshold = mesh._VANISHING_BOUND
+    largest = 0.0
+    for case in range(30):
+        shape = [int(n) for n in rng.integers(1, 5, size=step.size)]
+        if case < 3:  # one voxel, then two along each axis
+            shape = [1] * step.size
+        elif case < 3 + step.size:
+            shape = [1] * step.size
+            shape[case - 3] = 2
+        mask = rng.random(shape) < rng.uniform(0.2, 1.0)
+        if case < 3 + step.size:
+            mask[...] = True
+        mask.flat[0] = True
+        sigma = _sigma_with_bound(mask, step, rng.uniform(0.9, 1.0) * threshold)
+        bound = mesh._blur_bound(mask, sigma / step)
+        assert 0.9 * threshold <= bound < threshold, (case, bound)
+
+        real = float(_real_blur(mask, sigma / step, tight).max())
+
+        assert real <= 0.5, (case, shape, sigma, real, bound)
+        largest = max(largest, real)
+    assert largest > 0.4, largest
 
 
 def test_mesh_is_smoothed_only_for_curvature_features(monkeypatch) -> None:

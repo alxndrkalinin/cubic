@@ -11,7 +11,7 @@ from skimage.measure import marching_cubes
 
 trimesh = pytest.importorskip("trimesh")
 
-from cubic.cuda import ascupy, asnumpy  # noqa: E402
+from cubic.cuda import ascupy, asnumpy, get_device  # noqa: E402
 from cubic.feature import mesh, _marching_cubes_cuda  # noqa: E402
 from cubic.feature._array_mesh import ArrayMesh  # noqa: E402
 from cubic.feature._marching_cubes_cuda import (  # noqa: E402
@@ -607,6 +607,30 @@ def test_fractal_dimension_stays_on_the_gpu(
 
     assert np.isfinite(on_cpu)
     assert on_gpu == pytest.approx(on_cpu, rel=1e-9)
+
+
+def test_gpu_blur_that_provably_vanishes_does_not_run(
+    gpu_available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stand-in for a skipped blur is on the GPU, and ``mask2mesh`` raises."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+
+    def fail(*args, **kwargs) -> NoReturn:
+        raise AssertionError("ran the blur")
+
+    monkeypatch.setattr(mesh, "gaussian_filter_like_scipy", fail)
+    mask = ascupy(_labels() == 1)
+    for tight in (False, True):
+        volume, pad = mesh._padded_blur(mask, np.ones(3), 1e4, tight=tight)
+
+        assert get_device(volume) == "GPU"
+        assert volume.dtype == np.float32
+        assert volume.shape == tuple(n + 2 for n in mask.shape)
+        assert float(volume.max()) == 0
+        assert pad.tolist() == [1, 1, 1]
+    with pytest.raises(ValueError, match="vanishes when blurred"):
+        mesh.mask2mesh(mask, sigma=1e4)
 
 
 def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:

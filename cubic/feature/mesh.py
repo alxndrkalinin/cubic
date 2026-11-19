@@ -30,6 +30,7 @@ the length unit of ``spacing``. There are three levels:
 from __future__ import annotations
 
 import sys
+import math
 import numbers
 import warnings
 from typing import Any, TypeVar, Callable, SupportsFloat
@@ -631,8 +632,20 @@ def _padded_blur(
     frame and that ring are bitwise the same, and every ring value is below
     0.5 (see ``_smooth_twin``), so the 0.5 level still closes inside the
     array, at a fraction of the cost of a wide blur.
+
+    When ``_blur_bound`` shows that the blur stays below 0.5 everywhere, in
+    either mode, no padded array is built and no blur runs: a float32 array
+    of zeros, shaped like the mask padded by one voxel and on the mask's
+    device, stands in for the blur, with a padding of ones. Every caller only
+    takes the 0.5 level of the blur or thresholds it at 0.5, and both are
+    empty for the stand-in as for the real blur.
     """
     sigma_voxels = sigma / step
+    if _blur_bound(mask, sigma_voxels) < _VANISHING_BOUND:
+        shape = tuple(n + 2 for n in mask.shape)
+        return np.zeros_like(mask, dtype=np.float32, shape=shape), np.ones(
+            mask.ndim, dtype=int
+        )
     if tight:
         pad = np.ones(mask.ndim, dtype=int)
         mode = "constant"
@@ -646,6 +659,77 @@ def _padded_blur(
         np.pad(mask.astype(np.float32), [(p, p) for p in pad]), sigma_voxels, mode
     )
     return volume, pad
+
+
+# ``_padded_blur`` skips a blur whose ``_blur_bound`` is below this. The margin
+# under 0.5 absorbs the float32 rounding of the real blur's passes and the
+# float64 rounding of the bound, both below 1e-6 relative.
+_VANISHING_BOUND = 0.49
+# Kernel taps on each side of the centre that ``_largest_kernel_weight`` sums
+# exactly; the taps beyond them are bounded by an integral.
+_EXACT_TAPS = 16
+
+
+def _largest_kernel_weight(sigma: float, truncate: float = 4.0) -> float:
+    """Return an upper bound on the largest weight of a 1D Gaussian blur kernel.
+
+    The kernel is the one ``gaussian_filter_like_scipy`` applies (SciPy's, and
+    cupyx's, which builds the same one), at its default ``truncate``: the
+    samples of ``g(x) = exp(-x^2 / (2 sigma^2))`` at the integers ``|x| <= r``,
+    ``r = int(truncate * sigma + 0.5)``, divided by their sum ``S``. The
+    largest weight is the centre one, ``1 / S``, so a lower bound on ``S``
+    gives the upper bound. The taps with ``|x| <= m = min(r, _EXACT_TAPS)``
+    are summed as they are. ``g`` decreases for ``x >= 0``, so each tap
+    beyond, ``m < x <= r``, is at least the integral of ``g`` over
+    ``[x, x + 1]``: ``S`` is at least the exact sum plus twice the integral of
+    ``g`` from ``m + 1`` to ``r + 1``, a difference of error functions. The
+    cost does not grow with ``sigma``, and the bound is the weight itself, to
+    rounding, while ``r <= _EXACT_TAPS``. A ``sigma`` with ``r = 0`` (SciPy
+    also skips the axes of ``sigma <= 1e-15``) leaves the axis as it is:
+    weight 1.
+    """
+    radius = int(truncate * sigma + 0.5)
+    taps = min(radius, _EXACT_TAPS)
+    total = 1.0 + 2.0 * sum(
+        math.exp(-0.5 * (x / sigma) ** 2) for x in range(1, taps + 1)
+    )
+    if radius > taps:
+        scale = sigma * math.sqrt(2.0)
+        total += (
+            sigma
+            * math.sqrt(2.0 * math.pi)
+            * (math.erf((radius + 1) / scale) - math.erf((taps + 1) / scale))
+        )
+    return 1.0 / total
+
+
+def _blur_bound(mask: np.ndarray, sigma_voxels: np.ndarray) -> float:
+    """Return an upper bound on every value of ``_padded_blur`` of ``mask``.
+
+    ``sigma_voxels`` is the blur width per axis, in voxels. The separable blur
+    of a voxel is the product of one weight of each axis's kernel, so a
+    blurred value is at most the sum of the mask's positive values times the
+    product over axes of ``_largest_kernel_weight``.
+
+    That holds in both padding modes. ``tight`` blurs with zeros beyond the
+    array. With the wide padding, in ``reflect`` mode, a kernel near the
+    array's border also reaches mirror images of voxels, which can add a
+    second weight for one voxel along an axis. Along that axis, with
+    ``s = sigma_voxels`` and ``r <= 4 s + 0.5`` the kernel's radius, a voxel
+    lies ``d >= 3 s + 1`` voxels inside a border (the padding is
+    ``ceil(3 s) + 1``), and an output ``e`` voxels inside it reaches the
+    voxel's mirror image, ``e + d + 1`` away, only if ``e + d + 1 <= r``, so
+    ``e <= s - 1.5``. The voxel itself is then ``d - e >= 2 s + 2.5`` away, so
+    both weights are at most ``exp(-2) / S`` and their sum is below the
+    centre weight ``1 / S``. The array, at least ``6 s + 3`` voxels long, is
+    longer than ``r``, so no output reaches images beyond both borders, or
+    beyond one border twice.
+    """
+    positive = mask if mask.dtype == bool else np.maximum(mask, 0)
+    weight = float(positive.sum(dtype=np.float64))
+    for s in sigma_voxels:
+        weight *= _largest_kernel_weight(float(s))
+    return weight
 
 
 def _level_set(
