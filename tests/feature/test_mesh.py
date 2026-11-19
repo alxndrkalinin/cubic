@@ -2273,8 +2273,8 @@ def test_mesh_is_reachable_from_cubic_feature_without_eager_import() -> None:
 
 
 @pytest.mark.parametrize("version", ["4.6.11", "4.6", "3.23.5"])
-def test_trimesh_older_than_the_signed_curvature_is_refused(version: str) -> None:
-    """A trimesh without signed dihedral angles fails at import, not in the values."""
+def test_trimesh_older_than_the_floor_is_refused(version: str) -> None:
+    """A trimesh older than ``_MIN_TRIMESH`` fails at import, not in the values."""
     with pytest.raises(ImportError, match=r"trimesh>=4\.6\.12; found"):
         mesh._check_trimesh_version(version)
 

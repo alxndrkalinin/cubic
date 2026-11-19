@@ -43,7 +43,7 @@ cellpose = [
     "torch",
 ]
 mesh = [
-    # >=4.6.12 for Trimesh.integral_mean_curvature with signed angles
+    # >=4.6.12: no longer needed by cubic itself (see cubic.feature.mesh._MIN_TRIMESH)
     "trimesh>=4.6.12",
 ]
 plot = [

@@ -58,8 +58,13 @@ from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-# ``Trimesh.integral_mean_curvature`` signs its dihedral angles only from this
-# release on; older ones overstate the mean curvature of any concave surface.
+# The floor of the mesh extra in pyproject.toml. It was set because
+# ``Trimesh.integral_mean_curvature`` signs its dihedral angles only from
+# 4.6.12 on; cubic now signs its own (``_edge_curvatures``), and nothing it
+# reads changed in 4.6.12, so the floor is no longer needed by cubic and is
+# left where it was. On 4.6.11 and on 4.6.12 the tests fail only where
+# they use the return value of ``Trimesh.invert``, the mesh only from 4.10;
+# on 4.0.0 cubic's oriented bounding box fails.
 _MIN_TRIMESH = (4, 6, 12)
 
 
