@@ -174,7 +174,9 @@ def test_gpu_marching_cubes_rejects_spacing_of_other_lengths(
         mesh.mask2mesh(ascupy(mask), spacing=spacing)
 
 
-def test_missing_skimage_tables_break_only_the_gpu_path(monkeypatch) -> None:
+def test_missing_skimage_tables_break_only_the_gpu_path(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """Without skimage's private lookup tables only GPU marching cubes fails.
 
     The CPU path of mask2mesh still meshes, and the GPU entry point names the
@@ -182,9 +184,8 @@ def test_missing_skimage_tables_break_only_the_gpu_path(monkeypatch) -> None:
     """
     monkeypatch.setattr(_marching_cubes_cuda, "_mcluts", None)
     monkeypatch.setattr(_marching_cubes_cuda, "_to_array", None)
-    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
 
-    assert mesh.mask2mesh(z**2 + y**2 + x**2 <= 8**2).volume > 0
+    assert mesh.mask2mesh(ball_of(8, 20)).volume > 0
     with pytest.raises(ImportError, match=r"_marching_cubes_lewiner_luts.*_to_array"):
         marching_cubes_gpu(np.zeros((2, 2, 2), dtype=np.float32), 0.5)
 
@@ -211,14 +212,15 @@ def test_array_mesh_matches_trimesh() -> None:
     assert got == pytest.approx(expected, rel=1e-12)
 
 
-def test_array_mesh_measures_inward_faces_as_given(gpu_available: bool) -> None:
+def test_array_mesh_measures_inward_faces_as_given(
+    ball_of: Callable[[float, int], np.ndarray], gpu_available: bool
+) -> None:
     """Faces wound inward give minus the outward volume; they are not flipped.
 
     ``trimesh.Trimesh`` measures its faces as given too, so an inside-out mesh
     reaches the volume check on either device instead of being flipped on one.
     """
-    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
-    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    verts, faces = mesh._marching_cubes(np.pad(ball_of(8, 20), 1))
     arrays = [(verts, faces)]
     if gpu_available:
         arrays.append((ascupy(verts), ascupy(faces)))
@@ -279,14 +281,15 @@ def test_array_mesh_merges_vertices_like_trimesh(gpu_available: bool) -> None:
         )
 
 
-def test_array_mesh_refuses_in_place_changes() -> None:
+def test_array_mesh_refuses_in_place_changes(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A delegated method that would change the mesh raises; reads still work.
 
     Changing only the host copy would leave the arrays and the cached volume
     and area describing a different mesh from the delegated attributes.
     """
-    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
-    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    verts, faces = mesh._marching_cubes(np.pad(ball_of(8, 20), 1))
     ball = ArrayMesh(verts, faces)
 
     with pytest.raises(TypeError, match="in place"):
@@ -629,7 +632,9 @@ def test_gpu_blur_that_provably_vanishes_does_not_run(
         mesh.mask2mesh(mask, sigma=1e4)
 
 
-def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> None:
+def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(
+    ball_of: Callable[[float, int], np.ndarray], gpu_available: bool
+) -> None:
     """A raw voxel mesh's shape index agrees between NumPy and CuPy to rounding.
 
     Its flat vertices have dihedral angles and angle defects that are rounding
@@ -641,8 +646,7 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-    grid = np.indices((36, 36, 36)) - 17.5
-    ball = (grid**2).sum(axis=0) <= 15**2
+    ball = ball_of(15, 36)
     name = "Avg Shape Index"
 
     on_cpu = mesh.extract_mesh_features(mesh.mask2mesh(ball), [name])[name]
@@ -653,15 +657,14 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
 
 @pytest.mark.parametrize("angle", [1e-9, np.pi - 1e-9])
 def test_gpu_dihedral_angle_of_a_hinge_is_exact(
-    angle: float, gpu_available: bool
+    angle: float,
+    hinge_of: Callable[[float], tuple[np.ndarray, np.ndarray]],
+    gpu_available: bool,
 ) -> None:
     """On CuPy arrays too, two triangles at ``angle`` give that angle to rounding."""
     if not gpu_available:
         pytest.skip("GPU not available")
-    vertices = np.array(
-        [[0, 0, 0], [1, 0, 0], [0.5, 1, 0], [0.5, -np.cos(angle), np.sin(angle)]]
-    )
-    faces = np.array([[0, 1, 2], [1, 0, 3]])
+    vertices, faces = hinge_of(angle)
     hinge = ArrayMesh(ascupy(vertices), ascupy(faces), merge=False)
 
     measured = mesh._dihedral_angles(hinge)
@@ -671,7 +674,9 @@ def test_gpu_dihedral_angle_of_a_hinge_is_exact(
 
 
 def test_gpu_flat_vertices_of_a_raw_mesh_have_no_curvature(
-    flat_vertices_of: Callable[[object], np.ndarray], gpu_available: bool
+    flat_vertices_of: Callable[[object], np.ndarray],
+    ball_of: Callable[[float, int], np.ndarray],
+    gpu_available: bool,
 ) -> None:
     """On the GPU too, ``k1 = k2 = 0`` exactly where all faces of a vertex are coplanar.
 
@@ -679,8 +684,7 @@ def test_gpu_flat_vertices_of_a_raw_mesh_have_no_curvature(
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-    grid = np.indices((36, 36, 36)) - 17.5
-    ball = (grid**2).sum(axis=0) <= 15**2
+    ball = ball_of(15, 36)
     raw = mesh.mask2mesh(ascupy(ball), spacing=(2.117, 0.7884, 0.7884))
     measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw), center=True)
     flat = flat_vertices_of(measured)

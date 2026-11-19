@@ -28,6 +28,37 @@ def _ragged_ball(fraction: float) -> np.ndarray:
     return _largest_piece((r <= 15) ^ shell)
 
 
+def _ball(radius: float, shape: int) -> np.ndarray:
+    """Return a ``shape**3`` boolean mask of a centred ball of ``radius`` voxels."""
+    grid = np.meshgrid(*[np.arange(shape) - (shape - 1) / 2] * 3, indexing="ij")
+    return sum(axis**2 for axis in grid) <= radius**2
+
+
+@pytest.fixture
+def ball_of() -> Callable[[float, int], np.ndarray]:
+    """Return ``_ball``: a centred ball mask of a given radius in a cube of a given side."""
+    return _ball
+
+
+def _hinge(angle: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return the vertices and faces of two triangles at ``angle`` to each other.
+
+    The faces ``(0, 1, 2)`` and ``(1, 0, 3)`` share the edge from vertex 0 to
+    vertex 1; their dihedral angle is ``angle``.
+    """
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [0.5, 1, 0], [0.5, -np.cos(angle), np.sin(angle)]]
+    )
+    faces = np.array([[0, 1, 2], [1, 0, 3]])
+    return vertices, faces
+
+
+@pytest.fixture
+def hinge_of() -> Callable[[float], tuple[np.ndarray, np.ndarray]]:
+    """Return ``_hinge``: the vertices and faces of two triangles at a given angle."""
+    return _hinge
+
+
 @pytest.fixture
 def ragged_ball() -> np.ndarray:
     """Return a 41^3 mask of a radius-15 ball with 30% of its boundary shell flipped.

@@ -39,11 +39,6 @@ def _centred_grid(*shape: int) -> list[np.ndarray]:
     return np.meshgrid(*[np.arange(n) - (n - 1) / 2 for n in shape], indexing="ij")
 
 
-def _ball(radius: float, shape: int) -> np.ndarray:
-    """Return a ``shape**3`` boolean mask of a centred ball of ``radius`` voxels."""
-    return sum(axis**2 for axis in _centred_grid(shape, shape, shape)) <= radius**2
-
-
 def _torus() -> np.ndarray:
     """Return a 50^3 boolean mask of a centred torus, ring radius 14 and tube radius 6."""
     z, y, x = _centred_grid(50, 50, 50)
@@ -180,14 +175,16 @@ def test_outline_fractal_dimension_is_optional() -> None:
     assert surface["Outline Fractal Dimension"] == values[0, 0]
 
 
-def test_default_features_skip_the_outline(monkeypatch) -> None:
+def test_default_features_skip_the_outline(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """features=None returns the default list and never computes the outline."""
 
     def fail(*args, **kwargs):
         raise AssertionError("computed the outline")
 
     monkeypatch.setattr(mesh, "_outline_fractal_dimension", fail)
-    labels = _ball(8, 22).astype(np.int32)
+    labels = ball_of(8, 22).astype(np.int32)
     names = mesh.mesh_feature_list()
 
     _, values, columns = mesh.extract_features(labels)
@@ -341,7 +338,9 @@ def test_mask2mesh_spacing_scales_geometry() -> None:
 )
 @pytest.mark.parametrize("source", ["spacing", "marching_cubes_kwargs", "sigma"])
 def test_mask2mesh_rejects_a_spacing_that_is_not_three_positive_numbers(
-    source: str, spacing: float | tuple[float, ...]
+    source: str,
+    spacing: float | tuple[float, ...],
+    ball_of: Callable[[float, int], np.ndarray],
 ) -> None:
     """mask2mesh rejects such a spacing from either source, as extract_features does.
 
@@ -355,7 +354,7 @@ def test_mask2mesh_rejects_a_spacing_that_is_not_three_positive_numbers(
     }[source]
 
     with pytest.raises(ValueError, match=_SPACING_ERROR):
-        mesh.mask2mesh(_ball(8, 22), **kwargs)
+        mesh.mask2mesh(ball_of(8, 22), **kwargs)
 
 
 def test_extract_features_forwards_spacing(surface_calls) -> None:
@@ -470,7 +469,9 @@ def test_shape_features_do_not_depend_on_orientation(rot_deg: float) -> None:
     assert values[0, 3] == pytest.approx(np.pi / 6, rel=0.1)
 
 
-def test_extract_features_computes_only_requested(monkeypatch) -> None:
+def test_extract_features_computes_only_requested(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """Features that were not requested are never computed.
 
     A ``["Volume"]`` request used to compute every feature, mean curvature
@@ -502,7 +503,9 @@ def test_extract_features_computes_only_requested(monkeypatch) -> None:
     for name in mesh._CURVATURE_AVERAGES:
         with monkeypatch.context() as patch:
             fail_unrequested(patch, [name])
-            _, values, _ = mesh.extract_features(_ball(8, 22).astype(np.int32), [name])
+            _, values, _ = mesh.extract_features(
+                ball_of(8, 22).astype(np.int32), [name]
+            )
         assert np.isfinite(values).all(), name
 
 
@@ -524,18 +527,20 @@ def test_extract_surface_features_full_pipeline() -> None:
     assert 0 < features["Extent"] <= 1
 
 
-def test_curvature_of_a_sphere() -> None:
+def test_curvature_of_a_sphere(ball_of: Callable[[float, int], np.ndarray]) -> None:
     """Mean curvature is a surface average, 1 / R on a sphere of radius R."""
     radius = 8
     features = mesh.extract_surface_features(
-        _ball(radius, 22), features=["Avg Mean Curvature"]
+        ball_of(radius, 22), features=["Avg Mean Curvature"]
     )
 
     # The voxel staircase leaves the mean curvature 1.6% low at this radius.
     assert features["Avg Mean Curvature"] == pytest.approx(1 / radius, rel=0.03)
 
 
-def test_curvature_converts_with_the_spacing_unit() -> None:
+def test_curvature_converts_with_the_spacing_unit(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """Giving the same spacing in other units rescales curvature as 1 / length.
 
     The vertex-averaged ball measure used before integrated over a radius of 1
@@ -544,7 +549,7 @@ def test_curvature_converts_with_the_spacing_unit() -> None:
     features stay put and curvedness scales as 1 / length like the mean.
     """
     names = ["Avg Mean Curvature", "Euler Characteristic", *_CURVATURE_FEATURES]
-    mask = _ball(8, 22)
+    mask = ball_of(8, 22)
     coarse = mesh.extract_surface_features(mask, (1.0, 1.0, 1.0), names)
     fine = mesh.extract_surface_features(mask, (0.1, 0.1, 0.1), names)
 
@@ -577,13 +582,15 @@ def test_default_curvature_blur_is_twice_the_coarsest_spacing() -> None:
     assert default["Avg Curvedness"] != finest["Avg Curvedness"]
 
 
-def test_cavity_counts_as_concave_in_the_mean_curvature() -> None:
+def test_cavity_counts_as_concave_in_the_mean_curvature(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A cavity's shell faces the material, so its curvature counts negative.
 
     The hollow ball integrates to the outer ball minus the inner one (82.1).
     Orienting each shell outward on its own would add them instead (244.2).
     """
-    outer, inner = _ball(12, 32), _ball(6, 32)
+    outer, inner = ball_of(12, 32), ball_of(6, 32)
     names = ["Avg Mean Curvature", "Area"]
 
     def integral(mask: np.ndarray) -> float:
@@ -596,12 +603,14 @@ def test_cavity_counts_as_concave_in_the_mean_curvature() -> None:
     )
 
 
-def test_euler_characteristic_counts_topology() -> None:
+def test_euler_characteristic_counts_topology(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """Twice the pieces plus cavities, minus twice the handles."""
-    two_balls = np.concatenate([_ball(6, 16), _ball(6, 16)])
+    two_balls = np.concatenate([ball_of(6, 16), ball_of(6, 16)])
     shapes = {
-        "ball": (_ball(8, 22), 2),
-        "hollow ball": (_ball(12, 32) & ~_ball(6, 32), 4),
+        "ball": (ball_of(8, 22), 2),
+        "hollow ball": (ball_of(12, 32) & ~ball_of(6, 32), 4),
         "two balls": (two_balls, 4),
         "torus": (_torus(), 0),
     }
@@ -622,10 +631,12 @@ _CURVATURE_FEATURES = [
 ]
 
 
-def test_curvature_distribution_of_a_ball() -> None:
+def test_curvature_distribution_of_a_ball(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A convex ball: total |K| / 4 pi of 1, shape index near 1, curvedness 1 / R."""
     features = mesh.extract_surface_features(
-        _ball(10, 26), features=_CURVATURE_FEATURES
+        ball_of(10, 26), features=_CURVATURE_FEATURES
     )
 
     # Every angle defect of a convex surface is positive, so |K| integrates to
@@ -657,13 +668,15 @@ def test_total_absolute_gaussian_curvature_grows_with_saddles() -> None:
     assert peanut_k > 1.1
 
 
-def test_shape_index_tells_a_torus_from_a_ball() -> None:
+def test_shape_index_tells_a_torus_from_a_ball(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """Saddles lower the area-averaged shape index: a torus reads well below a ball.
 
     The ball is all cap (0.92 here); the inner half of the torus is saddle (0.50 here).
     """
     name = "Avg Shape Index"
-    ball = mesh.extract_surface_features(_ball(10, 26), features=[name])[name]
+    ball = mesh.extract_surface_features(ball_of(10, 26), features=[name])[name]
     torus = mesh.extract_surface_features(_torus(), features=[name])[name]
 
     assert torus < ball - 0.2
@@ -705,16 +718,17 @@ def test_flat_residues_leave_real_curvature_as_it_is(
     ids=["trimesh", "ArrayMesh"],
 )
 @pytest.mark.parametrize("angle", [1e-9, 1e-6, np.pi / 2, np.pi - 1e-9])
-def test_dihedral_angle_of_a_hinge_is_exact(angle: float, build: Callable) -> None:
+def test_dihedral_angle_of_a_hinge_is_exact(
+    angle: float,
+    build: Callable,
+    hinge_of: Callable[[float], tuple[np.ndarray, np.ndarray]],
+) -> None:
     """Two triangles at ``angle`` to each other give that angle to rounding.
 
     trimesh's ``arccos`` of the dot product of the normals reads 1e-9 rad as 0
     or 1.5e-8 and pi - 1e-9 as pi; 1e-9 is also above ``_FLAT_ANGLE``.
     """
-    vertices = np.array(
-        [[0, 0, 0], [1, 0, 0], [0.5, 1, 0], [0.5, -np.cos(angle), np.sin(angle)]]
-    )
-    faces = np.array([[0, 1, 2], [1, 0, 3]])
+    vertices, faces = hinge_of(angle)
 
     measured = mesh._dihedral_angles(build(vertices, faces))
 
@@ -724,6 +738,7 @@ def test_dihedral_angle_of_a_hinge_is_exact(angle: float, build: Callable) -> No
 
 def test_flat_vertices_of_a_raw_mesh_have_no_curvature(
     flat_vertices_of: Callable[[object], np.ndarray],
+    ball_of: Callable[[float, int], np.ndarray],
 ) -> None:
     """Where all the faces of a vertex are coplanar, ``k1 = k2 = 0`` exactly.
 
@@ -732,7 +747,7 @@ def test_flat_vertices_of_a_raw_mesh_have_no_curvature(
     read up to 1.2e-14 rad as arctangents and up to 3e-8 as trimesh's arccos;
     with ``_FLAT_ANGLE`` at 1e-14, 59 of them kept a curvature, at 0, 1482.
     """
-    raw = mesh.mask2mesh(_ball(15, 36), spacing=(2.117, 0.7884, 0.7884))
+    raw = mesh.mask2mesh(ball_of(15, 36), spacing=(2.117, 0.7884, 0.7884))
     measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw), center=True)
     flat = flat_vertices_of(measured)
 
@@ -768,6 +783,24 @@ def test_raw_shape_index_does_not_depend_on_scale_or_orientation(
     assert max(values) - min(values) <= 1e-12
 
 
+def _turned_cube(
+    side: float, offset: tuple[float, float, float] | None = None
+) -> trimesh.Trimesh:
+    """Return a cube of ``side`` subdivided four times, turned, and moved by ``offset``.
+
+    It is turned by a fixed random rotation. Its faces lie in the six planes of
+    the cube, so every vertex inside a face is flat.
+    """
+    box = trimesh.creation.box(extents=(side, side, side))
+    for _ in range(4):
+        box = box.subdivide()
+    turn = Rotation.random(1, random_state=2).as_matrix()[0]
+    vertices = box.vertices @ turn.T
+    if offset is not None:
+        vertices = vertices + np.array(offset)
+    return trimesh.Trimesh(vertices, box.faces, process=False)
+
+
 def test_rotated_cube_has_the_mean_curvature_of_its_edges(
     flat_vertices_of: Callable[[object], np.ndarray],
 ) -> None:
@@ -780,13 +813,7 @@ def test_rotated_cube_has_the_mean_curvature_of_its_edges(
     and Avg Mean Curvature was 1.3e-7 too high.
     """
     side = 2.0
-    box = trimesh.creation.box(extents=(side, side, side))
-    for _ in range(4):
-        box = box.subdivide()
-    turn = Rotation.random(1, random_state=2).as_matrix()[0]
-    cube = trimesh.Trimesh(
-        box.vertices @ turn.T + np.array([0.3, -0.2, 0.1]), box.faces, process=False
-    )
+    cube = _turned_cube(side, offset=(0.3, -0.2, 0.1))
     measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube), center=True)
     inside = flat_vertices_of(measured)
 
@@ -810,12 +837,7 @@ def test_shape_index_leaves_out_planar_vertices(
     least 0.5 (0.509 here); counting the 1350 face-interior vertices as 0 gave
     0.062.
     """
-    side = 2.0
-    box = trimesh.creation.box(extents=(side, side, side))
-    for _ in range(4):
-        box = box.subdivide()
-    turn = Rotation.random(1, random_state=2).as_matrix()[0]
-    cube = trimesh.Trimesh(box.vertices @ turn.T, box.faces, process=False)
+    cube = _turned_cube(2.0)
     measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube), center=True)
     k1, k2, area = mesh._principal_curvatures(measured)
     curved = ~flat_vertices_of(measured)
@@ -997,7 +1019,9 @@ def test_fractal_window_changes_only_fractal_dimension() -> None:
         assert custom[name] == default[name]
 
 
-def test_fractal_window_does_not_need_curvature_sigma() -> None:
+def test_fractal_window_does_not_need_curvature_sigma(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """With its own window, D no longer needs curvature_sigma above the spacing.
 
     The default window of this call would be empty and give NaN.
@@ -1005,7 +1029,7 @@ def test_fractal_window_does_not_need_curvature_sigma() -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         features = mesh.extract_surface_features(
-            _ball(10, 26),
+            ball_of(10, 26),
             features=["Fractal Dimension"],
             curvature_sigma=1.0,
             fractal_scales=(1.0, 3.0),
@@ -1037,7 +1061,9 @@ def test_fractal_window_does_not_need_curvature_sigma() -> None:
     ],
 )
 @pytest.mark.parametrize("keyword", ["fractal_scales", "outline_fractal_scales"])
-def test_fractal_window_is_validated(scales, error: type, keyword: str) -> None:
+def test_fractal_window_is_validated(
+    scales, error: type, keyword: str, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """A window that is not two finite numbers 0 < lowest < highest raises.
 
     TypeError when it is not a sequence of numbers, ValueError when the values
@@ -1047,7 +1073,7 @@ def test_fractal_window_is_validated(scales, error: type, keyword: str) -> None:
     match = f"^{keyword} must"
     with pytest.raises(error, match=match):
         mesh.extract_surface_features(
-            _ball(8, 22), features=["Fractal Dimension"], **{keyword: scales}
+            ball_of(8, 22), features=["Fractal Dimension"], **{keyword: scales}
         )
     with pytest.raises(error, match=match):
         mesh.extract_features(np.zeros((4, 4, 4), np.int32), **{keyword: scales})
@@ -1072,10 +1098,12 @@ def test_each_fractal_window_moves_only_its_own_feature() -> None:
     assert all(np.isfinite(v) for f in (by_3d, by_outline) for v in f.values())
 
 
-def test_extract_features_forwards_the_fractal_window() -> None:
+def test_extract_features_forwards_the_fractal_window(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """extract_features passes fractal_scales to every label's crop."""
     name = ["Fractal Dimension"]
-    labels = _ball(10, 26).astype(np.int32)
+    labels = ball_of(10, 26).astype(np.int32)
     crop = labels[ndimage.find_objects(labels)[0]] == 1
 
     _, values, _ = mesh.extract_features(labels, name, fractal_scales=(1.0, 3.0))
@@ -1142,7 +1170,9 @@ def test_fractal_dimension_warns_for_an_object_thinner_than_four_top_scales() ->
     ],
 )
 @pytest.mark.parametrize("entry", ["extract_surface_features", "extract_features"])
-def test_warnings_point_at_the_caller(case: str, match: str, entry: str) -> None:
+def test_warnings_point_at_the_caller(
+    case: str, match: str, entry: str, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """Warnings are attributed to the calling line, not to cubic, from either entry.
 
     The _require_trimesh wrapper adds a frame; with stacklevel=2 every warning
@@ -1154,7 +1184,7 @@ def test_warnings_point_at_the_caller(case: str, match: str, entry: str) -> None
     thin_sheet[3:6, 10:50, 10:50] = True
     calls = {
         "thin slab": (_slab(6), _NUCLEUS_SPACING, ["Fractal Dimension"], {}),
-        "outline narrower than the blur": (_ball(8, 22), None, [_OUTLINE], {}),
+        "outline narrower than the blur": (ball_of(8, 22), None, [_OUTLINE], {}),
         "3D twin vanishes": (thin_sheet, _NUCLEUS_SPACING, ["Fractal Dimension"], {}),
         "mask vanishes at curvature_sigma": (
             np.ones((1, 1, 1), dtype=bool),
@@ -1163,7 +1193,7 @@ def test_warnings_point_at_the_caller(case: str, match: str, entry: str) -> None
             {},
         ),
         "empty default window": (
-            _ball(8, 22),
+            ball_of(8, 22),
             None,
             ["Fractal Dimension"],
             {"curvature_sigma": 1.0},
@@ -1243,7 +1273,7 @@ def test_warnings_name_the_outermost_frame_when_every_frame_is_cubic() -> None:
     assert result == [2, filename]
 
 
-def _failing_bounding_cylinder(monkeypatch: pytest.MonkeyPatch) -> None:
+def _failing_convex_hull(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make every trimesh convex hull fail as a degenerate mesh's does."""
 
     def fail(self: trimesh.Trimesh) -> NoReturn:
@@ -1263,16 +1293,20 @@ def _failing_bounding_cylinder(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     "entry", ["extract_features", "extract_surface_features", "extract_mesh_features"]
 )
-def test_bounding_cylinder_warning_points_at_the_caller(
-    entry: str, name: str, message: str, monkeypatch: pytest.MonkeyPatch
+def test_convex_hull_failure_warning_points_at_the_caller(
+    entry: str,
+    name: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    ball_of: Callable[[float, int], np.ndarray],
 ) -> None:
-    """The bounding-cylinder and box fallbacks warn at the calling line and return 0.
+    """A failed convex hull makes the cylinder, box and Extent warn at the caller, 0.
 
     With stacklevel=2 the cylinder's pointed at the feature registry in
     mesh.py. trimesh's box search, used before, raised instead.
     """
-    _failing_bounding_cylinder(monkeypatch)
-    mask = _ball(6, 16)
+    _failing_convex_hull(monkeypatch)
+    mask = ball_of(6, 16)
     names = [name]
     calls = {
         "extract_features": lambda: mesh.extract_features(mask.astype(np.int32), names)[
@@ -1295,9 +1329,9 @@ def test_bounding_cylinder_warning_points_at_the_caller(
     assert [w.filename for w in matching] == [__file__]
 
 
-def _cylinder_volume(surface: Any) -> float:
-    names = ["Bounding Cylinder Volume"]
-    return mesh.extract_mesh_features(surface, names)[names[0]]
+def _feature(surface: Any, name: str) -> float:
+    """Return ``name`` of ``surface`` as ``extract_mesh_features`` measures it."""
+    return mesh.extract_mesh_features(surface, [name])[name]
 
 
 def _turned(surface: Any, rotation: np.ndarray) -> trimesh.Trimesh:
@@ -1333,9 +1367,9 @@ def test_bounding_cylinder_of_a_turned_box_and_cylinder(
     for the 2 x 3 x 5 box at one of them.
     """
     for rotation in _TURNS:
-        assert _cylinder_volume(_turned(shape, rotation)) == pytest.approx(
-            volume, rel=1e-12
-        )
+        assert _feature(
+            _turned(shape, rotation), "Bounding Cylinder Volume"
+        ) == pytest.approx(volume, rel=1e-12)
 
 
 def test_bounding_cylinder_of_a_polyhedral_sphere() -> None:
@@ -1347,7 +1381,10 @@ def test_bounding_cylinder_of_a_polyhedral_sphere() -> None:
     """
     sphere = trimesh.creation.icosphere(subdivisions=3, radius=2.0)
     inner = np.abs((sphere.face_normals * sphere.triangles_center).sum(axis=1)).min()
-    values = [_cylinder_volume(_turned(sphere, rotation)) for rotation in _TURNS]
+    values = [
+        _feature(_turned(sphere, rotation), "Bounding Cylinder Volume")
+        for rotation in _TURNS
+    ]
     assert 2 * np.pi * inner**3 <= min(values)
     assert max(values) <= 2 * np.pi * 2.0**3
     np.testing.assert_allclose(values, values[0], rtol=1e-12)
@@ -1370,39 +1407,60 @@ def test_bounding_cylinder_of_a_polyhedral_spheroid(semi_axes: tuple) -> None:
         process=False,
     )
     a, _, c = semi_axes
-    values = [_cylinder_volume(_turned(spheroid, rotation)) for rotation in _TURNS]
+    values = [
+        _feature(_turned(spheroid, rotation), "Bounding Cylinder Volume")
+        for rotation in _TURNS
+    ]
     assert spheroid.convex_hull.volume <= min(values)
     assert max(values) <= 2 * np.pi * a**2 * c * (1 + 1e-12)
     np.testing.assert_allclose(values, values[0], rtol=1e-12)
 
 
-def test_bounding_cylinder_turns_and_scales_with_the_mesh(
-    noise_blob_of: Callable[[int], np.ndarray],
+@pytest.mark.parametrize(
+    ("powers", "mask_of", "seed"),
+    [
+        ({"Bounding Cylinder Volume": 3}, "noise_blob_of", 2),
+        ({"Oriented Bounding Box Volume": 3, "Extent": 0}, "lumpy_nucleus_of", 5),
+    ],
+    ids=["cylinder", "box"],
+)
+def test_bounding_shape_turns_scales_and_reorders_with_the_mesh(
+    powers: dict[str, int], mask_of: str, seed: int, request: pytest.FixtureRequest
 ) -> None:
-    """The cylinder of a lobed blob is the same, to rounding, turned or rescaled.
+    """A bounding shape of a mesh is the same, to rounding, turned or reordered.
 
-    trimesh's minimum search, used before, gave this mesh volumes 43% apart
-    over the same rescalings, and up to 98% apart over turns of noise blobs.
-    The cylinder encloses the convex hull, so it is at least its volume.
+    Rescaled by a factor, each value scales with it to the power in ``powers``,
+    written out here, not read from the module's table: 3 for a volume, 0 for
+    Extent. The shapes are the cylinder of a lobed blob and the box of a lumpy
+    nucleus, with its Extent. ``reordered`` lists the vertices in reverse: the
+    CPU and GPU meshes list the same vertices in different orders. A shape
+    encloses the convex hull, so its volume is at least the hull's.
+
+    trimesh's minimum cylinder search, used before, gave this blob volumes 43%
+    apart over the same rescalings, and up to 98% apart over turns of noise
+    blobs; its box search gave this nucleus volumes 8.8% apart over these
+    turns, and 8.1% apart for its vertices listed in reverse.
     """
-    surface = mesh.mask2mesh(noise_blob_of(2), spacing=(2.685, 1.0, 1.0))
+    mask = request.getfixturevalue(mask_of)(seed)
+    surface = mesh.mask2mesh(mask, spacing=(2.685, 1.0, 1.0))
     vertices, faces = np.asarray(surface.vertices), np.asarray(surface.faces)
-    reference = _cylinder_volume(surface)
-    assert reference >= surface.convex_hull.volume
-    for factor in (0.95, 1.1, 1.25, 1.4):
-        scaled = trimesh.Trimesh(vertices * factor, faces, process=False)
-        assert _cylinder_volume(scaled) == pytest.approx(
-            factor**3 * reference, rel=1e-12
-        )
-    for rotation in _TURNS[1:]:
-        assert _cylinder_volume(_turned(surface, rotation)) == pytest.approx(
-            reference, rel=1e-12
-        )
-
-
-def _box_volume(surface: Any) -> float:
-    names = ["Oriented Bounding Box Volume"]
-    return mesh.extract_mesh_features(surface, names)[names[0]]
+    names = list(powers)
+    reference = {name: _feature(surface, name) for name in names}
+    assert surface.convex_hull.volume <= reference[names[0]]
+    reordered = trimesh.Trimesh(
+        vertices[::-1].copy(), len(vertices) - 1 - faces, process=False
+    )
+    moved = [(reordered, 1.0)]
+    moved += [
+        (trimesh.Trimesh(vertices * factor, faces, process=False), factor)
+        for factor in (0.95, 1.1, 1.25, 1.4)
+    ]
+    moved += [(_turned(surface, rotation), 1.0) for rotation in _TURNS[1:]]
+    for other, factor in moved:
+        values = mesh.extract_mesh_features(other, names)
+        for name in names:
+            expected = factor ** powers[name] * reference[name]
+            assert values[name] == pytest.approx(expected, rel=1e-12), name
 
 
 @pytest.mark.parametrize(
@@ -1430,43 +1488,23 @@ def test_oriented_bounding_box_of_a_regular_tetrahedron() -> None:
     corners = np.array([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], float)
     tetrahedron = trimesh.convex.convex_hull(corners)
     for rotation in _TURNS:
-        assert _box_volume(_turned(tetrahedron, rotation)) == pytest.approx(
-            2 * 2.0**3, rel=1e-12
-        )
+        assert _feature(
+            _turned(tetrahedron, rotation), "Oriented Bounding Box Volume"
+        ) == pytest.approx(2 * 2.0**3, rel=1e-12)
 
 
-def test_oriented_bounding_box_turns_scales_and_reorders_with_the_mesh(
+def test_oriented_bounding_box_is_at_most_trimeshs_and_gives_extent(
     lumpy_nucleus_of: Callable[[int], np.ndarray],
 ) -> None:
-    """The box of a lumpy nucleus is the same, to rounding, turned, rescaled or reordered.
+    """The box of a lumpy nucleus is at most the box trimesh finds.
 
-    trimesh's box search, used before, gave this mesh volumes 8.8% apart over
-    these turns, and 8.1% apart for its vertices listed in reverse: the CPU
-    and GPU meshes list the same vertices in different orders. The box
-    encloses the convex hull, and is at most the box trimesh finds, which
-    also has a face on a hull face.
+    trimesh's box also has a face on a hull face. Extent is the volume of the
+    mesh over the box.
     """
     surface = mesh.mask2mesh(lumpy_nucleus_of(5), spacing=(2.685, 1.0, 1.0))
-    vertices, faces = np.asarray(surface.vertices), np.asarray(surface.faces)
-    reference = _box_volume(surface)
-    assert surface.convex_hull.volume <= reference
-    assert reference <= surface.bounding_box_oriented.volume * (1 + 1e-12)
-    extent = mesh.extract_mesh_features(surface, ["Extent"])["Extent"]
-    assert extent == pytest.approx(surface.volume / reference, rel=1e-12)
-    reordered = trimesh.Trimesh(
-        vertices[::-1].copy(), len(vertices) - 1 - faces, process=False
-    )
-    moved = [(reordered, 1.0)]
-    moved += [
-        (trimesh.Trimesh(vertices * factor, faces, process=False), factor)
-        for factor in (0.95, 1.1, 1.25, 1.4)
-    ]
-    moved += [(_turned(surface, rotation), 1.0) for rotation in _TURNS[1:]]
-    names = ["Oriented Bounding Box Volume", "Extent"]
-    for other, factor in moved:
-        values = mesh.extract_mesh_features(other, names)
-        assert values[names[0]] == pytest.approx(factor**3 * reference, rel=1e-12)
-        assert values[names[1]] == pytest.approx(extent, rel=1e-12)
+    box = _feature(surface, "Oriented Bounding Box Volume")
+    assert box <= surface.bounding_box_oriented.volume * (1 + 1e-12)
+    assert _feature(surface, "Extent") == pytest.approx(surface.volume / box, rel=1e-12)
 
 
 def _brute_force_radius(points: np.ndarray) -> float:
@@ -1749,12 +1787,14 @@ def test_shared_edge_warning_is_shown_once_for_a_label_image(
 
 
 @pytest.mark.parametrize("name", ["Fractal Dimension", "Outline Fractal Dimension"])
-def test_fractal_dimension_needs_the_mask(name: str) -> None:
+def test_fractal_dimension_needs_the_mask(
+    name: str, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """extract_mesh_features refuses either D and leaves it out of its defaults.
 
     A single mesh cannot be re-blurred.
     """
-    ball = mesh.mask2mesh(_ball(8, 22))
+    ball = mesh.mask2mesh(ball_of(8, 22))
 
     with pytest.raises(ValueError, match=f"{name}.*mask"):
         mesh.extract_mesh_features(ball, [name])
@@ -1916,7 +1956,9 @@ def test_outline_fractal_window() -> None:
     assert abs(custom - default) > 1e-3
 
 
-def test_outline_fractal_dimension_of_a_footprint_narrower_than_the_blur() -> None:
+def test_outline_fractal_dimension_of_a_footprint_narrower_than_the_blur(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A footprint that vanishes at the top scale gives NaN, with a warning.
 
     The ball's footprint, 16 voxels across, vanishes under the default 16-voxel
@@ -1924,7 +1966,7 @@ def test_outline_fractal_dimension_of_a_footprint_narrower_than_the_blur() -> No
     """
     names = [_OUTLINE, "Fractal Dimension", "Volume"]
     with pytest.warns(UserWarning, match="Outline Fractal Dimension: the mask or its"):
-        features = mesh.extract_surface_features(_ball(8, 22), features=names)
+        features = mesh.extract_surface_features(ball_of(8, 22), features=names)
 
     assert np.isnan(features[_OUTLINE])
     assert np.isfinite(features["Fractal Dimension"])
@@ -1969,7 +2011,9 @@ def test_fractal_dimension_of_a_sheet_thinner_than_the_blur() -> None:
 
 
 @pytest.mark.parametrize("spacing", [None, _NUCLEUS_SPACING])
-def test_smooth_twin_fits_in_the_mask_frame(spacing) -> None:
+def test_smooth_twin_fits_in_the_mask_frame(
+    spacing, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """Cropping the twin to the mask's frame loses none of its voxels.
 
     Both objects touch their frame on every face, where the blur outside the
@@ -1979,7 +2023,7 @@ def test_smooth_twin_fits_in_the_mask_frame(spacing) -> None:
     step = mesh._step(spacing)
     sigma = mesh._curvature_sigma(spacing, None)
     box = np.ones((12, 30, 30), dtype=bool)
-    for mask in (box, _ball(6, 13)):
+    for mask in (box, ball_of(6, 13)):
         blurred, pad = mesh._padded_blur(mask, step, sigma)
         twin = mesh._smooth_twin(blurred, pad)
 
@@ -1991,21 +2035,27 @@ def test_smooth_twin_fits_in_the_mask_frame(spacing) -> None:
                 assert twin.take(-1, axis=axis).any()
 
 
-def test_fractal_dimension_needs_a_blur_above_the_finest_spacing() -> None:
+def test_fractal_dimension_needs_a_blur_above_the_finest_spacing(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """D is NaN, with a warning, when curvature_sigma is not above the finest spacing.
 
     There is then no range of scales to fit.
     """
     with pytest.warns(UserWarning, match="finest voxel spacing"):
         features = mesh.extract_surface_features(
-            _ball(8, 22), features=["Fractal Dimension", "Volume"], curvature_sigma=1.0
+            ball_of(8, 22),
+            features=["Fractal Dimension", "Volume"],
+            curvature_sigma=1.0,
         )
 
     assert np.isnan(features["Fractal Dimension"])
     assert features["Volume"] > 0
 
 
-def test_empty_fractal_window_is_decided_before_any_blur(monkeypatch) -> None:
+def test_empty_fractal_window_is_decided_before_any_blur(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """An empty default window gives NaN without blurring the mask.
 
     With a curvature feature too, a mask that vanishes at curvature_sigma
@@ -2019,7 +2069,7 @@ def test_empty_fractal_window_is_decided_before_any_blur(monkeypatch) -> None:
         patch.setattr(mesh, "_padded_blur", fail)
         with pytest.warns(UserWarning, match="finest voxel spacing"):
             alone = mesh.extract_surface_features(
-                _ball(8, 22), features=["Fractal Dimension"], curvature_sigma=1.0
+                ball_of(8, 22), features=["Fractal Dimension"], curvature_sigma=1.0
             )
     assert np.isnan(alone["Fractal Dimension"])
 
@@ -2057,7 +2107,9 @@ def test_curvature_features_of_an_object_too_small_for_the_blur() -> None:
     assert np.isnan(features["Fractal Dimension"])
 
 
-def test_a_blur_that_provably_vanishes_does_not_run(monkeypatch) -> None:
+def test_a_blur_that_provably_vanishes_does_not_run(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """A blur 1000 times the spacing gives the outcome of a vanished mask unblurred.
 
     Its wide padding alone would be a 6.3 TB array (6026 x 16136 x 16136
@@ -2065,7 +2117,7 @@ def test_a_blur_that_provably_vanishes_does_not_run(monkeypatch) -> None:
     stays below 0.5, so the curvature features and Fractal Dimension are NaN
     with the usual warning and ``mask2mesh`` raises, without blurring.
     """
-    ball = _ball(8, 22)
+    ball = ball_of(8, 22)
     spacing = (0.29, 0.108, 0.108)
     sigma = 1000 * max(spacing)
 
@@ -2092,12 +2144,14 @@ def test_a_blur_that_provably_vanishes_does_not_run(monkeypatch) -> None:
         ("outline_fractal_scales", "Outline Fractal Dimension"),
     ],
 )
-def test_a_fractal_window_far_wider_than_the_object(keyword: str, name: str) -> None:
+def test_a_fractal_window_far_wider_than_the_object(
+    keyword: str, name: str, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """A top scale of 1e6 voxels gives NaN with a warning; only the low rungs blur."""
     low = 1 if keyword == "fractal_scales" else 4
     with pytest.warns(UserWarning, match=f"{name}: the mask or its smooth twin"):
         features = mesh.extract_surface_features(
-            _ball(8, 22), features=[name], **{keyword: (low, 1e6)}
+            ball_of(8, 22), features=[name], **{keyword: (low, 1e6)}
         )
 
     assert np.isnan(features[name])
@@ -2159,7 +2213,9 @@ def test_the_blur_guard_fires_only_on_masks_that_vanish(
     assert largest > 0.4, largest
 
 
-def test_mesh_is_smoothed_only_for_curvature_features(monkeypatch) -> None:
+def test_mesh_is_smoothed_only_for_curvature_features(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """Features that need neither the blur nor the smoothed mesh never compute it."""
 
     def fail(*args, **kwargs):
@@ -2167,13 +2223,15 @@ def test_mesh_is_smoothed_only_for_curvature_features(monkeypatch) -> None:
 
     monkeypatch.setattr(mesh, "_padded_blur", fail)
     features = mesh.extract_surface_features(
-        _ball(8, 22), features=["Volume", "Avg Mean Curvature"]
+        ball_of(8, 22), features=["Volume", "Avg Mean Curvature"]
     )
 
     assert features["Volume"] > 0
 
 
-def test_fractal_dimension_alone_builds_no_smoothed_mesh(monkeypatch) -> None:
+def test_fractal_dimension_alone_builds_no_smoothed_mesh(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """Fractal Dimension reuses the blurred level set but needs no mesh object."""
 
     def fail(*args, **kwargs):
@@ -2181,14 +2239,16 @@ def test_fractal_dimension_alone_builds_no_smoothed_mesh(monkeypatch) -> None:
 
     monkeypatch.setattr(mesh, "_level_set_mesh", fail)
     name = "Fractal Dimension"
-    features = mesh.extract_surface_features(_ball(8, 22), features=[name])
+    features = mesh.extract_surface_features(ball_of(8, 22), features=[name])
 
     assert features[name] == pytest.approx(2, abs=0.05)
 
 
-def test_extract_mesh_features_measures_curvature_on_the_smooth_mesh() -> None:
+def test_extract_mesh_features_measures_curvature_on_the_smooth_mesh(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """Passing the smoothed mesh reproduces the per-mask pipeline exactly."""
-    mask = _ball(8, 22)
+    mask = ball_of(8, 22)
     raw, smooth = mesh.mask2mesh(mask), mesh.mask2mesh(mask, sigma=2.0)
 
     from_meshes = mesh.extract_mesh_features(
@@ -2202,7 +2262,7 @@ def test_extract_mesh_features_measures_curvature_on_the_smooth_mesh() -> None:
 
 
 def test_principal_curvatures_are_computed_once_per_call(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, ball_of: Callable[[float, int], np.ndarray]
 ) -> None:
     """Avg Shape Index and Avg Curvedness share one per-vertex curvature pass.
 
@@ -2219,7 +2279,7 @@ def test_principal_curvatures_are_computed_once_per_call(
         return principal_curvatures(surface, *args)
 
     monkeypatch.setattr(mesh, "_principal_curvatures", counted)
-    mask = _ball(8, 22)
+    mask = ball_of(8, 22)
 
     mesh.extract_surface_features(mask)
     assert len(calls) == 1
@@ -2240,7 +2300,9 @@ def test_principal_curvatures_are_computed_once_per_call(
 
 @pytest.mark.parametrize("smoothed", [False, True], ids=["one mesh", "smooth_mesh"])
 def test_shared_quantities_are_computed_once(
-    monkeypatch: pytest.MonkeyPatch, smoothed: bool
+    monkeypatch: pytest.MonkeyPatch,
+    smoothed: bool,
+    ball_of: Callable[[float, int], np.ndarray],
 ) -> None:
     """The oriented box and each mesh's edge terms are computed once per call.
 
@@ -2260,8 +2322,8 @@ def test_shared_quantities_are_computed_once(
         counts["edges"] += 1
         return edges(surface)
 
-    surface = mesh.mask2mesh(_ball(8, 22))
-    smooth = mesh.mask2mesh(_ball(8, 22), sigma=1.0) if smoothed else None
+    surface = mesh.mask2mesh(ball_of(8, 22))
+    smooth = mesh.mask2mesh(ball_of(8, 22), sigma=1.0) if smoothed else None
     names = [
         "Oriented Bounding Box Volume",
         "Extent",
@@ -2282,11 +2344,13 @@ def test_shared_quantities_are_computed_once(
     assert together == alone
 
 
-def test_curvature_sigma_is_validated() -> None:
+def test_curvature_sigma_is_validated(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A non-positive blur is rejected, and mask2mesh refuses a vanished mask."""
     with pytest.raises(ValueError, match="curvature_sigma must be finite and positive"):
         mesh.extract_surface_features(
-            _ball(8, 22), features=_CURVATURE_FEATURES, curvature_sigma=0
+            ball_of(8, 22), features=_CURVATURE_FEATURES, curvature_sigma=0
         )
     with pytest.raises(ValueError, match="vanishes when blurred"):
         mesh.mask2mesh(np.ones((1, 1, 1), dtype=bool), sigma=2.0)
@@ -2334,14 +2398,16 @@ def test_curvature_sigma_is_validated_whichever_features(
             call()
 
 
-def test_mask2mesh_checks_its_sigma_and_refuses_ignored_keywords() -> None:
+def test_mask2mesh_checks_its_sigma_and_refuses_ignored_keywords(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A bad ``sigma`` is named as such, and keywords it would ignore are refused.
 
     With ``sigma`` the mask is blurred and meshed without
     ``marching_cubes_kwargs``, so a ``spacing`` passed there would silently
     leave the mesh in voxel units.
     """
-    mask = _ball(8, 22)
+    mask = ball_of(8, 22)
     with pytest.raises(ValueError, match="^sigma must be finite and positive"):
         mesh.mask2mesh(mask, sigma=0)
     with pytest.raises(ValueError, match="marching_cubes_kwargs cannot be combined"):
@@ -2350,7 +2416,9 @@ def test_mask2mesh_checks_its_sigma_and_refuses_ignored_keywords() -> None:
         )
 
 
-def test_small_object_does_not_fail_a_label_image() -> None:
+def test_small_object_does_not_fail_a_label_image(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A tiny object next to a normal one gets NaN where it cannot be measured.
 
     A ball of radius 3 survives the default blur as a 44-face mesh. With the
@@ -2358,8 +2426,8 @@ def test_small_object_does_not_fail_a_label_image() -> None:
     ``Fractal Dimension``.
     """
     labels = np.zeros((22, 22, 44), dtype=np.int32)
-    labels[:, :, :22][_ball(3, 22)] = 1
-    labels[:, :, 22:][_ball(8, 22)] = 2
+    labels[:, :, :22][ball_of(3, 22)] = 1
+    labels[:, :, 22:][ball_of(8, 22)] = 2
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
