@@ -259,7 +259,8 @@ def test_volume_error_prints_the_callers_volume(
     """The open-mesh error names the volume in the caller's units.
 
     ``mask2mesh`` is replaced by one that leaves the surface open, which the
-    padding otherwise prevents.
+    padding otherwise prevents. The volume of an open surface depends on the
+    origin; it is that of the copy measured, centred on the origin.
     """
 
     def open_mask2mesh(
@@ -271,7 +272,7 @@ def test_volume_error_prints_the_callers_volume(
     mask = np.zeros((6, 6, 6), dtype=bool)
     mask[:3, :3, :3] = True  # touches the border, so its surface is open
     spacing = (0.5, 0.25, 0.25)
-    expected = open_mask2mesh(mask, spacing).volume
+    expected = mesh._scaled_copy(open_mask2mesh(mask, spacing), 1.0, center=True).volume
     monkeypatch.setattr(mesh, "mask2mesh", open_mask2mesh)
 
     with pytest.raises(ValueError, match="volume must be finite") as error:

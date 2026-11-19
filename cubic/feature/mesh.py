@@ -12,8 +12,8 @@ products with absolute tolerances, so whether a result is right can depend on
 the length unit of ``spacing``. There are three levels:
 
 1. ``extract_features`` and ``extract_surface_features`` measure in units of
-   the finest voxel spacing and convert the values back, so they work in any
-   unit.
+   the finest voxel spacing, on meshes centred on the origin, and convert the
+   values back, so they work in any unit and at any position in the image.
 2. ``mask2mesh`` builds its mesh in those units and returns it in the
    caller's units, and ``extract_mesh_features`` measures a mesh at the scale
    of its own edges, centred on the origin, and converts back. Both work in
@@ -565,14 +565,20 @@ def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
     return trimesh.Trimesh(vertices=verts, faces=faces)
 
 
-def _scaled_copy(surface: Any, factor: float, center: bool = False) -> Any:
+def _scaled_copy(
+    surface: Any,
+    factor: float,
+    center: bool = False,
+    bounds: tuple[list[float], list[float]] | None = None,
+) -> Any:
     """Return a copy of ``surface`` with every vertex times ``factor``, unmerged.
 
     See "Units and trimesh tolerances" in the module docstring. With
     ``center``, the middle of the box of the vertices of its faces
-    (``_vertex_bounds``) is subtracted from every vertex first, so the copy is
-    centred on the origin; the same vertices give the same copy on either
-    device. A mesh with a centre of mass set on it is not centred: trimesh
+    (``_vertex_bounds``, or ``bounds`` when already computed) is subtracted
+    from every vertex first, so the copy is centred on the origin; the same
+    vertices give the same copy on either device. A mesh with a centre of
+    mass set on it is not centred: trimesh
     shifts its inertia from the origin to that point as if it were the
     centroid, which depends on where the mesh lies. ``surface`` is not
     modified. An ``ArrayMesh`` stays one; any other mesh, a trimesh primitive
@@ -582,9 +588,10 @@ def _scaled_copy(surface: Any, factor: float, center: bool = False) -> Any:
     # trimesh keeps a density or centre of mass set on a mesh apart from its
     # cache, where reading them computes nothing on ``surface``.
     overrides = {} if isinstance(surface, ArrayMesh) else surface._data.data
-    bounds = (
-        _vertex_bounds(surface) if center and "center_mass" not in overrides else None
-    )
+    if not center or "center_mass" in overrides:
+        bounds = None
+    elif bounds is None:
+        bounds = _vertex_bounds(surface)
     origin = None
     if bounds is not None:
         middle = np.array([(low + high) / 2 for low, high in zip(*bounds)])
@@ -946,22 +953,17 @@ def extract_mesh_features(
         )
     # Measured on copies scaled by one factor so that the edges of ``mesh`` are
     # of order 1, where trimesh's absolute tolerances see the shape and not the
-    # unit, and converted back. Each copy is centred on the middle of its box
-    # first: every feature is translation-invariant, and coordinates of the
-    # order of the object's size round less than those of a far-off mesh. The
-    # copies leave the caller's meshes as they are.
-    unit = _edge_unit(mesh)
+    # unit, and converted back.
+    bounds = _vertex_bounds(mesh)
+    unit = _edge_unit(mesh, bounds)
     # The same object passed as both is measured once, as with no smooth mesh.
-    smooth = (
-        None
-        if smooth_mesh is None or smooth_mesh is mesh
-        else _scaled_copy(smooth_mesh, 1 / unit, center=True)
-    )
     values = _measure_mesh(
-        _scaled_copy(mesh, 1 / unit, center=True),
+        mesh,
         features,
-        smooth_mesh=smooth,
+        smooth_mesh=None if smooth_mesh is mesh else smooth_mesh,
         unit=unit,
+        scale=1 / unit,
+        bounds=bounds,
     )
     return _to_caller_units(values, unit)
 
@@ -987,7 +989,9 @@ def _vertex_bounds(surface: Any) -> tuple[list[float], list[float]] | None:
     )
 
 
-def _edge_unit(surface: Any) -> float:
+def _edge_unit(
+    surface: Any, bounds: tuple[list[float], list[float]] | None = None
+) -> float:
     """Return a length of the order of the edges of ``surface``.
 
     The square root of the area of the axis-aligned bounding box of the
@@ -999,9 +1003,11 @@ def _edge_unit(surface: Any) -> float:
     any device and in any order, and the face count, so a NumPy and a CuPy mesh
     with the same vertices get the same unit however their faces are listed.
     1 for a mesh without faces or whose box has no finite, positive area, which
-    the volume and area check of ``_measure_mesh`` then reports.
+    the volume and area check of ``_measure_mesh`` then reports. ``bounds``
+    are ``_vertex_bounds(surface)`` when already computed.
     """
-    bounds = _vertex_bounds(surface)
+    if bounds is None:
+        bounds = _vertex_bounds(surface)
     if bounds is None:
         return 1.0
     a, b, c = (high - low for low, high in zip(*bounds))
@@ -1016,12 +1022,23 @@ def _measure_mesh(
     features: Sequence[str],
     smooth_mesh: trimesh.Trimesh | None = None,
     unit: float = 1.0,
+    scale: float = 1.0,
+    bounds: tuple[list[float], list[float]] | None = None,
 ) -> dict[str, float]:
-    """Return ``features`` of a mesh whose lengths are in units of ``unit``.
+    """Return ``features`` of ``mesh`` times ``scale``, a length in units of ``unit``.
 
-    The values stay in the mesh's units; ``unit`` only converts the volume or
-    area printed by the errors to the caller's units.
+    They are measured on copies of ``mesh`` and ``smooth_mesh`` times
+    ``scale`` and centred on the middle of their boxes (``_scaled_copy``):
+    every feature is translation-invariant, and coordinates of the order of
+    the object's size round less than those of a far-off mesh. ``bounds`` are
+    ``_vertex_bounds(mesh)`` when already computed. The values stay in the
+    units of the copies; ``unit`` only converts the volume or area printed by
+    the errors to the caller's units. The caller's meshes are left as they
+    are.
     """
+    mesh = _scaled_copy(mesh, scale, center=True, bounds=bounds)
+    if smooth_mesh is not None:
+        smooth_mesh = _scaled_copy(smooth_mesh, scale, center=True)
     # Validate the mesh before any feature: an inside-out mesh reports a
     # negative volume, which would silently propagate into a NaN sphericity and
     # negative solidity and extent instead of failing. An open surface is not

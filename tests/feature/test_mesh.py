@@ -527,6 +527,37 @@ def test_extract_surface_features_full_pipeline() -> None:
     assert 0 < features["Extent"] <= 1
 
 
+def test_extract_surface_features_of_a_far_object_are_those_of_a_near_one(
+    lumpy_nucleus_of: Callable[[int], np.ndarray],
+) -> None:
+    """An object 2030 voxels from the origin of its mask gets the features it gets near it.
+
+    Every feature of the voxel mesh is measured on a copy centred on the
+    origin, so the inertia does not round with the distance. The features of
+    the blurred mesh and the fractal dimensions are not compared: those
+    meshes are built in the mask's frame, where their vertices round coarser
+    far from the origin.
+    """
+    nucleus = lumpy_nucleus_of(5)
+    names = [
+        name
+        for name in mesh.mesh_feature_list()
+        if name not in mesh._SMOOTHED_FEATURES and name not in mesh._MASK_FEATURES
+    ]
+    near = np.zeros((44, 68, 68), dtype=bool)
+    near[2:42, 2:66, 2:66] = nucleus
+    far = np.zeros((44, 68, 2100), dtype=bool)
+    far[2:42, 2:66, 2030:2094] = nucleus
+
+    values = [
+        mesh.extract_surface_features(mask, spacing=(2.685, 1.0, 1.0), features=names)
+        for mask in (near, far)
+    ]
+
+    for name in names:
+        assert values[1][name] == pytest.approx(values[0][name], rel=1e-13), name
+
+
 def test_curvature_of_a_sphere(ball_of: Callable[[float, int], np.ndarray]) -> None:
     """Mean curvature is a surface average, 1 / R on a sphere of radius R."""
     radius = 8
