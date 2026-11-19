@@ -1493,6 +1493,91 @@ def test_oriented_bounding_box_of_a_regular_tetrahedron() -> None:
         ) == pytest.approx(2 * 2.0**3, rel=1e-12)
 
 
+def _dense_support(
+    flat: np.ndarray, outward: np.ndarray, directions: np.ndarray
+) -> np.ndarray:
+    """``_projection_support`` searched among every segment end."""
+    ends = flat.reshape(len(flat), -1, 2)
+    return (directions @ ends.transpose(0, 2, 1)).max(axis=2)
+
+
+def test_box_calipers_match_a_search_of_every_end(
+    monkeypatch: pytest.MonkeyPatch,
+    lumpy_nucleus_of: Callable[[int], np.ndarray],
+) -> None:
+    """The rotating calipers give the box that every silhouette end gives.
+
+    The hulls have flat sides along the axes (voxel meshes and a cube, whose
+    faces across an axis count on both sides), repeated and collinear points
+    (rounded points), and edges along an axis, whose projection is a point.
+    """
+    rng = np.random.default_rng(3)
+    voxel = mesh.mask2mesh(lumpy_nucleus_of(5), spacing=(2.685, 1.0, 1.0))
+    hulls = [
+        voxel.convex_hull,
+        mesh.mask2mesh(lumpy_nucleus_of(2)).convex_hull,
+        trimesh.creation.box(extents=(1, 2, 3)),
+        trimesh.convex.convex_hull(rng.normal(size=(300, 3)) * [1, 2, 3]),
+        trimesh.convex.convex_hull(np.round(rng.normal(size=(400, 3)) * 4)),
+    ]
+    for surface in hulls:
+        found = mesh._hull_and_normals(surface, "box")
+        assert found is not None
+        hull, axes = found
+        searched = []
+        # Every hull through the calipers, however few its sides.
+        monkeypatch.setattr(mesh, "_DENSE_SIDES", 0)
+        for support in (mesh._projection_support, _dense_support):
+            monkeypatch.setattr(mesh, "_projection_support", support)
+            # Every axis, not only those the bounds leave.
+            volumes = [mesh._min_box_volume(hull, axes[[i]]) for i in range(len(axes))]
+            searched.append(np.array(volumes))
+        np.testing.assert_allclose(searched[0], searched[1], rtol=1e-13, atol=0)
+
+
+@pytest.mark.parametrize(
+    "name", ["Oriented Bounding Box Volume", "Bounding Cylinder Volume"]
+)
+def test_bounds_from_extreme_vertices_skip_no_smallest_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    lumpy_nucleus_of: Callable[[int], np.ndarray],
+) -> None:
+    """Bounding a large hull by its extreme vertices first gives the same volume.
+
+    The threshold is lowered so that these hulls of 642 and 150 vertices take
+    the path of a hull of thousands. Each bound the search is given, the
+    first and the tighter one, is at most the volume about every axis, not
+    only about those the search reached; with every vertex as the subset,
+    the bounds are those of the hull itself.
+    """
+    sphere = trimesh.creation.icosphere(subdivisions=3)
+    stretched = trimesh.Trimesh(sphere.vertices * [1.0, 2.0, 3.0], sphere.faces)
+    surfaces = [
+        _turned(stretched, _TURNS[1]),
+        mesh.mask2mesh(lumpy_nucleus_of(5), spacing=(2.685, 1.0, 1.0)),
+    ]
+    searches = []
+    search = mesh._smallest_over_axes
+
+    def recorded(lower, volumes, refine=None):
+        searches.append((lower, volumes, refine))
+        return search(lower, volumes, refine)
+
+    monkeypatch.setattr(mesh, "_smallest_over_axes", recorded)
+    monkeypatch.setattr(mesh, "_SUBSET_ABOVE", 100)
+    subset = [_feature(surface, name) for surface in surfaces]
+    for lower, volumes, refine in searches:
+        assert refine is not None
+        every = np.arange(len(lower))
+        exact = np.concatenate([volumes(c) for c in mesh._axis_chunks(len(every))])
+        assert (lower <= exact * (1 + 1e-12)).all()
+        assert (refine(every) <= exact * (1 + 1e-12)).all()
+    monkeypatch.setattr(mesh, "_bounding_subset", lambda points: points)
+    full = [_feature(surface, name) for surface in surfaces]
+    np.testing.assert_allclose(subset, full, rtol=1e-13, atol=0)
+
+
 def test_oriented_bounding_box_is_at_most_trimeshs_and_gives_extent(
     lumpy_nucleus_of: Callable[[int], np.ndarray],
 ) -> None:

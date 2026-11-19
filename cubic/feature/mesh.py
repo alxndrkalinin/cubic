@@ -1237,28 +1237,61 @@ def _min_box_volume(hull: trimesh.Trimesh, axes: np.ndarray) -> float:
     """Return the smallest volume of the boxes about unit ``axes`` enclosing ``hull``.
 
     Each box spans the extent of the hull vertices along its axis, and its base
+    is the minimum-area rectangle of their projection across it
+    (``_box_volumes``). Exact: an axis is skipped only when a lower bound of
+    its volume exceeds a volume already found (``_smallest_over_axes``). The
+    bound is the area of the projection times its height. For a hull of many
+    vertices it is that of the hull of the few extreme ones
+    (``_bounding_subset``), and then the box of that hull about the axis,
+    which every box enclosing the hull encloses.
+    """
+    points = np.asarray(hull.vertices, dtype=np.float64)
+    frames = _axis_frames(axes)
+    few = _bounding_subset(points)
+    inner = hull
+    if len(few) < len(points):
+        # Should Qhull fail on the few, the hull bounds itself.
+        try:
+            inner = trimesh.convex.convex_hull(few)
+        except (ValueError, QhullError):
+            pass
+    normals = np.asarray(inner.face_normals, dtype=np.float64)
+    areas = np.asarray(inner.area_faces, dtype=np.float64)
+    corners = np.asarray(inner.vertices, dtype=np.float64)
+    # The hull covers its projection twice, so this is the projection's area.
+    lower = np.concatenate(
+        [
+            areas
+            @ np.abs(normals @ axes[c].T)
+            / 2
+            * np.ptp(corners @ axes[c].T, axis=0)
+            for c in _axis_chunks(len(axes))
+        ]
+    )
+    refine = None if inner is hull else _box_volumes(inner, axes, frames)
+    return _smallest_over_axes(lower, _box_volumes(hull, axes, frames), refine)
+
+
+def _box_volumes(
+    hull: trimesh.Trimesh, axes: np.ndarray, frames: np.ndarray
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Return the volume of the smallest box about each of a batch of ``axes``.
+
+    Each box spans the extent of the hull vertices along its axis, and its base
     is the minimum-area rectangle of their projection across it. Its sides run
     along the projection of a silhouette edge, one between a hull face that
     faces along the axis and one that does not; every edge of the projection's
     hull is one, and any other direction gives a larger rectangle. The
-    projection's hull is that of the silhouette edges' ends, so only they are
-    projected. Exact: an axis is skipped only when a lower bound of its
-    volume, from the area of the projection, exceeds a volume already found
-    (``_smallest_over_axes``).
+    projection's hull is that of the silhouette edges' ends, and its widths
+    across each side are found by rotating calipers (``_projection_support``),
+    O(S log S) for S silhouette edges, or for at most ``_DENSE_SIDES`` sides
+    from every end, O(S^2) but fewer operations. ``frames`` are
+    ``_axis_frames(axes)``.
     """
     points = np.asarray(hull.vertices, dtype=np.float64)
     normals = np.asarray(hull.face_normals, dtype=np.float64)
-    areas = np.asarray(hull.area_faces, dtype=np.float64)
     pairs = np.asarray(hull.face_adjacency)
     edges = np.asarray(hull.face_adjacency_edges)
-    frames = _axis_frames(axes)
-    height = np.concatenate(
-        [np.ptp(points @ axes[c].T, axis=0) for c in _axis_chunks(len(axes))]
-    )
-    # The hull covers its projection twice, so this is the projection's area.
-    shadow = np.concatenate(
-        [areas @ np.abs(normals @ axes[c].T) / 2 for c in _axis_chunks(len(axes))]
-    )
 
     def volumes(batch: np.ndarray) -> np.ndarray:
         facing = normals @ axes[batch].T
@@ -1268,26 +1301,107 @@ def _min_box_volume(hull: trimesh.Trimesh, axes: np.ndarray) -> float:
             (ahead[pairs[:, 0]] & ahead[pairs[:, 1]])
             | (behind[pairs[:, 0]] & behind[pairs[:, 1]])
         )
-        # (axes, sides, 2): the ends of each axis's silhouette edges, padded
-        # with repeats of its first edge, which change no extent.
-        ends = edges[_padded_rows(np.ascontiguousarray(silhouette.T))]
+        # (axes, sides): each axis's silhouette edges, padded with repeats of
+        # its first, which change no extent.
+        sides_of = _padded_rows(np.ascontiguousarray(silhouette.T))
+        across = frames[batch, 1:].transpose(0, 2, 1)
         # The projection, in two unit vectors across each axis, so that each
         # rectangle is exactly a rectangle even for an edge along the axis,
-        # whose projection points anywhere.
-        flat = points[ends.reshape(len(batch), -1)] @ frames[batch, 1:].transpose(
-            0, 2, 1
+        # whose projection points anywhere: (axes, sides, ends, 2).
+        flat = (points[edges[sides_of].reshape(len(batch), -1)] @ across).reshape(
+            *sides_of.shape, 2, 2
         )
-        sides = flat[:, 1::2] - flat[:, 0::2]
+        sides = flat[:, :, 1] - flat[:, :, 0]
         length = np.sqrt((sides * sides).sum(axis=2))
         sides /= np.where(length > 0, length, 1.0)[..., None]
         both = np.concatenate([sides, sides[..., ::-1] * np.array([-1.0, 1.0])], 1)
-        reach = both @ flat.transpose(0, 2, 1)
-        width = reach.max(axis=2) - reach.min(axis=2)
         count = sides.shape[1]
+        if count <= _DENSE_SIDES:
+            # Every end against every side, which takes fewer operations than
+            # the calipers for few sides.
+            reach = both @ flat.reshape(len(batch), -1, 2).transpose(0, 2, 1)
+            width = reach.max(axis=2) - reach.min(axis=2)
+        else:
+            # The outward normal of each side in the projection: the
+            # combination of its two faces' normals that is across the axis,
+            # or the first normal when both faces are across it.
+            faces = pairs[sides_of]
+            on = facing.T[np.arange(len(batch))[:, None, None], faces]
+            outward = (
+                np.abs(on[..., 1:]) * normals[faces[..., 0]]
+                + np.abs(on[..., :1]) * normals[faces[..., 1]]
+            )
+            outward = np.where(
+                (on == 0).all(axis=2)[..., None], normals[faces[..., 0]], outward
+            )
+            support = _projection_support(
+                flat, outward @ across, np.concatenate([both, -both], 1)
+            )
+            width = support[:, : 2 * count] + support[:, 2 * count :]
         base = np.where(length > 0, width[:, :count] * width[:, count:], np.inf)
-        return base.min(axis=1) * height[batch]
+        height = np.ptp(points @ axes[batch].T, axis=0)
+        return base.min(axis=1) * height
 
-    return _smallest_over_axes(shadow * height, volumes)
+    return volumes
+
+
+# Up to this many silhouette edges, the widths of a projection are found from
+# every end, in fewer operations than the calipers for few edges; its
+# (32, 2 S, 2 S) products then stay below 70 MB.
+_DENSE_SIDES = 256
+
+
+def _projection_support(
+    flat: np.ndarray, outward: np.ndarray, directions: np.ndarray
+) -> np.ndarray:
+    """Return the largest projection onto each of ``directions`` of each convex polygon.
+
+    ``flat`` holds the ends ``(k, s, 2, 2)`` of the ``s`` boundary segments
+    of each of ``k`` convex polygons, in any order and with repeats, and
+    ``outward`` ``(k, s, 2)`` the outward normal of each, of any length;
+    ``directions`` are ``(k, q, 2)``. The result, ``(k, q)``, is the largest
+    product of a segment end with each direction, from rotating calipers: the
+    segments are put in order around the boundary by the angle of their
+    middles about the mean middle, where their normals turn once around; the
+    ends of the segments whose normals' angles bracket a direction's, and of
+    their neighbours, hold the largest product. A polygon whose normals do not
+    turn once around, to 1e-6, is searched in full.
+    """
+    k, s = outward.shape[:2]
+    rows = np.arange(k)[:, None]
+    middle = flat.mean(axis=2)
+    middle -= middle.mean(axis=1, keepdims=True)
+    order = np.argsort(np.arctan2(middle[..., 1], middle[..., 0]), axis=1)
+    ends = flat[rows, order]
+    angle = np.arctan2(outward[..., 1], outward[..., 0])[rows, order]
+    turns = (np.diff(angle, axis=1, append=angle[:, :1]) + np.pi) % (2 * np.pi) - np.pi
+    # The normals' angles from the first, turned on to rounding: nondecreasing
+    # and below 2 pi, so that they bracket every direction once.
+    turned = np.zeros((k, s))
+    turned[:, 1:] = np.cumsum(turns[:, :-1], axis=1)
+    turned = np.maximum.accumulate(turned, axis=1)
+    wanted = (np.arctan2(directions[..., 1], directions[..., 0]) - angle[:, :1]) % (
+        2 * np.pi
+    )
+    # One sorted search for every polygon: each row's angles shifted above
+    # the previous row's.
+    shift = 8.0 * np.arange(k)[:, None]
+    after = np.searchsorted((turned + shift).ravel(), (wanted + shift).ravel())
+    after = after.reshape(wanted.shape) - s * rows
+    x, y = ends[..., 0], ends[..., 1]
+    across, along = directions[..., 0], directions[..., 1]
+    support = np.full(wanted.shape, -np.inf)
+    for offset in (-2, -1, 0, 1):
+        near = (after + offset) % s
+        for end in (0, 1):
+            products = x[rows, near, end] * across + y[rows, near, end] * along
+            np.maximum(support, products, out=support)
+    # Rounding cannot turn the normals by much less or more than once around;
+    # a polygon they do not turn once around is searched among all its ends.
+    total = turns.sum(axis=1)
+    for row in np.flatnonzero(np.abs(total - 2 * np.pi) > 1e-6):
+        support[row] = (directions[row] @ flat[row].reshape(-1, 2).T).max(axis=1)
+    return support
 
 
 def _padded_rows(mask: np.ndarray) -> np.ndarray:
@@ -1310,13 +1424,16 @@ def _axis_chunks(count: int) -> list[np.ndarray]:
 
 
 def _smallest_over_axes(
-    lower: np.ndarray, volumes: Callable[[np.ndarray], np.ndarray]
+    lower: np.ndarray,
+    volumes: Callable[[np.ndarray], np.ndarray],
+    refine: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> float:
     """Return the smallest of ``volumes(batch)`` over all axes, exactly.
 
     The axes are tried in batches of 32 in increasing order of ``lower``, a
     lower bound of each axis's volume, and those whose bound exceeds the
-    smallest volume found are skipped.
+    smallest volume found are skipped. ``refine(batch)``, when given, is a
+    tighter lower bound, cheaper than ``volumes``, tested on the axes left.
     """
     order = np.argsort(lower, kind="stable")
     best = math.inf
@@ -1325,8 +1442,39 @@ def _smallest_over_axes(
         batch = batch[lower[batch] * (1 - _ENCLOSING_SLACK) <= best]
         if len(batch) == 0:
             break
+        if refine is not None:
+            batch = batch[refine(batch) * (1 - _ENCLOSING_SLACK) <= best]
+            if len(batch) == 0:
+                continue
         best = min(best, float(volumes(batch).min()))
     return best
+
+
+# Hulls of more vertices than this are bounded by a subset of them first.
+_SUBSET_ABOVE = 4096
+
+
+def _bounding_subset(points: np.ndarray) -> np.ndarray:
+    """Return ``points``, or for more than ``_SUBSET_ABOVE`` the few extreme ones.
+
+    Those extreme along either way of each of 512 directions spread over the
+    sphere: a shape that encloses ``points`` encloses them, so their bounding
+    shapes bound those of ``points`` from below, closely for a hull of many
+    small faces.
+    """
+    if len(points) <= _SUBSET_ABOVE:
+        return points
+    i = np.arange(512) + 0.5
+    z = 1 - i / 256
+    turn = np.pi * (1 + math.sqrt(5)) * i
+    ring = np.sqrt(1 - z * z)
+    directions = np.stack([ring * np.cos(turn), ring * np.sin(turn), z])
+    # 32 directions at a time, to bound the memory.
+    extremes = []
+    for start in range(0, 512, 32):
+        along = points @ directions[:, start : start + 32]
+        extremes += [along.argmax(axis=0), along.argmin(axis=0)]
+    return points[np.unique(np.concatenate(extremes))]
 
 
 # Relative slack of the enclosing tests, against the rounding of distances, and
@@ -1354,22 +1502,40 @@ def _min_cylinder_volume(points: np.ndarray, axes: np.ndarray) -> float:
     Each cylinder spans the extent of the points along its axis and has the
     radius of their minimum enclosing circle across it. Exact: an axis is
     skipped only when a lower bound of its volume, from the radius of at
-    least half the larger width of the projection, exceeds a volume already
-    found (``_smallest_over_axes``).
+    least half the largest width of the projection, exceeds a volume already
+    found (``_smallest_over_axes``): first that of the points, or for many
+    points the few extreme ones (``_bounding_subset``), which every cylinder
+    enclosing ``points`` encloses, then that of all of them in more
+    directions.
     """
     frames = _axis_frames(axes)
-    # (axes, 3, points): each point along and across each axis.
-    extent = np.concatenate(
-        [np.ptp(frames[c] @ points.T, axis=2) for c in _axis_chunks(len(axes))]
-    )
-    height = extent[:, 0]
+
+    def widths(batch: np.ndarray, of: np.ndarray, turns: int = 2) -> np.ndarray:
+        # (axes, 3, points): each point along and across each axis.
+        along = frames[batch] @ of.T
+        extent = np.ptp(along, axis=2)
+        # The largest width across the axis in ``turns`` directions spread
+        # evenly over a half turn, the frame's two among them.
+        width = extent[:, 1:].max(axis=1)
+        for k in range(1, turns):
+            if 2 * k != turns:
+                turn = k * math.pi / turns
+                spread = math.cos(turn) * along[:, 1] + math.sin(turn) * along[:, 2]
+                width = np.maximum(width, np.ptp(spread, axis=1))
+        return np.pi * (width / 2) ** 2 * extent[:, 0]
 
     def volumes(batch: np.ndarray) -> np.ndarray:
-        across = (frames[batch, 1:] @ points.T).transpose(0, 2, 1)
-        return np.pi * _enclosing_radii(across) ** 2 * height[batch]
+        along = frames[batch] @ points.T
+        height = np.ptp(along[:, 0], axis=1)
+        return np.pi * _enclosing_radii(along[:, 1:].transpose(0, 2, 1)) ** 2 * height
 
-    lower = np.pi * (extent[:, 1:].max(axis=1) / 2) ** 2 * height
-    return _smallest_over_axes(lower, volumes)
+    few = _bounding_subset(points)
+    # Widths in the 2 directions of each frame, or of few points in 8, on
+    # every axis; then of every point in 8 on the axes left. Two directions
+    # can miss a diameter by an eighth of a turn, 8 by a thirty-second.
+    turns = 2 if len(few) == len(points) else 8
+    lower = np.concatenate([widths(c, few, turns) for c in _axis_chunks(len(axes))])
+    return _smallest_over_axes(lower, volumes, lambda batch: widths(batch, points, 8))
 
 
 def _enclosing_radii(points: np.ndarray) -> np.ndarray:
