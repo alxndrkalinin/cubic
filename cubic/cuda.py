@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+import functools
 import threading
 from types import ModuleType
 from typing import Any
@@ -231,6 +232,29 @@ def dispatch_device_call(
         )
         return _on_cpu(return_to_gpu=True)
     return func(*args, **kwargs)
+
+
+@functools.cache
+def _cuda_functions(
+    source: str, names: tuple[str, ...], device_id: int
+) -> tuple[Any, ...]:
+    """Compile CUDA ``source`` once per device and return its kernels ``names``.
+
+    ``--fmad=false`` keeps every multiply and add separately rounded, as in the
+    scalar C/C++ references; contractions the reference does perform are
+    spelled out as explicit ``fma`` calls.
+    """
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        raise RuntimeError("CuPy is required for the CUDA kernels")
+    with cp.cuda.Device(device_id):
+        module = cp.RawModule(code=source, options=("--fmad=false",))
+        return tuple(module.get_function(name) for name in names)
+
+
+def _launch_config(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
+    """Grid-stride launch configuration for ``size`` elements, at least one block."""
+    return (max(1, min((size + threads - 1) // threads, 65535 * 8)),), (threads,)
 
 
 def to_device(array: np.ndarray, device: str) -> np.ndarray:

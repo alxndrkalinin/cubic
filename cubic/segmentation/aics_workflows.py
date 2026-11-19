@@ -25,15 +25,21 @@ conductance ``K`` replays ITK's serial summation only near a float32 rounding
 midpoint (see ``_K_SERIAL_MARGIN``).
 """
 
-import functools
 from typing import Any
 from collections.abc import Sequence
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure
 
-from ..cuda import CUDAManager, asnumpy, get_device, get_array_module
+from ..cuda import (
+    asnumpy,
+    get_device,
+    _launch_config,
+    _cuda_functions,
+    get_array_module,
+)
 from ..scipy import ndimage as _ndimage
+from ..image_utils import gaussian_filter_like_scipy
 from .segment_utils import _SKIMAGE_USES_MAX_SIZE
 
 # Relative distance from a float32 rounding midpoint below which ITK's serially
@@ -49,32 +55,9 @@ from .segment_utils import _SKIMAGE_USES_MAX_SIZE
 _K_SERIAL_MARGIN = 1e-9
 
 
-@functools.cache
-def _cuda_functions(
-    source: str, names: tuple[str, ...], device_id: int
-) -> tuple[Any, ...]:
-    """Compile ``source`` once per device and return its kernels.
-
-    ``--fmad=false`` keeps every multiply and add separately rounded, as in the
-    scalar C/C++ references; contractions the reference does perform are
-    spelled out as explicit ``fma`` calls.
-    """
-    cp = CUDAManager().get_cp()
-    if cp is None:
-        raise RuntimeError("CuPy is required for the CUDA kernels")
-    with cp.cuda.Device(device_id):
-        module = cp.RawModule(code=source, options=("--fmad=false",))
-        return tuple(module.get_function(name) for name in names)
-
-
 def _cupy_device(array: np.ndarray) -> Any:
     """CuPy device of ``array``; NumPy's stubs type ``.device`` as ``"cpu"``."""
     return array.device
-
-
-def _launch_config(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
-    """Grid-stride launch configuration for ``size`` elements."""
-    return (min((size + threads - 1) // threads, 65535 * 8),), (threads,)
 
 
 def intensity_normalization(
@@ -445,24 +428,8 @@ def _diffusion_step_cuda(
 
 
 def _gaussian_nearest(image: np.ndarray, sigmas: list[float]) -> np.ndarray:
-    """Separable Gaussian (``mode="nearest"``, ``truncate=3``) rounded like SciPy.
-
-    SciPy filters a float32 image one axis at a time, accumulating each pass in
-    float64 and storing it as float32. cupyx accumulates float32 input in
-    float32, so on GPU each pass runs on a float64 copy to stay on SciPy's
-    arithmetic. Axes with ``sigma == 0`` are skipped, as in SciPy.
-    """
-    if get_device(image) == "CPU":
-        return _ndimage.gaussian_filter(
-            image, sigma=sigmas, mode="nearest", truncate=3.0
-        )
-    out = image
-    for axis, sigma in enumerate(sigmas):
-        if sigma > 1e-15:
-            out = _ndimage.gaussian_filter1d(
-                out.astype(np.float64), sigma, axis=axis, mode="nearest", truncate=3.0
-            ).astype(image.dtype)
-    return out
+    """Separable Gaussian (``mode="nearest"``, ``truncate=3``) rounded like SciPy."""
+    return gaussian_filter_like_scipy(image, sigmas, mode="nearest", truncate=3.0)
 
 
 def _hessian_2d_eigen_max(image: np.ndarray, sigma: float) -> np.ndarray:

@@ -33,6 +33,7 @@ from cubic.image_utils import (
     get_xy_block_coords,
     pad_to_matching_shape,
     distance_transform_edt,
+    gaussian_filter_like_scipy,
     reverse_checkerboard_split,
     select_max_contrast_slices,
 )
@@ -712,3 +713,19 @@ class TestBinomialSplitNoiseModelWarnings:
             assert sample.size <= _SAMPLE_MAX_VALUES
             if shape[0] > 1:
                 assert np.any(sample != 0.0), f"{shape} sampled plane 0 only"
+
+
+def test_gaussian_filter_like_scipy_keeps_complex_input(gpu_available: bool) -> None:
+    """A complex image keeps its imaginary part on the GPU, as SciPy keeps it."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(0)
+    image = (rng.random((8, 9, 10)) + 1j * rng.random((8, 9, 10))).astype(np.complex64)
+    sigma = [1.0, 0.5, 2.0]
+
+    expected = ndimage.gaussian_filter(image, sigma)
+    got = asnumpy(gaussian_filter_like_scipy(ascupy(image), sigma))
+
+    assert got.dtype == np.complex64
+    assert np.abs(expected.imag).max() > 0.1
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
