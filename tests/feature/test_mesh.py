@@ -678,13 +678,13 @@ def test_flat_residues_leave_real_curvature_as_it_is(
     down to 4.5e-13 radians, and no angle defect lies between 1e-14 and 1e-13.
     No dihedral angle lies between 1e-13 and 1e-9 either, so ``_FLAT_ANGLE``
     sits in an empty band. What the two floors set to 0 on the copy that
-    ``extract_mesh_features`` measures are residues: 57 dihedral angles of at
-    most 1e-13 and 260 angle defects of 8.9e-16 (one ulp of 2 pi).
+    ``extract_mesh_features`` measures are residues: 63 dihedral angles of at
+    most 1e-13 and 187 angle defects of 8.9e-16 (one ulp of 2 pi).
     """
     z, y, x = _centred_grid(20, 132, 132)
     flat = (z / 6) ** 2 + (y / 60) ** 2 + (x / 60) ** 2 <= 1
     smooth = mesh.mask2mesh(flat, sigma=2.0)
-    measured = mesh._scaled_copy(smooth, 1 / mesh._edge_unit(smooth))
+    measured = mesh._scaled_copy(smooth, 1 / mesh._edge_unit(smooth), center=True)
     defects = np.abs(measured.vertex_defects)
     monkeypatch.setattr(mesh, "_FLAT_ANGLE", 0.0)
     angles = mesh._dihedral_angles(measured)
@@ -728,13 +728,12 @@ def test_flat_vertices_of_a_raw_mesh_have_no_curvature(
     """Where all the faces of a vertex are coplanar, ``k1 = k2 = 0`` exactly.
 
     On this raw anisotropic ball, measured as ``extract_mesh_features`` does,
-    1872 of 4296 vertices are flat. Their dihedral angles read up to 1.9e-14
-    rad as arctangents and up to 3e-8 as trimesh's arccos; with
-    ``_FLAT_ANGLE`` at 1e-14, 175 of them kept a curvature, at 0, 1497, and
-    with arccos angles, 974.
+    1872 of 4296 vertices are flat. Between two of them the dihedral angles
+    read up to 1.2e-14 rad as arctangents and up to 3e-8 as trimesh's arccos;
+    with ``_FLAT_ANGLE`` at 1e-14, 59 of them kept a curvature, at 0, 1482.
     """
     raw = mesh.mask2mesh(_ball(15, 36), spacing=(2.117, 0.7884, 0.7884))
-    measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw))
+    measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw), center=True)
     flat = flat_vertices_of(measured)
 
     k1, k2, _ = mesh._principal_curvatures(measured)
@@ -750,9 +749,9 @@ def test_raw_shape_index_does_not_depend_on_scale_or_orientation(
     """A raw mesh's Avg Shape Index agrees to rounding at any scale and orientation.
 
     Over spacings 1e-8 to 1e3 times (0.29, 0.108, 0.108) and three
-    orientations, the 30% ragged ball's varied by 2.0e-16; with
-    ``_FLAT_ANGLE`` at 1e-14 by 1.0e-2, at 3e-14 by 1.0e-3, and with trimesh's
-    arccos angles by 3.0e-3.
+    orientations, the 30% ragged ball's varied by 1.3e-16; with
+    ``_FLAT_ANGLE`` at 1e-14 by 9.5e-3, at 3e-14 by 6.4e-4, and with trimesh's
+    arccos angles, measured before the copies were centred, by 3.0e-3.
     """
     mask = ragged_ball_of(0.3)
     turns = Rotation.random(2, random_state=1).as_matrix()
@@ -788,7 +787,7 @@ def test_rotated_cube_has_the_mean_curvature_of_its_edges(
     cube = trimesh.Trimesh(
         box.vertices @ turn.T + np.array([0.3, -0.2, 0.1]), box.faces, process=False
     )
-    measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube))
+    measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube), center=True)
     inside = flat_vertices_of(measured)
 
     name = "Avg Mean Curvature"
@@ -817,7 +816,7 @@ def test_shape_index_leaves_out_planar_vertices(
         box = box.subdivide()
     turn = Rotation.random(1, random_state=2).as_matrix()[0]
     cube = trimesh.Trimesh(box.vertices @ turn.T, box.faces, process=False)
-    measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube))
+    measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube), center=True)
     k1, k2, area = mesh._principal_curvatures(measured)
     curved = ~flat_vertices_of(measured)
     shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)

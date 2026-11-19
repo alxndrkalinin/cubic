@@ -16,8 +16,9 @@ the length unit of ``spacing``. There are three levels:
    unit.
 2. ``mask2mesh`` builds its mesh in those units and returns it in the
    caller's units, and ``extract_mesh_features`` measures a mesh at the scale
-   of its own edges and converts back. Both work in any unit, for meshes from
-   ``mask2mesh``.
+   of its own edges, centred on the origin, and converts back. Both work in
+   any unit, for meshes from ``mask2mesh``, and the second at any position
+   but for a mesh with a centre of mass set on it, which is not centred.
 3. Attributes read straight off a returned mesh, and a mesh the caller builds
    themselves, are subject to trimesh's absolute tolerances. trimesh sets a
    face normal to zero when the norm of the face's cross product is below
@@ -575,23 +576,38 @@ def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
     return trimesh.Trimesh(vertices=verts, faces=faces)
 
 
-def _scaled_copy(surface: Any, factor: float) -> Any:
+def _scaled_copy(surface: Any, factor: float, center: bool = False) -> Any:
     """Return a copy of ``surface`` with every vertex times ``factor``, unmerged.
 
-    See "Units and trimesh tolerances" in the module docstring. ``surface`` is
-    not modified. An ``ArrayMesh`` stays one; any other mesh, a trimesh
-    primitive included, becomes a plain ``trimesh.Trimesh`` of its vertices
-    and faces that keeps a density or centre of mass set on it.
+    See "Units and trimesh tolerances" in the module docstring. With
+    ``center``, the middle of the box of the vertices of its faces
+    (``_vertex_bounds``) is subtracted from every vertex first, so the copy is
+    centred on the origin; the same vertices give the same copy on either
+    device. A mesh with a centre of mass set on it is not centred: trimesh
+    shifts its inertia from the origin to that point as if it were the
+    centroid, which depends on where the mesh lies. ``surface`` is not
+    modified. An ``ArrayMesh`` stays one; any other mesh, a trimesh primitive
+    included, becomes a plain ``trimesh.Trimesh`` of its vertices and faces
+    that keeps a density or centre of mass set on it.
     """
-    if isinstance(surface, ArrayMesh):
-        return surface.scaled(factor)
     # trimesh keeps a density or centre of mass set on a mesh apart from its
-    # cache, where reading them computes nothing on ``surface``. A new mesh,
-    # since a primitive refuses new vertices, and not ``apply_scale``, which
-    # leaves the vertices as they are for any factor within 1e-8 of 1.
-    overrides = surface._data.data
+    # cache, where reading them computes nothing on ``surface``.
+    overrides = {} if isinstance(surface, ArrayMesh) else surface._data.data
+    bounds = (
+        _vertex_bounds(surface) if center and "center_mass" not in overrides else None
+    )
+    origin = None
+    if bounds is not None:
+        middle = np.array([(low + high) / 2 for low, high in zip(*bounds)])
+        origin = middle if np.isfinite(middle).all() else None
+    if isinstance(surface, ArrayMesh):
+        return surface.scaled(factor, origin=origin)
+    # A new mesh, since a primitive refuses new vertices, and not
+    # ``apply_scale``, which leaves the vertices as they are for any factor
+    # within 1e-8 of 1.
+    shift = 0.0 if origin is None else origin
     copied = trimesh.Trimesh(
-        vertices=np.asarray(surface.vertices) * factor,
+        vertices=(np.asarray(surface.vertices) - shift) * factor,
         faces=np.array(surface.faces),
         process=False,
     )
@@ -941,19 +957,45 @@ def extract_mesh_features(
         )
     # Measured on copies scaled by one factor so that the edges of ``mesh`` are
     # of order 1, where trimesh's absolute tolerances see the shape and not the
-    # unit, and converted back. The copies leave the caller's meshes as they
-    # are.
+    # unit, and converted back. Each copy is centred on the middle of its box
+    # first: every feature is translation-invariant, and coordinates of the
+    # order of the object's size round less than those of a far-off mesh. The
+    # copies leave the caller's meshes as they are.
     unit = _edge_unit(mesh)
     # The same object passed as both is measured once, as with no smooth mesh.
     smooth = (
         None
         if smooth_mesh is None or smooth_mesh is mesh
-        else _scaled_copy(smooth_mesh, 1 / unit)
+        else _scaled_copy(smooth_mesh, 1 / unit, center=True)
     )
     values = _measure_mesh(
-        _scaled_copy(mesh, 1 / unit), features, smooth_mesh=smooth, unit=unit
+        _scaled_copy(mesh, 1 / unit, center=True),
+        features,
+        smooth_mesh=smooth,
+        unit=unit,
     )
     return _to_caller_units(values, unit)
+
+
+def _vertex_bounds(surface: Any) -> tuple[list[float], list[float]] | None:
+    """Return the per-axis minima and maxima of the vertices of the faces of ``surface``.
+
+    Exact on any device and in any order of the faces; None for a mesh
+    without faces.
+    """
+    faces = surface.faces
+    if len(faces) == 0:
+        return None
+    vertices = surface.vertices
+    used = np.zeros_like(vertices[:, 0], dtype=bool)
+    used[faces.ravel()] = True
+    corners = vertices[used]
+    # One axis at a time: NumPy reduces a (V, 3) array along axis 0 ten times
+    # slower than its columns.
+    return (
+        [float(corners[:, i].min()) for i in range(3)],
+        [float(corners[:, i].max()) for i in range(3)],
+    )
 
 
 def _edge_unit(surface: Any) -> float:
@@ -973,22 +1015,14 @@ def _edge_unit(surface: Any) -> float:
     mesh without faces or whose box has no finite, positive area, which the
     volume and area check of ``_measure_mesh`` then reports.
     """
-    faces = surface.faces
-    if len(faces) == 0:
+    bounds = _vertex_bounds(surface)
+    if bounds is None:
         return 1.0
-    vertices = surface.vertices
-    used = np.zeros_like(vertices[:, 0], dtype=bool)
-    used[faces.ravel()] = True
-    corners = vertices[used]
-    # One axis at a time: NumPy reduces a (V, 3) array along axis 0 ten times
-    # slower than its columns.
-    a, b, c = (
-        float(corners[:, i].max()) - float(corners[:, i].min()) for i in range(3)
-    )
+    a, b, c = (high - low for low, high in zip(*bounds))
     area = 2 * (a * b + b * c + c * a)
     if not math.isfinite(area) or area <= 0:
         return 1.0
-    return math.sqrt(area / len(faces))
+    return math.sqrt(area / len(surface.faces))
 
 
 def _measure_mesh(

@@ -4,6 +4,7 @@ import re
 import warnings
 from typing import Any
 from functools import cache
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -575,6 +576,59 @@ def test_extract_mesh_features_keeps_a_density_and_centre_of_mass() -> None:
         np.testing.assert_array_equal(copy.vertices, surface.vertices * factor)
         np.testing.assert_array_equal(copy.center_mass, surface.center_mass * factor)
         assert copy.density == 2.0
+    # Not centred: trimesh's inertia about a set centre of mass depends on
+    # where the mesh lies.
+    copy = mesh._scaled_copy(surface, 1e-9, center=True)
+    np.testing.assert_array_equal(copy.vertices, surface.vertices * 1e-9)
+
+
+def test_extract_mesh_features_does_not_depend_on_position(
+    noise_blob_of: Callable[[int], np.ndarray],
+) -> None:
+    """A mesh moved far from the origin has the features it has at the origin.
+
+    ``extract_mesh_features`` measures a copy centred on the middle of the
+    mesh's box. The vertices of this mesh are half-integers, so the moves are
+    exact and the centred copies equal; measured where they lay, 3e3 and 1e4
+    voxels away the inertia features of three such meshes moved by up to
+    1.4e-7 relative and the curvature features by up to 1.7e-12.
+    """
+    raw = mesh.mask2mesh(noise_blob_of(2))
+    names = list(mesh._MESH_FEATURES)
+    at_origin = mesh.extract_mesh_features(raw, names)
+
+    for offset in (3e3, 1e4):
+        moved = trimesh.Trimesh(
+            raw.vertices + offset * np.array([1.0, -1.0, 1.0]), raw.faces, process=False
+        )
+        assert mesh.extract_mesh_features(moved, names) == at_origin, offset
+
+
+def test_centred_copy_of_an_array_mesh_is_that_of_a_trimesh(
+    gpu_available: bool,
+) -> None:
+    """An ``ArrayMesh`` on either device and a ``trimesh.Trimesh`` centre alike."""
+    surface = mesh.mask2mesh(_ball(10), spacing=(0.29, 0.108, 0.108))
+    vertices = np.asarray(surface.vertices) + np.array([3e3, -7.1, 0.2])
+    faces = np.asarray(surface.faces)
+    from_trimesh = mesh._scaled_copy(
+        trimesh.Trimesh(vertices, faces, process=False), 1 / 0.108, center=True
+    )
+    devices = ["cpu", "gpu"] if gpu_available else ["cpu"]
+
+    for device in devices:
+        as_array = ArrayMesh(
+            _on(device, vertices, gpu_available),
+            _on(device, faces, gpu_available),
+            merge=False,
+        )
+        from_array = mesh._scaled_copy(as_array, 1 / 0.108, center=True)
+        assert isinstance(from_array, ArrayMesh)
+        np.testing.assert_array_equal(
+            asnumpy(from_array.vertices), from_trimesh.vertices
+        )
+    middle = from_trimesh.vertices.max(axis=0) + from_trimesh.vertices.min(axis=0)
+    assert np.abs(middle).max() <= 1e-12
 
 
 @pytest.mark.parametrize("c", [1.0, 1e-9])

@@ -685,7 +685,7 @@ def test_gpu_flat_vertices_of_a_raw_mesh_have_no_curvature(
     grid = np.indices((36, 36, 36)) - 17.5
     ball = (grid**2).sum(axis=0) <= 15**2
     raw = mesh.mask2mesh(ascupy(ball), spacing=(2.117, 0.7884, 0.7884))
-    measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw))
+    measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw), center=True)
     flat = flat_vertices_of(measured)
 
     k1, k2, _ = mesh._principal_curvatures(measured)

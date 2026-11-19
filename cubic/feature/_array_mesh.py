@@ -23,6 +23,7 @@ from ..cuda import (
     asnumpy,
     get_device,
     _launch_config,
+    to_same_device,
     _cuda_functions,
     get_array_module,
 )
@@ -179,8 +180,11 @@ class ArrayMesh:
             )
         self.vertices, self.faces = vertices, faces
 
-    def scaled(self, factor: float) -> ArrayMesh:
+    def scaled(self, factor: float, origin: Any = None) -> ArrayMesh:
         """Return a new mesh with every vertex times ``factor``, on the same device.
+
+        With ``origin``, a point ``(3,)`` on the host, every vertex minus it is
+        scaled instead, so ``origin`` moves to 0.
 
         The vertices are not merged again: the merge tolerance is absolute, so
         at a small enough ``factor`` it would join vertices this mesh keeps
@@ -196,7 +200,12 @@ class ArrayMesh:
         factor = float(factor)
         if not np.isfinite(factor) or factor <= 0:
             raise ValueError(f"factor must be finite and positive; got {factor}")
-        return type(self)(self.vertices * factor, self.faces, merge=False)
+        vertices = self.vertices
+        if origin is not None:
+            vertices = vertices - to_same_device(
+                np.asarray(origin, dtype=np.float64), vertices
+            )
+        return type(self)(vertices * factor, self.faces, merge=False)
 
     def __getattr__(self, name: str) -> Any:
         # Called for attributes not defined here, which go to trimesh, and also
