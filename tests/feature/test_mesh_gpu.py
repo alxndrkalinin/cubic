@@ -389,13 +389,9 @@ _SHARED_EDGE_REQUEST = [
     "Avg Shape Index",
     "Avg Curvedness",
 ]
-# On the raw mesh, without smooth_mesh. With _principal_curvatures' floors
-# (_FLAT_ANGLE, _FLAT_DEFECT) and both devices measuring at one unit
-# (_edge_unit), Avg Shape Index of 275 raw meshes (noise blobs, balls and
-# ragged balls at five scales, some also turned) differed between CuPy and
-# NumPy by at most 1.8e-16, one CuPy 14.0.1 run and two 14.2.0 runs; with
-# trimesh's arccos angles and no floors, 365 such meshes differed by up to
-# 7.6e-3.
+# On the raw mesh, without smooth_mesh, where the devices agree to rounding:
+# _principal_curvatures sets the curvatures of flat vertices to 0 (_FLAT_ANGLE,
+# _FLAT_DEFECT) and both devices measure at one unit (_edge_unit).
 _RAW_CURVATURE = [
     "Total Absolute Gaussian Curvature",
     "Avg Curvedness",
@@ -640,9 +636,8 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> Non
     residues, which differ between the devices; ``_principal_curvatures`` sets
     them to 0 (``_FLAT_ANGLE``, ``_FLAT_DEFECT``), and the shape index, which
     differed by about 1e-3 between the devices, then agrees to 1e-12. This ball
-    is at the default spacing; the same agreement at an anisotropic spacing
-    needs both devices to measure at one unit, which
-    ``test_gpu_edge_unit_matches_numpy`` covers.
+    is at the default spacing; ``test_gpu_edge_unit_matches_numpy`` covers the
+    unit the devices measure at.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
@@ -718,10 +713,8 @@ def test_gpu_edge_unit_matches_numpy(
     """A NumPy and a CuPy mesh of one mask are measured at bitwise the same unit.
 
     ``extract_mesh_features`` measures scaled copies of the meshes at the unit
-    ``_edge_unit`` returns. Units an ulp apart move the coplanar dihedral
-    angles of the copies between 0 and 1.5e-8 rad, and with them the raw
-    ``Avg Shape Index`` by up to 11% over 40 such masks at three spacings.
-    The CuPy meshes have bitwise the same vertices and
+    ``_edge_unit`` returns, which uses only the vertex extremes and the face
+    count. The CuPy meshes have bitwise the same vertices and
     triangles as the NumPy ones; seed 2's is also given with each face rotated
     to start at its next vertex. The test asserts that some face areas differ
     between the devices, as CuPy 14.0.1 computes them for seeds 5, 7 and 11

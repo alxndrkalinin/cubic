@@ -60,13 +60,7 @@ from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-# The floor of the mesh extra in pyproject.toml. It was set because
-# ``Trimesh.integral_mean_curvature`` signs its dihedral angles only from
-# 4.6.12 on; cubic now signs its own (``_edge_curvatures``), and nothing it
-# reads changed in 4.6.12, so the floor is no longer needed by cubic and is
-# left where it was. On 4.6.11 and on 4.6.12 the tests fail only where
-# they use the return value of ``Trimesh.invert``, the mesh only from 4.10;
-# on 4.0.0 trimesh's oriented bounding box, which cubic no longer uses, failed.
+# pyproject's mesh floor: cubic itself no longer needs 4.6.12; the floor is kept.
 _MIN_TRIMESH = (4, 6, 12)
 
 
@@ -120,17 +114,12 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     each with the exact minimum-area rectangle across that face's normal; it
     turns, scales and reorders with the mesh to rounding. It is an upper bound
     of the minimum enclosing box, which can instead have two adjacent faces
-    each on a hull edge: it is twice the minimum for a regular tetrahedron,
-    and for 60 nuclei it was as small as the smallest box a dense search over
-    axes found for 51 and at most 1.1% above it for the rest.
+    each on a hull edge: it is twice the minimum for a regular tetrahedron.
     ``Bounding Cylinder Volume`` is the smallest volume of the cylinders that
     enclose the mesh about the normals of its convex hull faces and its three
     principal axes of inertia, each with the exact minimum enclosing circle
     across its axis; it turns and scales with the mesh to rounding. It is an
-    upper bound of the minimum enclosing cylinder. It matched a dense search
-    over axes for three boxes and a cylinder mesh, and for 60 nuclei it was
-    as small as the smallest that search found for 52 and at most 2.4% above
-    it for the rest.
+    upper bound of the minimum enclosing cylinder.
     The mean curvature is averaged over the surface, in inverse units
     of ``spacing``. ``Euler Characteristic`` is twice the number of separate
     pieces plus cavities, minus twice the number of handles: 2 for a ball, 4
@@ -319,7 +308,7 @@ def extract_surface_features(
         in units of ``spacing``, in metres or nanometres alike. Given in
         another unit, they convert with it exactly (to the rounding of the
         conversion) when the ratios of the spacings round alike in both units,
-        and otherwise to about 1e-8 relative.
+        and otherwise to about 1e-14 relative.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()``. Optional
         features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
@@ -1008,12 +997,9 @@ def _edge_unit(surface: Any) -> float:
 
     It uses only the per-axis extremes of those vertices, which are exact on
     any device and in any order, and the face count, so a NumPy and a CuPy mesh
-    with the same vertices get the same unit however their faces are listed. A
-    unit from the face areas does not: CuPy 14.0.1 computes some face areas an
-    ulp away from NumPy, and units an ulp apart move the raw-mesh
-    ``Avg Shape Index`` by percents. 1 for a
-    mesh without faces or whose box has no finite, positive area, which the
-    volume and area check of ``_measure_mesh`` then reports.
+    with the same vertices get the same unit however their faces are listed.
+    1 for a mesh without faces or whose box has no finite, positive area, which
+    the volume and area check of ``_measure_mesh`` then reports.
     """
     bounds = _vertex_bounds(surface)
     if bounds is None:
@@ -1169,15 +1155,12 @@ def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
     three principal axes of inertia. About each axis the cylinder is exact:
     its height is the extent of the hull vertices along the axis and its
     radius that of the minimum enclosing circle of their projection. The
-    volume is the smallest of these, so it turns and scales with the mesh.
-    The hull normals give a box the smallest of the cylinders about its edges
-    and a cylinder mesh itself. An elongated body with rounded or pointed ends
-    can have no hull face normal to its long axis, which the inertia axes
-    supply: from the hull normals alone, an icosphere stretched to a 1:1:3
-    spheroid came out 1.44 times the smallest cylinder a dense search found.
-    Measured on the host from the hull that trimesh caches for
-    ``Convex Hull Volume``; 0, with a warning, for a mesh whose hull cannot be
-    built.
+    volume is the smallest of these, so it turns and scales with the mesh, and
+    an upper bound of the minimum enclosing cylinder. An elongated body with
+    rounded or pointed ends can have no hull face normal to its long axis,
+    which the inertia axes supply. Measured on the host from the hull that
+    trimesh caches for ``Convex Hull Volume``; 0, with a warning, for a mesh
+    whose hull cannot be built.
     """
     found = _hull_and_normals(mesh, "bounding cylinder volume")
     if found is None:
@@ -1401,10 +1384,7 @@ def _enclosing_radii(points: np.ndarray) -> np.ndarray:
     the circle through another three of them comes out an ulp smaller while
     the farthest point is still up to 3e-11 outside. The radius returned is
     the distance from the last centre to the farthest point, so the circle
-    encloses every point. On the one such set met, the projection of a noise
-    blob along a direction of a dense search, it was 1.2e-11 above the
-    minimum; no hull normal of 204 meshes, each in 15 turns and rescalings,
-    met one.
+    encloses every point.
     """
     rows = np.arange(len(points))
     first = points[rows, ((points - points[:, :1]) ** 2).sum(axis=2).argmax(axis=1)]
@@ -1486,13 +1466,9 @@ def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
 
 
 # Dihedral angles of at most this many radians are set to 0: they are the
-# rounding residues of coplanar faces. On the copies that
-# ``extract_mesh_features`` measures, in units of their edges, the residues
-# reached 1.7e-13 rad on the raw meshes of 60 nuclei, and the smallest other
-# angle on the blurred meshes of 240 nuclei was 1.6e-9 rad; this is about the
-# geometric middle. The residues are a few ulps of the largest vertex
-# coordinate (up to 4.7 times eps times it, in edge lengths), so they pass
-# this floor only on a mesh some 1e4 edges from the origin.
+# rounding residues of coplanar faces. In units of the edges they reached
+# 1.7e-13 rad on 60 raw nuclei, and the smallest other angle on 240 blurred
+# nuclei was 1.6e-9 rad; this is about the geometric middle.
 _FLAT_ANGLE = 1e-11
 # Angle defects of at most this many radians are set to 0: at a flat vertex
 # the defect is 2 pi minus a sum of face angles, a few ulps of 2 pi.
@@ -1502,12 +1478,11 @@ _FLAT_DEFECT = 1e-14
 def _dihedral_angles(mesh: trimesh.Trimesh) -> np.ndarray:
     """Return the angle between the normals of each pair of adjacent faces.
 
-    ``arctan2(|n0 x n1|, n0 . n1)``, which is accurate to rounding at every
-    angle, set to 0 at or below ``_FLAT_ANGLE``. trimesh's
-    ``face_adjacency_angles`` is ``arccos(n0 . n1)``, which cannot resolve
-    angles below 1.5e-8: coplanar faces read 0 or 1.5e-8 to 3e-8 depending on
-    the rounding of their normals, so which of them did changed with the scale,
-    orientation and position at which a mesh was measured.
+    ``arctan2(|n0 x n1|, n0 . n1)``, set to 0 at or below ``_FLAT_ANGLE``. It
+    is accurate to rounding at every angle, where trimesh's
+    ``face_adjacency_angles``, ``arccos(n0 . n1)``, cannot resolve angles below
+    1.5e-8 and so reads coplanar faces differently at different scales and
+    orientations.
     """
     normals = mesh.face_normals[mesh.face_adjacency]
     n0, n1 = normals[:, 0], normals[:, 1]
@@ -1585,11 +1560,7 @@ def _principal_curvatures(
     The defect test matters at the nearly flat vertices of a blurred mesh,
     where dihedral angles of 1e-9 rad give a mean curvature whose square is
     below a defect residue's curvature, so the residue would decide the shape
-    index; on 240 nuclei it moved ``Avg Shape Index``, then averaged over
-    every vertex, by at most 4.2e-10. With both, the ``Avg Shape Index`` of 34
-    raw voxel meshes measured at five scales from 1e-8 to 1e3 varied by at
-    most 2.2e-16, and of 7 more, each also turned three ways, by at most
-    6.1e-16; with trimesh's arccos angles, by 0.044 and 0.11.
+    index.
 
     ``edge_curvatures`` is ``_edge_curvatures(mesh)`` when already computed.
     """
