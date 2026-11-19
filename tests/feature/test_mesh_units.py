@@ -65,9 +65,6 @@ CELLS = [
     (1e-6, "unit rounding", False),
 ]
 
-# Features whose GPU value varies between runs of the same code (atomic sums).
-_GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
-
 
 def _mask(
     shape: tuple[int, int, int] = (26, 96, 96),
@@ -139,10 +136,7 @@ def _assert_covariant(device: str, base: str, c: float, explicit: bool) -> None:
             rtol = 1e-6
         else:
             rtol = 1e-12 if device == "cpu" else 1e-9
-        atol = 0.0
-        if device == "gpu" and name in _GPU_JITTER:
-            atol = 1e-7 * c ** DIMENSIONS[name]
-        if not abs(value - expected) <= atol + rtol * abs(expected):
+        if not abs(value - expected) <= rtol * abs(expected):
             off[name] = (value, expected, abs(value - expected) / abs(expected))
     assert not off, f"not covariant at c={c:g}: {off}"
 

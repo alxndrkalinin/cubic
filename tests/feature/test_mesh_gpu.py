@@ -389,8 +389,6 @@ _SHARED_EDGE_REQUEST = [
     "Avg Shape Index",
     "Avg Curvedness",
 ]
-# Vary between GPU runs of the same code by about 1e-13 (atomic sums).
-_GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
 # On the raw mesh, without smooth_mesh. With _principal_curvatures' floors
 # (_FLAT_ANGLE, _FLAT_DEFECT) and both devices measuring at one unit
 # (_edge_unit), Avg Shape Index of 275 raw meshes (noise blobs, balls and
@@ -530,12 +528,10 @@ def test_shared_edge_masks_match_on_both_devices(
                 **{f"raw {k}": v for k, v in raw_reference.items()},
             }
             for feature, value in values.items():
-                atol = 1e-7 if feature.removeprefix("raw ") in _GPU_JITTER else 0.0
                 np.testing.assert_allclose(
                     value,
                     reference[feature],
                     rtol=1e-9,
-                    atol=atol,
                     equal_nan=True,
                     err_msg=f"{name}, {way}, {feature}",
                 )
@@ -814,9 +810,40 @@ def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
             value,
             on_cpu[name],
             rtol=1e-9,
-            atol=1e-7 if name in _GPU_JITTER else 0.0,
             err_msg=name,
         )
+
+
+def test_gpu_curvatures_are_the_same_on_every_run(
+    noise_blob_of: Callable[[int], np.ndarray], gpu_available: bool
+) -> None:
+    """The GPU curvatures of a blurred mesh, and every feature, repeat to the bit.
+
+    The per-vertex angle defects, mixed areas and edge sums are bin sums that
+    ``ordered_bincount`` adds in input order. With CuPy's weighted
+    ``bincount``, which adds them with atomics, the per-vertex curvatures of
+    this mesh differed between two runs.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    spacing = (2.685, 1.0, 1.0)
+    mask = ascupy(noise_blob_of(7))
+    blurred = mesh.mask2mesh(
+        mask, spacing=spacing, sigma=mesh._curvature_sigma(spacing, None)
+    )
+
+    def curvatures() -> list[np.ndarray]:
+        # A new mesh each run, so no per-vertex sum comes from a cache.
+        fresh = ArrayMesh(blurred.vertices, blurred.faces, merge=False)
+        return [asnumpy(a) for a in mesh._principal_curvatures(fresh)]
+
+    for first, second in zip(curvatures(), curvatures()):
+        np.testing.assert_array_equal(second, first)
+    first = mesh.extract_surface_features(mask, spacing=spacing)
+    second = mesh.extract_surface_features(mask, spacing=spacing)
+    assert second.keys() == first.keys()
+    for name, value in second.items():
+        np.testing.assert_array_equal(value, first[name], err_msg=name)
 
 
 def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:

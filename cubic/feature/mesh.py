@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover - import failure path
     )
 
 from ..cuda import asnumpy, get_device, to_same_device
-from ._array_mesh import ArrayMesh, face_areas
+from ._array_mesh import ArrayMesh, face_areas, ordered_bincount
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
 
@@ -1356,9 +1356,7 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
         face_area / 2,
         np.where(obtuse.any(axis=1, keepdims=True), face_area / 4, voronoi),
     )
-    return np.bincount(
-        mesh.faces.ravel(), weights=area.ravel(), minlength=len(mesh.vertices)
-    )
+    return ordered_bincount(mesh.faces.ravel(), area.ravel(), len(mesh.vertices))
 
 
 def _principal_curvatures(
@@ -1389,9 +1387,7 @@ def _principal_curvatures(
     defects = np.where(np.abs(defects) <= _FLAT_DEFECT, 0.0, defects)
     gaussian = defects / area
     edges, terms = _edge_curvatures(mesh)
-    edge_sum = np.bincount(
-        edges.ravel(), weights=np.repeat(terms, 2), minlength=len(mesh.vertices)
-    )
+    edge_sum = ordered_bincount(edges.ravel(), np.repeat(terms, 2), len(mesh.vertices))
     mean = edge_sum / (4 * area)
     spread = np.sqrt(np.maximum(mean**2 - gaussian, 0))
     return mean - spread, mean + spread, area
