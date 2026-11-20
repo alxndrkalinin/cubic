@@ -401,9 +401,11 @@ def extract_surface_features(
     # spacing, normalises to twice the coarsest normalised spacing.
     sigma = _curvature_sigma(spacing, curvature_sigma) / unit
     # Measured on the object's bounding box, as extract_features crops each
-    # label, so that no value depends on where the object lies in the mask:
-    # the blurred level sets have float32 vertices, which round coarser far
-    # from the frame's origin. Every blur and mesh pads the box as it needs.
+    # label, so that no value depends on where the object lies in the mask: a
+    # level-set vertex that rounds to a grid point or a cube centre in float32
+    # keeps that float32 position, and float32 rounds coarser far from the
+    # frame's origin. The crop makes the frame the object's own. Every blur and
+    # mesh pads the box as it needs.
     box = _object_box(mask)
     if box is not None:
         mask = mask[box]
@@ -660,9 +662,11 @@ def _smooth_mask2mesh(
 ) -> Any:
     """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes.
 
-    The mask is blurred and meshed over the bounding box of the object, whose
-    float32 vertices then round alike wherever it lies, and the vertices are
-    moved back to the mask's frame in float64.
+    The mask is blurred and meshed over the bounding box of the object, which
+    makes the frame the object's own: a vertex that rounds to a grid point or a
+    cube centre in float32 keeps that float32 position, which depends on where
+    the object lies in the array. The vertices are then moved back to the
+    mask's frame in float64.
     """
     step = _step(spacing)
     box = _object_box(mask_3d)
@@ -1908,10 +1912,10 @@ def _principal_curvatures(
     0 (``_FLAT_ANGLE``), so its edge sum is exactly 0, and its angle defect is
     set to 0 where its absolute value is at most ``_FLAT_DEFECT`` radians, so
     ``k1 = k2 = 0`` there on either device and at any scale and orientation.
-    The defect test matters at the nearly flat vertices of a blurred mesh,
-    where dihedral angles of 1e-9 rad give a mean curvature whose square is
-    below a defect residue's curvature, so the residue would decide the shape
-    index.
+    The defect test matters on raw voxel meshes, where thousands of vertices
+    are flat and carry a rounding-residue defect of at most 1e-14 radians:
+    left as it is, the defect gives the vertex a Gaussian curvature that the
+    surface does not have, and a ``k1, k2`` that Avg Curvedness counts.
 
     ``edge_curvatures`` is ``_edge_curvatures(mesh)`` when already computed.
     """
