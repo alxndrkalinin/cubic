@@ -131,6 +131,7 @@ def _assert_far_object_like_near(
     copy's to 1e-12, and ``mask2mesh(..., sigma=...)`` of the far copy must be
     the near copy's mesh moved by the offset.
     """
+    # Local import: the voxel and texture tests share this conftest and need no trimesh.
     from cubic.feature import mesh
 
     names = mesh.mesh_feature_list(optional=True)
