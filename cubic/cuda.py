@@ -342,12 +342,14 @@ def on_device_of(array: Any) -> AbstractContextManager[Any]:
     current device.
     """
     cp = CUDAManager().get_cp()
-    if cp is None or get_device(array) != "GPU":
+    if cp is None:
         return nullcontext()
-    if _is_torch_tensor(array):
-        index = array.device.index  # type: ignore[attr-defined]
-    else:
-        index = getattr(array.device, "id", None)
+    # A CuPy array is recognised by the ``id`` of its device, without the torch
+    # check of ``get_device``, which runs at most once, for any other array.
+    index = getattr(getattr(array, "device", None), "id", None)
+    if index is None and _is_torch_tensor(array):
+        device = array.device
+        index = device.index if device.type == "cuda" else None
     return nullcontext() if index is None else cp.cuda.Device(index)
 
 
@@ -364,8 +366,9 @@ def to_same_device(source_array: np.ndarray, reference_array: np.ndarray) -> np.
     with on_device_of(reference_array):
         moved: Any = to_device(source_array, "GPU")
         # A CuPy source that is still on another GPU is copied to this one.
-        cp = CUDAManager().get_cp()
-        if cp is not None and moved.device.id != cp.cuda.Device().id:
+        # ``to_device`` has raised unless CuPy is installed.
+        cp: Any = CUDAManager().get_cp()
+        if moved.device.id != cp.cuda.Device().id:
             moved = moved.copy()
     return moved
 
