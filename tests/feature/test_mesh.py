@@ -1739,7 +1739,15 @@ def test_minimum_enclosing_circle_stops_enclosing_where_growth_fails(
     smallest radius, found by brute force on the trios centred, where they
     round finely.
     """
-    radii = mesh._enclosing_radii(_ROUNDED_TRIOS)
+
+    def assert_encloses(
+        points: np.ndarray, center: np.ndarray, radii: np.ndarray
+    ) -> None:
+        distances = np.sqrt(((points - center[:, None]) ** 2).sum(axis=2))
+        assert (distances <= radii[:, None]).all()
+
+    center, radii = mesh._enclosing_circles(_ROUNDED_TRIOS)
+    assert_encloses(_ROUNDED_TRIOS, center, radii)
     smallest = np.array(
         [_brute_force_radius(trio - trio.mean(axis=0)) for trio in _ROUNDED_TRIOS]
     )
@@ -1749,7 +1757,8 @@ def test_minimum_enclosing_circle_stops_enclosing_where_growth_fails(
     points = np.random.default_rng(0).normal(size=(1, 50, 2))
     grown = mesh._enclosing_radii(points)
     monkeypatch.setattr(mesh, "_ENCLOSING_STEPS", 1)
-    capped = mesh._enclosing_radii(points)
+    center, capped = mesh._enclosing_circles(points)
+    assert_encloses(points, center, capped)
     # The centre is within the smallest radius of a point of the set, so the
     # set is within three times it of the centre.
     assert grown[0] < capped[0] <= 3 * grown[0]

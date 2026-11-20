@@ -1603,6 +1603,14 @@ def _min_cylinder_volume(points: np.ndarray, axes: np.ndarray) -> float:
 def _enclosing_radii(points: np.ndarray) -> np.ndarray:
     """Return the radius of the minimum enclosing circle of each set ``(k, n, 2)``.
 
+    The radius of ``_enclosing_circles``.
+    """
+    return _enclosing_circles(points)[1]
+
+
+def _enclosing_circles(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the centre and radius of the minimum enclosing circle of each set ``(k, n, 2)``.
+
     The circle of a support set of at most three points grows by the point
     farthest outside it: the new support set is the smallest circle through
     two or three of the four that encloses all four. The radius grows at
@@ -1613,9 +1621,10 @@ def _enclosing_radii(points: np.ndarray) -> np.ndarray:
     the farthest point is still up to 3e-11 outside. Far from the origin, or
     on nearly collinear points, rounding can also leave no circle that
     encloses the four within the slack; the growth of that set then stops
-    there, as it does after ``_ENCLOSING_STEPS`` steps. The radius returned is
-    the distance from the last centre to the farthest point, so the circle
-    encloses every point, and the cylinder about it stays an upper bound.
+    there, as it does after ``_ENCLOSING_STEPS`` steps. The centre returned is
+    the last one and the radius its distance to the farthest point, so the
+    circle encloses every point, and the cylinder about it stays an upper
+    bound.
     """
     rows = np.arange(len(points))
     first = points[rows, ((points - points[:, :1]) ** 2).sum(axis=2).argmax(axis=1)]
@@ -1652,7 +1661,7 @@ def _enclosing_radii(points: np.ndarray) -> np.ndarray:
         r2 = np.where(growing, new_r2, r2)
         center = np.where(growing[:, None], new_center, center)
         support = np.where(growing[:, None, None], new_support, support)
-    return np.sqrt(((points - center[:, None]) ** 2).sum(axis=2).max(axis=1))
+    return center, np.sqrt(((points - center[:, None]) ** 2).sum(axis=2).max(axis=1))
 
 
 def _circle_center(trio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
