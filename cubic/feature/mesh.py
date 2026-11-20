@@ -929,7 +929,7 @@ def _level_set_area(level_set: tuple[np.ndarray, np.ndarray] | None) -> float:
     if level_set is None:
         return float("nan")
     verts, faces = level_set
-    return float(face_areas(verts.astype(np.float64), faces).sum())
+    return float(face_areas(verts.astype(np.float64, copy=False), faces).sum())
 
 
 @_require_trimesh

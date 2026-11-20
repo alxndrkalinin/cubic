@@ -144,7 +144,7 @@ class ArrayMesh:
         if merge:
             with on_device_of(vertices):
                 vertices, faces = _merge_vertices(
-                    vertices.astype(np.float64), faces.astype(np.int64)
+                    vertices.astype(np.float64, copy=False), faces.astype(np.int64)
                 )
         self.vertices, self.faces = vertices, faces
 
