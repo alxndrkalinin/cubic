@@ -8,6 +8,7 @@ import threading
 from types import ModuleType
 from typing import Any
 from importlib import import_module
+from contextlib import AbstractContextManager, nullcontext
 
 import numpy as np
 
@@ -330,10 +331,43 @@ def to_device(array: np.ndarray, device: str) -> np.ndarray:
         )
 
 
+def on_device_of(array: Any) -> AbstractContextManager[Any]:
+    """Return a context in which the GPU that holds ``array`` is current.
+
+    CuPy allocates every new array, and runs every kernel, on the current
+    device, not on that of the operands, so code that should stay on an
+    array's GPU runs inside this. A no-op for a host array. A CuPy array
+    gives its ``device``, a CUDA torch tensor its ``device.index``; any other
+    GPU array (see ``get_device``), or a tensor without an index, keeps the
+    current device.
+    """
+    cp = CUDAManager().get_cp()
+    if cp is None or get_device(array) != "GPU":
+        return nullcontext()
+    if _is_torch_tensor(array):
+        index = array.device.index  # type: ignore[attr-defined]
+    else:
+        index = getattr(array.device, "id", None)
+    return nullcontext() if index is None else cp.cuda.Device(index)
+
+
 def to_same_device(source_array: np.ndarray, reference_array: np.ndarray) -> np.ndarray:
-    """Move the source_array to the same device as reference_array."""
+    """Move the source_array to the same device as reference_array.
+
+    On the GPU, to the GPU that holds ``reference_array`` (see
+    ``on_device_of``), whichever device is current; a source already there is
+    returned as it is.
+    """
     target_device = get_device(reference_array)
-    return to_device(source_array, target_device)
+    if target_device != "GPU":
+        return to_device(source_array, target_device)
+    with on_device_of(reference_array):
+        moved: Any = to_device(source_array, "GPU")
+        # A CuPy source that is still on another GPU is copied to this one.
+        cp = CUDAManager().get_cp()
+        if cp is not None and moved.device.id != cp.cuda.Device().id:
+            moved = moved.copy()
+    return moved
 
 
 def check_same_device(*arrays: np.ndarray) -> None:

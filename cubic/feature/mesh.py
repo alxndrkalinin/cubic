@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import sys
 import math
+import inspect
 import numbers
 import warnings
 from typing import Any, TypeVar, Callable, TypeAlias, SupportsFloat
@@ -56,7 +57,13 @@ except ImportError:  # pragma: no cover - import failure path
         stacklevel=2,
     )
 
-from ..cuda import asnumpy, get_device, to_same_device, ordered_bincount
+from ..cuda import (
+    asnumpy,
+    get_device,
+    on_device_of,
+    to_same_device,
+    ordered_bincount,
+)
 from ._array_mesh import ArrayMesh, face_areas
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
@@ -93,6 +100,25 @@ def _require_trimesh(func: F) -> F:
                 "trimesh is required for mesh operations. Install with 'cubic[mesh]'"
             )
         return func(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
+
+
+def _on_input_device(func: F) -> F:
+    """Run ``func`` with the GPU that holds its first argument current.
+
+    The first argument is an array, or a mesh, whose vertices decide. CuPy
+    allocates every new array on the current device, so without this the
+    pad, blur and mesh of an input on another GPU land on the current one.
+    """
+    name = next(iter(inspect.signature(func).parameters))
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        first = args[0] if args else kwargs.get(name)
+        held = first.vertices if isinstance(first, ArrayMesh) else first
+        with on_device_of(held):
+            return func(*args, **kwargs)
 
     return wrapper  # type: ignore[return-value]
 
@@ -197,6 +223,7 @@ def _resolve_features(features: Sequence[str] | None) -> list[str]:
 
 
 @_require_trimesh
+@_on_input_device
 def extract_features(
     label_image: np.ndarray,
     features: list[str] | None = None,
@@ -291,6 +318,7 @@ def extract_features(
 
 
 @_require_trimesh
+@_on_input_device
 def extract_surface_features(
     mask: np.ndarray,
     spacing: Sequence[float] | None = None,
@@ -856,6 +884,7 @@ def _level_set_area(level_set: tuple[np.ndarray, np.ndarray] | None) -> float:
 
 
 @_require_trimesh
+@_on_input_device
 def mask2mesh(
     mask_3d: np.ndarray,
     spacing: Sequence[float] | None = None,
@@ -950,6 +979,7 @@ def sphericity(v: float, sa: float) -> float:
 
 
 @_require_trimesh
+@_on_input_device
 def extract_mesh_features(
     mesh: trimesh.Trimesh,
     features: Sequence[str] | None = None,

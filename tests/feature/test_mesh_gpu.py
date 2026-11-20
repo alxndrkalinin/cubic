@@ -346,6 +346,58 @@ def test_scaled_copy_stays_on_the_mesh_device(
         np.testing.assert_allclose(asnumpy(copy.vertices), expected, rtol=1e-15)
 
 
+def test_mesh_of_a_mask_on_gpu_1_stays_on_gpu_1(gpu_available: bool) -> None:
+    """A mask on GPU 1 is meshed and measured on GPU 1 while GPU 0 is current.
+
+    The mesh, voxel and blurred, its device arrays computed later with GPU 0
+    current, and its scaled copy all stay on GPU 1, and the features match the
+    host's. CuPy allocates new arrays on the current device, so the pad before
+    marching cubes used to move the whole mesh to GPU 0.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    labels = _labels()
+    mask, spacing = labels == 1, (0.3, 0.1, 0.1)
+    with cp.cuda.Device(1):
+        mask_1, labels_1 = cp.asarray(mask), cp.asarray(labels)
+
+    with cp.cuda.Device(0):
+        surfaces = [
+            mesh.mask2mesh(mask_1, spacing=spacing),
+            mesh.mask2mesh(mask_1, spacing=spacing, sigma=0.6),
+        ]
+        arrays = [
+            getattr(surface, name)
+            for surface in surfaces + [surfaces[0].scaled(2.0, origin=np.ones(3))]
+            for name in (
+                "vertices",
+                "faces",
+                "area_faces",
+                "face_normals",
+                "vertex_defects",
+                "face_adjacency",
+            )
+        ]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            on_gpu = mesh.extract_surface_features(mask_1, spacing=spacing)
+            _, on_gpu_labels, _ = mesh.extract_features(labels_1, spacing=spacing)
+        assert cp.cuda.Device().id == 0
+
+    assert [a.device.id for a in arrays] == [1] * len(arrays)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        on_cpu = mesh.extract_surface_features(mask, spacing=spacing)
+        _, on_cpu_labels, _ = mesh.extract_features(labels, spacing=spacing)
+    for name, expected in on_cpu.items():
+        assert on_gpu[name] == pytest.approx(expected, rel=1e-6, nan_ok=True), name
+    np.testing.assert_allclose(on_gpu_labels, on_cpu_labels, rtol=1e-6)
+
+
 def _labels() -> np.ndarray:
     z, y, x = np.meshgrid(*[np.arange(n) for n in (30, 64, 64)], indexing="ij")
     labels = np.zeros((30, 64, 64), dtype=np.int32)

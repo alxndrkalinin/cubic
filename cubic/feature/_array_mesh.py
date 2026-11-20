@@ -9,9 +9,9 @@ to a ``trimesh.Trimesh`` built on the host on first use.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeVar
 from functools import wraps, cached_property
-from contextlib import nullcontext
+from collections.abc import Callable
 
 import numpy as np
 
@@ -22,14 +22,31 @@ except ImportError:  # pragma: no cover - import failure path
 
 from ..cuda import (
     asnumpy,
-    get_device,
+    on_device_of,
     to_same_device,
     ordered_bincount,
 )
 
+_T = TypeVar("_T")
+
 # trimesh.constants.tol: zero for unitize, merge for angles and convexity.
 _TOL_ZERO = 1e-13
 _TOL_MERGE = 1e-8
+
+
+def _on_mesh_device(method: Callable[[ArrayMesh], _T]) -> cached_property[_T]:
+    """Return a ``cached_property`` computed with the mesh's GPU current.
+
+    CuPy allocates every new array on the current device, which need not be
+    the one that holds the mesh; see ``cubic.cuda.on_device_of``.
+    """
+
+    @wraps(method)
+    def compute(self: ArrayMesh) -> _T:
+        with on_device_of(self.vertices):
+            return method(self)
+
+    return cached_property(compute)
 
 
 def _unitize(vectors: Any) -> tuple[Any, Any]:
@@ -125,9 +142,10 @@ class ArrayMesh:
 
     def __init__(self, vertices: Any, faces: Any, *, merge: bool = True) -> None:
         if merge:
-            vertices, faces = _merge_vertices(
-                vertices.astype(np.float64), faces.astype(np.int64)
-            )
+            with on_device_of(vertices):
+                vertices, faces = _merge_vertices(
+                    vertices.astype(np.float64), faces.astype(np.int64)
+                )
         self.vertices, self.faces = vertices, faces
 
     def scaled(self, factor: float, origin: Any = None) -> ArrayMesh:
@@ -151,9 +169,9 @@ class ArrayMesh:
         if not np.isfinite(factor) or factor <= 0:
             raise ValueError(f"factor must be finite and positive; got {factor}")
         vertices = self.vertices
-        # The origin and the new vertices on the vertices' device, which need
-        # not be the current one.
-        with vertices.device if get_device(vertices) == "GPU" else nullcontext():
+        # The new vertices on the vertices' device, which need not be the
+        # current one.
+        with on_device_of(vertices):
             if origin is not None:
                 vertices = vertices - to_same_device(
                     np.asarray(origin, dtype=np.float64), vertices
@@ -206,28 +224,28 @@ class ArrayMesh:
 
     # -- per-face geometry (trimesh.triangles) --------------------------------
 
-    @cached_property
+    @_on_mesh_device
     def triangles(self) -> Any:
         return self.vertices[self.faces]
 
-    @cached_property
+    @_on_mesh_device
     def triangles_cross(self) -> Any:
         return _triangles_cross(self.triangles)
 
-    @cached_property
+    @_on_mesh_device
     def area_faces(self) -> Any:
         return np.sqrt((self.triangles_cross**2).sum(axis=1)) / 2.0
 
-    @cached_property
+    @_on_mesh_device
     def area(self) -> float:
         return float(self.area_faces.sum())
 
-    @cached_property
+    @_on_mesh_device
     def face_normals(self) -> Any:
         unit, valid = _unitize(self.triangles_cross)
         return np.where(valid[:, None], unit, 0.0)
 
-    @cached_property
+    @_on_mesh_device
     def face_angles(self) -> Any:
         tri = self.triangles
         u, _ = _unitize(tri[:, 1] - tri[:, 0])
@@ -238,7 +256,7 @@ class ArrayMesh:
         angles = np.stack([a0, a1, np.pi - a0 - a1], axis=1)
         return np.where((angles < _TOL_MERGE).any(axis=1, keepdims=True), 0.0, angles)
 
-    @cached_property
+    @_on_mesh_device
     def vertex_defects(self) -> Any:
         angle_sum = ordered_bincount(
             self.faces.ravel(), self.face_angles.ravel(), len(self.vertices)
@@ -247,7 +265,7 @@ class ArrayMesh:
 
     # -- mass properties (trimesh.triangles.mass_properties, density 1) -------
 
-    @cached_property
+    @_on_mesh_device
     def _integrated(self) -> np.ndarray:
         tri, crosses = self.triangles, self.triangles_cross
         t0, t1, t2 = tri[:, 0, :], tri[:, 1, :], tri[:, 2, :]
@@ -271,7 +289,7 @@ class ArrayMesh:
             [6, 24, 24, 24, 60, 60, 60, 120, 120, 120], dtype=np.float64
         )
 
-    @cached_property
+    @_on_mesh_device
     def volume(self) -> float:
         return float(self._integrated[0])
 
@@ -279,11 +297,11 @@ class ArrayMesh:
     def mass(self) -> float:
         return self.volume
 
-    @cached_property
+    @_on_mesh_device
     def center_mass(self) -> np.ndarray:
         return self._integrated[1:4] / self.volume
 
-    @cached_property
+    @_on_mesh_device
     def moment_inertia(self) -> np.ndarray:
         s, v, c = self._integrated, self.volume, self.center_mass
         inertia = np.zeros((3, 3))
@@ -295,13 +313,13 @@ class ArrayMesh:
         inertia[0, 2] = inertia[2, 0] = -(s[9] - v * np.prod(c[[0, 2]]))
         return inertia
 
-    @cached_property
+    @_on_mesh_device
     def principal_inertia_components(self) -> np.ndarray:
         return np.linalg.eigh(self.moment_inertia)[0]
 
     # -- edges and adjacency (trimesh.graph) ----------------------------------
 
-    @cached_property
+    @_on_mesh_device
     def _edge_groups(self) -> tuple[Any, Any, Any, Any]:
         """Edges grouped by vertex pair: (edges, order, start of each run, run length).
 
@@ -314,9 +332,9 @@ class ArrayMesh:
         lengths = np.diff(starts, append=len(edges))
         return edges, order, starts, lengths
 
-    @cached_property
+    @_on_mesh_device
     def overshared_edge_count(self) -> int:
-        """Number of edges shared by more than two faces, from ``_edge_groups``.
+        """Count the edges shared by more than two faces, from ``_edge_groups``.
 
         Neither the Euler number (each counted once) nor the face adjacency
         (left out) measures such an edge as a surface would.
@@ -324,13 +342,13 @@ class ArrayMesh:
         _, _, _, lengths = self._edge_groups
         return int((lengths > 2).sum())
 
-    @cached_property
+    @_on_mesh_device
     def euler_number(self) -> int:
         referenced = int(np.unique(self.faces).size)
         _, _, starts, _ = self._edge_groups
         return referenced - int(starts.size) + len(self.faces)
 
-    @cached_property
+    @_on_mesh_device
     def _face_adjacency(self) -> tuple[Any, Any]:
         """Pairs of faces sharing an edge, and that edge: (pairs, edges)."""
         edges, order, starts, lengths = self._edge_groups
@@ -340,15 +358,15 @@ class ArrayMesh:
         keep = pair[:, 0] != pair[:, 1]
         return np.sort(pair[keep], axis=1), edges[edge_a[keep]]
 
-    @cached_property
+    @_on_mesh_device
     def face_adjacency(self) -> Any:
         return self._face_adjacency[0]
 
-    @cached_property
+    @_on_mesh_device
     def face_adjacency_edges(self) -> Any:
         return self._face_adjacency[1]
 
-    @cached_property
+    @_on_mesh_device
     def face_adjacency_unshared(self) -> Any:
         edges = self.face_adjacency_edges
         out = []
@@ -361,7 +379,7 @@ class ArrayMesh:
             out.append(np.where(row_ok, picked, -1))
         return np.stack(out, axis=1)
 
-    @cached_property
+    @_on_mesh_device
     def face_adjacency_convex(self) -> Any:
         normals = self.face_normals[self.face_adjacency[:, 0]]
         origins = self.vertices[self.face_adjacency_edges[:, 0]]
