@@ -730,11 +730,15 @@ def test_flat_residues_leave_real_curvature_as_it_is(
     smooth = mesh.mask2mesh(flat, sigma=2.0)
     measured = mesh._scaled_copy(smooth, 1 / mesh._edge_unit(smooth), center=True)
     defects = np.abs(measured.vertex_defects)
+    k1, k2, _ = mesh._principal_curvatures(measured)
     monkeypatch.setattr(mesh, "_FLAT_ANGLE", 0.0)
     angles = mesh._dihedral_angles(measured)
 
-    zeroed_defects = defects[(defects > 0) & (defects <= mesh._FLAT_DEFECT)]
-    assert (zeroed_defects <= 4 * np.spacing(2 * np.pi)).all(), zeroed_defects.max()
+    zeroed = (defects > 0) & (defects <= mesh._FLAT_DEFECT)
+    assert zeroed.any()
+    assert (defects[zeroed] <= 4 * np.spacing(2 * np.pi)).all(), defects[zeroed].max()
+    # Their Gaussian curvature k1 k2 is the floored defect, 0.
+    assert (k1[zeroed] * k2[zeroed] == 0).all()
     assert not ((defects > 1e-14) & (defects <= 1e-13)).any()
     assert ((angles > 0) & (angles <= 1e-13)).sum() > 0
     assert not ((angles > 1e-13) & (angles <= 1e-9)).any()
