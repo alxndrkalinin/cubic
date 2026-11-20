@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import warnings
 import functools
 import threading
@@ -81,12 +82,13 @@ class CUDAManager:
 def _is_torch_tensor(array: Any) -> bool:
     """Return True if ``array`` is a torch.Tensor.
 
-    Uses a lazy import: returns False when torch is not installed so the
-    cubic runtime never hard-depends on torch.
+    Reads ``sys.modules`` instead of importing torch: a tensor cannot exist
+    unless torch has been imported, so the answer is False when it has not.
+    There is no import to run or to retry, and the cubic runtime never
+    hard-depends on torch.
     """
-    try:
-        import torch
-    except ImportError:
+    torch = sys.modules.get("torch")
+    if torch is None:
         return False
     return isinstance(array, torch.Tensor)
 
@@ -447,8 +449,7 @@ def to_torch(array: Any, device: Any = None, dtype: Any = None) -> Any:
     - NumPy array → ``torch.from_numpy`` then moved to ``device``.
     - torch.Tensor → moved/cast to ``device``/``dtype`` as requested.
 
-    torch is imported lazily so ``cubic`` still imports without torch installed
-    (mirrors :func:`_is_torch_tensor`).
+    torch is imported lazily so ``cubic`` still imports without torch installed.
 
     Args:
         array: CuPy/NumPy array or torch tensor.
