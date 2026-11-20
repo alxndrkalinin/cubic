@@ -13,13 +13,10 @@ the length unit of ``spacing``. There are three levels:
 
 1. ``extract_features`` and ``extract_surface_features`` measure in units of
    the finest voxel spacing, on meshes centred on the origin, and convert the
-   values back, so they work in any unit. ``extract_features`` meshes each
-   label in its own bounding box, so its values do not depend on where the
-   label lies in the image. ``extract_surface_features`` meshes the mask in
-   its own frame: its voxel-mesh features do not depend on the object's
-   position either, but the curvature-distribution features and the fractal
-   dimension are measured on level sets of a blur whose float32 vertices
-   round coarser far from the frame's origin, so they move slightly with it.
+   values back, so they work in any unit. Both mesh and blur each object
+   over its own bounding box, so their values do not depend on where the
+   object lies in the image: ``extract_surface_features`` gives a mask the
+   values ``extract_features`` gives the same object as a label.
 2. ``mask2mesh`` builds its mesh in those units and returns it in the
    caller's units, and ``extract_mesh_features`` measures a mesh at the scale
    of its own edges, centred on the origin, and converts back. Both work in
@@ -39,6 +36,7 @@ from __future__ import annotations
 
 import sys
 import math
+import inspect
 import numbers
 import warnings
 from typing import Any, TypeVar, Callable, TypeAlias, SupportsFloat
@@ -59,7 +57,14 @@ except ImportError:  # pragma: no cover - import failure path
         stacklevel=2,
     )
 
-from ..cuda import asnumpy, get_device, to_same_device, ordered_bincount
+from ..cuda import (
+    asnumpy,
+    get_device,
+    on_device_of,
+    to_same_device,
+    ordered_bincount,
+)
+from ..scipy import ndimage as device_ndimage
 from ._array_mesh import ArrayMesh, face_areas
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
@@ -96,6 +101,25 @@ def _require_trimesh(func: F) -> F:
                 "trimesh is required for mesh operations. Install with 'cubic[mesh]'"
             )
         return func(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
+
+
+def _on_input_device(func: F) -> F:
+    """Run ``func`` with the GPU that holds its first argument current.
+
+    The first argument is an array, or a mesh, whose vertices decide. CuPy
+    allocates every new array on the current device, so without this the
+    pad, blur and mesh of an input on another GPU land on the current one.
+    """
+    name = next(iter(inspect.signature(func).parameters))
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        first = args[0] if args else kwargs.get(name)
+        held = first.vertices if isinstance(first, ArrayMesh) else first
+        with on_device_of(held):
+            return func(*args, **kwargs)
 
     return wrapper  # type: ignore[return-value]
 
@@ -139,9 +163,11 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     region (grooves, waists, the necks of lobes), unitless. ``Avg Shape Index``
     (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
     (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
-    units of ``spacing``; both are averaged over the surface by area, the shape
-    index over its curved part only: it is undefined where the surface is
-    planar (``k1 = k2 = 0``), and NaN, with a warning, on a mesh without a
+    units of ``spacing``. Curvedness is averaged over the surface by area, and
+    the shape index by area times curvedness: the shape index is the angle of
+    ``(k1, k2)`` and curvedness its length, so where the surface is nearly
+    planar the angle is set by rounding, and it counts in proportion to the
+    curvature it describes. It is NaN, with a warning, on a mesh without a
     curved vertex.
     ``Euler Characteristic``, ``Avg Mean Curvature`` and these three are
     approximate on a mesh with edges shared by more than two faces, which
@@ -200,6 +226,7 @@ def _resolve_features(features: Sequence[str] | None) -> list[str]:
 
 
 @_require_trimesh
+@_on_input_device
 def extract_features(
     label_image: np.ndarray,
     features: list[str] | None = None,
@@ -294,6 +321,7 @@ def extract_features(
 
 
 @_require_trimesh
+@_on_input_device
 def extract_surface_features(
     mask: np.ndarray,
     spacing: Sequence[float] | None = None,
@@ -372,6 +400,15 @@ def extract_surface_features(
     # before any meshing, then normalised; the default, twice the coarsest
     # spacing, normalises to twice the coarsest normalised spacing.
     sigma = _curvature_sigma(spacing, curvature_sigma) / unit
+    # Measured on the object's bounding box, as extract_features crops each
+    # label, so that no value depends on where the object lies in the mask: a
+    # level-set vertex that rounds to a grid point or a cube centre in float32
+    # keeps that float32 position, and float32 rounds coarser far from the
+    # frame's origin. The crop makes the frame the object's own. Every blur and
+    # mesh pads the box as it needs.
+    box = _object_box(mask)
+    if box is not None:
+        mask = mask[box]
     mesh = mask2mesh(mask, spacing=None if spacing is None else tuple(step))
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
@@ -623,17 +660,43 @@ def _scaled_copy(
 def _smooth_mask2mesh(
     mask_3d: np.ndarray, spacing: Sequence[float] | None, sigma: float
 ) -> Any:
-    """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes."""
+    """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes.
+
+    The mask is blurred and meshed over the bounding box of the object, which
+    makes the frame the object's own: a vertex that rounds to a grid point or a
+    cube centre in float32 keeps that float32 position, which depends on where
+    the object lies in the array. The vertices are then moved back to the
+    mask's frame in float64.
+    """
     step = _step(spacing)
-    volume, pad = _padded_blur(mask_3d, step, sigma)
+    box = _object_box(mask_3d)
+    if box is None:
+        return None
+    volume, pad = _padded_blur(mask_3d[box], step, sigma)
     level_set = _level_set(volume, step)
-    return None if level_set is None else _level_set_mesh(level_set, pad, step)
+    if level_set is None:
+        return None
+    corner = np.array([s.start for s in box])
+    return _level_set_mesh(level_set, pad - corner, step)
+
+
+def _object_box(mask: np.ndarray) -> tuple[slice, ...] | None:
+    """Return the slices of the smallest box holding every nonzero voxel of ``mask``.
+
+    None for a mask without one.
+    """
+    occupied = mask if mask.dtype == bool else mask != 0
+    return device_ndimage.find_objects(occupied.view(np.uint8), 1)[0]
 
 
 def _level_set_mesh(
     level_set: tuple[np.ndarray, np.ndarray], pad: np.ndarray, step: np.ndarray
 ) -> Any:
-    """Return the closed mesh of a padded blur's level set, in the mask's frame."""
+    """Return the closed mesh of a padded blur's level set, in the mask's frame.
+
+    ``pad`` is the number of voxels, per axis, by which the origin of the
+    blurred volume lies before the origin of the mask's frame.
+    """
     verts, faces = level_set
     return _closed_mesh(verts - to_same_device(pad * step, verts), faces)
 
@@ -804,7 +867,61 @@ def _level_set(
     """
     if float(volume.max()) <= 0.5:
         return None
-    return _marching_cubes(volume, 0.5, spacing=tuple(step), allow_degenerate=False)
+    verts, faces = _marching_cubes(volume, 0.5, allow_degenerate=False)
+    verts = _float64_vertices(volume, verts, 0.5)
+    # Each column times a Python float, in place on the fresh float64 array: the
+    # same products as ``verts * step``, without copying ``step`` to the GPU, and
+    # none for a step of 1, which leaves every double as it is.
+    for axis, factor in enumerate(np.asarray(step, dtype=np.float64).tolist()):
+        if factor != 1.0:
+            verts[:, axis] *= factor
+    return verts, faces
+
+
+# skimage's FLT_EPSILON in the vertex interpolation is the double epsilon.
+_MC_EPS = float(np.spacing(1.0))
+
+
+def _float64_vertices(
+    volume: np.ndarray, verts: np.ndarray, level: float
+) -> np.ndarray:
+    """Return marching-cubes vertices (index units) in float64, on their device.
+
+    Both marching cubes compute each edge vertex in float64, as ``floor + t_far
+    / (t_near + t_far)`` along the edge with ``t = 1 / (eps + |value - level|)``,
+    and round it to float32; the rounding step depends on where the object
+    lies in the array and is amplified by the curvature estimates. A float32
+    vertex with exactly one non-integer coordinate lies on the grid edge from
+    its floor along that axis, or is a cube-centre vertex on that line: it is
+    recomputed in float64 when that edge straddles ``level`` and the result
+    rounds back to it. Every other vertex, rounded onto a grid point or a
+    centre vertex, keeps its float32 position. The result depends only on the
+    float32 vertex, so both devices give the same mesh, and vertices coincide
+    in float64 exactly when they do in float32.
+    """
+    v32 = verts.astype(np.float32, copy=False)
+    corner = np.floor(v32)
+    on_edge = v32 != corner
+    single = on_edge.sum(axis=1) == 1
+    # Every row is computed and the rows that qualify are selected, since picking
+    # them by index makes the host wait for the device. A row with several
+    # non-integer coordinates reads the field at its floor, inside the volume,
+    # and is discarded.
+    along = on_edge & single[:, None]
+    near = corner.astype(np.int64)
+    # the float32 field both marching cubes mesh
+    values = [
+        volume[tuple(index.T)].astype(np.float32, copy=False).astype(np.float64) - level
+        for index in (near, near + along)
+    ]
+    t_near, t_far = (1.0 / (_MC_EPS + np.abs(value)) for value in values)
+    pos = np.where(along, near + (t_far / (t_near + t_far))[:, None], near)
+    keep = (
+        single
+        & ((values[0] > 0) != (values[1] > 0))
+        & (pos.astype(np.float32) == v32).all(axis=1)
+    )
+    return np.where(keep[:, None], pos, v32)
 
 
 def _level_set_area(level_set: tuple[np.ndarray, np.ndarray] | None) -> float:
@@ -812,10 +929,11 @@ def _level_set_area(level_set: tuple[np.ndarray, np.ndarray] | None) -> float:
     if level_set is None:
         return float("nan")
     verts, faces = level_set
-    return float(face_areas(verts.astype(np.float64), faces).sum())
+    return float(face_areas(verts.astype(np.float64, copy=False), faces).sum())
 
 
 @_require_trimesh
+@_on_input_device
 def mask2mesh(
     mask_3d: np.ndarray,
     spacing: Sequence[float] | None = None,
@@ -910,6 +1028,7 @@ def sphericity(v: float, sa: float) -> float:
 
 
 @_require_trimesh
+@_on_input_device
 def extract_mesh_features(
     mesh: trimesh.Trimesh,
     features: Sequence[str] | None = None,
@@ -1793,10 +1912,10 @@ def _principal_curvatures(
     0 (``_FLAT_ANGLE``), so its edge sum is exactly 0, and its angle defect is
     set to 0 where its absolute value is at most ``_FLAT_DEFECT`` radians, so
     ``k1 = k2 = 0`` there on either device and at any scale and orientation.
-    The defect test matters at the nearly flat vertices of a blurred mesh,
-    where dihedral angles of 1e-9 rad give a mean curvature whose square is
-    below a defect residue's curvature, so the residue would decide the shape
-    index.
+    The defect test matters on raw voxel meshes, where thousands of vertices
+    are flat and carry a rounding-residue defect of at most 1e-14 radians:
+    left as it is, the defect gives the vertex a Gaussian curvature that the
+    surface does not have, and a ``k1, k2`` that Avg Curvedness counts.
 
     ``edge_curvatures`` is ``_edge_curvatures(mesh)`` when already computed.
     """
@@ -1819,28 +1938,37 @@ def _area_average(values: np.ndarray, area: np.ndarray) -> float:
     return float((values[valid] * area[valid]).sum() / area[valid].sum())
 
 
-def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
-    """Return the area-weighted shape index, 1 on a sphere and 0 on a saddle.
+def _vertex_curvedness(k1: np.ndarray, k2: np.ndarray) -> np.ndarray:
+    """Return the curvedness ``sqrt((k1^2 + k2^2) / 2)`` of each vertex."""
+    return np.sqrt((k1**2 + k2**2) / 2)
 
-    The shape index is undefined at a planar point, ``k1 = k2 = 0``, so the
-    vertices of curvedness 0 are left out of the average; NaN, with a warning,
-    when no vertex is curved.
+
+def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
+    """Return the shape index averaged by area times curvedness.
+
+    1 on a sphere, 0.5 on a cylinder and 0 on a saddle, as the area average.
+    The shape index ``(2 / pi) atan2(k1 + k2, k2 - k1)`` is the angle of
+    ``(k1, k2)``, undefined at a planar point and set by rounding near one; its
+    weight ``sqrt((k1^2 + k2^2) / 2)``, the curvedness, goes to 0 there, so
+    each vertex's term is continuous in its curvatures. NaN, with a warning,
+    when no vertex has a finite, positive area times curvedness.
     """
-    curved = (k1 != 0) | (k2 != 0)
-    if not bool(curved.any()):
+    weight = area * _vertex_curvedness(k1, k2)
+    valid = (weight > 0) & np.isfinite(weight)
+    if not bool(valid.any()):
         warnings.warn(
-            "Avg Shape Index is undefined on a mesh whose vertices are all "
-            "planar (k1 = k2 = 0); returning NaN.",
+            "Avg Shape Index is undefined on a mesh in which no vertex has a "
+            "finite, positive area times curvedness; returning NaN.",
             stacklevel=_stacklevel_outside_package(),
         )
         return float("nan")
     shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
-    return _area_average(shape_index, np.where(curved, area, 0.0))
+    return _area_average(shape_index, np.where(valid, weight, 0.0))
 
 
 def _curvedness(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
     """Return the area-weighted curvedness, ``1 / R`` on a sphere of radius R."""
-    return _area_average(np.sqrt((k1**2 + k2**2) / 2), area)
+    return _area_average(_vertex_curvedness(k1, k2), area)
 
 
 def _smooth_twin(blurred: np.ndarray, pad: np.ndarray) -> np.ndarray:
@@ -1956,8 +2084,8 @@ def _contour_length(field: np.ndarray, plane_step: np.ndarray) -> float:
 
     Marching cubes on the field stacked twice along a new first axis, one unit
     apart, gives a ribbon whose area is the contour length times that unit, on
-    the field's device. It matches skimage's ``find_contours`` to 1e-7 relative
-    (float32 vertices), except in saddle cells, which marching cubes resolves
+    the field's device. It matches skimage's ``find_contours`` to 1e-15 relative,
+    except in saddle cells, which marching cubes resolves
     by the bilinear interpolant, like ``find_contours(fully_connected="high")``
     when the saddle lies above 0.5.
     """

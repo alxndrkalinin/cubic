@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 import warnings
 import functools
 import threading
 from types import ModuleType
 from typing import Any
 from importlib import import_module
+from contextlib import AbstractContextManager, nullcontext
 
 import numpy as np
 
@@ -80,12 +82,13 @@ class CUDAManager:
 def _is_torch_tensor(array: Any) -> bool:
     """Return True if ``array`` is a torch.Tensor.
 
-    Uses a lazy import: returns False when torch is not installed so the
-    cubic runtime never hard-depends on torch.
+    Reads ``sys.modules`` instead of importing torch: a tensor cannot exist
+    unless torch has been imported, so the answer is False when it has not.
+    There is no import to run or to retry, and the cubic runtime never
+    hard-depends on torch.
     """
-    try:
-        import torch
-    except ImportError:
+    torch = sys.modules.get("torch")
+    if torch is None:
         return False
     return isinstance(array, torch.Tensor)
 
@@ -330,10 +333,46 @@ def to_device(array: np.ndarray, device: str) -> np.ndarray:
         )
 
 
+def on_device_of(array: Any) -> AbstractContextManager[Any]:
+    """Return a context in which the GPU that holds ``array`` is current.
+
+    CuPy allocates every new array, and runs every kernel, on the current
+    device, not on that of the operands, so code that should stay on an
+    array's GPU runs inside this. A no-op for a host array. A CuPy array
+    gives its ``device``, a CUDA torch tensor its ``device.index``; any other
+    GPU array (see ``get_device``), or a tensor without an index, keeps the
+    current device.
+    """
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        return nullcontext()
+    # A CuPy array is recognised by the ``id`` of its device, without the torch
+    # check of ``get_device``, which runs at most once, for any other array.
+    index = getattr(getattr(array, "device", None), "id", None)
+    if index is None and _is_torch_tensor(array):
+        device = array.device
+        index = device.index if device.type == "cuda" else None
+    return nullcontext() if index is None else cp.cuda.Device(index)
+
+
 def to_same_device(source_array: np.ndarray, reference_array: np.ndarray) -> np.ndarray:
-    """Move the source_array to the same device as reference_array."""
+    """Move the source_array to the same device as reference_array.
+
+    On the GPU, to the GPU that holds ``reference_array`` (see
+    ``on_device_of``), whichever device is current; a source already there is
+    returned as it is.
+    """
     target_device = get_device(reference_array)
-    return to_device(source_array, target_device)
+    if target_device != "GPU":
+        return to_device(source_array, target_device)
+    with on_device_of(reference_array):
+        moved: Any = to_device(source_array, "GPU")
+        # A CuPy source that is still on another GPU is copied to this one.
+        # ``to_device`` has raised unless CuPy is installed.
+        cp: Any = CUDAManager().get_cp()
+        if moved.device.id != cp.cuda.Device().id:
+            moved = moved.copy()
+    return moved
 
 
 def check_same_device(*arrays: np.ndarray) -> None:
@@ -410,8 +449,7 @@ def to_torch(array: Any, device: Any = None, dtype: Any = None) -> Any:
     - NumPy array → ``torch.from_numpy`` then moved to ``device``.
     - torch.Tensor → moved/cast to ``device``/``dtype`` as requested.
 
-    torch is imported lazily so ``cubic`` still imports without torch installed
-    (mirrors :func:`_is_torch_tensor`).
+    torch is imported lazily so ``cubic`` still imports without torch installed.
 
     Args:
         array: CuPy/NumPy array or torch tensor.

@@ -529,33 +529,16 @@ def test_extract_surface_features_full_pipeline() -> None:
 
 def test_extract_surface_features_of_a_far_object_are_those_of_a_near_one(
     lumpy_nucleus_of: Callable[[int], np.ndarray],
+    assert_far_object_like_near: Callable[..., None],
 ) -> None:
     """An object 2030 voxels from the origin of its mask gets the features it gets near it.
 
-    Every feature of the voxel mesh is measured on a copy centred on the
-    origin, so the inertia does not round with the distance. The features of
-    the blurred mesh and the fractal dimensions are not compared: those
-    meshes are built in the mask's frame, where their vertices round coarser
-    far from the origin.
+    Every feature, the blurred mesh's and the fractal dimensions included,
+    matches the near copy's, and so does the value ``extract_features`` gives
+    the object as a label; ``mask2mesh(..., sigma=...)`` returns the near mesh
+    moved by the offset.
     """
-    nucleus = lumpy_nucleus_of(5)
-    names = [
-        name
-        for name in mesh.mesh_feature_list()
-        if name not in mesh._SMOOTHED_FEATURES and name not in mesh._MASK_FEATURES
-    ]
-    near = np.zeros((44, 68, 68), dtype=bool)
-    near[2:42, 2:66, 2:66] = nucleus
-    far = np.zeros((44, 68, 2100), dtype=bool)
-    far[2:42, 2:66, 2030:2094] = nucleus
-
-    values = [
-        mesh.extract_surface_features(mask, spacing=(2.685, 1.0, 1.0), features=names)
-        for mask in (near, far)
-    ]
-
-    for name in names:
-        assert values[1][name] == pytest.approx(values[0][name], rel=1e-13), name
+    assert_far_object_like_near(lumpy_nucleus_of(5), np.asarray)
 
 
 def test_curvature_of_a_sphere(ball_of: Callable[[float, int], np.ndarray]) -> None:
@@ -673,8 +656,7 @@ def test_curvature_distribution_of_a_ball(
     # Every angle defect of a convex surface is positive, so |K| integrates to
     # exactly the 4 pi of Gauss-Bonnet.
     assert features["Total Absolute Gaussian Curvature"] == pytest.approx(1, rel=1e-6)
-    # Per-vertex principal curvatures are noisy, which pulls the area-average
-    # below 1 (0.92 here).
+    # Per-vertex principal curvatures are noisy, which pulls the average below 1.
     assert features["Avg Shape Index"] > 0.85
     # The blur shrinks a convex body by about sigma^2 / R, raising curvedness.
     assert features["Avg Curvedness"] == pytest.approx(1 / 10, rel=0.15)
@@ -704,7 +686,7 @@ def test_shape_index_tells_a_torus_from_a_ball(
 ) -> None:
     """Saddles lower the area-averaged shape index: a torus reads well below a ball.
 
-    The ball is all cap (0.92 here); the inner half of the torus is saddle (0.50 here).
+    The ball is all cap; the inner half of the torus is saddle.
     """
     name = "Avg Shape Index"
     ball = mesh.extract_surface_features(ball_of(10, 26), features=[name])[name]
@@ -718,16 +700,25 @@ def test_flat_residues_leave_real_curvature_as_it_is(
 ) -> None:
     """On a blurred flat ellipsoid only rounding residues are set to 0.
 
-    The terraces that the blur leaves on its shallow slopes have angle defects
-    down to 4.5e-13 radians, and no angle defect lies between 1e-14 and 1e-13.
-    No dihedral angle lies between 1e-13 and 1e-9 either, so ``_FLAT_ANGLE``
-    sits in an empty band. What the two floors set to 0 on the copy that
-    ``extract_mesh_features`` measures are residues: 63 dihedral angles of at
-    most 1e-13 and 187 angle defects of 8.9e-16 (one ulp of 2 pi).
+    No dihedral angle of the copy that ``extract_mesh_features`` measures lies
+    between 1e-13 and 1e-9, so ``_FLAT_ANGLE`` sits in an empty band. What the
+    two floors set to 0 are residues: dihedral angles of at most 1e-13 and
+    angle defects of at most four ulps of 2 pi. The angle defects between 1e-14
+    and 1e-13, which the floor keeps, do not decide the curvature: with the
+    floor at 1e-15 or at 1e-13, Avg Shape Index and Avg Curvedness, the
+    features that read it, differ from the default's by at most 5e-8, relative.
     """
     z, y, x = _centred_grid(20, 132, 132)
     flat = (z / 6) ** 2 + (y / 60) ** 2 + (x / 60) ** 2 <= 1
     smooth = mesh.mask2mesh(flat, sigma=2.0)
+    names = ["Avg Shape Index", "Avg Curvedness"]
+    features = mesh.extract_mesh_features(smooth, names)
+    for floor in (1e-15, 1e-13):
+        with monkeypatch.context() as patch:
+            patch.setattr(mesh, "_FLAT_DEFECT", floor)
+            moved = mesh.extract_mesh_features(smooth, names)
+        for name in names:
+            assert moved[name] == pytest.approx(features[name], rel=5e-8), (name, floor)
     measured = mesh._scaled_copy(smooth, 1 / mesh._edge_unit(smooth), center=True)
     defects = np.abs(measured.vertex_defects)
     k1, k2, _ = mesh._principal_curvatures(measured)
@@ -739,9 +730,31 @@ def test_flat_residues_leave_real_curvature_as_it_is(
     assert (defects[zeroed] <= 4 * np.spacing(2 * np.pi)).all(), defects[zeroed].max()
     # Their Gaussian curvature k1 k2 is the floored defect, 0.
     assert (k1[zeroed] * k2[zeroed] == 0).all()
-    assert not ((defects > 1e-14) & (defects <= 1e-13)).any()
     assert ((angles > 0) & (angles <= 1e-13)).sum() > 0
     assert not ((angles > 1e-13) & (angles <= 1e-9)).any()
+
+
+def test_level_set_vertices_do_not_round_with_their_place_in_the_array(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
+    """A blurred level set moved by whole voxels moves by exactly that, to 1e-12.
+
+    The two copies, at index 1 and at index 1500 of the array, have the same
+    faces and float64 vertices.
+    """
+    field = ndimage.gaussian_filter(ball_of(8, 22).astype(np.float32), 2.0)
+    step = np.array([2.39, 1.0, 1.0])
+    meshes = []
+    for corner in ((1, 1, 1), (3, 1500, 2)):
+        volume = np.zeros((30, 1530, 30), dtype=np.float32)
+        volume[tuple(slice(c, c + 22) for c in corner)] = field
+        verts, faces = mesh._level_set(volume, step)
+        meshes.append((verts - np.array(corner) * step, faces))
+
+    (va, fa), (vb, fb) = meshes
+    assert va.dtype == np.float64
+    np.testing.assert_array_equal(fa, fb)
+    assert np.abs(va - vb).max() <= 1e-12
 
 
 @pytest.mark.parametrize(
@@ -819,18 +832,27 @@ def test_raw_shape_index_does_not_depend_on_scale_or_orientation(
 
 
 def _turned_cube(
-    side: float, offset: tuple[float, float, float] | None = None
+    side: float,
+    offset: tuple[float, float, float] | None = None,
+    bump: float = 0.0,
 ) -> trimesh.Trimesh:
     """Return a cube of ``side`` subdivided four times, turned, and moved by ``offset``.
 
     It is turned by a fixed random rotation. Its faces lie in the six planes of
-    the cube, so every vertex inside a face is flat.
+    the cube, so every vertex inside a face is flat, unless ``bump`` moves each
+    of them, before the turn, along its normal by a random distance of at most
+    ``bump``.
     """
     box = trimesh.creation.box(extents=(side, side, side))
     for _ in range(4):
         box = box.subdivide()
+    vertices = box.vertices
+    if bump:
+        inside = (np.abs(vertices) < side / 2 - 1e-9).sum(axis=1) == 2
+        moves = np.random.default_rng(0).uniform(-bump, bump, len(vertices))
+        vertices = vertices + np.where(inside, moves, 0)[:, None] * box.vertex_normals
     turn = Rotation.random(1, random_state=2).as_matrix()[0]
-    vertices = box.vertices @ turn.T
+    vertices = vertices @ turn.T
     if offset is not None:
         vertices = vertices + np.array(offset)
     return trimesh.Trimesh(vertices, box.faces, process=False)
@@ -862,28 +884,46 @@ def test_rotated_cube_has_the_mean_curvature_of_its_edges(
     assert (k2[inside] == 0).all()
 
 
-def test_shape_index_leaves_out_planar_vertices(
+def test_shape_index_weights_vertices_by_curvedness(
     flat_vertices_of: Callable[[object], np.ndarray],
 ) -> None:
     """The shape index of a cube averages its edges and corners, not its faces.
 
-    It is undefined where ``k1 = k2 = 0``. On the cube's edges ``k1 = 0 < k2``,
-    a shape index of 0.5, and its corners read more, so the average is at
-    least 0.5 (0.509 here); counting the 1350 face-interior vertices as 0 gave
-    0.062.
+    Each vertex counts by area times curvedness, which is 0 where
+    ``k1 = k2 = 0``, as at the cube's face-interior vertices. On its edges
+    ``k1 = 0 < k2``, a shape index of 0.5, and its corners read more, so the
+    average is at least 0.5.
     """
     cube = _turned_cube(2.0)
     measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube), center=True)
     k1, k2, area = mesh._principal_curvatures(measured)
-    curved = ~flat_vertices_of(measured)
-    shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
+    flat = flat_vertices_of(measured)
+    weight = area * np.sqrt((k1**2 + k2**2) / 2)
 
     name = "Avg Shape Index"
     value = mesh.extract_mesh_features(cube, [name])[name]
 
+    assert (weight[flat] == 0).all()
     assert 0.5 <= value <= 1
-    expected = (shape_index * area)[curved].sum() / area[curved].sum()
-    assert value == pytest.approx(expected, rel=1e-12)
+
+
+def test_shape_index_of_nearly_flat_faces_follows_their_curvature() -> None:
+    """Faces bent by 1e-9 move the shape index by about that much, not by their shape.
+
+    The shape index of a nearly flat vertex is the angle of a vanishing
+    ``(k1, k2)``, so rounding sets it. Each vertex counts by its curvedness,
+    so moving the cube's face-interior vertices by up to 1e-9 along their
+    normals, at random, moves the average by at most 1e-7.
+    """
+    straight = _turned_cube(2.0)
+    bent = _turned_cube(2.0, bump=1e-9)
+    name = "Avg Shape Index"
+
+    flat = mesh.extract_mesh_features(straight, [name])[name]
+    nearly_flat = mesh.extract_mesh_features(bent, [name])[name]
+
+    assert (bent.vertices != straight.vertices).any(axis=1).sum() == 1350
+    assert abs(nearly_flat - flat) <= 1e-7
 
 
 def test_shape_index_of_a_mesh_without_curvature_is_nan() -> None:
@@ -903,10 +943,10 @@ def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
     ``h = |(x / a^2, y / b^2, z / c^2)|``, ``K = 1 / (abc h^2)^2`` and
     ``H = (a^2 + b^2 + c^2 - |x|^2) / (2 (abc)^2 h^3)``, integrated over the
     surface by the midpoint rule in the two angles (the integral of ``K`` is
-    ``4 pi`` to 2e-7). The icosphere of subdivision 5 stretched to it reads
-    within 2.0e-4 (mean curvature), 3.8e-5 (shape index) and 2.1e-4
-    (curvedness) of them. trimesh's arccos angles give the same to 8 digits
-    here: this checks the formulas, not the rounding of angles near 0.
+    ``4 pi`` to 2e-7). The icosphere of subdivision 5 stretched to it must read
+    within 1e-3 (mean curvature and curvedness, relative) and 2e-4 (shape
+    index, weighted by curvedness) of them. This checks the formulas, not the
+    rounding of angles near 0.
     """
     a, b, c = 3.0, 2.0, 1.5
     n = 1000
@@ -938,8 +978,9 @@ def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
     assert average(gaussian) * dA.sum() / (4 * np.pi) == pytest.approx(1, abs=1e-6)
     assert got["Avg Mean Curvature"] == pytest.approx(average(mean), rel=1e-3)
     shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
-    assert got["Avg Shape Index"] == pytest.approx(average(shape_index), abs=1e-3)
     curvedness = np.sqrt((k1**2 + k2**2) / 2)
+    weighted = average(shape_index * curvedness) / average(curvedness)
+    assert got["Avg Shape Index"] == pytest.approx(weighted, abs=2e-4)
     assert got["Avg Curvedness"] == pytest.approx(average(curvedness), rel=1e-3)
 
 
