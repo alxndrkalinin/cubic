@@ -13,7 +13,13 @@ the length unit of ``spacing``. There are three levels:
 
 1. ``extract_features`` and ``extract_surface_features`` measure in units of
    the finest voxel spacing, on meshes centred on the origin, and convert the
-   values back, so they work in any unit and at any position in the image.
+   values back, so they work in any unit. ``extract_features`` meshes each
+   label in its own bounding box, so its values do not depend on where the
+   label lies in the image. ``extract_surface_features`` meshes the mask in
+   its own frame: its voxel-mesh features do not depend on the object's
+   position either, but the curvature-distribution features and the fractal
+   dimension are measured on level sets of a blur whose float32 vertices
+   round coarser far from the frame's origin, so they move slightly with it.
 2. ``mask2mesh`` builds its mesh in those units and returns it in the
    caller's units, and ``extract_mesh_features`` measures a mesh at the scale
    of its own edges, centred on the origin, and converts back. Both work in
