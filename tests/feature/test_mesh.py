@@ -658,8 +658,8 @@ def test_curvature_distribution_of_a_ball(
     # Every angle defect of a convex surface is positive, so |K| integrates to
     # exactly the 4 pi of Gauss-Bonnet.
     assert features["Total Absolute Gaussian Curvature"] == pytest.approx(1, rel=1e-6)
-    # Per-vertex principal curvatures are noisy, which pulls the area-average
-    # below 1 (0.92 here).
+    # Per-vertex principal curvatures are noisy, which pulls the average
+    # below 1 (0.90 here).
     assert features["Avg Shape Index"] > 0.85
     # The blur shrinks a convex body by about sigma^2 / R, raising curvedness.
     assert features["Avg Curvedness"] == pytest.approx(1 / 10, rel=0.15)
@@ -689,7 +689,7 @@ def test_shape_index_tells_a_torus_from_a_ball(
 ) -> None:
     """Saddles lower the area-averaged shape index: a torus reads well below a ball.
 
-    The ball is all cap (0.92 here); the inner half of the torus is saddle (0.50 here).
+    The ball is all cap (0.90 here); the inner half of the torus is saddle (0.50 here).
     """
     name = "Avg Shape Index"
     ball = mesh.extract_surface_features(ball_of(10, 26), features=[name])[name]
@@ -847,28 +847,61 @@ def test_rotated_cube_has_the_mean_curvature_of_its_edges(
     assert (k2[inside] == 0).all()
 
 
-def test_shape_index_leaves_out_planar_vertices(
+def test_shape_index_weights_vertices_by_curvedness(
     flat_vertices_of: Callable[[object], np.ndarray],
 ) -> None:
     """The shape index of a cube averages its edges and corners, not its faces.
 
-    It is undefined where ``k1 = k2 = 0``. On the cube's edges ``k1 = 0 < k2``,
-    a shape index of 0.5, and its corners read more, so the average is at
-    least 0.5 (0.509 here); counting the 1350 face-interior vertices as 0 gave
-    0.062.
+    Each vertex counts by area times curvedness, which is 0 where
+    ``k1 = k2 = 0``, as at the cube's 1350 face-interior vertices. On its edges
+    ``k1 = 0 < k2``, a shape index of 0.5, and its corners read more, so the
+    average is at least 0.5 (0.513 here); counting the face-interior vertices
+    as 0 at their area gave 0.062.
     """
     cube = _turned_cube(2.0)
     measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube), center=True)
     k1, k2, area = mesh._principal_curvatures(measured)
-    curved = ~flat_vertices_of(measured)
+    flat = flat_vertices_of(measured)
     shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
+    weight = area * np.sqrt((k1**2 + k2**2) / 2)
 
     name = "Avg Shape Index"
     value = mesh.extract_mesh_features(cube, [name])[name]
 
+    assert (weight[flat] == 0).all()
     assert 0.5 <= value <= 1
-    expected = (shape_index * area)[curved].sum() / area[curved].sum()
+    expected = (shape_index * weight).sum() / weight.sum()
     assert value == pytest.approx(expected, rel=1e-12)
+
+
+def test_shape_index_of_nearly_flat_faces_follows_their_curvature() -> None:
+    """Faces bent by 1e-9 move the shape index by about that much, not by their shape.
+
+    The shape index of a nearly flat vertex is the angle of a vanishing
+    ``(k1, k2)``, so rounding sets it, and averaged by area alone it counts in
+    full: moving the cube's 1350 face-interior vertices by up to 1e-9 along
+    their normals, at random, moved the average from 0.509 to 0.310. Weighted
+    by curvedness it moved by 1.5e-8.
+    """
+    box = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    for _ in range(4):
+        box = box.subdivide()
+    turn = Rotation.random(1, random_state=2).as_matrix()[0]
+    inside = (np.abs(box.vertices) < 1 - 1e-9).sum(axis=1) == 2
+    normals = box.vertex_normals
+    bump = np.random.default_rng(0).uniform(-1e-9, 1e-9, len(box.vertices))
+    bent = box.vertices + np.where(inside, bump, 0)[:, None] * normals
+    name = "Avg Shape Index"
+
+    flat = mesh.extract_mesh_features(
+        trimesh.Trimesh(box.vertices @ turn.T, box.faces, process=False), [name]
+    )[name]
+    nearly_flat = mesh.extract_mesh_features(
+        trimesh.Trimesh(bent @ turn.T, box.faces, process=False), [name]
+    )[name]
+
+    assert inside.sum() == 1350
+    assert abs(nearly_flat - flat) <= 1e-7
 
 
 def test_shape_index_of_a_mesh_without_curvature_is_nan() -> None:
@@ -889,8 +922,9 @@ def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
     ``H = (a^2 + b^2 + c^2 - |x|^2) / (2 (abc)^2 h^3)``, integrated over the
     surface by the midpoint rule in the two angles (the integral of ``K`` is
     ``4 pi`` to 2e-7). The icosphere of subdivision 5 stretched to it reads
-    within 2.0e-4 (mean curvature), 3.8e-5 (shape index) and 2.1e-4
-    (curvedness) of them. trimesh's arccos angles give the same to 8 digits
+    within 2.0e-4 (mean curvature), 4.6e-5 (shape index, weighted by
+    curvedness) and 2.1e-4 (curvedness) of them; the area average of the
+    shape index is 9.5e-4 away from the weighted one. trimesh's arccos angles give the same to 8 digits
     here: this checks the formulas, not the rounding of angles near 0.
     """
     a, b, c = 3.0, 2.0, 1.5
@@ -923,8 +957,9 @@ def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
     assert average(gaussian) * dA.sum() / (4 * np.pi) == pytest.approx(1, abs=1e-6)
     assert got["Avg Mean Curvature"] == pytest.approx(average(mean), rel=1e-3)
     shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
-    assert got["Avg Shape Index"] == pytest.approx(average(shape_index), abs=1e-3)
     curvedness = np.sqrt((k1**2 + k2**2) / 2)
+    weighted = average(shape_index * curvedness) / average(curvedness)
+    assert got["Avg Shape Index"] == pytest.approx(weighted, abs=2e-4)
     assert got["Avg Curvedness"] == pytest.approx(average(curvedness), rel=1e-3)
 
 
