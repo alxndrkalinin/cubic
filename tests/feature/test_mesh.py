@@ -703,11 +703,22 @@ def test_flat_residues_leave_real_curvature_as_it_is(
     No dihedral angle of the copy that ``extract_mesh_features`` measures lies
     between 1e-13 and 1e-9, so ``_FLAT_ANGLE`` sits in an empty band. What the
     two floors set to 0 are residues: dihedral angles of at most 1e-13 and
-    angle defects of at most four ulps of 2 pi.
+    angle defects of at most four ulps of 2 pi. The angle defects between 1e-14
+    and 1e-13, which the floor keeps, do not decide the curvature: with the
+    floor at 1e-15 or at 1e-13, Avg Shape Index and Avg Curvedness, the
+    features that read it, differ from the default's by at most 5e-8, relative.
     """
     z, y, x = _centred_grid(20, 132, 132)
     flat = (z / 6) ** 2 + (y / 60) ** 2 + (x / 60) ** 2 <= 1
     smooth = mesh.mask2mesh(flat, sigma=2.0)
+    names = ["Avg Shape Index", "Avg Curvedness"]
+    features = mesh.extract_mesh_features(smooth, names)
+    for floor in (1e-15, 1e-13):
+        with monkeypatch.context() as patch:
+            patch.setattr(mesh, "_FLAT_DEFECT", floor)
+            moved = mesh.extract_mesh_features(smooth, names)
+        for name in names:
+            assert moved[name] == pytest.approx(features[name], rel=5e-8), (name, floor)
     measured = mesh._scaled_copy(smooth, 1 / mesh._edge_unit(smooth), center=True)
     defects = np.abs(measured.vertex_defects)
     k1, k2, _ = mesh._principal_curvatures(measured)
