@@ -4,19 +4,27 @@ Each label is converted into a surface mesh with marching cubes and measured
 with ``trimesh``. A CuPy label image or mask stays on the GPU: it is meshed by a
 CUDA port of the same marching cubes and measured as an ``ArrayMesh``, which
 computes the trimesh quantities on the device and hands the convex hull and
-bounding primitives to trimesh on the host.
+bounding sphere to trimesh on the host; the bounding box and cylinder are
+measured on the host from that hull.
 
 Units and trimesh tolerances. trimesh compares lengths, areas and cross
 products with absolute tolerances, so whether a result is right can depend on
 the length unit of ``spacing``. There are three levels:
 
 1. ``extract_features`` and ``extract_surface_features`` measure in units of
-   the finest voxel spacing and convert the values back, so they work in any
-   unit.
+   the finest voxel spacing, on meshes centred on the origin, and convert the
+   values back, so they work in any unit. ``extract_features`` meshes each
+   label in its own bounding box, so its values do not depend on where the
+   label lies in the image. ``extract_surface_features`` meshes the mask in
+   its own frame: its voxel-mesh features do not depend on the object's
+   position either, but the curvature-distribution features and the fractal
+   dimension are measured on level sets of a blur whose float32 vertices
+   round coarser far from the frame's origin, so they move slightly with it.
 2. ``mask2mesh`` builds its mesh in those units and returns it in the
    caller's units, and ``extract_mesh_features`` measures a mesh at the scale
-   of its own edges and converts back. Both work in any unit, for meshes from
-   ``mask2mesh``.
+   of its own edges, centred on the origin, and converts back. Both work in
+   any unit, for meshes from ``mask2mesh``, and the second at any position
+   but for a mesh with a centre of mass set on it, which is not centred.
 3. Attributes read straight off a returned mesh, and a mesh the caller builds
    themselves, are subject to trimesh's absolute tolerances. trimesh sets a
    face normal to zero when the norm of the face's cross product is below
@@ -33,7 +41,7 @@ import sys
 import math
 import numbers
 import warnings
-from typing import Any, TypeVar, Callable, SupportsFloat
+from typing import Any, TypeVar, Callable, TypeAlias, SupportsFloat
 from functools import cache, wraps
 from collections.abc import Sequence
 
@@ -51,15 +59,14 @@ except ImportError:  # pragma: no cover - import failure path
         stacklevel=2,
     )
 
-from ..cuda import asnumpy, get_device, to_same_device
+from ..cuda import asnumpy, get_device, to_same_device, ordered_bincount
 from ._array_mesh import ArrayMesh, face_areas
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-# ``Trimesh.integral_mean_curvature`` signs its dihedral angles only from this
-# release on; older ones overstate the mean curvature of any concave surface.
+# pyproject's mesh floor: cubic itself no longer needs 4.6.12; the floor is kept.
 _MIN_TRIMESH = (4, 6, 12)
 
 
@@ -106,10 +113,20 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     No default feature is defined on the image axes. The axis lengths are the
     full axes of the ellipsoid with the same inertia, and ``Extent`` is the
     volume over the oriented bounding box volume. Voxelization still moves
-    every feature a little with orientation, and the oriented box and bounding
-    cylinder come from trimesh's approximate minimum searches, so they move
-    more: ``Extent`` spans 0.50-0.55 for one ellipsoid turned by 0, 30 and 45
-    degrees. The mean curvature is averaged over the surface, in inverse units
+    every feature a little with orientation, and the box more than most:
+    ``Extent`` spans 0.50-0.55 for one ellipsoid turned by 0, 30 and 45
+    degrees. ``Oriented Bounding Box Volume`` is the smallest volume of the
+    boxes that enclose the mesh with a face on a face of its convex hull,
+    each with the exact minimum-area rectangle across that face's normal; it
+    turns, scales and reorders with the mesh to rounding. It is an upper bound
+    of the minimum enclosing box, which can instead have two adjacent faces
+    each on a hull edge: it is twice the minimum for a regular tetrahedron.
+    ``Bounding Cylinder Volume`` is the smallest volume of the cylinders that
+    enclose the mesh about the normals of its convex hull faces and its three
+    principal axes of inertia, each with the exact minimum enclosing circle
+    across its axis; it turns and scales with the mesh to rounding. It is an
+    upper bound of the minimum enclosing cylinder.
+    The mean curvature is averaged over the surface, in inverse units
     of ``spacing``. ``Euler Characteristic`` is twice the number of separate
     pieces plus cavities, minus twice the number of handles: 2 for a ball, 4
     for a hollow ball, 0 for a torus.
@@ -122,7 +139,10 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     region (grooves, waists, the necks of lobes), unitless. ``Avg Shape Index``
     (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
     (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
-    units of ``spacing``; both are averaged over the surface by area.
+    units of ``spacing``; both are averaged over the surface by area, the shape
+    index over its curved part only: it is undefined where the surface is
+    planar (``k1 = k2 = 0``), and NaN, with a warning, on a mesh without a
+    curved vertex.
     ``Euler Characteristic``, ``Avg Mean Curvature`` and these three are
     approximate on a mesh with edges shared by more than two faces, which
     marching cubes makes where voxels touch only along an edge, and a warning
@@ -294,8 +314,7 @@ def extract_surface_features(
         in units of ``spacing``, in metres or nanometres alike. Given in
         another unit, they convert with it exactly (to the rounding of the
         conversion) when the ratios of the spacings round alike in both units,
-        and otherwise to about 1e-8 relative; ``Bounding Cylinder Volume``
-        comes from an approximate search and can then move by a few 1e-4.
+        and otherwise to about 1e-14 relative.
     features : sequence of str, optional
         Feature names to compute, defaults to ``mesh_feature_list()``. Optional
         features (``mesh_feature_list(optional=True)``, e.g. ``Outline Fractal
@@ -552,23 +571,45 @@ def _closed_mesh(verts: np.ndarray, faces: np.ndarray) -> Any:
     return trimesh.Trimesh(vertices=verts, faces=faces)
 
 
-def _scaled_copy(surface: Any, factor: float) -> Any:
+def _scaled_copy(
+    surface: Any,
+    factor: float,
+    center: bool = False,
+    bounds: tuple[list[float], list[float]] | None = None,
+) -> Any:
     """Return a copy of ``surface`` with every vertex times ``factor``, unmerged.
 
-    See "Units and trimesh tolerances" in the module docstring. ``surface`` is
-    not modified. An ``ArrayMesh`` stays one; any other mesh, a trimesh
-    primitive included, becomes a plain ``trimesh.Trimesh`` of its vertices
-    and faces that keeps a density or centre of mass set on it.
+    See "Units and trimesh tolerances" in the module docstring. With
+    ``center``, the middle of the box of the vertices of its faces
+    (``_vertex_bounds``, or ``bounds`` when already computed) is subtracted
+    from every vertex first, so the copy is centred on the origin; the same
+    vertices give the same copy on either device. A mesh with a centre of
+    mass set on it is not centred: trimesh
+    shifts its inertia from the origin to that point as if it were the
+    centroid, which depends on where the mesh lies. ``surface`` is not
+    modified. An ``ArrayMesh`` stays one; any other mesh, a trimesh primitive
+    included, becomes a plain ``trimesh.Trimesh`` of its vertices and faces
+    that keeps a density or centre of mass set on it.
     """
-    if isinstance(surface, ArrayMesh):
-        return surface.scaled(factor)
     # trimesh keeps a density or centre of mass set on a mesh apart from its
-    # cache, where reading them computes nothing on ``surface``. A new mesh,
-    # since a primitive refuses new vertices, and not ``apply_scale``, which
-    # leaves the vertices as they are for any factor within 1e-8 of 1.
-    overrides = surface._data.data
+    # cache, where reading them computes nothing on ``surface``.
+    overrides = {} if isinstance(surface, ArrayMesh) else surface._data.data
+    if not center or "center_mass" in overrides:
+        bounds = None
+    elif bounds is None:
+        bounds = _vertex_bounds(surface)
+    origin = None
+    if bounds is not None:
+        middle = np.array([(low + high) / 2 for low, high in zip(*bounds)])
+        origin = middle if np.isfinite(middle).all() else None
+    if isinstance(surface, ArrayMesh):
+        return surface.scaled(factor, origin=origin)
+    # A new mesh, since a primitive refuses new vertices, and not
+    # ``apply_scale``, which leaves the vertices as they are for any factor
+    # within 1e-8 of 1.
+    shift = 0.0 if origin is None else origin
     copied = trimesh.Trimesh(
-        vertices=np.asarray(surface.vertices) * factor,
+        vertices=(np.asarray(surface.vertices) - shift) * factor,
         faces=np.array(surface.faces),
         process=False,
     )
@@ -918,22 +959,45 @@ def extract_mesh_features(
         )
     # Measured on copies scaled by one factor so that the edges of ``mesh`` are
     # of order 1, where trimesh's absolute tolerances see the shape and not the
-    # unit, and converted back. The copies leave the caller's meshes as they
-    # are.
-    unit = _edge_unit(mesh)
+    # unit, and converted back.
+    bounds = _vertex_bounds(mesh)
+    unit = _edge_unit(mesh, bounds)
     # The same object passed as both is measured once, as with no smooth mesh.
-    smooth = (
-        None
-        if smooth_mesh is None or smooth_mesh is mesh
-        else _scaled_copy(smooth_mesh, 1 / unit)
-    )
     values = _measure_mesh(
-        _scaled_copy(mesh, 1 / unit), features, smooth_mesh=smooth, unit=unit
+        mesh,
+        features,
+        smooth_mesh=None if smooth_mesh is mesh else smooth_mesh,
+        unit=unit,
+        scale=1 / unit,
+        bounds=bounds,
     )
     return _to_caller_units(values, unit)
 
 
-def _edge_unit(surface: Any) -> float:
+def _vertex_bounds(surface: Any) -> tuple[list[float], list[float]] | None:
+    """Return the per-axis minima and maxima of the vertices of the faces of ``surface``.
+
+    Exact on any device and in any order of the faces; None for a mesh
+    without faces.
+    """
+    faces = surface.faces
+    if len(faces) == 0:
+        return None
+    vertices = surface.vertices
+    used = np.zeros_like(vertices[:, 0], dtype=bool)
+    used[faces.ravel()] = True
+    corners = vertices[used]
+    # One axis at a time: NumPy reduces a (V, 3) array along axis 0 ten times
+    # slower than its columns.
+    return (
+        [float(corners[:, i].min()) for i in range(3)],
+        [float(corners[:, i].max()) for i in range(3)],
+    )
+
+
+def _edge_unit(
+    surface: Any, bounds: tuple[list[float], list[float]] | None = None
+) -> float:
     """Return a length of the order of the edges of ``surface``.
 
     The square root of the area of the axis-aligned bounding box of the
@@ -943,29 +1007,20 @@ def _edge_unit(surface: Any) -> float:
 
     It uses only the per-axis extremes of those vertices, which are exact on
     any device and in any order, and the face count, so a NumPy and a CuPy mesh
-    with the same vertices get the same unit however their faces are listed. A
-    unit from the face areas does not: CuPy 14.0.1 computes some face areas an
-    ulp away from NumPy, and units an ulp apart move the raw-mesh
-    ``Avg Shape Index`` and ``Bounding Cylinder Volume`` by percents. 1 for a
-    mesh without faces or whose box has no finite, positive area, which the
-    volume and area check of ``_measure_mesh`` then reports.
+    with the same vertices get the same unit however their faces are listed.
+    1 for a mesh without faces or whose box has no finite, positive area, which
+    the volume and area check of ``_measure_mesh`` then reports. ``bounds``
+    are ``_vertex_bounds(surface)`` when already computed.
     """
-    faces = surface.faces
-    if len(faces) == 0:
+    if bounds is None:
+        bounds = _vertex_bounds(surface)
+    if bounds is None:
         return 1.0
-    vertices = surface.vertices
-    used = np.zeros_like(vertices[:, 0], dtype=bool)
-    used[faces.ravel()] = True
-    corners = vertices[used]
-    # One axis at a time: NumPy reduces a (V, 3) array along axis 0 ten times
-    # slower than its columns.
-    a, b, c = (
-        float(corners[:, i].max()) - float(corners[:, i].min()) for i in range(3)
-    )
+    a, b, c = (high - low for low, high in zip(*bounds))
     area = 2 * (a * b + b * c + c * a)
     if not math.isfinite(area) or area <= 0:
         return 1.0
-    return math.sqrt(area / len(faces))
+    return math.sqrt(area / len(surface.faces))
 
 
 def _measure_mesh(
@@ -973,12 +1028,23 @@ def _measure_mesh(
     features: Sequence[str],
     smooth_mesh: trimesh.Trimesh | None = None,
     unit: float = 1.0,
+    scale: float = 1.0,
+    bounds: tuple[list[float], list[float]] | None = None,
 ) -> dict[str, float]:
-    """Return ``features`` of a mesh whose lengths are in units of ``unit``.
+    """Return ``features`` of ``mesh`` times ``scale``, a length in units of ``unit``.
 
-    The values stay in the mesh's units; ``unit`` only converts the volume or
-    area printed by the errors to the caller's units.
+    They are measured on copies of ``mesh`` and ``smooth_mesh`` times
+    ``scale`` and centred on the middle of their boxes (``_scaled_copy``):
+    every feature is translation-invariant, and coordinates of the order of
+    the object's size round less than those of a far-off mesh. ``bounds`` are
+    ``_vertex_bounds(mesh)`` when already computed. The values stay in the
+    units of the copies; ``unit`` only converts the volume or area printed by
+    the errors to the caller's units. The caller's meshes are left as they
+    are.
     """
+    mesh = _scaled_copy(mesh, scale, center=True, bounds=bounds)
+    if smooth_mesh is not None:
+        smooth_mesh = _scaled_copy(smooth_mesh, scale, center=True)
     # Validate the mesh before any feature: an inside-out mesh reports a
     # negative volume, which would silently propagate into a NaN sphericity and
     # negative solidity and extent instead of failing. An open surface is not
@@ -1002,21 +1068,47 @@ def _measure_mesh(
     def measured_on(name: str) -> Any:
         return curvature_mesh if name in _SMOOTHED_FEATURES else mesh
 
-    # The per-vertex curvatures behind both curvature averages, computed once
-    # when either is requested.
+    # What several features share is computed at most once per call: the edge
+    # terms of each mesh, behind Avg Mean Curvature and the per-vertex
+    # curvatures, which are one mesh without a smooth mesh; the per-vertex
+    # curvatures behind both curvature averages; the convex hull's distinct
+    # face normals behind the box and the cylinder; and the oriented box behind
+    # its volume and Extent. trimesh caches the volume, convex hull and
+    # bounding primitives on the mesh itself.
+    edge_terms: dict[int, tuple[Any, Any]] = {}
+
+    def edge_curvatures_of(surface: Any) -> tuple[Any, Any]:
+        if id(surface) not in edge_terms:
+            edge_terms[id(surface)] = _edge_curvatures(surface)
+        return edge_terms[id(surface)]
+
     curvatures = (
-        _principal_curvatures(curvature_mesh)
+        _principal_curvatures(curvature_mesh, edge_curvatures_of(curvature_mesh))
         if any(name in _CURVATURE_AVERAGES for name in features)
         else None
     )
 
+    @cache
+    def hull_axes() -> _HullAxes:
+        return _hull_axes(mesh)
+
+    @cache
+    def box() -> float:
+        return _oriented_bounding_box_volume(mesh, hull_axes())
+
     def measure(name: str) -> SupportsFloat:
         if curvatures is not None and name in _CURVATURE_AVERAGES:
             return _CURVATURE_AVERAGES[name](*curvatures)
+        if name == "Avg Mean Curvature":
+            return _avg_mean_curvature(mesh, edge_curvatures_of(mesh))
+        if name == "Oriented Bounding Box Volume":
+            return box()
+        if name == "Extent":
+            return _extent(mesh, box())
+        if name == "Bounding Cylinder Volume":
+            return _bounding_cylinder_volume(mesh, hull_axes())
         return _MESH_FEATURES[name](measured_on(name))
 
-    # trimesh caches volume, convex hull and bounding primitives on the mesh, so
-    # features sharing them do not recompute them.
     values = {name: float(measure(name)) for name in features}
     # Only the meshes that a requested approximate feature was measured on are
     # checked, each once: keyed by identity, since a Trimesh hashes its content.
@@ -1086,18 +1178,511 @@ def _stacklevel_outside_package() -> int:
     return level if frame is not None else level - 1
 
 
-def _bounding_cylinder_volume(mesh: trimesh.Trimesh) -> float:
-    """Return the minimum bounding cylinder volume, 0 for degenerate meshes."""
+# The convex hull of a mesh and the distinct axes of its face normals, or the
+# error building the hull raised (``_hull_axes``).
+_HullAxes: TypeAlias = tuple[Any, np.ndarray] | ValueError | QhullError
+
+
+def _bounding_cylinder_volume(
+    mesh: trimesh.Trimesh, found: _HullAxes | None = None
+) -> float:
+    """Return the smallest enclosing cylinder volume about a hull normal or inertia axis.
+
+    The candidate axes are the normals of the faces of the convex hull and the
+    three principal axes of inertia. About each axis the cylinder is exact:
+    its height is the extent of the hull vertices along the axis and its
+    radius that of the minimum enclosing circle of their projection. The
+    volume is the smallest of these, so it turns and scales with the mesh, and
+    an upper bound of the minimum enclosing cylinder. An elongated body with
+    rounded or pointed ends can have no hull face normal to its long axis,
+    which the inertia axes supply. Measured on the host from the hull that
+    trimesh caches for ``Convex Hull Volume``; 0, with a warning, for a mesh
+    whose hull cannot be built. ``found`` is ``_hull_axes(mesh)`` when
+    already computed.
+    """
+    usable = _usable_hull(
+        _hull_axes(mesh) if found is None else found, "bounding cylinder volume"
+    )
+    if usable is None:
+        return 0.0
+    hull, normals = usable
+    inertia_axes = np.linalg.eigh(np.asarray(mesh.moment_inertia, dtype=np.float64))[1]
+    return _min_cylinder_volume(
+        np.asarray(hull.vertices, dtype=np.float64),
+        np.vstack([normals, inertia_axes.T]),
+    )
+
+
+def _hull_axes(mesh: trimesh.Trimesh) -> _HullAxes:
+    """Return the convex hull of ``mesh`` and the distinct axes of its face normals.
+
+    The hull is the one trimesh caches for ``Convex Hull Volume``, on the host.
+    For a mesh whose hull cannot be built, the error trimesh raised instead,
+    which ``_usable_hull`` reports for each feature that needs the hull.
+    """
     try:
-        return mesh.bounding_cylinder.volume
+        hull = mesh.convex_hull
     except (ValueError, QhullError) as e:
-        # Degenerate meshes fail in the convex hull (QhullError) or in the
-        # eigendecomposition of the inertia tensor (LinAlgError, a ValueError).
+        return e
+    normals = np.asarray(hull.face_normals, dtype=np.float64)
+    # trimesh gives a face too small for a normal a zero one.
+    normals = normals[(normals * normals).sum(axis=1) > 0.5]
+    # An axis and its reverse give the same cylinder or box, and the faces of
+    # one flat side of the hull share a normal to rounding: keep one of each.
+    largest = np.abs(normals).argmax(axis=1)
+    normals *= np.sign(normals[np.arange(len(normals)), largest])[:, None]
+    _, first = np.unique(normals.round(9), axis=0, return_index=True)
+    return hull, normals[np.sort(first)]
+
+
+def _usable_hull(found: _HullAxes, name: str) -> tuple[Any, np.ndarray] | None:
+    """Return the hull and axes ``found``, or None, warning, for a failed hull.
+
+    The warning names the feature ``name``, which is then 0.
+    """
+    if isinstance(found, Exception):
         warnings.warn(
-            f"Unable extract bounding cylinder volume. Returning 0. Exception: {e}",
+            f"Unable extract {name}. Returning 0. Exception: {found}",
+            stacklevel=_stacklevel_outside_package(),
+        )
+        return None
+    return found
+
+
+def _oriented_bounding_box_volume(
+    mesh: trimesh.Trimesh, found: _HullAxes | None = None
+) -> float:
+    """Return the smallest volume of the enclosing boxes with a face on a hull face.
+
+    The candidate axes are the normals of the faces of the convex hull. About
+    each axis the box is exact: its height is the extent of the hull vertices
+    along the axis and its base the minimum-area rectangle of their
+    projection, which has a side on an edge of the projection's convex hull
+    (Freeman and Shapira, 1975). The volume is the smallest of these, so it
+    turns and scales with the mesh to rounding. A minimum-volume box has a
+    face on a hull face or two adjacent faces each on a hull edge
+    (O'Rourke, 1985); only the first kind is searched, so this is an upper
+    bound of the minimum, exact for a box and twice it for a regular
+    tetrahedron. Measured on the host from the hull that trimesh caches for
+    ``Convex Hull Volume``; 0, with a warning, for a mesh whose hull cannot be
+    built or has no face with a normal. ``found`` is ``_hull_axes(mesh)``
+    when already computed.
+    """
+    name = "oriented bounding box volume"
+    usable = _usable_hull(_hull_axes(mesh) if found is None else found, name)
+    if usable is None:
+        return 0.0
+    if len(usable[1]) == 0:
+        warnings.warn(
+            f"Unable extract {name}. Returning 0. No face of the convex hull has "
+            "a normal.",
             stacklevel=_stacklevel_outside_package(),
         )
         return 0.0
+    return _min_box_volume(*usable)
+
+
+def _extent(mesh: trimesh.Trimesh, box: float | None = None) -> float:
+    """Return the volume over the oriented bounding box volume; 0 without a box.
+
+    ``box`` is that volume when already computed.
+    """
+    if box is None:
+        box = _oriented_bounding_box_volume(mesh)
+    return float(mesh.volume) / box if box > 0 else 0.0
+
+
+def _min_box_volume(hull: trimesh.Trimesh, axes: np.ndarray) -> float:
+    """Return the smallest volume of the boxes about unit ``axes`` enclosing ``hull``.
+
+    Each box spans the extent of the hull vertices along its axis, and its base
+    is the minimum-area rectangle of their projection across it
+    (``_box_volumes``). Exact: an axis is skipped only when a lower bound of
+    its volume exceeds a volume already found (``_smallest_over_axes``). The
+    bound is the area of the projection times its height. For a hull of many
+    vertices it is that of the hull of the few extreme ones
+    (``_bounding_subset``), and then the box of that hull about the axis,
+    which every box enclosing the hull encloses.
+    """
+    points = np.asarray(hull.vertices, dtype=np.float64)
+    frames = _axis_frames(axes)
+    few = _bounding_subset(points)
+    inner = hull
+    if len(few) < len(points):
+        # Should Qhull fail on the few, the hull bounds itself.
+        try:
+            inner = trimesh.convex.convex_hull(few)
+        except (ValueError, QhullError):
+            pass
+    normals = np.asarray(inner.face_normals, dtype=np.float64)
+    areas = np.asarray(inner.area_faces, dtype=np.float64)
+    corners = np.asarray(inner.vertices, dtype=np.float64)
+    # The hull covers its projection twice, so this is the projection's area.
+    lower = np.concatenate(
+        [
+            areas
+            @ np.abs(normals @ axes[c].T)
+            / 2
+            * np.ptp(corners @ axes[c].T, axis=0)
+            for c in _axis_chunks(len(axes))
+        ]
+    )
+    refine = None if inner is hull else _box_volumes(inner, axes, frames)
+    return _smallest_over_axes(lower, _box_volumes(hull, axes, frames), refine)
+
+
+def _box_volumes(
+    hull: trimesh.Trimesh, axes: np.ndarray, frames: np.ndarray
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Return the volume of the smallest box about each of a batch of ``axes``.
+
+    Each box spans the extent of the hull vertices along its axis, and its base
+    is the minimum-area rectangle of their projection across it. Its sides run
+    along the projection of a silhouette edge, one between a hull face that
+    faces along the axis and one that does not; every edge of the projection's
+    hull is one, and any other direction gives a larger rectangle. The
+    projection's hull is that of the silhouette edges' ends, and its widths
+    across each side are found by rotating calipers (``_projection_support``),
+    O(S log S) for S silhouette edges, or for at most ``_DENSE_SIDES`` sides
+    from every end, O(S^2) but fewer operations. ``frames`` are
+    ``_axis_frames(axes)``.
+    """
+    points = np.asarray(hull.vertices, dtype=np.float64)
+    normals = np.asarray(hull.face_normals, dtype=np.float64)
+    pairs = np.asarray(hull.face_adjacency)
+    edges = np.asarray(hull.face_adjacency_edges)
+
+    def volumes(batch: np.ndarray) -> np.ndarray:
+        facing = normals @ axes[batch].T
+        ahead, behind = facing > 0, facing < 0
+        # A face across the axis, of either sign, counts on both sides.
+        silhouette = ~(
+            (ahead[pairs[:, 0]] & ahead[pairs[:, 1]])
+            | (behind[pairs[:, 0]] & behind[pairs[:, 1]])
+        )
+        # (axes, sides): each axis's silhouette edges, padded with repeats of
+        # its first, which change no extent.
+        sides_of = _padded_rows(np.ascontiguousarray(silhouette.T))
+        across = frames[batch, 1:].transpose(0, 2, 1)
+        # The projection, in two unit vectors across each axis, so that each
+        # rectangle is exactly a rectangle even for an edge along the axis,
+        # whose projection points anywhere: (axes, sides, ends, 2).
+        flat = (points[edges[sides_of].reshape(len(batch), -1)] @ across).reshape(
+            *sides_of.shape, 2, 2
+        )
+        sides = flat[:, :, 1] - flat[:, :, 0]
+        length = np.sqrt((sides * sides).sum(axis=2))
+        sides /= np.where(length > 0, length, 1.0)[..., None]
+        both = np.concatenate([sides, sides[..., ::-1] * np.array([-1.0, 1.0])], 1)
+        count = sides.shape[1]
+        if count <= _DENSE_SIDES:
+            # Every end against every side, which takes fewer operations than
+            # the calipers for few sides.
+            reach = both @ flat.reshape(len(batch), -1, 2).transpose(0, 2, 1)
+            width = reach.max(axis=2) - reach.min(axis=2)
+        else:
+            # The outward normal of each side in the projection: the
+            # combination of its two faces' normals that is across the axis,
+            # or the first normal when both faces are across it.
+            faces = pairs[sides_of]
+            on = facing.T[np.arange(len(batch))[:, None, None], faces]
+            outward = (
+                np.abs(on[..., 1:]) * normals[faces[..., 0]]
+                + np.abs(on[..., :1]) * normals[faces[..., 1]]
+            )
+            outward = np.where(
+                (on == 0).all(axis=2)[..., None], normals[faces[..., 0]], outward
+            )
+            support = _projection_support(
+                flat, outward @ across, np.concatenate([both, -both], 1)
+            )
+            width = support[:, : 2 * count] + support[:, 2 * count :]
+        base = np.where(length > 0, width[:, :count] * width[:, count:], np.inf)
+        height = np.ptp(points @ axes[batch].T, axis=0)
+        return base.min(axis=1) * height
+
+    return volumes
+
+
+# Up to this many silhouette edges, the widths of a projection are found from
+# every end, in fewer operations than the calipers for few edges; its
+# (32, 2 S, 2 S) products then stay below 70 MB.
+_DENSE_SIDES = 256
+
+
+def _projection_support(
+    flat: np.ndarray, outward: np.ndarray, directions: np.ndarray
+) -> np.ndarray:
+    """Return the largest projection onto each of ``directions`` of each convex polygon.
+
+    ``flat`` holds the ends ``(k, s, 2, 2)`` of the ``s`` boundary segments
+    of each of ``k`` convex polygons, in any order and with repeats, and
+    ``outward`` ``(k, s, 2)`` the outward normal of each, of any length;
+    ``directions`` are ``(k, q, 2)``. The result, ``(k, q)``, is the largest
+    product of a segment end with each direction, from rotating calipers: the
+    segments are put in order around the boundary by the angle of their
+    middles about the mean middle, where their normals turn once around; the
+    ends of the segments whose normals' angles bracket a direction's, and of
+    their neighbours, hold the largest product. A polygon whose normals do not
+    turn once around, to 1e-6, is searched in full.
+    """
+    k, s = outward.shape[:2]
+    rows = np.arange(k)[:, None]
+    middle = flat.mean(axis=2)
+    middle -= middle.mean(axis=1, keepdims=True)
+    order = np.argsort(np.arctan2(middle[..., 1], middle[..., 0]), axis=1)
+    ends = flat[rows, order]
+    angle = np.arctan2(outward[..., 1], outward[..., 0])[rows, order]
+    turns = (np.diff(angle, axis=1, append=angle[:, :1]) + np.pi) % (2 * np.pi) - np.pi
+    # The normals' angles from the first, turned on to rounding: nondecreasing
+    # and below 2 pi, so that they bracket every direction once.
+    turned = np.zeros((k, s))
+    turned[:, 1:] = np.cumsum(turns[:, :-1], axis=1)
+    turned = np.maximum.accumulate(turned, axis=1)
+    wanted = (np.arctan2(directions[..., 1], directions[..., 0]) - angle[:, :1]) % (
+        2 * np.pi
+    )
+    # One sorted search for every polygon: each row's angles shifted above
+    # the previous row's.
+    shift = 8.0 * np.arange(k)[:, None]
+    after = np.searchsorted((turned + shift).ravel(), (wanted + shift).ravel())
+    after = after.reshape(wanted.shape) - s * rows
+    x, y = ends[..., 0], ends[..., 1]
+    across, along = directions[..., 0], directions[..., 1]
+    support = np.full(wanted.shape, -np.inf)
+    for offset in (-2, -1, 0, 1):
+        near = (after + offset) % s
+        for end in (0, 1):
+            products = x[rows, near, end] * across + y[rows, near, end] * along
+            np.maximum(support, products, out=support)
+    # Rounding cannot turn the normals by much less or more than once around;
+    # a polygon they do not turn once around is searched among all its ends.
+    total = turns.sum(axis=1)
+    for row in np.flatnonzero(np.abs(total - 2 * np.pi) > 1e-6):
+        support[row] = (directions[row] @ flat[row].reshape(-1, 2).T).max(axis=1)
+    return support
+
+
+def _padded_rows(mask: np.ndarray) -> np.ndarray:
+    """Return the column indices of the True entries of each row of ``mask``.
+
+    As a ``(rows, most per row)`` array, each row padded with its first index;
+    every row needs one True entry.
+    """
+    rows, columns = np.nonzero(mask)
+    counts = np.bincount(rows, minlength=len(mask))
+    starts = np.cumsum(counts) - counts
+    padded = np.repeat(columns[starts][:, None], int(counts.max()), axis=1)
+    padded[rows, np.arange(len(columns)) - starts[rows]] = columns
+    return padded
+
+
+def _axis_chunks(count: int) -> list[np.ndarray]:
+    """Split ``range(count)`` into chunks of at most 256 axes, to bound the memory.
+
+    One empty chunk for no axes.
+    """
+    return np.array_split(np.arange(count), max(1, -(-count // 256)))
+
+
+def _smallest_over_axes(
+    lower: np.ndarray,
+    volumes: Callable[[np.ndarray], np.ndarray],
+    refine: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> float:
+    """Return the smallest of ``volumes(batch)`` over all axes, exactly.
+
+    The axes are tried in batches of 32 in increasing order of ``lower``, a
+    lower bound of each axis's volume, and those whose bound exceeds the
+    smallest volume found are skipped. ``refine(batch)``, when given, is a
+    tighter lower bound, cheaper than ``volumes``, tested on the axes left.
+    """
+    order = np.argsort(lower, kind="stable")
+    best = math.inf
+    for start in range(0, len(order), 32):
+        batch = order[start : start + 32]
+        batch = batch[lower[batch] * (1 - _ENCLOSING_SLACK) <= best]
+        if len(batch) == 0:
+            break
+        if refine is not None:
+            batch = batch[refine(batch) * (1 - _ENCLOSING_SLACK) <= best]
+            if len(batch) == 0:
+                continue
+        best = min(best, float(volumes(batch).min()))
+    return best
+
+
+# Hulls of more vertices than this are bounded by a subset of them first.
+_SUBSET_ABOVE = 4096
+
+
+def _bounding_subset(points: np.ndarray) -> np.ndarray:
+    """Return ``points``, or for more than ``_SUBSET_ABOVE`` the few extreme ones.
+
+    Those extreme along either way of each of 512 directions spread over the
+    sphere: a shape that encloses ``points`` encloses them, so their bounding
+    shapes bound those of ``points`` from below, closely for a hull of many
+    small faces.
+    """
+    if len(points) <= _SUBSET_ABOVE:
+        return points
+    i = np.arange(512) + 0.5
+    z = 1 - i / 256
+    turn = np.pi * (1 + math.sqrt(5)) * i
+    ring = np.sqrt(1 - z * z)
+    directions = np.stack([ring * np.cos(turn), ring * np.sin(turn), z])
+    # 32 directions at a time, to bound the memory.
+    extremes = []
+    for start in range(0, 512, 32):
+        along = points @ directions[:, start : start + 32]
+        extremes += [along.argmax(axis=0), along.argmin(axis=0)]
+    return points[np.unique(np.concatenate(extremes))]
+
+
+# Relative slack of the enclosing tests, against the rounding of distances, and
+# a bound on the growth steps of a minimum enclosing circle, far above the at
+# most 8 measured for 71,556 hull face normals of 204 meshes.
+_ENCLOSING_SLACK = 1e-12
+_ENCLOSING_STEPS = 1000
+
+
+def _axis_frames(axes: np.ndarray) -> np.ndarray:
+    """Return ``(k, 3, 3)`` orthonormal frames whose first row is each unit axis.
+
+    The two unit vectors across each axis come from its cross product with the
+    coordinate axis it is least aligned with.
+    """
+    helper = np.eye(3)[np.abs(axes).argmin(axis=1)]
+    across = np.cross(axes, helper)
+    across /= np.sqrt((across * across).sum(axis=1))[:, None]
+    return np.stack([axes, across, np.cross(axes, across)], axis=1)
+
+
+def _min_cylinder_volume(points: np.ndarray, axes: np.ndarray) -> float:
+    """Return the smallest volume of the cylinders about unit ``axes`` enclosing ``points``.
+
+    Each cylinder spans the extent of the points along its axis and has the
+    radius of their minimum enclosing circle across it. Exact: an axis is
+    skipped only when a lower bound of its volume, from the radius of at
+    least half the largest width of the projection, exceeds a volume already
+    found (``_smallest_over_axes``): first that of the points, or for many
+    points the few extreme ones (``_bounding_subset``), which every cylinder
+    enclosing ``points`` encloses, then that of all of them in more
+    directions.
+    """
+    frames = _axis_frames(axes)
+
+    def widths(batch: np.ndarray, of: np.ndarray, turns: int = 2) -> np.ndarray:
+        # (axes, 3, points): each point along and across each axis.
+        along = frames[batch] @ of.T
+        extent = np.ptp(along, axis=2)
+        # The largest width across the axis in ``turns`` directions spread
+        # evenly over a half turn, the frame's two among them.
+        width = extent[:, 1:].max(axis=1)
+        for k in range(1, turns):
+            if 2 * k != turns:
+                turn = k * math.pi / turns
+                spread = math.cos(turn) * along[:, 1] + math.sin(turn) * along[:, 2]
+                width = np.maximum(width, np.ptp(spread, axis=1))
+        return np.pi * (width / 2) ** 2 * extent[:, 0]
+
+    def volumes(batch: np.ndarray) -> np.ndarray:
+        along = frames[batch] @ points.T
+        height = np.ptp(along[:, 0], axis=1)
+        return np.pi * _enclosing_radii(along[:, 1:].transpose(0, 2, 1)) ** 2 * height
+
+    few = _bounding_subset(points)
+    # Widths in the 2 directions of each frame, or of few points in 8, on
+    # every axis; then of every point in 8 on the axes left. Two directions
+    # can miss a diameter by an eighth of a turn, 8 by a thirty-second.
+    turns = 2 if len(few) == len(points) else 8
+    lower = np.concatenate([widths(c, few, turns) for c in _axis_chunks(len(axes))])
+    return _smallest_over_axes(lower, volumes, lambda batch: widths(batch, points, 8))
+
+
+def _enclosing_radii(points: np.ndarray) -> np.ndarray:
+    """Return the radius of the minimum enclosing circle of each set ``(k, n, 2)``.
+
+    The radius of ``_enclosing_circles``.
+    """
+    return _enclosing_circles(points)[1]
+
+
+def _enclosing_circles(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the centre and radius of the minimum enclosing circle of each set ``(k, n, 2)``.
+
+    The circle of a support set of at most three points grows by the point
+    farthest outside it: the new support set is the smallest circle through
+    two or three of the four that encloses all four. The radius grows at
+    every step, so no support set returns, and the circle reached encloses
+    every point, which makes it the minimum enclosing circle, unique for any
+    point set. Rounding can end the growth early on nearly cocircular points:
+    the circle through another three of them comes out an ulp smaller while
+    the farthest point is still up to 3e-11 outside. Far from the origin, or
+    on nearly collinear points, rounding can also leave no circle that
+    encloses the four within the slack; the growth of that set then stops
+    there, as it does after ``_ENCLOSING_STEPS`` steps. The centre returned is
+    the last one and the radius its distance to the farthest point, so the
+    circle encloses every point, and the cylinder about it stays an upper
+    bound.
+    """
+    rows = np.arange(len(points))
+    first = points[rows, ((points - points[:, :1]) ** 2).sum(axis=2).argmax(axis=1)]
+    second = points[rows, ((points - first[:, None]) ** 2).sum(axis=2).argmax(axis=1)]
+    support = np.stack([first, second, second], axis=1)
+    center = (first + second) / 2
+    r2 = ((first - center) ** 2).sum(axis=1)
+    slack = (1 + _ENCLOSING_SLACK) ** 2
+    # Pairs (a third index repeating the second) and triples of the four points.
+    subsets = [(0, 1, 1), (0, 2, 2), (0, 3, 3), (1, 2, 2), (1, 3, 3), (2, 3, 3)]
+    subsets += [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+    growing = np.ones(len(points), dtype=bool)
+    for _ in range(_ENCLOSING_STEPS):
+        d2 = ((points - center[:, None]) ** 2).sum(axis=2)
+        farthest = d2.argmax(axis=1)
+        growing &= d2[rows, farthest] > r2 * slack
+        if not growing.any():
+            break
+        four = np.concatenate([support, points[rows, farthest][:, None]], axis=1)
+        new_r2 = np.full_like(r2, np.inf)
+        new_center, new_support = center, support
+        for subset in subsets:
+            trio = four[:, list(subset)]
+            c, ok = _circle_center(trio)
+            c_r2 = ((trio[:, 0] - c) ** 2).sum(axis=1)
+            encloses = (
+                ((four - c[:, None]) ** 2).sum(axis=2) <= c_r2[:, None] * slack
+            ).all(axis=1)
+            take = growing & ok & encloses & (c_r2 < new_r2)
+            new_r2 = np.where(take, c_r2, new_r2)
+            new_center = np.where(take[:, None], c, new_center)
+            new_support = np.where(take[:, None, None], trio, new_support)
+        growing &= np.isfinite(new_r2) & (new_r2 > r2)
+        r2 = np.where(growing, new_r2, r2)
+        center = np.where(growing[:, None], new_center, center)
+        support = np.where(growing[:, None, None], new_support, support)
+    return center, np.sqrt(((points - center[:, None]) ** 2).sum(axis=2).max(axis=1))
+
+
+def _circle_center(trio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the center of the circle through each ``(k, 3, 2)`` trio, and where it exists.
+
+    A trio whose last two points coincide stands for the pair of its first
+    two, whose circle has them as a diameter. Three collinear points have no
+    circle through them.
+    """
+    a, b, c = trio[:, 0], trio[:, 1], trio[:, 2]
+    pair = (b == c).all(axis=1)
+    ab, ac = b - a, c - a
+    det = 2 * (ab[:, 0] * ac[:, 1] - ab[:, 1] * ac[:, 0])
+    ab2, ac2 = (ab * ab).sum(axis=1), (ac * ac).sum(axis=1)
+    ok = pair | (np.abs(det) > _ENCLOSING_SLACK * np.sqrt(ab2 * ac2))
+    det = np.where(pair | ~ok, 1.0, det)
+    offset = np.stack(
+        [ac[:, 1] * ab2 - ab[:, 1] * ac2, ab[:, 0] * ac2 - ac[:, 0] * ab2], axis=1
+    )
+    center = np.where(pair[:, None], (a + b) / 2, a + offset / det[:, None])
+    return center, ok
 
 
 def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
@@ -1116,13 +1701,56 @@ def _equivalent_ellipsoid_axes(mesh: trimesh.Trimesh) -> np.ndarray:
     return np.sort(2 * np.sqrt(5 * second_moments / mesh.mass))
 
 
-def _avg_mean_curvature(mesh: trimesh.Trimesh) -> float:
+# Dihedral angles of at most this many radians are set to 0: they are the
+# rounding residues of coplanar faces. In units of the edges they reached
+# 1.7e-13 rad on 60 raw nuclei, and the smallest other angle on 240 blurred
+# nuclei was 1.6e-9 rad; this is about the geometric middle.
+_FLAT_ANGLE = 1e-11
+# Angle defects of at most this many radians are set to 0: at a flat vertex
+# the defect is 2 pi minus a sum of face angles, a few ulps of 2 pi.
+_FLAT_DEFECT = 1e-14
+
+
+def _dihedral_angles(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Return the angle between the normals of each pair of adjacent faces.
+
+    ``arctan2(|n0 x n1|, n0 . n1)``, set to 0 at or below ``_FLAT_ANGLE``. It
+    is accurate to rounding at every angle, where trimesh's
+    ``face_adjacency_angles``, ``arccos(n0 . n1)``, cannot resolve angles below
+    1.5e-8 and so reads coplanar faces differently at different scales and
+    orientations.
+    """
+    normals = mesh.face_normals[mesh.face_adjacency]
+    n0, n1 = normals[:, 0], normals[:, 1]
+    angles = np.arctan2(np.linalg.norm(np.cross(n0, n1), axis=1), (n0 * n1).sum(axis=1))
+    return np.where(angles <= _FLAT_ANGLE, 0.0, angles)
+
+
+def _edge_curvatures(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """Return the edges shared by two faces and their length times signed angle.
+
+    The angle is ``_dihedral_angles``, positive on convex edges. Half the sum
+    over the edges is the integral of the mean curvature (Cohen-Steiner and
+    Morvan, 2003). Every curvature feature reads its dihedral angles from
+    here, on a ``trimesh.Trimesh`` and an ``ArrayMesh`` alike.
+    """
+    edges = mesh.face_adjacency_edges
+    lengths = np.linalg.norm(
+        mesh.vertices[edges[:, 1]] - mesh.vertices[edges[:, 0]], axis=1
+    )
+    signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
+    return edges, lengths * _dihedral_angles(mesh) * signs
+
+
+def _avg_mean_curvature(
+    mesh: trimesh.Trimesh, edge_curvatures: tuple[Any, Any] | None = None
+) -> float:
     """Return the surface average of the mean curvature, ``1 / R`` on a sphere.
 
-    trimesh integrates it as half the sum of edge length times signed dihedral
-    angle over the edges (Cohen-Steiner and Morvan, 2003).
+    ``edge_curvatures`` is ``_edge_curvatures(mesh)`` when already computed.
     """
-    return mesh.integral_mean_curvature / mesh.area
+    _, terms = _edge_curvatures(mesh) if edge_curvatures is None else edge_curvatures
+    return float(terms.sum()) / (2 * float(mesh.area))
 
 
 def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
@@ -1137,7 +1765,9 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
     nxt, prv = [1, 2, 0], [2, 0, 1]
     # Squared length of the edge opposite each corner.
     opposite = ((corners[:, nxt] - corners[:, prv]) ** 2).sum(axis=-1)
-    cot = 1 / np.tan(angles)
+    # cos / sin, not 1 / tan: with glibc 2.28, np.tan took 2.4e-4 s per angle
+    # at pi / 2, the right angles of every voxel mesh, and 1e-8 s elsewhere.
+    cot = np.cos(angles) / np.sin(angles)
     voronoi = (opposite[:, nxt] * cot[:, nxt] + opposite[:, prv] * cot[:, prv]) / 8
     face_area = mesh.area_faces[:, None]
     obtuse = angles > np.pi / 2
@@ -1146,70 +1776,38 @@ def _mixed_area(mesh: trimesh.Trimesh) -> np.ndarray:
         face_area / 2,
         np.where(obtuse.any(axis=1, keepdims=True), face_area / 4, voronoi),
     )
-    return np.bincount(
-        mesh.faces.ravel(), weights=area.ravel(), minlength=len(mesh.vertices)
-    )
-
-
-# Threshold of the two tests in ``_principal_curvatures`` that set the rounding
-# residues of flat vertices to 0: an angle defect of at most this many radians,
-# and an edge sum of at most this fraction of the sum of the absolute values of
-# its terms. With both tests the Avg Shape Index of a raw voxel mesh differed
-# between NumPy and CuPy by at most 1.1e-16 on 128 meshes; with this threshold
-# at 0, by up to 1.0e-2. The edge-sum test only catches sums whose terms
-# cancel; at a flat vertex of a raw voxel mesh they do not.
-_FLAT_RESIDUE = 1e-14
+    return ordered_bincount(mesh.faces.ravel(), area.ravel(), len(mesh.vertices))
 
 
 def _principal_curvatures(
-    mesh: trimesh.Trimesh,
+    mesh: trimesh.Trimesh, edge_curvatures: tuple[Any, Any] | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return the per-vertex principal curvatures ``k1 <= k2`` and vertex areas.
 
     Gaussian curvature is the angle defect and mean curvature the edge sum of
-    length times signed dihedral angle over four times the vertex area, as in
-    LONI ShapeTools; ``k1, k2 = H -+ sqrt(H^2 - K)``, clamped to ``H`` where
+    ``_edge_curvatures`` over four times the vertex area, as in LONI
+    ShapeTools; ``k1, k2 = H -+ sqrt(H^2 - K)``, clamped to ``H`` where
     discretisation makes ``H^2 < K``.
 
-    At a flat vertex both sums should be 0 and are rounding residues, and the
-    shape index there would be the arctangent of two residues, which differ
-    between NumPy and CuPy. Two tests set them to 0. The angle defect is set to
-    0 where its absolute value is at most ``_FLAT_RESIDUE`` radians. The edge
-    sum is set to 0 where its absolute value is at most ``_FLAT_RESIDUE`` times
-    the sum of the absolute values of its terms; this catches only sums whose
-    terms cancel. How many residues either test meets depends on the measuring
-    unit. With both tests, and both devices' meshes measured at one unit
-    (``_edge_unit``), the ``Avg Shape Index`` of a raw voxel mesh agrees between
-    NumPy and CuPy to rounding.
+    At a flat vertex both sums are rounding residues. Its dihedral angles are
+    0 (``_FLAT_ANGLE``), so its edge sum is exactly 0, and its angle defect is
+    set to 0 where its absolute value is at most ``_FLAT_DEFECT`` radians, so
+    ``k1 = k2 = 0`` there on either device and at any scale and orientation.
+    The defect test matters at the nearly flat vertices of a blurred mesh,
+    where dihedral angles of 1e-9 rad give a mean curvature whose square is
+    below a defect residue's curvature, so the residue would decide the shape
+    index.
 
-    At a flat vertex of a raw voxel mesh the terms do not cancel. The dihedral
-    angle of two coplanar faces is an arccos of a dot product within four ulps
-    of 1, which reads 1.5e-8 to 3e-8 rad, and these edges are all convex, so
-    the vertex keeps a mean curvature of that size and a shape index of 0.5.
-    The ``Avg Shape Index`` of a raw voxel mesh therefore still depends on the
-    scale at which the mesh is measured: on 144 voxel meshes, a unit 0.95 to
-    1.4 times another moved it by up to 57%. On the blurred meshes of 240 real
-    nuclei the two tests moved it by at most 1.1e-6.
+    ``edge_curvatures`` is ``_edge_curvatures(mesh)`` when already computed.
     """
     area = _mixed_area(mesh)
     defects = mesh.vertex_defects
-    defects = np.where(np.abs(defects) <= _FLAT_RESIDUE, 0.0, defects)
+    defects = np.where(np.abs(defects) <= _FLAT_DEFECT, 0.0, defects)
     gaussian = defects / area
-    edges = mesh.face_adjacency_edges
-    lengths = np.linalg.norm(
-        mesh.vertices[edges[:, 1]] - mesh.vertices[edges[:, 0]], axis=1
+    edges, terms = (
+        _edge_curvatures(mesh) if edge_curvatures is None else edge_curvatures
     )
-    signs = np.where(mesh.face_adjacency_convex, 1.0, -1.0)
-    terms = lengths * mesh.face_adjacency_angles * signs
-    edge_sum = np.bincount(
-        edges.ravel(), weights=np.repeat(terms, 2), minlength=len(mesh.vertices)
-    )
-    term_sum = np.bincount(
-        edges.ravel(),
-        weights=np.repeat(np.abs(terms), 2),
-        minlength=len(mesh.vertices),
-    )
-    edge_sum = np.where(np.abs(edge_sum) <= _FLAT_RESIDUE * term_sum, 0.0, edge_sum)
+    edge_sum = ordered_bincount(edges.ravel(), np.repeat(terms, 2), len(mesh.vertices))
     mean = edge_sum / (4 * area)
     spread = np.sqrt(np.maximum(mean**2 - gaussian, 0))
     return mean - spread, mean + spread, area
@@ -1222,8 +1820,22 @@ def _area_average(values: np.ndarray, area: np.ndarray) -> float:
 
 
 def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
-    """Return the area-weighted shape index, 1 on a sphere and 0 on a saddle."""
-    return _area_average((2 / np.pi) * np.arctan2(k1 + k2, k2 - k1), area)
+    """Return the area-weighted shape index, 1 on a sphere and 0 on a saddle.
+
+    The shape index is undefined at a planar point, ``k1 = k2 = 0``, so the
+    vertices of curvedness 0 are left out of the average; NaN, with a warning,
+    when no vertex is curved.
+    """
+    curved = (k1 != 0) | (k2 != 0)
+    if not bool(curved.any()):
+        warnings.warn(
+            "Avg Shape Index is undefined on a mesh whose vertices are all "
+            "planar (k1 = k2 = 0); returning NaN.",
+            stacklevel=_stacklevel_outside_package(),
+        )
+        return float("nan")
+    shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
+    return _area_average(shape_index, np.where(curved, area, 0.0))
 
 
 def _curvedness(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
@@ -1424,13 +2036,13 @@ _MESH_FEATURES: dict[str, Callable[[trimesh.Trimesh], SupportsFloat]] = {
     "Inertia PC1": lambda m: m.principal_inertia_components[0],
     "Inertia PC2": lambda m: m.principal_inertia_components[1],
     "Inertia PC3": lambda m: m.principal_inertia_components[2],
-    "Oriented Bounding Box Volume": lambda m: m.bounding_box_oriented.volume,
+    "Oriented Bounding Box Volume": _oriented_bounding_box_volume,
     "Bounding Cylinder Volume": _bounding_cylinder_volume,
     "Bounding Sphere Volume": lambda m: m.bounding_sphere.volume,
     "Convex Hull Volume": lambda m: m.convex_hull.volume,
     "Convex Hull Area": lambda m: m.convex_hull.area,
     "Sphericity": lambda m: sphericity(float(m.volume), float(m.area)),
-    "Extent": lambda m: m.volume / m.bounding_box_oriented.volume,
+    "Extent": _extent,
     "Solidity": lambda m: m.volume / m.convex_hull.volume,
     # The surface average of the Gaussian curvature would be exactly
     # 2 pi * euler_number / area (Gauss-Bonnet), so it adds nothing to Area
