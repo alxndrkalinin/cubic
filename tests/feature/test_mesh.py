@@ -704,11 +704,11 @@ def test_flat_residues_leave_real_curvature_as_it_is(
     """On a blurred flat ellipsoid only rounding residues are set to 0.
 
     The terraces that the blur leaves on its shallow slopes have angle defects
-    down to 4.5e-13 radians, and no angle defect lies between 1e-14 and 1e-13.
-    No dihedral angle lies between 1e-13 and 1e-9 either, so ``_FLAT_ANGLE``
-    sits in an empty band. What the two floors set to 0 on the copy that
-    ``extract_mesh_features`` measures are residues: 63 dihedral angles of at
-    most 1e-13 and 187 angle defects of 8.9e-16 (one ulp of 2 pi).
+    down to 2.5e-14 radians, above ``_FLAT_DEFECT``, and no dihedral angle lies
+    between 1e-13 and 1e-9, so ``_FLAT_ANGLE`` sits in an empty band. What the
+    two floors set to 0 on the copy that ``extract_mesh_features`` measures are
+    residues: 25 dihedral angles of at most 8.4e-15 and 18 angle defects of at
+    most 3.6e-15 (four ulps of 2 pi).
     """
     z, y, x = _centred_grid(20, 132, 132)
     flat = (z / 6) ** 2 + (y / 60) ** 2 + (x / 60) ** 2 <= 1
@@ -724,9 +724,32 @@ def test_flat_residues_leave_real_curvature_as_it_is(
     assert (defects[zeroed] <= 4 * np.spacing(2 * np.pi)).all(), defects[zeroed].max()
     # Their Gaussian curvature k1 k2 is the floored defect, 0.
     assert (k1[zeroed] * k2[zeroed] == 0).all()
-    assert not ((defects > 1e-14) & (defects <= 1e-13)).any()
     assert ((angles > 0) & (angles <= 1e-13)).sum() > 0
     assert not ((angles > 1e-13) & (angles <= 1e-9)).any()
+
+
+def test_level_set_vertices_do_not_round_with_their_place_in_the_array(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
+    """A blurred level set moved by whole voxels moves by exactly that, to 1e-12.
+
+    Marching cubes rounds its vertices to float32 at a step that grows with the
+    index; in float32 the two copies (at index 1 and 1500) differed by up to
+    6.0e-5, in float64 by 1.1e-13. The field and the faces are the same.
+    """
+    field = ndimage.gaussian_filter(ball_of(8, 22).astype(np.float32), 2.0)
+    step = np.array([2.39, 1.0, 1.0])
+    meshes = []
+    for corner in ((1, 1, 1), (3, 1500, 2)):
+        volume = np.zeros((30, 1530, 30), dtype=np.float32)
+        volume[tuple(slice(c, c + 22) for c in corner)] = field
+        verts, faces = mesh._level_set(volume, step)
+        meshes.append((verts - np.array(corner) * step, faces))
+
+    (va, fa), (vb, fb) = meshes
+    assert va.dtype == np.float64
+    np.testing.assert_array_equal(fa, fb)
+    assert np.abs(va - vb).max() <= 1e-12
 
 
 @pytest.mark.parametrize(

@@ -102,6 +102,37 @@ def test_gpu_marching_cubes_matches_skimage(name: str, gpu_available: bool) -> N
     _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
+def test_gpu_level_set_matches_cpu_in_float64(gpu_available: bool) -> None:
+    """Both devices give the same float64 level set, bit for bit, at and near level hits.
+
+    A third of the grid values near the level are set to 0.5 or to a float32
+    neighbour of it: 2958 of 12659 vertices round onto grid points and keep
+    their float32 position, 9650 move in float64.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(1)
+    volume = ndimage.gaussian_filter(rng.normal(size=(22, 26, 30)), 1.0)
+    volume = (0.5 + 0.5 * volume / np.abs(volume).max()).astype(np.float32)
+    near = np.flatnonzero(np.abs(volume - 0.5) < 0.1)
+    hits = rng.choice(near, size=len(near) // 3, replace=False)
+    half = np.float32(0.5)
+    neighbours = [
+        half,
+        np.nextafter(half, np.float32(1)),
+        np.nextafter(half, np.float32(0)),
+    ]
+    volume.flat[hits] = np.resize(neighbours, len(hits))
+    volume = np.pad(volume, ((3, 2), (5, 1), (40, 0)))
+    step = np.array([2.39, 1.0, 1.0])
+
+    v_cpu, f_cpu = mesh._level_set(volume, step)
+    v_gpu, f_gpu = mesh._level_set(ascupy(volume), step)
+
+    assert v_cpu.dtype == asnumpy(v_gpu).dtype == np.float64
+    _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
+
+
 @pytest.mark.parametrize("device", ["CPU", "GPU"])
 def test_marching_cubes_faces_wind_outward(device: str, gpu_available: bool) -> None:
     """The faces from ``mesh._marching_cubes`` enclose a positive volume.
