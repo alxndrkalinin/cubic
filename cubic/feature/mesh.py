@@ -2084,8 +2084,8 @@ def _contour_length(field: np.ndarray, plane_step: np.ndarray) -> float:
 
     Marching cubes on the field stacked twice along a new first axis, one unit
     apart, gives a ribbon whose area is the contour length times that unit, on
-    the field's device. It matches skimage's ``find_contours`` to 1e-7 relative
-    (float32 vertices), except in saddle cells, which marching cubes resolves
+    the field's device. It matches skimage's ``find_contours`` to 1e-15 relative,
+    except in saddle cells, which marching cubes resolves
     by the bilinear interpolant, like ``find_contours(fully_connected="high")``
     when the saddle lies above 0.5.
     """
