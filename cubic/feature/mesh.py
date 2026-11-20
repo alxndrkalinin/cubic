@@ -64,6 +64,7 @@ from ..cuda import (
     to_same_device,
     ordered_bincount,
 )
+from ..scipy import ndimage as device_ndimage
 from ._array_mesh import ArrayMesh, face_areas
 from ..image_utils import gaussian_filter_like_scipy
 from ._marching_cubes_cuda import marching_cubes as _marching_cubes_gpu
@@ -665,47 +666,35 @@ def _smooth_mask2mesh(
     """
     step = _step(spacing)
     box = _object_box(mask_3d)
-    corner = np.zeros(3) if box is None else np.array([s.start for s in box])
-    if box is not None:
-        mask_3d = mask_3d[box]
-    volume, pad = _padded_blur(mask_3d, step, sigma)
+    if box is None:
+        return None
+    volume, pad = _padded_blur(mask_3d[box], step, sigma)
     level_set = _level_set(volume, step)
     if level_set is None:
         return None
-    return _level_set_mesh(level_set, pad, step, corner=corner)
+    corner = np.array([s.start for s in box])
+    return _level_set_mesh(level_set, pad - corner, step)
 
 
 def _object_box(mask: np.ndarray) -> tuple[slice, ...] | None:
     """Return the slices of the smallest box holding every nonzero voxel of ``mask``.
 
-    None for a mask without one. Only the projection of the mask on each
-    axis leaves its device.
+    None for a mask without one.
     """
     occupied = mask if mask.dtype == bool else mask != 0
-    box = []
-    for axis in range(mask.ndim):
-        others = tuple(a for a in range(mask.ndim) if a != axis)
-        present = np.flatnonzero(asnumpy(occupied.any(axis=others)))
-        if present.size == 0:
-            return None
-        box.append(slice(int(present[0]), int(present[-1]) + 1))
-    return tuple(box)
+    return device_ndimage.find_objects(occupied.view(np.uint8), 1)[0]
 
 
 def _level_set_mesh(
-    level_set: tuple[np.ndarray, np.ndarray],
-    pad: np.ndarray,
-    step: np.ndarray,
-    corner: np.ndarray | None = None,
+    level_set: tuple[np.ndarray, np.ndarray], pad: np.ndarray, step: np.ndarray
 ) -> Any:
     """Return the closed mesh of a padded blur's level set, in the mask's frame.
 
-    ``corner`` is the voxel of the mask at which the blurred crop starts, so
-    that the mesh lands in the frame of the mask the crop was taken from.
+    ``pad`` is the number of voxels, per axis, by which the origin of the
+    blurred volume lies before the origin of the mask's frame.
     """
     verts, faces = level_set
-    shift = pad * step if corner is None else (pad - corner) * step
-    return _closed_mesh(verts - to_same_device(shift, verts), faces)
+    return _closed_mesh(verts - to_same_device(pad * step, verts), faces)
 
 
 def _step(spacing: Sequence[float] | None) -> np.ndarray:
@@ -1945,6 +1934,11 @@ def _area_average(values: np.ndarray, area: np.ndarray) -> float:
     return float((values[valid] * area[valid]).sum() / area[valid].sum())
 
 
+def _vertex_curvedness(k1: np.ndarray, k2: np.ndarray) -> np.ndarray:
+    """Return the curvedness ``sqrt((k1^2 + k2^2) / 2)`` of each vertex."""
+    return np.sqrt((k1**2 + k2**2) / 2)
+
+
 def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
     """Return the shape index averaged by area times curvedness.
 
@@ -1955,7 +1949,7 @@ def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
     each vertex's term is continuous in its curvatures. NaN,
     with a warning, when no vertex is curved.
     """
-    weight = area * np.sqrt((k1**2 + k2**2) / 2)
+    weight = area * _vertex_curvedness(k1, k2)
     valid = (weight > 0) & np.isfinite(weight)
     if not bool(valid.any()):
         warnings.warn(
@@ -1970,7 +1964,7 @@ def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
 
 def _curvedness(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
     """Return the area-weighted curvedness, ``1 / R`` on a sphere of radius R."""
-    return _area_average(np.sqrt((k1**2 + k2**2) / 2), area)
+    return _area_average(_vertex_curvedness(k1, k2), area)
 
 
 def _smooth_twin(blurred: np.ndarray, pad: np.ndarray) -> np.ndarray:
