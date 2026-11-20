@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 from functools import wraps, cached_property
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover - import failure path
 
 from ..cuda import (
     asnumpy,
+    get_device,
     to_same_device,
     ordered_bincount,
 )
@@ -149,11 +151,14 @@ class ArrayMesh:
         if not np.isfinite(factor) or factor <= 0:
             raise ValueError(f"factor must be finite and positive; got {factor}")
         vertices = self.vertices
-        if origin is not None:
-            vertices = vertices - to_same_device(
-                np.asarray(origin, dtype=np.float64), vertices
-            )
-        return type(self)(vertices * factor, self.faces, merge=False)
+        # The origin and the new vertices on the vertices' device, which need
+        # not be the current one.
+        with vertices.device if get_device(vertices) == "GPU" else nullcontext():
+            if origin is not None:
+                vertices = vertices - to_same_device(
+                    np.asarray(origin, dtype=np.float64), vertices
+                )
+            return type(self)(vertices * factor, self.faces, merge=False)
 
     def __getattr__(self, name: str) -> Any:
         # Called for attributes not defined here, which go to trimesh, and also

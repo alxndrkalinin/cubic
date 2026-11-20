@@ -322,6 +322,30 @@ def test_gpu_marching_cubes_runs_on_the_input_device(gpu_available: bool) -> Non
         _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
+def test_scaled_copy_stays_on_the_mesh_device(
+    gpu_available: bool, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
+    """A mesh on GPU 1 is scaled about a host origin on GPU 1 while GPU 0 is current."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    verts, faces = mesh._marching_cubes(np.pad(ball_of(8, 20), 1))
+    with cp.cuda.Device(1):
+        ball = ArrayMesh(cp.asarray(verts), cp.asarray(faces))
+    origin = np.array([10.0, 11.0, 12.0])
+
+    with cp.cuda.Device(0):
+        copies = [ball.scaled(0.5), ball.scaled(0.5, origin=origin)]
+
+    for copy, shift in zip(copies, (0.0, origin)):
+        assert copy.vertices.device.id == 1
+        expected = (asnumpy(ball.vertices) - shift) * 0.5
+        np.testing.assert_allclose(asnumpy(copy.vertices), expected, rtol=1e-15)
+
+
 def _labels() -> np.ndarray:
     z, y, x = np.meshgrid(*[np.arange(n) for n in (30, 64, 64)], indexing="ij")
     labels = np.zeros((30, 64, 64), dtype=np.int32)
