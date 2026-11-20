@@ -970,6 +970,17 @@ def test_extract_mesh_features_stays_on_the_gpu(c: float, gpu_available: bool) -
     assert all(np.isfinite(v) for v in values.values()), values
 
 
+def test_far_object_on_gpu_is_measured_as_near(
+    gpu_available: bool,
+    lumpy_nucleus_of: Callable[[int], np.ndarray],
+    assert_far_object_like_near: Callable[..., None],
+) -> None:
+    """A CuPy mask's object 2030 voxels out gets the features it gets near the origin."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    assert_far_object_like_near(lumpy_nucleus_of(5), ascupy)
+
+
 def test_mask2mesh_on_gpu(gpu_available: bool) -> None:
     """A CuPy mask is meshed on the GPU.
 

@@ -13,13 +13,10 @@ the length unit of ``spacing``. There are three levels:
 
 1. ``extract_features`` and ``extract_surface_features`` measure in units of
    the finest voxel spacing, on meshes centred on the origin, and convert the
-   values back, so they work in any unit. ``extract_features`` meshes each
-   label in its own bounding box, so its values do not depend on where the
-   label lies in the image. ``extract_surface_features`` meshes the mask in
-   its own frame: its voxel-mesh features do not depend on the object's
-   position either, but the curvature-distribution features and the fractal
-   dimension are measured on level sets of a blur whose float32 vertices
-   round coarser far from the frame's origin, so they move slightly with it.
+   values back, so they work in any unit. Both mesh and blur each object
+   over its own bounding box, so their values do not depend on where the
+   object lies in the image: ``extract_surface_features`` gives a mask the
+   values ``extract_features`` gives the same object as a label.
 2. ``mask2mesh`` builds its mesh in those units and returns it in the
    caller's units, and ``extract_mesh_features`` measures a mesh at the scale
    of its own edges, centred on the origin, and converts back. Both work in
@@ -372,6 +369,13 @@ def extract_surface_features(
     # before any meshing, then normalised; the default, twice the coarsest
     # spacing, normalises to twice the coarsest normalised spacing.
     sigma = _curvature_sigma(spacing, curvature_sigma) / unit
+    # Measured on the object's bounding box, as extract_features crops each
+    # label, so that no value depends on where the object lies in the mask:
+    # the blurred level sets have float32 vertices, which round coarser far
+    # from the frame's origin. Every blur and mesh pads the box as it needs.
+    box = _object_box(mask)
+    if box is not None:
+        mask = mask[box]
     mesh = mask2mesh(mask, spacing=None if spacing is None else tuple(step))
     blurred = [n for n in features if n in _SMOOTHED_FEATURES or n in _MASK_FEATURES]
     on_mesh = [name for name in features if name not in _MASK_FEATURES]
@@ -623,19 +627,55 @@ def _scaled_copy(
 def _smooth_mask2mesh(
     mask_3d: np.ndarray, spacing: Sequence[float] | None, sigma: float
 ) -> Any:
-    """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes."""
+    """Mesh the 0.5 level of the mask blurred at ``sigma``; None if it vanishes.
+
+    The mask is blurred and meshed over the bounding box of the object, whose
+    float32 vertices then round alike wherever it lies, and the vertices are
+    moved back to the mask's frame in float64.
+    """
     step = _step(spacing)
+    box = _object_box(mask_3d)
+    corner = np.zeros(3) if box is None else np.array([s.start for s in box])
+    if box is not None:
+        mask_3d = mask_3d[box]
     volume, pad = _padded_blur(mask_3d, step, sigma)
     level_set = _level_set(volume, step)
-    return None if level_set is None else _level_set_mesh(level_set, pad, step)
+    if level_set is None:
+        return None
+    return _level_set_mesh(level_set, pad, step, corner=corner)
+
+
+def _object_box(mask: np.ndarray) -> tuple[slice, ...] | None:
+    """Return the slices of the smallest box holding every nonzero voxel of ``mask``.
+
+    None for a mask without one. Only the projection of the mask on each
+    axis leaves its device.
+    """
+    occupied = mask if mask.dtype == bool else mask != 0
+    box = []
+    for axis in range(mask.ndim):
+        others = tuple(a for a in range(mask.ndim) if a != axis)
+        present = np.flatnonzero(asnumpy(occupied.any(axis=others)))
+        if present.size == 0:
+            return None
+        box.append(slice(int(present[0]), int(present[-1]) + 1))
+    return tuple(box)
 
 
 def _level_set_mesh(
-    level_set: tuple[np.ndarray, np.ndarray], pad: np.ndarray, step: np.ndarray
+    level_set: tuple[np.ndarray, np.ndarray],
+    pad: np.ndarray,
+    step: np.ndarray,
+    corner: np.ndarray | None = None,
 ) -> Any:
-    """Return the closed mesh of a padded blur's level set, in the mask's frame."""
+    """Return the closed mesh of a padded blur's level set, in the mask's frame.
+
+    ``corner`` is the voxel of the mask at which the blurred crop starts, so
+    that the mesh lands in the frame of the mask the crop was taken from.
+    """
     verts, faces = level_set
-    return _closed_mesh(verts - to_same_device(pad * step, verts), faces)
+    shift = pad * step if corner is None else (pad - corner) * step
+    return _closed_mesh(verts - to_same_device(shift, verts), faces)
 
 
 def _step(spacing: Sequence[float] | None) -> np.ndarray:

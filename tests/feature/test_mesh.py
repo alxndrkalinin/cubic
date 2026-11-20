@@ -529,33 +529,18 @@ def test_extract_surface_features_full_pipeline() -> None:
 
 def test_extract_surface_features_of_a_far_object_are_those_of_a_near_one(
     lumpy_nucleus_of: Callable[[int], np.ndarray],
+    assert_far_object_like_near: Callable[..., None],
 ) -> None:
     """An object 2030 voxels from the origin of its mask gets the features it gets near it.
 
-    Every feature of the voxel mesh is measured on a copy centred on the
-    origin, so the inertia does not round with the distance. The features of
-    the blurred mesh and the fractal dimensions are not compared: those
-    meshes are built in the mask's frame, where their vertices round coarser
-    far from the origin.
+    Every feature, the blurred mesh's and the fractal dimensions included,
+    and the same values as ``extract_features`` gives the object as a label;
+    ``mask2mesh(..., sigma=...)`` returns the near mesh moved by the offset.
+    Meshed in the mask's frame, the blurred level sets have float32 vertices
+    that round coarser far from the origin, which moved Avg Shape Index by
+    6.6e-4 relative.
     """
-    nucleus = lumpy_nucleus_of(5)
-    names = [
-        name
-        for name in mesh.mesh_feature_list()
-        if name not in mesh._SMOOTHED_FEATURES and name not in mesh._MASK_FEATURES
-    ]
-    near = np.zeros((44, 68, 68), dtype=bool)
-    near[2:42, 2:66, 2:66] = nucleus
-    far = np.zeros((44, 68, 2100), dtype=bool)
-    far[2:42, 2:66, 2030:2094] = nucleus
-
-    values = [
-        mesh.extract_surface_features(mask, spacing=(2.685, 1.0, 1.0), features=names)
-        for mask in (near, far)
-    ]
-
-    for name in names:
-        assert values[1][name] == pytest.approx(values[0][name], rel=1e-13), name
+    assert_far_object_like_near(lumpy_nucleus_of(5), np.asarray)
 
 
 def test_curvature_of_a_sphere(ball_of: Callable[[float, int], np.ndarray]) -> None:
