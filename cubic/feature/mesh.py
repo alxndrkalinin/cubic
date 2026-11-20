@@ -876,7 +876,13 @@ def _level_set(
         return None
     verts, faces = _marching_cubes(volume, 0.5, allow_degenerate=False)
     verts = _float64_vertices(volume, verts, 0.5)
-    return verts * to_same_device(np.asarray(step, dtype=np.float64), verts), faces
+    # Each column times a Python float, in place on the fresh float64 array: the
+    # same products as ``verts * step``, without copying ``step`` to the GPU, and
+    # none for a step of 1, which leaves every double as it is.
+    for axis, factor in enumerate(np.asarray(step, dtype=np.float64).tolist()):
+        if factor != 1.0:
+            verts[:, axis] *= factor
+    return verts, faces
 
 
 # skimage's FLT_EPSILON in the vertex interpolation is the double epsilon.
@@ -900,25 +906,29 @@ def _float64_vertices(
     float32 vertex, so both devices give the same mesh, and vertices coincide
     in float64 exactly when they do in float32.
     """
-    v32 = verts.astype(np.float32)
+    v32 = verts.astype(np.float32, copy=False)
     corner = np.floor(v32)
     on_edge = v32 != corner
-    rows = np.flatnonzero(on_edge.sum(axis=1) == 1)
-    near = corner[rows].astype(np.int64)
-    along = on_edge[rows]
+    single = on_edge.sum(axis=1) == 1
+    # Every row is computed and the rows that qualify are selected, since picking
+    # them by index makes the host wait for the device. A row with several
+    # non-integer coordinates reads the field at its floor, inside the volume,
+    # and is discarded.
+    along = on_edge & single[:, None]
+    near = corner.astype(np.int64)
     # the float32 field both marching cubes mesh
     values = [
-        volume[tuple(index.T)].astype(np.float32).astype(np.float64) - level
+        volume[tuple(index.T)].astype(np.float32, copy=False).astype(np.float64) - level
         for index in (near, near + along)
     ]
     t_near, t_far = (1.0 / (_MC_EPS + np.abs(value)) for value in values)
     pos = np.where(along, near + (t_far / (t_near + t_far))[:, None], near)
-    keep = ((values[0] > 0) != (values[1] > 0)) & (
-        pos.astype(np.float32) == v32[rows]
-    ).all(axis=1)
-    out = v32.astype(np.float64)
-    out[rows[keep]] = pos[keep]
-    return out
+    keep = (
+        single
+        & ((values[0] > 0) != (values[1] > 0))
+        & (pos.astype(np.float32) == v32).all(axis=1)
+    )
+    return np.where(keep[:, None], pos, v32)
 
 
 def _level_set_area(level_set: tuple[np.ndarray, np.ndarray] | None) -> float:
