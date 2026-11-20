@@ -1950,15 +1950,15 @@ def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
     The shape index ``(2 / pi) atan2(k1 + k2, k2 - k1)`` is the angle of
     ``(k1, k2)``, undefined at a planar point and set by rounding near one; its
     weight ``sqrt((k1^2 + k2^2) / 2)``, the curvedness, goes to 0 there, so
-    each vertex's term is continuous in its curvatures. NaN,
-    with a warning, when no vertex is curved.
+    each vertex's term is continuous in its curvatures. NaN, with a warning,
+    when no vertex has a finite, positive area times curvedness.
     """
     weight = area * _vertex_curvedness(k1, k2)
     valid = (weight > 0) & np.isfinite(weight)
     if not bool(valid.any()):
         warnings.warn(
-            "Avg Shape Index is undefined on a mesh whose vertices are all "
-            "planar (k1 = k2 = 0); returning NaN.",
+            "Avg Shape Index is undefined on a mesh in which no vertex has a "
+            "finite, positive area times curvedness; returning NaN.",
             stacklevel=_stacklevel_outside_package(),
         )
         return float("nan")
