@@ -45,6 +45,9 @@ cellpose = [
 mesh = [
     # >=4.6.12 for Trimesh.integral_mean_curvature with signed angles
     "trimesh>=4.6.12",
+    # mesh "Fractal Dimension": Trimesh.simplify_quadric_decimation; 0.1.7 does
+    # not import under NumPy 2
+    "fast-simplification>=0.1.9",
 ]
 plot = [
     "matplotlib>=3.5",
