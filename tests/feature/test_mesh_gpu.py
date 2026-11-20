@@ -106,8 +106,8 @@ def test_gpu_level_set_matches_cpu_in_float64(gpu_available: bool) -> None:
     """Both devices give the same float64 level set, bit for bit, at and near level hits.
 
     A third of the grid values near the level are set to 0.5 or to a float32
-    neighbour of it: 2958 of 12659 vertices round onto grid points and keep
-    their float32 position, 9650 move in float64.
+    neighbour of it, so that some vertices round onto grid points and keep
+    their float32 position, and the others move in float64.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
@@ -382,8 +382,7 @@ def test_mesh_of_a_mask_on_gpu_1_stays_on_gpu_1(gpu_available: bool) -> None:
 
     The mesh, voxel and blurred, its device arrays computed later with GPU 0
     current, and its scaled copy all stay on GPU 1, and the features match the
-    host's. CuPy allocates new arrays on the current device, so the pad before
-    marching cubes used to move the whole mesh to GPU 0.
+    host's.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
