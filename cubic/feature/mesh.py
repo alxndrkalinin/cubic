@@ -163,12 +163,12 @@ def mesh_feature_list(optional: bool = False) -> list[str]:
     region (grooves, waists, the necks of lobes), unitless. ``Avg Shape Index``
     (Koenderink and van Doorn, 1992) runs from -1 (cup) through 0 (saddle) to 1
     (cap), and ``Avg Curvedness`` is ``sqrt((k1^2 + k2^2) / 2)``, in inverse
-    units of ``spacing``. Curvedness is averaged over the surface by area, and
-    the shape index by area times curvedness: the shape index is the angle of
-    ``(k1, k2)`` and curvedness its length, so where the surface is nearly
-    planar the angle is set by rounding, and it counts in proportion to the
-    curvature it describes. It is NaN, with a warning, on a mesh without a
-    curved vertex.
+    units of ``spacing``. Both are averaged over the surface by area. The
+    shape index is the angle of ``(k1, k2)`` and curvedness its length, so
+    where the surface is nearly planar the angle is set by rounding; the shape
+    index leaves out the vertices whose curvedness is below 1% of the
+    area-weighted median curvedness of the object's curved vertices. It is
+    NaN, with a warning, on a mesh without a curved vertex.
     ``Euler Characteristic``, ``Avg Mean Curvature`` and these three are
     approximate on a mesh with edges shared by more than two faces, which
     marching cubes makes where voxels touch only along an edge, and a warning
@@ -1943,27 +1943,54 @@ def _vertex_curvedness(k1: np.ndarray, k2: np.ndarray) -> np.ndarray:
     return np.sqrt((k1**2 + k2**2) / 2)
 
 
-def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
-    """Return the shape index averaged by area times curvedness.
+# Avg Shape Index leaves out the vertices whose curvedness is below this
+# fraction of the object's median: rounding sets the shape index of a nearly
+# flat vertex. With a cut of 1e-3, rounding still moved the average of blurred
+# nuclei by more than 1e-9 between devices and frames; with 1e-2 it did not.
+_SHAPE_INDEX_CUT = 1e-2
 
-    1 on a sphere, 0.5 on a cylinder and 0 on a saddle, as the area average.
-    The shape index ``(2 / pi) atan2(k1 + k2, k2 - k1)`` is the angle of
-    ``(k1, k2)``, undefined at a planar point and set by rounding near one; its
-    weight ``sqrt((k1^2 + k2^2) / 2)``, the curvedness, goes to 0 there, so
-    each vertex's term is continuous in its curvatures. NaN, with a warning,
-    when no vertex has a finite, positive area times curvedness.
+
+def _area_median(values: np.ndarray, area: np.ndarray) -> float:
+    """Return the area-weighted median of ``values``.
+
+    It is the value at the first position, in ascending order of ``values``,
+    where the cumulative area reaches half the total area.
     """
-    weight = area * _vertex_curvedness(k1, k2)
-    valid = (weight > 0) & np.isfinite(weight)
-    if not bool(valid.any()):
+    order = np.argsort(values)
+    cumulative = np.cumsum(area[order])
+    index = int(np.argmax(cumulative >= cumulative[-1] / 2))
+    return float(values[order][index])
+
+
+def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
+    """Return the shape index averaged by area over the non-planar vertices.
+
+    1 on a sphere, 0.5 on a cylinder and 0 on a saddle. The shape index
+    ``(2 / pi) atan2(k1 + k2, k2 - k1)`` and the curvedness
+    ``sqrt((k1^2 + k2^2) / 2)`` are the angle and radius of ``(k1, k2)``
+    (Koenderink and van Doorn, 1992), so the shape index is undefined at a
+    planar point and set by rounding near one. The average is taken by area
+    over the vertices with a finite, positive area and curvedness at least
+    ``_SHAPE_INDEX_CUT`` times the area-weighted median curvedness of the
+    vertices with positive curvedness: planar relative to the object, so the
+    cut does not depend on its scale. The cut is relative to the object's own
+    median curvedness, so on a surface that is mostly nearly flat the median,
+    and with it the cut, is that of the nearly flat vertices, and they are
+    kept. NaN, with a warning, when no vertex is kept.
+    """
+    curvedness = _vertex_curvedness(k1, k2)
+    curved = (area > 0) & np.isfinite(curvedness) & (curvedness > 0)
+    if not bool(curved.any()):
         warnings.warn(
             "Avg Shape Index is undefined on a mesh in which no vertex has a "
-            "finite, positive area times curvedness; returning NaN.",
+            "finite, positive area and curvedness; returning NaN.",
             stacklevel=_stacklevel_outside_package(),
         )
         return float("nan")
+    median = _area_median(curvedness[curved], area[curved])
+    kept = curved & (curvedness >= _SHAPE_INDEX_CUT * median)
     shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
-    return _area_average(shape_index, np.where(valid, weight, 0.0))
+    return _area_average(shape_index, np.where(kept, area, 0.0))
 
 
 def _curvedness(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:

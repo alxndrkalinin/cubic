@@ -835,13 +835,15 @@ def _turned_cube(
     side: float,
     offset: tuple[float, float, float] | None = None,
     bump: float = 0.0,
+    half_face: bool = False,
 ) -> trimesh.Trimesh:
     """Return a cube of ``side`` subdivided four times, turned, and moved by ``offset``.
 
     It is turned by a fixed random rotation. Its faces lie in the six planes of
     the cube, so every vertex inside a face is flat, unless ``bump`` moves each
     of them, before the turn, along its normal by a random distance of at most
-    ``bump``.
+    ``bump``. With ``half_face``, only the 105 face-interior vertices of one
+    half of one face are moved.
     """
     box = trimesh.creation.box(extents=(side, side, side))
     for _ in range(4):
@@ -849,6 +851,8 @@ def _turned_cube(
     vertices = box.vertices
     if bump:
         inside = (np.abs(vertices) < side / 2 - 1e-9).sum(axis=1) == 2
+        if half_face:
+            inside &= (vertices[:, 0] > side / 2 - 1e-9) & (vertices[:, 1] < 0)
         moves = np.random.default_rng(0).uniform(-bump, bump, len(vertices))
         vertices = vertices + np.where(inside, moves, 0)[:, None] * box.vertex_normals
     turn = Rotation.random(1, random_state=2).as_matrix()[0]
@@ -884,46 +888,83 @@ def test_rotated_cube_has_the_mean_curvature_of_its_edges(
     assert (k2[inside] == 0).all()
 
 
-def test_shape_index_weights_vertices_by_curvedness(
+def test_shape_index_of_a_cube_leaves_out_its_faces(
     flat_vertices_of: Callable[[object], np.ndarray],
 ) -> None:
-    """The shape index of a cube averages its edges and corners, not its faces.
+    """The shape index of a cube is the area average over its edges and corners.
 
-    Each vertex counts by area times curvedness, which is 0 where
-    ``k1 = k2 = 0``, as at the cube's face-interior vertices. On its edges
-    ``k1 = 0 < k2``, a shape index of 0.5, and its corners read more, so the
-    average is at least 0.5.
+    Its face-interior vertices have ``k1 = k2 = 0``, a curvedness of 0, so
+    they are left out, and every other vertex is kept: the value equals the
+    area average of the shape index over the vertices off the faces. On the
+    edges ``k1 = 0 < k2``, a shape index of 0.5, and the corners read more,
+    so the average is at least 0.5.
     """
     cube = _turned_cube(2.0)
     measured = mesh._scaled_copy(cube, 1 / mesh._edge_unit(cube), center=True)
     k1, k2, area = mesh._principal_curvatures(measured)
     flat = flat_vertices_of(measured)
-    weight = area * np.sqrt((k1**2 + k2**2) / 2)
+    shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
+    expected = (shape_index * area)[~flat].sum() / area[~flat].sum()
 
     name = "Avg Shape Index"
     value = mesh.extract_mesh_features(cube, [name])[name]
 
-    assert (weight[flat] == 0).all()
+    assert flat.sum() == 1350
+    assert (np.sqrt((k1**2 + k2**2) / 2)[flat] == 0).all()
+    assert value == pytest.approx(expected, rel=1e-12)
     assert 0.5 <= value <= 1
 
 
-def test_shape_index_of_nearly_flat_faces_follows_their_curvature() -> None:
-    """Faces bent by 1e-9 move the shape index by about that much, not by their shape.
+def test_shape_index_leaves_out_nearly_flat_vertices() -> None:
+    """Half a face bent by 1e-9 falls below the cut and moves the value by <= 1e-7.
 
-    The shape index of a nearly flat vertex is the angle of a vanishing
-    ``(k1, k2)``, so rounding sets it. Each vertex counts by its curvedness,
-    so moving the cube's face-interior vertices by up to 1e-9 along their
-    normals, at random, moves the average by at most 1e-7.
+    The 105 vertices of half of one face, moved by up to 1e-9 along their
+    normal at random, have a positive curvedness below ``_SHAPE_INDEX_CUT``
+    times the area-weighted median curvedness, that of the cube's edges and
+    corners. They are left out, so the average stays within 1e-7 of the
+    straight cube's.
     """
     straight = _turned_cube(2.0)
-    bent = _turned_cube(2.0, bump=1e-9)
-    name = "Avg Shape Index"
+    bent = _turned_cube(2.0, bump=1e-9, half_face=True)
+    measured = mesh._scaled_copy(bent, 1 / mesh._edge_unit(bent), center=True)
+    moved = (bent.vertices != straight.vertices).any(axis=1)
+    k1, k2, area = mesh._principal_curvatures(measured)
+    curvedness = np.sqrt((k1**2 + k2**2) / 2)
+    curved = curvedness > 0
+    median = mesh._area_median(curvedness[curved], area[curved])
 
+    name = "Avg Shape Index"
     flat = mesh.extract_mesh_features(straight, [name])[name]
     nearly_flat = mesh.extract_mesh_features(bent, [name])[name]
 
-    assert (bent.vertices != straight.vertices).any(axis=1).sum() == 1350
+    assert moved.sum() == 105
+    assert (curvedness[moved] > 0).all()
+    assert (curvedness[moved] < mesh._SHAPE_INDEX_CUT * median).all()
     assert abs(nearly_flat - flat) <= 1e-7
+
+
+def test_shape_index_of_faces_moved_by_rounding_is_unchanged() -> None:
+    """Face-interior vertices moved by up to 1e-14 stay flat; the value holds.
+
+    A move of that size along the normals gives dihedral angles and angle
+    defects within ``_FLAT_ANGLE`` and ``_FLAT_DEFECT``, so those vertices
+    keep ``k1 = k2 = 0`` and the shape index agrees with the straight cube's
+    within 1e-12.
+    """
+    straight = _turned_cube(2.0)
+    jittered = _turned_cube(2.0, bump=1e-14)
+    measured = mesh._scaled_copy(jittered, 1 / mesh._edge_unit(jittered), center=True)
+    moved = (jittered.vertices != straight.vertices).any(axis=1)
+    k1, k2, _ = mesh._principal_curvatures(measured)
+
+    name = "Avg Shape Index"
+    before = mesh.extract_mesh_features(straight, [name])[name]
+    after = mesh.extract_mesh_features(jittered, [name])[name]
+
+    assert moved.sum() >= 1300
+    assert (k1[moved] == 0).all()
+    assert (k2[moved] == 0).all()
+    assert abs(after - before) <= 1e-12
 
 
 def test_shape_index_of_a_mesh_without_curvature_is_nan() -> None:
@@ -945,7 +986,7 @@ def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
     surface by the midpoint rule in the two angles (the integral of ``K`` is
     ``4 pi`` to 2e-7). The icosphere of subdivision 5 stretched to it must read
     within 1e-3 (mean curvature and curvedness, relative) and 2e-4 (shape
-    index, weighted by curvedness) of them. This checks the formulas, not the
+    index, absolute) of them. This checks the formulas, not the
     rounding of angles near 0.
     """
     a, b, c = 3.0, 2.0, 1.5
@@ -979,8 +1020,7 @@ def test_ellipsoid_curvatures_match_the_analytic_surface_averages() -> None:
     assert got["Avg Mean Curvature"] == pytest.approx(average(mean), rel=1e-3)
     shape_index = (2 / np.pi) * np.arctan2(k1 + k2, k2 - k1)
     curvedness = np.sqrt((k1**2 + k2**2) / 2)
-    weighted = average(shape_index * curvedness) / average(curvedness)
-    assert got["Avg Shape Index"] == pytest.approx(weighted, abs=2e-4)
+    assert got["Avg Shape Index"] == pytest.approx(average(shape_index), abs=2e-4)
     assert got["Avg Curvedness"] == pytest.approx(average(curvedness), rel=1e-3)
 
 
