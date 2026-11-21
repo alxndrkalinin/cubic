@@ -812,9 +812,8 @@ def test_raw_shape_index_does_not_depend_on_scale_or_orientation(
     """A raw mesh's Avg Shape Index agrees to rounding at any scale and orientation.
 
     Over spacings 1e-8 to 1e3 times (0.29, 0.108, 0.108) and three
-    orientations, the 30% ragged ball's varied by 1.3e-16; with
-    ``_FLAT_ANGLE`` at 1e-14 by 9.5e-3, at 3e-14 by 6.4e-4, and with trimesh's
-    arccos angles, measured before the copies were centred, by 3.0e-3.
+    orientations, the 30% ragged ball's varied by 1.3e-16; with trimesh's
+    arccos angles in place of ``_dihedral_angles``, by 5.1e-10.
     """
     mask = ragged_ball_of(0.3)
     turns = Rotation.random(2, random_state=1).as_matrix()

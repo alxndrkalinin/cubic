@@ -745,10 +745,9 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(
 
     Its flat vertices have dihedral angles and angle defects that are rounding
     residues, which differ between the devices; ``_principal_curvatures`` sets
-    them to 0 (``_FLAT_ANGLE``, ``_FLAT_DEFECT``), and the shape index, which
-    differed by about 1e-3 between the devices, then agrees to 1e-12. This ball
-    is at the default spacing; ``test_gpu_edge_unit_matches_numpy`` covers the
-    unit the devices measure at.
+    them to 0 (``_FLAT_ANGLE``, ``_FLAT_DEFECT``), and the shape index then
+    agrees to 1e-12. This ball is at the default spacing;
+    ``test_gpu_edge_unit_matches_numpy`` covers the unit the devices measure at.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
