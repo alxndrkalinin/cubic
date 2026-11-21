@@ -23,9 +23,11 @@ _SPACING_ERROR = re.escape(
 # Relative tolerance of the covariance, conversion and pipeline checks below. A
 # feature at another unit or through another entry point differs by the rounding
 # of a multiplication or of a sum over the mesh; the largest difference measured
-# on the CPU and on both CuPy versions is 5.6e-14, for Avg Shape Index of the
-# blurred mesh. 1e-12 leaves room for another libm.
-_RTOL = 1e-12
+# on the CPU and on both CuPy versions is 6.9e-13, for Avg Shape Index of the
+# blurred mesh, which keeps vertices down to 1% of the median curvedness, where
+# the angle of (k1, k2) moves most with rounding. Every other feature differs by
+# at most 5.3e-14. 1e-11 leaves room for another libm.
+_RTOL = 1e-11
 
 # Power of the length unit in each feature, measured independently of the
 # module's table: log2 of each feature's ratio between isotropic spacings s and
