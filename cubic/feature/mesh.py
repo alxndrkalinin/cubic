@@ -1959,7 +1959,7 @@ def _area_median(values: np.ndarray, area: np.ndarray) -> float:
     order = np.argsort(values)
     cumulative = np.cumsum(area[order])
     index = int(np.argmax(cumulative >= cumulative[-1] / 2))
-    return float(values[order][index])
+    return float(values[order[index]])
 
 
 def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
