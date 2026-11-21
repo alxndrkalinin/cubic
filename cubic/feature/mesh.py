@@ -1972,11 +1972,12 @@ def _shape_index(k1: np.ndarray, k2: np.ndarray, area: np.ndarray) -> float:
     planar point and set by rounding near one. The average is taken by area
     over the vertices with a finite, positive area and curvedness at least
     ``_SHAPE_INDEX_CUT`` times the area-weighted median curvedness of the
-    vertices with positive curvedness: planar relative to the object, so the
-    cut does not depend on its scale. The cut is relative to the object's own
-    median curvedness, so on a surface that is mostly nearly flat the median,
-    and with it the cut, is that of the nearly flat vertices, and they are
-    kept. NaN, with a warning, when no vertex is kept.
+    vertices with positive curvedness. The cut is a fraction of the object's
+    own median, so a vertex counts as planar relative to the object and the
+    same vertices are kept at any scale. On a surface that is mostly nearly
+    flat the median is that of the nearly flat vertices, so the cut is
+    correspondingly low and they are kept. NaN, with a warning, when no vertex
+    is kept.
     """
     curvedness = _vertex_curvedness(k1, k2)
     curved = (area > 0) & np.isfinite(curvedness) & (curvedness > 0)
