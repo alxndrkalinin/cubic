@@ -90,6 +90,12 @@ ring correlation." *Optics Express* 32(12):21767, 2024.
 | `axial_floor_factor` | 2.0 | Report `z` as `nan` below this multiple of the pre-resampling Z spacing; 0 disables |
 | `backend` | `"hist"` | GPU-accelerated histogram-based backend |
 
+On the GPU, the per-bin sums of the `hist` backend, the FSC and the DCR curves
+use atomic additions, whose order changes between runs, so the same input can
+give sums that differ in their last bits (up to 3e-14 relative over five runs
+at 512³ on an A40, with no change in any resolution value). Results are
+bitwise reproducible on the CPU.
+
 `fsc_resolution` returns `{"xy": ..., "z": ...}`. A sector centred on polar angle
 theta measures the shell radius `|k| = k_z / cos(theta)`, not `k_z`, so the two
 keys are extracted differently:
