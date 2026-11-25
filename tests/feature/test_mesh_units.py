@@ -4,6 +4,7 @@ import re
 import warnings
 from typing import Any
 from functools import cache
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -18,6 +19,13 @@ from cubic.feature._array_mesh import ArrayMesh  # noqa: E402
 _SPACING_ERROR = re.escape(
     "spacing must be three finite, positive numbers (z, y, x); got "
 )
+
+# Relative tolerance of the covariance, conversion and pipeline checks below. A
+# feature at another unit or through another entry point differs by the rounding
+# of a multiplication or of a sum over the mesh; the largest difference measured
+# on the CPU and on both CuPy versions is 5.6e-14, for Avg Shape Index of the
+# blurred mesh. 1e-12 leaves room for another libm.
+_RTOL = 1e-12
 
 # Power of the length unit in each feature, measured independently of the
 # module's table: log2 of each feature's ratio between isotropic spacings s and
@@ -64,9 +72,6 @@ CELLS = [
     (1e3, "anisotropic", False),
     (1e-6, "unit rounding", False),
 ]
-
-# Features whose GPU value varies between runs of the same code (atomic sums).
-_GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
 
 
 def _mask(
@@ -135,14 +140,7 @@ def _assert_covariant(device: str, base: str, c: float, explicit: bool) -> None:
     off = {}
     for name, value in actual.items():
         expected = c ** DIMENSIONS[name] * reference[name]
-        if base == "unit rounding":
-            rtol = 5e-3 if name == "Bounding Cylinder Volume" else 1e-6
-        else:
-            rtol = 1e-12 if device == "cpu" else 1e-9
-        atol = 0.0
-        if device == "gpu" and name in _GPU_JITTER:
-            atol = 1e-7 * c ** DIMENSIONS[name]
-        if not abs(value - expected) <= atol + rtol * abs(expected):
+        if not abs(value - expected) <= _RTOL * abs(expected):
             off[name] = (value, expected, abs(value - expected) / abs(expected))
     assert not off, f"not covariant at c={c:g}: {off}"
 
@@ -158,14 +156,12 @@ def test_features_are_covariant_with_the_unit(
 ) -> None:
     """Each feature at spacing ``c * base`` is ``c ** dimension`` times its value.
 
-    The reference is the value at ``base``; the tolerance is the rounding of the
-    final multiplication. ``explicit`` scales ``curvature_sigma`` and both fractal windows with the
-    spacing; the default windows follow the spacing by themselves.
+    The reference is the value at ``base``. ``explicit`` scales
+    ``curvature_sigma`` and both fractal windows with the spacing; the default
+    windows follow the spacing by themselves.
 
-    The ``unit rounding`` cell is looser: the ratio of its spacings rounds
-    differently in the two units, so the internal problem differs by one ulp,
-    which moved Avg Mean Curvature by 1e-8 relative; Bounding Cylinder Volume
-    comes from an approximate search and moved by 4e-4.
+    In the ``unit rounding`` cell the ratio of the spacings rounds differently
+    in the two units, so the internal problems differ by one ulp.
     """
     _assert_covariant("cpu", base, c, explicit)
 
@@ -263,7 +259,8 @@ def test_volume_error_prints_the_callers_volume(
     """The open-mesh error names the volume in the caller's units.
 
     ``mask2mesh`` is replaced by one that leaves the surface open, which the
-    padding otherwise prevents.
+    padding otherwise prevents. The volume of an open surface depends on the
+    origin; it is that of the copy measured, centred on the origin.
     """
 
     def open_mask2mesh(
@@ -275,7 +272,7 @@ def test_volume_error_prints_the_callers_volume(
     mask = np.zeros((6, 6, 6), dtype=bool)
     mask[:3, :3, :3] = True  # touches the border, so its surface is open
     spacing = (0.5, 0.25, 0.25)
-    expected = open_mask2mesh(mask, spacing).volume
+    expected = mesh._scaled_copy(open_mask2mesh(mask, spacing), 1.0, center=True).volume
     monkeypatch.setattr(mesh, "mask2mesh", open_mask2mesh)
 
     with pytest.raises(ValueError, match="volume must be finite") as error:
@@ -416,29 +413,11 @@ def test_mask2mesh_is_covariant_with_the_unit(
 _SMALL_MASK = {"shape": (20, 44, 44), "axes": (19, 13, 6), "lobe": (4, 5, -7, 4)}
 
 
-# Relative tolerance of extract_mesh_features against itself at another unit,
-# set from the largest change measured at factors 1e-9 to 1e3, on an isotropic
-# and the anisotropic base, on either device (in brackets); 1e-13 for every
-# other feature (1.1e-14). The bounding cylinder comes from an approximate
-# search. The mean-curvature sums take arccos of dot products of face normals,
-# which turns the last bit of a dot product of two coplanar faces into an angle
-# of up to 1.5e-8.
-_CONVERSION_RTOL = {
-    "Bounding Cylinder Volume": 1e-2,  # 4.3e-3
-    "Avg Mean Curvature": 2e-7,  # 6.3e-8
-    "Avg Curvedness": 2e-7,  # 9.5e-9
-    "Avg Shape Index": 1e-7,  # 5.9e-9, on the blurred mesh
-    "Total Absolute Gaussian Curvature": 1e-11,  # 1.1e-13
-}
-
-
-def _assert_close(
-    got: dict[str, float], expected: dict[str, float], rtol: dict[str, float]
-) -> None:
+def _assert_close(got: dict[str, float], expected: dict[str, float]) -> None:
     off = {
         name: (got[name], value)
         for name, value in expected.items()
-        if not abs(got[name] - value) <= rtol.get(name, 1e-13) * abs(value)
+        if not abs(got[name] - value) <= _RTOL * abs(value)
     }
     assert not off, off
 
@@ -455,15 +434,13 @@ def test_extract_mesh_features_convert_with_the_unit(
     (``_edge_unit``), so trimesh's absolute tolerances see the same
     problem at every factor. Unscaled, Avg Mean Curvature came out 32 times
     too high at 1e-7. ``smooth`` passes ``mask2mesh(..., sigma=...)`` for the
-    curvature-distribution features. Avg Shape Index on a raw voxel mesh is
-    left out: it moved by up to 6.8% between factors here (5.5% on the GPU).
+    curvature-distribution features; without it they are measured on the raw
+    mesh.
     """
     mask = _on(device, _mask(**_SMALL_MASK), gpu_available)
     spacing, sigma = MESH_BASES[base]
     step = np.asarray(spacing)
-    names = [
-        name for name in mesh._MESH_FEATURES if smooth or name != "Avg Shape Index"
-    ]
+    names = list(mesh._MESH_FEATURES)
 
     def features_at(c: float) -> dict[str, float]:
         surface = mesh.mask2mesh(mask, spacing=tuple(c * step))
@@ -477,20 +454,7 @@ def test_extract_mesh_features_convert_with_the_unit(
     reference = features_at(1.0)
     for c in UNIT_FACTORS:
         expected = {n: c ** DIMENSIONS[n] * v for n, v in reference.items()}
-        _assert_close(features_at(c), expected, _CONVERSION_RTOL)
-
-
-# Relative tolerance of extract_mesh_features against extract_surface_features,
-# from the largest difference measured on either device (in brackets); 1e-13
-# for every other feature (6e-15). The pipeline measures in units of the finest
-# spacing, extract_mesh_features in units of the mesh's edges.
-_PIPELINE_RTOL = {
-    "Bounding Cylinder Volume": 1e-2,  # 1.2e-3
-    "Avg Mean Curvature": 1e-7,  # 2.1e-8
-    "Avg Shape Index": 1e-8,  # 4.9e-10
-    "Avg Curvedness": 1e-8,  # 1.2e-10
-    "Total Absolute Gaussian Curvature": 1e-11,  # 4.7e-15
-}
+        _assert_close(features_at(c), expected)
 
 
 @pytest.mark.parametrize("device", ["cpu", "gpu"])
@@ -513,7 +477,7 @@ def test_extract_mesh_features_matches_the_pipeline(
     direct = mesh.extract_mesh_features(surface, names, smooth_mesh=smooth_mesh)
     pipeline = mesh.extract_surface_features(mask, spacing=spacing, features=names)
 
-    _assert_close(direct, pipeline, _PIPELINE_RTOL)
+    _assert_close(direct, pipeline)
 
 
 @pytest.mark.parametrize("device", ["cpu", "gpu"])
@@ -540,7 +504,7 @@ def test_tiny_units_keep_the_mesh_and_its_mean_curvature(
     at_one = mesh.extract_mesh_features(mesh.mask2mesh(ball), [name])[name]
     surface = mesh.mask2mesh(ball, spacing=(1e-7,) * 3)
     assert mesh.extract_mesh_features(surface, [name])[name] == pytest.approx(
-        1e7 * at_one, rel=_CONVERSION_RTOL[name]
+        1e7 * at_one, rel=_RTOL
     )
 
 
@@ -585,6 +549,59 @@ def test_extract_mesh_features_keeps_a_density_and_centre_of_mass() -> None:
         np.testing.assert_array_equal(copy.vertices, surface.vertices * factor)
         np.testing.assert_array_equal(copy.center_mass, surface.center_mass * factor)
         assert copy.density == 2.0
+    # Not centred: trimesh's inertia about a set centre of mass depends on
+    # where the mesh lies.
+    copy = mesh._scaled_copy(surface, 1e-9, center=True)
+    np.testing.assert_array_equal(copy.vertices, surface.vertices * 1e-9)
+
+
+def test_extract_mesh_features_does_not_depend_on_position(
+    noise_blob_of: Callable[[int], np.ndarray],
+) -> None:
+    """A mesh moved far from the origin has the features it has at the origin.
+
+    ``extract_mesh_features`` measures a copy centred on the middle of the
+    mesh's box. The vertices of this mesh are half-integers, so the moves are
+    exact and the centred copies equal; measured where they lay, 3e3 and 1e4
+    voxels away the inertia features of three such meshes moved by up to
+    1.4e-7 relative and the curvature features by up to 1.7e-12.
+    """
+    raw = mesh.mask2mesh(noise_blob_of(2))
+    names = list(mesh._MESH_FEATURES)
+    at_origin = mesh.extract_mesh_features(raw, names)
+
+    for offset in (3e3, 1e4):
+        moved = trimesh.Trimesh(
+            raw.vertices + offset * np.array([1.0, -1.0, 1.0]), raw.faces, process=False
+        )
+        assert mesh.extract_mesh_features(moved, names) == at_origin, offset
+
+
+def test_centred_copy_of_an_array_mesh_is_that_of_a_trimesh(
+    gpu_available: bool,
+) -> None:
+    """An ``ArrayMesh`` on either device and a ``trimesh.Trimesh`` centre alike."""
+    surface = mesh.mask2mesh(_ball(10), spacing=(0.29, 0.108, 0.108))
+    vertices = np.asarray(surface.vertices) + np.array([3e3, -7.1, 0.2])
+    faces = np.asarray(surface.faces)
+    from_trimesh = mesh._scaled_copy(
+        trimesh.Trimesh(vertices, faces, process=False), 1 / 0.108, center=True
+    )
+    devices = ["cpu", "gpu"] if gpu_available else ["cpu"]
+
+    for device in devices:
+        as_array = ArrayMesh(
+            _on(device, vertices, gpu_available),
+            _on(device, faces, gpu_available),
+            merge=False,
+        )
+        from_array = mesh._scaled_copy(as_array, 1 / 0.108, center=True)
+        assert isinstance(from_array, ArrayMesh)
+        np.testing.assert_array_equal(
+            asnumpy(from_array.vertices), from_trimesh.vertices
+        )
+    middle = from_trimesh.vertices.max(axis=0) + from_trimesh.vertices.min(axis=0)
+    assert np.abs(middle).max() <= 1e-12
 
 
 @pytest.mark.parametrize("c", [1.0, 1e-9])

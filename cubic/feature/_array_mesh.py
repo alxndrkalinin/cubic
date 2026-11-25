@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 from functools import wraps, cached_property
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -19,7 +20,12 @@ try:  # pragma: no cover - optional dependency; mesh.py warns when it is missing
 except ImportError:  # pragma: no cover - import failure path
     trimesh = None  # type: ignore[assignment]
 
-from ..cuda import asnumpy
+from ..cuda import (
+    asnumpy,
+    get_device,
+    to_same_device,
+    ordered_bincount,
+)
 
 # trimesh.constants.tol: zero for unitize, merge for angles and convexity.
 _TOL_ZERO = 1e-13
@@ -124,8 +130,11 @@ class ArrayMesh:
             )
         self.vertices, self.faces = vertices, faces
 
-    def scaled(self, factor: float) -> ArrayMesh:
+    def scaled(self, factor: float, origin: Any = None) -> ArrayMesh:
         """Return a new mesh with every vertex times ``factor``, on the same device.
+
+        With ``origin``, a point ``(3,)`` on the host, every vertex minus it is
+        scaled instead, so ``origin`` moves to 0.
 
         The vertices are not merged again: the merge tolerance is absolute, so
         at a small enough ``factor`` it would join vertices this mesh keeps
@@ -141,7 +150,15 @@ class ArrayMesh:
         factor = float(factor)
         if not np.isfinite(factor) or factor <= 0:
             raise ValueError(f"factor must be finite and positive; got {factor}")
-        return type(self)(self.vertices * factor, self.faces, merge=False)
+        vertices = self.vertices
+        # The origin and the new vertices on the vertices' device, which need
+        # not be the current one.
+        with vertices.device if get_device(vertices) == "GPU" else nullcontext():
+            if origin is not None:
+                vertices = vertices - to_same_device(
+                    np.asarray(origin, dtype=np.float64), vertices
+                )
+            return type(self)(vertices * factor, self.faces, merge=False)
 
     def __getattr__(self, name: str) -> Any:
         # Called for attributes not defined here, which go to trimesh, and also
@@ -223,10 +240,8 @@ class ArrayMesh:
 
     @cached_property
     def vertex_defects(self) -> Any:
-        angle_sum = np.bincount(
-            self.faces.ravel(),
-            weights=self.face_angles.ravel(),
-            minlength=len(self.vertices),
+        angle_sum = ordered_bincount(
+            self.faces.ravel(), self.face_angles.ravel(), len(self.vertices)
         )
         return 2 * np.pi - angle_sum
 
@@ -334,12 +349,6 @@ class ArrayMesh:
         return self._face_adjacency[1]
 
     @cached_property
-    def face_adjacency_angles(self) -> Any:
-        normals = self.face_normals[self.face_adjacency]
-        dots = np.clip((normals[:, 0] * normals[:, 1]).sum(axis=1), -1.0, 1.0)
-        return np.abs(np.arccos(dots))
-
-    @cached_property
     def face_adjacency_unshared(self) -> Any:
         edges = self.face_adjacency_edges
         out = []
@@ -358,12 +367,3 @@ class ArrayMesh:
         origins = self.vertices[self.face_adjacency_edges[:, 0]]
         other = self.vertices[self.face_adjacency_unshared[:, 1]] - origins
         return (other * normals).sum(axis=1) < _TOL_MERGE
-
-    @cached_property
-    def integral_mean_curvature(self) -> float:
-        edges = self.face_adjacency_edges
-        lengths = np.linalg.norm(
-            self.vertices[edges[:, 0]] - self.vertices[edges[:, 1]], axis=1
-        )
-        signs = np.where(self.face_adjacency_convex, 1.0, -1.0)
-        return float((self.face_adjacency_angles * signs * lengths).sum() * 0.5)

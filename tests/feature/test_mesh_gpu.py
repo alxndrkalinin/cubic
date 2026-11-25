@@ -174,7 +174,9 @@ def test_gpu_marching_cubes_rejects_spacing_of_other_lengths(
         mesh.mask2mesh(ascupy(mask), spacing=spacing)
 
 
-def test_missing_skimage_tables_break_only_the_gpu_path(monkeypatch) -> None:
+def test_missing_skimage_tables_break_only_the_gpu_path(
+    monkeypatch, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
     """Without skimage's private lookup tables only GPU marching cubes fails.
 
     The CPU path of mask2mesh still meshes, and the GPU entry point names the
@@ -182,9 +184,8 @@ def test_missing_skimage_tables_break_only_the_gpu_path(monkeypatch) -> None:
     """
     monkeypatch.setattr(_marching_cubes_cuda, "_mcluts", None)
     monkeypatch.setattr(_marching_cubes_cuda, "_to_array", None)
-    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
 
-    assert mesh.mask2mesh(z**2 + y**2 + x**2 <= 8**2).volume > 0
+    assert mesh.mask2mesh(ball_of(8, 20)).volume > 0
     with pytest.raises(ImportError, match=r"_marching_cubes_lewiner_luts.*_to_array"):
         marching_cubes_gpu(np.zeros((2, 2, 2), dtype=np.float32), 0.5)
 
@@ -193,8 +194,9 @@ def test_array_mesh_matches_trimesh() -> None:
     """On NumPy arrays, ArrayMesh reproduces trimesh's features to rounding.
 
     It recomputes the trimesh quantities the features read (mass properties,
-    adjacency, dihedral angles, angle defects) with trimesh's formulas, and
-    hands hull-based features to trimesh itself.
+    adjacency, convexity, angle defects) with trimesh's formulas, and hands
+    hull-based features to trimesh itself. The dihedral angles of both come
+    from mesh._dihedral_angles.
     """
     z, y, x = np.meshgrid(
         *[np.arange(n) - (n - 1) / 2 for n in (30, 30, 30)], indexing="ij"
@@ -210,14 +212,15 @@ def test_array_mesh_matches_trimesh() -> None:
     assert got == pytest.approx(expected, rel=1e-12)
 
 
-def test_array_mesh_measures_inward_faces_as_given(gpu_available: bool) -> None:
+def test_array_mesh_measures_inward_faces_as_given(
+    ball_of: Callable[[float, int], np.ndarray], gpu_available: bool
+) -> None:
     """Faces wound inward give minus the outward volume; they are not flipped.
 
     ``trimesh.Trimesh`` measures its faces as given too, so an inside-out mesh
     reaches the volume check on either device instead of being flipped on one.
     """
-    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
-    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    verts, faces = mesh._marching_cubes(np.pad(ball_of(8, 20), 1))
     arrays = [(verts, faces)]
     if gpu_available:
         arrays.append((ascupy(verts), ascupy(faces)))
@@ -278,14 +281,15 @@ def test_array_mesh_merges_vertices_like_trimesh(gpu_available: bool) -> None:
         )
 
 
-def test_array_mesh_refuses_in_place_changes() -> None:
+def test_array_mesh_refuses_in_place_changes(
+    ball_of: Callable[[float, int], np.ndarray],
+) -> None:
     """A delegated method that would change the mesh raises; reads still work.
 
     Changing only the host copy would leave the arrays and the cached volume
     and area describing a different mesh from the delegated attributes.
     """
-    z, y, x = np.meshgrid(*[np.arange(n) - 9.5 for n in (20, 20, 20)], indexing="ij")
-    verts, faces = mesh._marching_cubes(np.pad(z**2 + y**2 + x**2 <= 8**2, 1))
+    verts, faces = mesh._marching_cubes(np.pad(ball_of(8, 20), 1))
     ball = ArrayMesh(verts, faces)
 
     with pytest.raises(TypeError, match="in place"):
@@ -316,6 +320,30 @@ def test_gpu_marching_cubes_runs_on_the_input_device(gpu_available: bool) -> Non
 
         assert v_gpu.device.id == 1 and f_gpu.device.id == 1
         _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
+
+
+def test_scaled_copy_stays_on_the_mesh_device(
+    gpu_available: bool, ball_of: Callable[[float, int], np.ndarray]
+) -> None:
+    """A mesh on GPU 1 is scaled about a host origin on GPU 1 while GPU 0 is current."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    verts, faces = mesh._marching_cubes(np.pad(ball_of(8, 20), 1))
+    with cp.cuda.Device(1):
+        ball = ArrayMesh(cp.asarray(verts), cp.asarray(faces))
+    origin = np.array([10.0, 11.0, 12.0])
+
+    with cp.cuda.Device(0):
+        copies = [ball.scaled(0.5), ball.scaled(0.5, origin=origin)]
+
+    for copy, shift in zip(copies, (0.0, origin)):
+        assert copy.vertices.device.id == 1
+        expected = (asnumpy(ball.vertices) - shift) * 0.5
+        np.testing.assert_allclose(asnumpy(copy.vertices), expected, rtol=1e-15)
 
 
 def _labels() -> np.ndarray:
@@ -388,15 +416,9 @@ _SHARED_EDGE_REQUEST = [
     "Avg Shape Index",
     "Avg Curvedness",
 ]
-# Vary between GPU runs of the same code by about 1e-13 (atomic sums).
-_GPU_JITTER = ("Total Absolute Gaussian Curvature", "Avg Shape Index", "Avg Curvedness")
-# On the raw mesh, without smooth_mesh. With _principal_curvatures' flat-residue
-# tests and both devices measuring at one unit (_edge_unit), Avg Shape Index of
-# the 2%, 10% and 30% ragged balls differed between CuPy and NumPy by at most
-# 5.6e-17 at spacing None and (0.29, 0.108, 0.108), one CuPy run each with
-# CuPy 14.0.1 and with 14.2.0; with _FLAT_RESIDUE at 0, by up to 2.9e-3 (the
-# 2% ball at spacing None, 14.2.0), and by up to 8.9% relative (the 30% ball at
-# (0.29, 0.108, 0.108), 14.0.1).
+# On the raw mesh, without smooth_mesh, where the devices agree to rounding:
+# _principal_curvatures sets the curvatures of flat vertices to 0 (_FLAT_ANGLE,
+# _FLAT_DEFECT) and both devices measure at one unit (_edge_unit).
 _RAW_CURVATURE = [
     "Total Absolute Gaussian Curvature",
     "Avg Curvedness",
@@ -529,12 +551,10 @@ def test_shared_edge_masks_match_on_both_devices(
                 **{f"raw {k}": v for k, v in raw_reference.items()},
             }
             for feature, value in values.items():
-                atol = 1e-7 if feature.removeprefix("raw ") in _GPU_JITTER else 0.0
                 np.testing.assert_allclose(
                     value,
                     reference[feature],
                     rtol=1e-9,
-                    atol=atol,
                     equal_nan=True,
                     err_msg=f"{name}, {way}, {feature}",
                 )
@@ -549,9 +569,11 @@ def test_gpu_principal_curvatures_are_computed_once(
     calls = []
     principal_curvatures = mesh._principal_curvatures
 
-    def counted(surface: ArrayMesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def counted(
+        surface: ArrayMesh, *args: object
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         calls.append(type(surface))
-        return principal_curvatures(surface)
+        return principal_curvatures(surface, *args)
 
     monkeypatch.setattr(mesh, "_principal_curvatures", counted)
     mesh.extract_surface_features(
@@ -634,27 +656,69 @@ def test_gpu_blur_that_provably_vanishes_does_not_run(
         mesh.mask2mesh(mask, sigma=1e4)
 
 
-def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(gpu_available: bool) -> None:
+def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(
+    ball_of: Callable[[float, int], np.ndarray], gpu_available: bool
+) -> None:
     """A raw voxel mesh's shape index agrees between NumPy and CuPy to rounding.
 
-    Its flat vertices have angle defects that are rounding residues, which the
-    two devices sum in different orders; ``_principal_curvatures`` sets those
-    of at most ``_FLAT_RESIDUE`` radians to 0, and the shape index, which
+    Its flat vertices have dihedral angles and angle defects that are rounding
+    residues, which differ between the devices; ``_principal_curvatures`` sets
+    them to 0 (``_FLAT_ANGLE``, ``_FLAT_DEFECT``), and the shape index, which
     differed by about 1e-3 between the devices, then agrees to 1e-12. This ball
-    is at the default spacing; the same agreement at an anisotropic spacing
-    needs both devices to measure at one unit, which
-    ``test_gpu_edge_unit_matches_numpy`` covers.
+    is at the default spacing; ``test_gpu_edge_unit_matches_numpy`` covers the
+    unit the devices measure at.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
-    grid = np.indices((36, 36, 36)) - 17.5
-    ball = (grid**2).sum(axis=0) <= 15**2
+    ball = ball_of(15, 36)
     name = "Avg Shape Index"
 
     on_cpu = mesh.extract_mesh_features(mesh.mask2mesh(ball), [name])[name]
     on_gpu = mesh.extract_mesh_features(mesh.mask2mesh(ascupy(ball)), [name])[name]
 
     assert abs(on_gpu - on_cpu) <= 1e-12
+
+
+@pytest.mark.parametrize("angle", [1e-9, np.pi - 1e-9])
+def test_gpu_dihedral_angle_of_a_hinge_is_exact(
+    angle: float,
+    hinge_of: Callable[[float], tuple[np.ndarray, np.ndarray]],
+    gpu_available: bool,
+) -> None:
+    """On CuPy arrays too, two triangles at ``angle`` give that angle to rounding."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    vertices, faces = hinge_of(angle)
+    hinge = ArrayMesh(ascupy(vertices), ascupy(faces), merge=False)
+
+    measured = mesh._dihedral_angles(hinge)
+
+    assert get_device(measured) == "GPU"
+    assert float(measured[0]) == pytest.approx(angle, rel=1e-12)
+
+
+def test_gpu_flat_vertices_of_a_raw_mesh_have_no_curvature(
+    flat_vertices_of: Callable[[object], np.ndarray],
+    ball_of: Callable[[float, int], np.ndarray],
+    gpu_available: bool,
+) -> None:
+    """On the GPU too, ``k1 = k2 = 0`` exactly where all faces of a vertex are coplanar.
+
+    The raw anisotropic ball of the CPU test, meshed and measured on the GPU.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    ball = ball_of(15, 36)
+    raw = mesh.mask2mesh(ascupy(ball), spacing=(2.117, 0.7884, 0.7884))
+    measured = mesh._scaled_copy(raw, 1 / mesh._edge_unit(raw), center=True)
+    flat = flat_vertices_of(measured)
+
+    k1, k2, _ = mesh._principal_curvatures(measured)
+
+    assert get_device(k1) == "GPU"
+    assert flat.sum() == 1872
+    assert (asnumpy(k1)[flat] == 0).all()
+    assert (asnumpy(k2)[flat] == 0).all()
 
 
 def _areas_by_face(vertices, faces) -> tuple[np.ndarray, np.ndarray]:
@@ -677,10 +741,8 @@ def test_gpu_edge_unit_matches_numpy(
     """A NumPy and a CuPy mesh of one mask are measured at bitwise the same unit.
 
     ``extract_mesh_features`` measures scaled copies of the meshes at the unit
-    ``_edge_unit`` returns. Units an ulp apart move the coplanar dihedral
-    angles of the copies between 0 and 1.5e-8 rad, and with them the raw
-    ``Avg Shape Index`` and ``Bounding Cylinder Volume`` by up to 11% and 8.7%
-    over 40 such masks at three spacings. The CuPy meshes have bitwise the same vertices and
+    ``_edge_unit`` returns, which uses only the vertex extremes and the face
+    count. The CuPy meshes have bitwise the same vertices and
     triangles as the NumPy ones; seed 2's is also given with each face rotated
     to start at its next vertex. The test asserts that some face areas differ
     between the devices, as CuPy 14.0.1 computes them for seeds 5, 7 and 11
@@ -711,6 +773,53 @@ def test_gpu_edge_unit_matches_numpy(
     assert differing > 0
 
 
+def test_gpu_bounding_cylinder_matches_numpy(
+    noise_blob_of: Callable[[int], np.ndarray], gpu_available: bool
+) -> None:
+    """The bounding cylinder of a CuPy mesh is that of the NumPy mesh, to rounding.
+
+    Both are measured on the host, from trimesh's convex hull of bitwise the
+    same vertices and the inertia tensor. The hull of a CuPy mesh can list or
+    triangulate its faces otherwise, and its inertia tensor is summed on the
+    device; together they moved the volume by at most 9.8e-16 relative over
+    144 masks under CuPy 14.0.1 and 14.2.0, and left 128 of them bitwise
+    equal, but not these two (5.1e-16 and 4.4e-16 apart under 14.0.1).
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    names = ["Bounding Cylinder Volume"]
+    for seed, spacing in [(3, (0.29, 0.108, 0.108)), (23, (1.0, 1.0, 1.0))]:
+        mask = noise_blob_of(seed)
+        cpu = mesh.extract_mesh_features(mesh.mask2mesh(mask, spacing=spacing), names)
+        gpu = mesh.extract_mesh_features(
+            mesh.mask2mesh(ascupy(mask), spacing=spacing), names
+        )
+        assert gpu[names[0]] == pytest.approx(cpu[names[0]], rel=1e-14), seed
+
+
+def test_gpu_oriented_bounding_box_matches_numpy(
+    lumpy_nucleus_of: Callable[[int], np.ndarray], gpu_available: bool
+) -> None:
+    """The oriented bounding box of a CuPy mesh is that of the NumPy mesh, to rounding.
+
+    Both are measured on the host, from trimesh's convex hull of the same
+    vertices, which the CuPy mesh lists in another order. trimesh's box
+    search, used before, depends on that order: it put the box of this mesh
+    1.7% apart between the devices, and that of 10 of 240 nuclei up to 9.4%.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    names = ["Oriented Bounding Box Volume", "Extent"]
+    spacing = (2.685, 1.0, 1.0)
+    mask = lumpy_nucleus_of(6)
+    cpu = mesh.extract_mesh_features(mesh.mask2mesh(mask, spacing=spacing), names)
+    gpu = mesh.extract_mesh_features(
+        mesh.mask2mesh(ascupy(mask), spacing=spacing), names
+    )
+    for name in names:
+        assert gpu[name] == pytest.approx(cpu[name], rel=1e-12), name
+
+
 @pytest.mark.parametrize("smoothed", [False, True], ids=["raw", "smooth_mesh"])
 def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
     noise_blob_of: Callable[[int], np.ndarray], smoothed: bool, gpu_available: bool
@@ -718,8 +827,9 @@ def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
     """Every mesh feature agrees between NumPy and CuPy for a lobed anisotropic mask.
 
     The mesh of this mask (seed 7, spacing (2.685, 1, 1)) is one where a unit
-    an ulp apart moves ``Bounding Cylinder Volume`` by 8.7% between the
-    devices. Under CuPy 14.0.1 its face areas differ from NumPy's at 2873 of
+    an ulp apart moved trimesh's bounding cylinder search, which
+    ``Bounding Cylinder Volume`` used before, by 8.7% between the devices.
+    Under CuPy 14.0.1 its face areas differ from NumPy's at 2873 of
     16568 faces, and a unit computed from them differs by an ulp; under CuPy
     14.2.0 they are equal, and this test passes with either unit, which
     ``test_gpu_edge_unit_matches_numpy`` covers instead.
@@ -746,9 +856,40 @@ def test_gpu_mesh_features_match_numpy_at_an_anisotropic_spacing(
             value,
             on_cpu[name],
             rtol=1e-9,
-            atol=1e-7 if name in _GPU_JITTER else 0.0,
             err_msg=name,
         )
+
+
+def test_gpu_curvatures_are_the_same_on_every_run(
+    noise_blob_of: Callable[[int], np.ndarray], gpu_available: bool
+) -> None:
+    """The GPU curvatures of a blurred mesh, and every feature, repeat to the bit.
+
+    The per-vertex angle defects, mixed areas and edge sums are bin sums that
+    ``ordered_bincount`` adds in input order. With CuPy's weighted
+    ``bincount``, which adds them with atomics, the per-vertex curvatures of
+    this mesh differed between two runs.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    spacing = (2.685, 1.0, 1.0)
+    mask = ascupy(noise_blob_of(7))
+    blurred = mesh.mask2mesh(
+        mask, spacing=spacing, sigma=mesh._curvature_sigma(spacing, None)
+    )
+
+    def curvatures() -> list[np.ndarray]:
+        # A new mesh each run, so no per-vertex sum comes from a cache.
+        fresh = ArrayMesh(blurred.vertices, blurred.faces, merge=False)
+        return [asnumpy(a) for a in mesh._principal_curvatures(fresh)]
+
+    for first, second in zip(curvatures(), curvatures()):
+        np.testing.assert_array_equal(second, first)
+    first = mesh.extract_surface_features(mask, spacing=spacing)
+    second = mesh.extract_surface_features(mask, spacing=spacing)
+    assert second.keys() == first.keys()
+    for name, value in second.items():
+        np.testing.assert_array_equal(value, first[name], err_msg=name)
 
 
 def _rough_flat_ellipsoid(spacing: tuple) -> np.ndarray:
