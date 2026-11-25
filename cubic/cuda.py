@@ -83,14 +83,13 @@ def _is_torch_tensor(array: Any) -> bool:
     """Return True if ``array`` is a torch.Tensor.
 
     Reads ``sys.modules`` instead of importing torch: a tensor cannot exist
-    unless torch has been imported, so the answer is False when it has not.
-    There is no import to run or to retry, and the cubic runtime never
-    hard-depends on torch.
+    unless torch has been imported, so the answer is False when it has not,
+    and also while another thread is still importing it and ``torch.Tensor``
+    does not exist yet. There is no import to run or to retry, and the cubic
+    runtime never hard-depends on torch.
     """
-    torch = sys.modules.get("torch")
-    if torch is None:
-        return False
-    return isinstance(array, torch.Tensor)
+    tensor = getattr(sys.modules.get("torch"), "Tensor", None)
+    return tensor is not None and isinstance(array, tensor)
 
 
 def get_device(array: np.ndarray) -> str:

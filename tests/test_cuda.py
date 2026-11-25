@@ -2,6 +2,7 @@
 
 import sys
 import time
+import types
 import threading
 
 import numpy as np
@@ -16,6 +17,7 @@ from cubic.cuda import (
     is_gpu_array,
     on_device_of,
     to_same_device,
+    _is_torch_tensor,
     ordered_bincount,
     check_same_device,
 )
@@ -339,3 +341,13 @@ def test_ordered_bincount_runs_on_the_input_device(gpu_available: bool) -> None:
     np.testing.assert_array_equal(
         asnumpy(got), np.bincount(ids, weights=weights, minlength=60)
     )
+
+
+def test_is_torch_tensor_while_torch_is_still_importing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A torch module without ``Tensor`` yet, as mid-import, answers False."""
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+
+    assert _is_torch_tensor(np.zeros(3)) is False
+    assert get_device(np.zeros(3)) == "CPU"
