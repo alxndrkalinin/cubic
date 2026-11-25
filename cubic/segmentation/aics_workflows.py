@@ -34,7 +34,6 @@ conductance ``K`` replays ITK's serial summation only near a float32 rounding
 midpoint (see ``_K_SERIAL_MARGIN``).
 """
 
-import functools
 from typing import Any
 from collections.abc import Callable, Sequence
 
@@ -44,7 +43,14 @@ from skimage.filters import threshold_otsu
 from skimage.morphology import ball
 from scipy.ndimage._filters import _gaussian_kernel1d as _scipy_gaussian_kernel1d
 
-from ..cuda import CUDAManager, asnumpy, get_device, to_same_device, get_array_module
+from ..cuda import (
+    asnumpy,
+    get_device,
+    _launch_config,
+    to_same_device,
+    _cuda_functions,
+    get_array_module,
+)
 from ..scipy import ndimage as _ndimage
 from ..image_utils import gaussian_filter_like_scipy
 from .segment_utils import _SKIMAGE_USES_MAX_SIZE
@@ -62,32 +68,9 @@ from .segment_utils import _SKIMAGE_USES_MAX_SIZE
 _K_SERIAL_MARGIN = 1e-9
 
 
-@functools.cache
-def _cuda_functions(
-    source: str, names: tuple[str, ...], device_id: int
-) -> tuple[Any, ...]:
-    """Compile ``source`` once per device and return its kernels.
-
-    ``--fmad=false`` keeps every multiply and add separately rounded, as in the
-    scalar C/C++ references; contractions the reference does perform are
-    spelled out as explicit ``fma`` calls.
-    """
-    cp = CUDAManager().get_cp()
-    if cp is None:
-        raise RuntimeError("CuPy is required for the CUDA kernels")
-    with cp.cuda.Device(device_id):
-        module = cp.RawModule(code=source, options=("--fmad=false",))
-        return tuple(module.get_function(name) for name in names)
-
-
 def _cupy_device(array: np.ndarray) -> Any:
     """CuPy device of ``array``; NumPy's stubs type ``.device`` as ``"cpu"``."""
     return array.device
-
-
-def _launch_config(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
-    """Grid-stride launch configuration for ``size`` elements."""
-    return (min((size + threads - 1) // threads, 65535 * 8),), (threads,)
 
 
 def intensity_normalization(

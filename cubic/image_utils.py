@@ -1006,10 +1006,12 @@ def gaussian_filter_like_scipy(
             image, sigma=sigmas, mode=mode, truncate=truncate
         )
     out = image
+    # float64 for real input, complex128 for complex, as SciPy keeps both parts
+    work = np.result_type(image.dtype, np.float64)
     for axis, s in enumerate(sigmas):
         if s > 1e-15:
             out = ndimage.gaussian_filter1d(
-                out.astype(np.float64), s, axis=axis, mode=mode, truncate=truncate
+                out.astype(work), s, axis=axis, mode=mode, truncate=truncate
             ).astype(image.dtype)
     return out
 

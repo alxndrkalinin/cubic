@@ -1,0 +1,644 @@
+"""Mesh features convert with the unit of ``spacing``, on the CPU and the GPU."""
+
+import re
+import warnings
+from typing import Any
+from functools import cache
+from collections.abc import Callable
+
+import numpy as np
+import pytest
+from skimage.measure import marching_cubes
+
+trimesh = pytest.importorskip("trimesh")
+
+from cubic.cuda import ascupy, asnumpy, to_same_device  # noqa: E402
+from cubic.feature import mesh  # noqa: E402
+from cubic.feature._array_mesh import ArrayMesh  # noqa: E402
+
+_SPACING_ERROR = re.escape(
+    "spacing must be three finite, positive numbers (z, y, x); got "
+)
+
+# Relative tolerance of the covariance, conversion and pipeline checks below. A
+# feature at another unit or through another entry point differs by the rounding
+# of a multiplication or of a sum over the mesh; the largest difference measured
+# on the CPU and on both CuPy versions is 6.9e-13, for Avg Shape Index of the
+# blurred mesh, which keeps vertices down to 1% of the median curvedness, where
+# the angle of (k1, k2) moves most with rounding. Every other feature differs by
+# at most 5.3e-14. 1e-11 leaves room for another libm.
+_RTOL = 1e-11
+
+# Power of the length unit in each feature, measured independently of the
+# module's table: log2 of each feature's ratio between isotropic spacings s and
+# 2 s (windows scaled with them) is this integer to 1e-5.
+DIMENSIONS = {
+    "Area": 2,
+    "Volume": 3,
+    "Min Axis Length": 1,
+    "Med Axis Length": 1,
+    "Max Axis Length": 1,
+    "Inertia PC1": 5,
+    "Inertia PC2": 5,
+    "Inertia PC3": 5,
+    "Oriented Bounding Box Volume": 3,
+    "Bounding Cylinder Volume": 3,
+    "Bounding Sphere Volume": 3,
+    "Convex Hull Volume": 3,
+    "Convex Hull Area": 2,
+    "Sphericity": 0,
+    "Extent": 0,
+    "Solidity": 0,
+    "Euler Characteristic": 0,
+    "Avg Mean Curvature": -1,
+    "Total Absolute Gaussian Curvature": 0,
+    "Avg Shape Index": 0,
+    "Avg Curvedness": -1,
+    "Fractal Dimension": 0,
+    "Outline Fractal Dimension": 0,
+}
+
+BASES = {
+    "anisotropic": (2.685, 1.0, 1.0),
+    # (0.2e-6 / 0.065e-6) is not 0.2 / 0.065 in floating point, one ulp apart.
+    "unit rounding": (0.2, 0.065, 0.065),
+}
+# (factor, base, explicit windows) of each covariance check. For the
+# anisotropic base and one window mode the internal problem is the same at
+# every factor, so one factor other than 1 checks each mode; 1e-9 and 1e3 put
+# the caller's lengths far below and above trimesh's absolute tolerances. The
+# unit-rounding base is the exception that the last cell bounds.
+CELLS = [
+    (1e-9, "anisotropic", False),
+    (1e-9, "anisotropic", True),
+    (1e3, "anisotropic", False),
+    (1e-6, "unit rounding", False),
+]
+
+
+def _mask(
+    shape: tuple[int, int, int] = (26, 96, 96),
+    axes: tuple[int, int, int] = (44, 36, 7),
+    lobe: tuple[int, int, int, int] = (5, 10, -14, 6),
+) -> np.ndarray:
+    """Return a flat ellipsoid turned in plane, with a lobe on top.
+
+    ``axes`` are the ellipsoid's two in-plane semi-axes and its half
+    thickness, ``lobe`` the lobe's centre ``(z, y, x)`` from the array's
+    centre and its radius, all in voxels. By default its footprint is about 72
+    by 88 voxels, over 4.5 times the top of the default outline window (16
+    in-plane voxels), so ``Outline Fractal Dimension`` is finite, and it is 14
+    voxels thick, enough for the default 3D fractal window.
+    """
+    z, y, x = np.meshgrid(*[np.arange(n) - (n - 1) / 2 for n in shape], indexing="ij")
+    turn = np.deg2rad(30)
+    u = y * np.cos(turn) + x * np.sin(turn)
+    v = -y * np.sin(turn) + x * np.cos(turn)
+    a, b, c = axes
+    body = (u / a) ** 2 + (v / b) ** 2 + (z / c) ** 2 <= 1
+    lz, ly, lx, radius = lobe
+    return body | ((z - lz) ** 2 + (y - ly) ** 2 + (x - lx) ** 2 <= radius**2)
+
+
+def _windows(c: float) -> dict[str, object]:
+    """Explicit windows, in units of the base spacing times ``c``.
+
+    3 sigma / step stays clear of integers (9.3, and 3.46 on the anisotropic
+    axis), so an ulp in the normalised sigma cannot change the blur's padding.
+    """
+    return {
+        "curvature_sigma": c * 3.1,
+        "fractal_scales": (c * 1.0, c * 3.1),
+        "outline_fractal_scales": (c * 2.0, c * 8.0),
+    }
+
+
+def _features(device: str, base: str, c: float, explicit: bool) -> dict[str, float]:
+    """Every feature of ``_mask()`` at spacing ``c * base``, on ``device``."""
+    mask = _mask() if device == "cpu" else ascupy(_mask())
+    spacing = tuple(c * s for s in BASES[base])
+    windows = _windows(c) if explicit else {}
+    with warnings.catch_warnings():
+        # Only the values are compared here.
+        warnings.simplefilter("ignore")
+        return mesh.extract_surface_features(
+            mask,
+            spacing=spacing,
+            features=mesh.mesh_feature_list(optional=True),
+            **windows,
+        )
+
+
+@cache
+def _reference(device: str, base: str, explicit: bool) -> dict[str, float]:
+    """``_features`` at ``c = 1``, computed once per combination."""
+    return _features(device, base, 1.0, explicit)
+
+
+def _assert_covariant(device: str, base: str, c: float, explicit: bool) -> None:
+    reference = _reference(device, base, explicit)
+    assert all(np.isfinite(v) for v in reference.values()), reference
+    actual = _features(device, base, c, explicit)
+    off = {}
+    for name, value in actual.items():
+        expected = c ** DIMENSIONS[name] * reference[name]
+        if not abs(value - expected) <= _RTOL * abs(expected):
+            off[name] = (value, expected, abs(value - expected) / abs(expected))
+    assert not off, f"not covariant at c={c:g}: {off}"
+
+
+def _cell_id(cell: tuple[float, str, bool]) -> str:
+    c, base, explicit = cell
+    return f"{c:g}-{base}-{'explicit' if explicit else 'default'}"
+
+
+@pytest.mark.parametrize(("c", "base", "explicit"), CELLS, ids=map(_cell_id, CELLS))
+def test_features_are_covariant_with_the_unit(
+    c: float, base: str, explicit: bool
+) -> None:
+    """Each feature at spacing ``c * base`` is ``c ** dimension`` times its value.
+
+    The reference is the value at ``base``. ``explicit`` scales
+    ``curvature_sigma`` and both fractal windows with the spacing; the default
+    windows follow the spacing by themselves.
+
+    In the ``unit rounding`` cell the ratio of the spacings rounds differently
+    in the two units, so the internal problems differ by one ulp.
+    """
+    _assert_covariant("cpu", base, c, explicit)
+
+
+@pytest.mark.parametrize(("c", "base", "explicit"), CELLS, ids=map(_cell_id, CELLS))
+def test_gpu_features_are_covariant_with_the_unit(
+    c: float, base: str, explicit: bool, gpu_available: bool
+) -> None:
+    """The covariance of the CPU test, for a CuPy mask meshed on the GPU."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    _assert_covariant("gpu", base, c, explicit)
+
+
+def test_every_feature_has_a_dimension() -> None:
+    """The module's dimension table covers every feature, as measured here."""
+    names = mesh.mesh_feature_list(optional=True)
+    assert set(mesh._FEATURE_DIMENSIONS) == set(names)
+    assert mesh._FEATURE_DIMENSIONS == DIMENSIONS
+
+
+@pytest.mark.parametrize(
+    "spacing",
+    [(0.0, 1.0, 1.0), (-1.0, 1.0, 1.0), (-1.0, -1.0, -1.0), (np.nan, 1.0, 1.0)]
+    + [(np.inf, 1.0, 1.0)]
+    + [0.5, (1.0,), (1.0, 1.0), (1.0, 1.0, 1.0, 1.0), np.ones((2, 3))],
+)
+def test_spacing_must_be_three_finite_positive_numbers(
+    spacing: float | tuple[float, ...] | np.ndarray,
+) -> None:
+    """Each entry rejects such a spacing, even for an image without labels.
+
+    It used to fail deep in the blur, or for an all-negative spacing to return
+    the features of the mirrored object, and an image without labels returned
+    an empty table. A scalar failed with a TypeError, a spacing of another
+    length with skimage's marching cubes error, and an image without labels
+    accepted a spacing of any length.
+    """
+    ball = np.pad(np.ones((5, 5, 5), dtype=bool), 2)
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
+        mesh.extract_surface_features(ball, spacing=spacing)
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
+        mesh.extract_features(ball.astype(np.int32), spacing=spacing)
+    with pytest.raises(ValueError, match=_SPACING_ERROR):
+        mesh.extract_features(np.zeros((4, 4, 4), dtype=np.int32), spacing=spacing)
+
+
+def _ball(radius: int) -> np.ndarray:
+    grid = np.meshgrid(*[np.arange(2 * radius + 3) - radius - 1] * 3, indexing="ij")
+    return sum(axis**2 for axis in grid) <= radius**2
+
+
+@pytest.mark.parametrize(
+    ("mask", "kwargs", "text"),
+    [
+        # Fractal Dimension's default window is empty below the finest spacing.
+        (
+            _ball(6),
+            {"features": ["Fractal Dimension"], "curvature_sigma": 0.2},
+            r"spacing 0\.25; got 0\.2\.",
+        ),
+        # A footprint 3.25 wide vanishes at the outline window's top scale of 2.
+        (
+            _ball(6),
+            {
+                "features": ["Outline Fractal Dimension"],
+                "outline_fractal_scales": (0.5, 2.0),
+            },
+            r"scale up to 2 \(",
+        ),
+        # Two voxels across vanish at the default curvature_sigma, twice 0.25.
+        (
+            np.pad(np.ones((2, 2, 2), dtype=bool), 2),
+            {"features": ["Avg Shape Index"]},
+            r"curvature_sigma=0\.5;",
+        ),
+    ],
+    ids=["fractal window", "outline vanishes", "blur vanishes"],
+)
+def test_warnings_print_lengths_in_the_callers_units(
+    mask: np.ndarray, kwargs: dict[str, Any], text: str
+) -> None:
+    """Scales in warnings are the caller's, not those of the internal unit.
+
+    At spacing 0.25 the internal unit is 0.25, so each scale would print four
+    times larger.
+    """
+    with pytest.warns(UserWarning, match=text):
+        mesh.extract_surface_features(mask, spacing=(0.25, 0.25, 0.25), **kwargs)
+
+
+def test_volume_error_prints_the_callers_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The open-mesh error names the volume in the caller's units.
+
+    ``mask2mesh`` is replaced by one that leaves the surface open, which the
+    padding otherwise prevents. The volume of an open surface depends on the
+    origin; it is that of the copy measured, centred on the origin. The mask
+    is meshed over its bounding box, so a voxel of it is cleared for the
+    replacement to find a level.
+    """
+
+    def open_mask2mesh(
+        mask: np.ndarray, spacing: tuple[float, ...] | None = None
+    ) -> trimesh.Trimesh:
+        verts, faces, _, _ = marching_cubes(mask, 0.5, spacing=spacing)
+        return trimesh.Trimesh(vertices=verts, faces=faces)
+
+    mask = np.zeros((6, 6, 6), dtype=bool)
+    mask[:3, :3, :3] = True  # touches the border, so its surface is open
+    mask[2, 2, 2] = False
+    spacing = (0.5, 0.25, 0.25)
+    box = open_mask2mesh(mask[:3, :3, :3], spacing)
+    expected = mesh._scaled_copy(box, 1.0, center=True).volume
+    monkeypatch.setattr(mesh, "mask2mesh", open_mask2mesh)
+
+    with pytest.raises(ValueError, match="volume must be finite") as error:
+        mesh.extract_surface_features(mask, spacing, ["Volume"])
+
+    got = float(re.search(r"got (\S+)\. ", str(error.value)).group(1))
+    assert got == pytest.approx(expected, rel=1e-12)
+
+
+def _on(device: str, mask: np.ndarray, gpu_available: bool) -> Any:
+    """``mask`` on ``device``; skips the test for the GPU without one."""
+    if device == "cpu":
+        return mask
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    return ascupy(mask)
+
+
+def _arrays(surface: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices and faces of a mesh of either type, on the host."""
+    return np.asarray(asnumpy(surface.vertices)), np.asarray(asnumpy(surface.faces))
+
+
+def _old_mask2mesh(
+    mask: Any, spacing: tuple[float, ...] | None, sigma: float | None
+) -> Any:
+    """``mask2mesh`` as it was before it normalised the spacing, from its helpers."""
+    if sigma is not None:
+        return mesh._smooth_mask2mesh(mask, spacing, sigma)
+    step = (1.0, 1.0, 1.0) if spacing is None else spacing
+    verts, faces = mesh._marching_cubes(np.pad(mask, 1), spacing=step)
+    one_voxel = np.asarray(step, dtype=float)
+    return mesh._closed_mesh(verts - to_same_device(one_voxel, verts), faces)
+
+
+# (branch, spacing) of each call. No spacing through marching_cubes_kwargs is
+# the call of the spacing branch, mask2mesh(mask), so it is left out.
+_UNIT_FINEST_CASES = [
+    (branch, spacing)
+    for branch in ("spacing", "marching_cubes_kwargs", "sigma")
+    for spacing in (None, (1.0, 1.0, 1.0), (2.685, 1.0, 1.0))
+    if not (branch == "marching_cubes_kwargs" and spacing is None)
+]
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize(("branch", "spacing"), _UNIT_FINEST_CASES)
+def test_mask2mesh_with_a_unit_finest_spacing_is_unchanged(
+    device: str,
+    spacing: tuple[float, ...] | None,
+    branch: str,
+    gpu_available: bool,
+) -> None:
+    """With a finest spacing of 1 (or none), the mesh is the one built before.
+
+    ``extract_surface_features`` meshes at such a spacing, so its values must
+    not move: the vertices and faces are bitwise those of the code before the
+    spacing was normalised, rebuilt here from the same helpers.
+    """
+    mask = _on(device, _ball(10), gpu_available)
+    sigma = 3.1 if branch == "sigma" else None
+    kwargs: dict[str, Any] = {
+        "spacing": {"spacing": spacing},
+        "marching_cubes_kwargs": {"marching_cubes_kwargs": {"spacing": spacing}},
+        "sigma": {"spacing": spacing, "sigma": sigma},
+    }[branch]
+
+    got = _arrays(mesh.mask2mesh(mask, **kwargs))
+    expected = _arrays(_old_mask2mesh(mask, spacing, sigma))
+
+    for g, e in zip(got, expected, strict=True):
+        assert g.dtype == e.dtype
+        np.testing.assert_array_equal(g, e)
+
+
+# Factors of the caller's unit, far below and above trimesh's absolute merge
+# tolerance (1e-8), and 0.3, which is not a power of ten. Factors 1e-6 and
+# 1e-3, and an isotropic base (1, 1, 1), caught no mutant of the scaling (no
+# scaling, no conversion back, a wrong dimension, no normalisation in
+# mask2mesh, a second merge) that these miss.
+UNIT_FACTORS = [1e-9, 1e-8, 1e-7, 0.3, 1e3]
+# Spacing and blur scale at factor 1 of each base. The anisotropic one is the
+# unit-rounding base: (0.2 c) / (0.065 c) is not 0.2 / 0.065 at every c (at
+# 1e-7 and 0.3 here), so its normalised spacing differs by an ulp between
+# factors. 3 sigma / step stays clear of integers (9.3, and 3.02 on the coarse
+# axis), so that ulp cannot change the blur's padding.
+MESH_BASES = {
+    "anisotropic": ((0.2, 0.065, 0.065), 0.2015),
+}
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("base", list(MESH_BASES))
+@pytest.mark.parametrize("smooth", [False, True], ids=["plain", "sigma"])
+@pytest.mark.parametrize("shape", ["ball", "ragged ball"])
+def test_mask2mesh_is_covariant_with_the_unit(
+    device: str,
+    base: str,
+    smooth: bool,
+    shape: str,
+    ragged_ball: np.ndarray,
+    gpu_available: bool,
+) -> None:
+    """At spacing ``c * base``, the mesh is ``c`` times the mesh at ``base``.
+
+    Same vertex and face count, watertightness and Euler number, the same faces,
+    and vertices ``c`` times those at factor 1 to 4 float64 ulps of the
+    coordinate before the pad was removed: the mesh is scaled once by its unit
+    at each factor and the normalised spacing may differ by an ulp (measured
+    up to 1.8). Unnormalised, the ball at spacing 1e-8 came out with 1,402 of
+    its 1,896 vertices and Euler number 566, its vertices merged at trimesh's
+    absolute tolerance.
+    """
+    mask = _on(device, _ball(10) if shape == "ball" else ragged_ball, gpu_available)
+    spacing, sigma = MESH_BASES[base]
+    step = np.asarray(spacing)
+
+    def mesh_at(c: float) -> Any:
+        kwargs = {"sigma": c * sigma} if smooth else {}
+        return mesh.mask2mesh(mask, spacing=tuple(c * step), **kwargs)
+
+    reference = mesh_at(1.0)
+    ref_verts, ref_faces = _arrays(reference)
+    pad = (np.ceil(3 * sigma / step) + 1) if smooth else 1
+    padded = np.abs(ref_verts) + pad * step
+    for c in UNIT_FACTORS:
+        surface = mesh_at(c)
+        verts, faces = _arrays(surface)
+        topology = (len(verts), len(faces), surface.is_watertight)
+        assert topology == (len(ref_verts), len(ref_faces), reference.is_watertight), c
+        assert surface.euler_number == reference.euler_number, c
+        np.testing.assert_array_equal(faces, ref_faces, err_msg=f"c={c:g}")
+        off = np.abs(verts - c * ref_verts) / (c * np.finfo(float).eps * padded)
+        assert off.max() <= 4, (c, off.max())
+
+
+# A smaller ``_mask``, 20 x 44 x 44, for the tests of the direct functions.
+_SMALL_MASK = {"shape": (20, 44, 44), "axes": (19, 13, 6), "lobe": (4, 5, -7, 4)}
+
+
+def _assert_close(got: dict[str, float], expected: dict[str, float]) -> None:
+    off = {
+        name: (got[name], value)
+        for name, value in expected.items()
+        if not abs(got[name] - value) <= _RTOL * abs(value)
+    }
+    assert not off, off
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("base", list(MESH_BASES))
+@pytest.mark.parametrize("smooth", [False, True], ids=["raw", "smooth mesh"])
+def test_extract_mesh_features_convert_with_the_unit(
+    device: str, base: str, smooth: bool, gpu_available: bool
+) -> None:
+    """At spacing ``c * base``, each feature is ``c ** dimension`` times its value.
+
+    The features are measured on a copy of the mesh scaled to its edge unit
+    (``_edge_unit``), so trimesh's absolute tolerances see the same
+    problem at every factor. Unscaled, Avg Mean Curvature came out 32 times
+    too high at 1e-7. ``smooth`` passes ``mask2mesh(..., sigma=...)`` for the
+    curvature-distribution features; without it they are measured on the raw
+    mesh.
+    """
+    mask = _on(device, _mask(**_SMALL_MASK), gpu_available)
+    spacing, sigma = MESH_BASES[base]
+    step = np.asarray(spacing)
+    names = list(mesh._MESH_FEATURES)
+
+    def features_at(c: float) -> dict[str, float]:
+        surface = mesh.mask2mesh(mask, spacing=tuple(c * step))
+        smooth_mesh = (
+            mesh.mask2mesh(mask, spacing=tuple(c * step), sigma=c * sigma)
+            if smooth
+            else None
+        )
+        return mesh.extract_mesh_features(surface, names, smooth_mesh=smooth_mesh)
+
+    reference = features_at(1.0)
+    for c in UNIT_FACTORS:
+        expected = {n: c ** DIMENSIONS[n] * v for n, v in reference.items()}
+        _assert_close(features_at(c), expected)
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("c", [1.0, 1e-8])
+def test_extract_mesh_features_matches_the_pipeline(
+    device: str, c: float, gpu_available: bool
+) -> None:
+    """The direct functions give ``extract_surface_features`` at any unit.
+
+    At spacing ``c * (0.29, 0.108, 0.108)``, the raw mesh measures the raw-mesh
+    features, and ``mask2mesh`` at the default ``curvature_sigma`` (twice the
+    coarsest spacing) the curvature-distribution ones.
+    """
+    mask = _on(device, _mask(**_SMALL_MASK), gpu_available)
+    spacing = tuple(c * s for s in (0.29, 0.108, 0.108))
+    names = list(mesh._MESH_FEATURES)
+    surface = mesh.mask2mesh(mask, spacing=spacing)
+    smooth_mesh = mesh.mask2mesh(mask, spacing=spacing, sigma=2 * max(spacing))
+
+    direct = mesh.extract_mesh_features(surface, names, smooth_mesh=smooth_mesh)
+    pipeline = mesh.extract_surface_features(mask, spacing=spacing, features=names)
+
+    _assert_close(direct, pipeline)
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+def test_tiny_units_keep_the_mesh_and_its_mean_curvature(
+    device: str, gpu_available: bool
+) -> None:
+    """The two failures reported at tiny spacings are gone.
+
+    On a 26^3 grid centred between voxels, a radius-10 ball's mesh built in
+    metres at spacing 1e-8 kept 1,402 of its 1,896 vertices, Euler number 566
+    and not watertight. At 1e-7 it was intact, but its Avg Mean Curvature came
+    out 32 times too high: every face normal was zero, since trimesh zeroes a
+    face normal when the norm of the face's cross product is below 1e-13, as
+    it is for edges shorter than about 3e-7.
+    """
+    grid = np.meshgrid(*[np.arange(26) - 12.5] * 3, indexing="ij")
+    ball = _on(device, sum(axis**2 for axis in grid) <= 10**2, gpu_available)
+    tiny = mesh.mask2mesh(ball, spacing=(1e-8,) * 3)
+    shape = (len(tiny.vertices), len(tiny.faces), tiny.euler_number)
+    assert shape == (1896, 3788, 2)
+    assert tiny.is_watertight
+
+    name = "Avg Mean Curvature"
+    at_one = mesh.extract_mesh_features(mesh.mask2mesh(ball), [name])[name]
+    surface = mesh.mask2mesh(ball, spacing=(1e-7,) * 3)
+    assert mesh.extract_mesh_features(surface, [name])[name] == pytest.approx(
+        1e7 * at_one, rel=_RTOL
+    )
+
+
+@pytest.mark.parametrize("kind", ["trimesh", "ArrayMesh, NumPy", "ArrayMesh, CuPy"])
+def test_extract_mesh_features_leaves_the_meshes_as_they_are(
+    kind: str, gpu_available: bool
+) -> None:
+    """Neither mesh is modified: the features are measured on scaled copies."""
+    mask = _on("gpu" if kind.endswith("CuPy") else "cpu", _ball(10), gpu_available)
+    spacing = (0.29, 0.108, 0.108)
+    surface = mesh.mask2mesh(mask, spacing=spacing)
+    smooth_mesh = mesh.mask2mesh(mask, spacing=spacing, sigma=0.65)
+    if kind == "ArrayMesh, NumPy":
+        surface, smooth_mesh = (ArrayMesh(*_arrays(m)) for m in (surface, smooth_mesh))
+    before = [[a.copy() for a in _arrays(m)] for m in (surface, smooth_mesh)]
+
+    mesh.extract_mesh_features(surface, smooth_mesh=smooth_mesh)
+
+    for arrays, m in zip(before, (surface, smooth_mesh), strict=True):
+        for after, was in zip(_arrays(m), arrays, strict=True):
+            np.testing.assert_array_equal(after, was)
+
+
+def test_extract_mesh_features_keeps_a_density_and_centre_of_mass() -> None:
+    """A density and centre of mass set on a trimesh mesh carry over to the copy.
+
+    The inertia features read both; the centre is a point, scaled with the
+    vertices. trimesh's own ``apply_scale`` is not used for the copy: it leaves
+    the vertices as they are for a factor within 1e-8 of 1.
+    """
+    surface = mesh.mask2mesh(_ball(10), spacing=(0.29, 0.108, 0.108))
+    surface.density = 2.0
+    surface.center_mass = np.asarray(surface.centroid) + (0.5, 0.0, 0.0)
+    names = ["Inertia PC1", "Inertia PC2", "Inertia PC3"]
+
+    got = mesh.extract_mesh_features(surface, names)
+
+    expected = surface.principal_inertia_components
+    assert [got[name] for name in names] == pytest.approx(list(expected), rel=1e-12)
+    for factor in (1 + 5e-9, 1e-9):
+        copy = mesh._scaled_copy(surface, factor)
+        np.testing.assert_array_equal(copy.vertices, surface.vertices * factor)
+        np.testing.assert_array_equal(copy.center_mass, surface.center_mass * factor)
+        assert copy.density == 2.0
+    # Not centred: trimesh's inertia about a set centre of mass depends on
+    # where the mesh lies.
+    copy = mesh._scaled_copy(surface, 1e-9, center=True)
+    np.testing.assert_array_equal(copy.vertices, surface.vertices * 1e-9)
+
+
+def test_extract_mesh_features_does_not_depend_on_position(
+    noise_blob_of: Callable[[int], np.ndarray],
+) -> None:
+    """A mesh moved far from the origin has the features it has at the origin.
+
+    ``extract_mesh_features`` measures a copy centred on the middle of the
+    mesh's box. The vertices of this mesh are half-integers, so the moves are
+    exact and the centred copies equal; measured where they lay, 3e3 and 1e4
+    voxels away the inertia features of three such meshes moved by up to
+    1.4e-7 relative and the curvature features by up to 1.7e-12.
+    """
+    raw = mesh.mask2mesh(noise_blob_of(2))
+    names = list(mesh._MESH_FEATURES)
+    at_origin = mesh.extract_mesh_features(raw, names)
+
+    for offset in (3e3, 1e4):
+        moved = trimesh.Trimesh(
+            raw.vertices + offset * np.array([1.0, -1.0, 1.0]), raw.faces, process=False
+        )
+        assert mesh.extract_mesh_features(moved, names) == at_origin, offset
+
+
+def test_centred_copy_of_an_array_mesh_is_that_of_a_trimesh(
+    gpu_available: bool,
+) -> None:
+    """An ``ArrayMesh`` on either device and a ``trimesh.Trimesh`` centre alike."""
+    surface = mesh.mask2mesh(_ball(10), spacing=(0.29, 0.108, 0.108))
+    vertices = np.asarray(surface.vertices) + np.array([3e3, -7.1, 0.2])
+    faces = np.asarray(surface.faces)
+    from_trimesh = mesh._scaled_copy(
+        trimesh.Trimesh(vertices, faces, process=False), 1 / 0.108, center=True
+    )
+    devices = ["cpu", "gpu"] if gpu_available else ["cpu"]
+
+    for device in devices:
+        as_array = ArrayMesh(
+            _on(device, vertices, gpu_available),
+            _on(device, faces, gpu_available),
+            merge=False,
+        )
+        from_array = mesh._scaled_copy(as_array, 1 / 0.108, center=True)
+        assert isinstance(from_array, ArrayMesh)
+        np.testing.assert_array_equal(
+            asnumpy(from_array.vertices), from_trimesh.vertices
+        )
+    middle = from_trimesh.vertices.max(axis=0) + from_trimesh.vertices.min(axis=0)
+    assert np.abs(middle).max() <= 1e-12
+
+
+@pytest.mark.parametrize("c", [1.0, 1e-9])
+def test_extract_mesh_features_measures_a_primitive_as_its_triangles(c: float) -> None:
+    """A trimesh primitive gives the features of a mesh of its triangles.
+
+    A primitive refuses new vertices, so copying it and scaling the copy's
+    vertices raised. A box's triangles enclose its volume exactly; the plain mesh
+    is built unmerged, since trimesh merges vertices closer than 1e-8.
+    """
+    box = trimesh.primitives.Box(extents=(2 * c, 3 * c, 4 * c))
+    names = ["Area", "Volume", "Inertia PC1", "Euler Characteristic"]
+
+    got = mesh.extract_mesh_features(box, names)
+
+    plain = trimesh.Trimesh(box.vertices, box.faces, process=False)
+    assert got == mesh.extract_mesh_features(plain, names)
+    assert got["Volume"] == pytest.approx(24 * c**3, rel=1e-12)
+
+
+@pytest.mark.parametrize("c", [1.0, 1e-8])
+def test_extract_mesh_features_errors_print_the_callers_volume(c: float) -> None:
+    """The volume check prints the volume of the caller's mesh, in its units.
+
+    It is measured on a copy scaled to the mesh's edges and converted back.
+    """
+    spacing = tuple(c * s for s in (0.29, 0.108, 0.108))
+    inside_out = mesh.mask2mesh(_ball(10), spacing=spacing).invert()
+
+    with pytest.raises(ValueError, match="volume must be finite") as error:
+        mesh.extract_mesh_features(inside_out, ["Volume"])
+
+    got = float(re.search(r"got (\S+)\. ", str(error.value)).group(1))
+    assert got == pytest.approx(inside_out.volume, rel=1e-12)

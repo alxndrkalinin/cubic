@@ -2,6 +2,7 @@
 
 import sys
 import time
+import types
 import threading
 
 import numpy as np
@@ -14,7 +15,10 @@ from cubic.cuda import (
     to_device,
     get_device,
     is_gpu_array,
+    on_device_of,
     to_same_device,
+    _is_torch_tensor,
+    ordered_bincount,
     check_same_device,
 )
 
@@ -67,6 +71,48 @@ def test_to_same_device_moves_gpu_source_to_cpu_reference(gpu_available: bool) -
     out = to_same_device(ascupy(arr), arr)
     assert get_device(out) == "CPU"
     np.testing.assert_array_equal(out, arr)
+
+
+def test_to_same_device_places_on_the_reference_gpu(gpu_available: bool) -> None:
+    """A source lands on the GPU that holds the reference, not on the current one.
+
+    From the host, from the current GPU and from the reference's own GPU,
+    which is returned as it is.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    cp = CUDAManager().get_cp()
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    arr = np.arange(6, dtype=np.float32)
+    with cp.cuda.Device(1):
+        reference, on_1 = cp.zeros(3), cp.asarray(arr)
+    with cp.cuda.Device(0):
+        on_0 = cp.asarray(arr)
+        moved = [to_same_device(source, reference) for source in (arr, on_0, on_1)]
+
+        assert cp.cuda.Device().id == 0
+    assert [m.device.id for m in moved] == [1, 1, 1]
+    assert moved[2] is on_1
+    for m in moved:
+        np.testing.assert_array_equal(asnumpy(m), arr)
+
+
+def test_on_device_of_makes_the_array_gpu_current(gpu_available: bool) -> None:
+    """Inside ``on_device_of``, new arrays land on the GPU of its argument."""
+    with on_device_of(np.zeros(2)):
+        pass  # a no-op on the host
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    cp = CUDAManager().get_cp()
+    last = cp.cuda.runtime.getDeviceCount() - 1
+    with cp.cuda.Device(last):
+        held = cp.zeros(2)
+    with cp.cuda.Device(0):
+        with on_device_of(held):
+            made = cp.ones(2) + held
+        assert cp.cuda.Device().id == 0
+    assert made.device.id == last
 
 
 def test_to_device_cpu_accepts_cuda_torch_tensor(gpu_available: bool) -> None:
@@ -238,3 +284,70 @@ def test_metrics_do_not_mutate_input(gpu_available: bool) -> None:
 
     cp = CUDAManager().get_cp()
     assert cp.array_equal(gpu, baseline), "ascupy view was mutated by a metric call"
+
+
+@pytest.mark.parametrize("device", ["CPU", "GPU"])
+@pytest.mark.parametrize("dtype", [np.int64, np.int32])
+def test_ordered_bincount_adds_in_input_order(
+    device: str, dtype: type, gpu_available: bool
+) -> None:
+    """It is ``np.bincount`` on either device, to the bit and the same every run.
+
+    The weights span 16 orders of magnitude, so a sum in any other order
+    differs in the last bits.
+    """
+    if device == "GPU" and not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, 50, 20_000).astype(dtype)
+    weights = rng.standard_normal(20_000) * 10.0 ** rng.integers(-8, 8, 20_000)
+    expected = np.bincount(ids, weights=weights, minlength=60)
+
+    runs = [
+        asnumpy(
+            ordered_bincount(to_device(ids, device), to_device(weights, device), 60)
+        )
+        for _ in range(2)
+    ]
+
+    for got in runs:
+        assert got.dtype == np.float64
+        np.testing.assert_array_equal(got, expected)
+    empty = ordered_bincount(
+        to_device(ids[:0], device), to_device(weights[:0], device), 5
+    )
+    assert get_device(empty) == device
+    np.testing.assert_array_equal(asnumpy(empty), np.zeros(5))
+
+
+def test_ordered_bincount_runs_on_the_input_device(gpu_available: bool) -> None:
+    """Weights on GPU 1 are added on GPU 1 while GPU 0 is current."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    cp = CUDAManager().get_cp()
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, 50, 2_000)
+    weights = rng.standard_normal(2_000)
+    with cp.cuda.Device(1):
+        ids_1, weights_1 = cp.asarray(ids), cp.asarray(weights)
+
+    with cp.cuda.Device(0):
+        got = ordered_bincount(ids_1, weights_1, 60)
+        empty = ordered_bincount(ids_1[:0], weights_1[:0], 5)
+
+    assert got.device.id == 1 and empty.device.id == 1
+    np.testing.assert_array_equal(
+        asnumpy(got), np.bincount(ids, weights=weights, minlength=60)
+    )
+
+
+def test_is_torch_tensor_while_torch_is_still_importing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A torch module without ``Tensor`` yet, as mid-import, answers False."""
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+
+    assert _is_torch_tensor(np.zeros(3)) is False
+    assert get_device(np.zeros(3)) == "CPU"

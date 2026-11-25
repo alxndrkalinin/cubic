@@ -3,22 +3,50 @@
 ``ArrayMesh`` exposes the ``trimesh.Trimesh`` attributes that the mesh feature
 registry reads, computed with the same formulas as trimesh from NumPy or CuPy
 arrays, so the features run on whichever device holds the mesh. Anything it
-does not implement (convex hull, bounding primitives, decimation) is delegated
+does not implement (convex hull, bounding primitives) is delegated
 to a ``trimesh.Trimesh`` built on the host on first use.
 """
 
 from __future__ import annotations
 
-from typing import Any
-from functools import cached_property
+from typing import Any, TypeVar
+from functools import wraps, cached_property
+from collections.abc import Callable
 
 import numpy as np
 
-from ..cuda import asnumpy, get_array_module
+try:  # pragma: no cover - optional dependency; mesh.py warns when it is missing
+    import trimesh
+except ImportError:  # pragma: no cover - import failure path
+    trimesh = None  # type: ignore[assignment]
+
+from ..cuda import (
+    asnumpy,
+    on_device_of,
+    to_same_device,
+    ordered_bincount,
+)
+
+_T = TypeVar("_T")
 
 # trimesh.constants.tol: zero for unitize, merge for angles and convexity.
 _TOL_ZERO = 1e-13
 _TOL_MERGE = 1e-8
+
+
+def _on_mesh_device(method: Callable[[ArrayMesh], _T]) -> cached_property[_T]:
+    """Return a ``cached_property`` computed with the mesh's GPU current.
+
+    CuPy allocates every new array on the current device, which need not be
+    the one that holds the mesh; see ``cubic.cuda.on_device_of``.
+    """
+
+    @wraps(method)
+    def compute(self: ArrayMesh) -> _T:
+        with on_device_of(self.vertices):
+            return method(self)
+
+    return cached_property(compute)
 
 
 def _unitize(vectors: Any) -> tuple[Any, Any]:
@@ -33,6 +61,60 @@ def _unitize(vectors: Any) -> tuple[Any, Any]:
     return vectors * scale[:, None], valid
 
 
+def _group_rows(keys: Any) -> tuple[Any, Any]:
+    """Sort the rows of ``keys`` and mark the first row of each run of equal rows.
+
+    Returns ``(order, is_new)``: ``keys[order]`` is sorted lexicographically
+    and ``is_new[i]`` is True where row ``i`` of it differs from the row before,
+    so ``np.cumsum(is_new) - 1`` numbers the groups. A lexsort and a neighbour
+    comparison instead of ``unique(axis=0)``: ``cupy.unique(axis=0)`` took about
+    7 s per 1,000 rows, against 1.5 ms per 300,000 rows for the lexsort.
+    """
+    order = np.lexsort(keys.T[::-1])
+    sorted_keys = keys[order]
+    is_new = np.ones_like(order, dtype=bool)
+    is_new[1:] = (sorted_keys[1:] != sorted_keys[:-1]).any(axis=1)
+    return order, is_new
+
+
+def _merge_vertices(vertices: Any, faces: Any) -> tuple[Any, Any]:
+    """Drop unreferenced vertices and merge equal ones, as trimesh's processing does.
+
+    Marching cubes with degenerate faces removed leaves both after an exact level
+    hit. trimesh merges them on the CPU path (``process=True``); without this,
+    each unreferenced vertex adds a ``2 pi`` defect (0.5 to total |K|) and each
+    duplicate splits defects and edges at a seam. Vertices equal to trimesh's
+    merge tolerance (8 decimals) are merged. The arrays come back unchanged when
+    there is nothing to merge.
+    """
+    referenced = np.zeros_like(vertices[:, 0], dtype=bool)
+    referenced[faces.ravel()] = True
+    index = np.flatnonzero(referenced)
+    # trimesh.grouping.merge_vertices: vertices * 10**digits(tol.merge), rounded;
+    # dividing by 1e-8 instead rounds a few vertices into other groups
+    keys = np.round(vertices[index] * 1e8).astype(np.int64)
+    order, new = _group_rows(keys)
+    if len(index) == len(vertices) and bool(new.all()):
+        return vertices, faces
+    remap = np.zeros_like(faces, shape=len(vertices))
+    remap[index[order]] = np.cumsum(new) - 1
+    return vertices[index[order[new]]], remap[faces]
+
+
+def _triangles_cross(triangles: Any) -> Any:
+    """Cross product of each triangle's edges, in trimesh's operand order."""
+    vectors = triangles[:, 1:, :] - triangles[:, :2, :]
+    return np.cross(vectors[:, 0], vectors[:, 1])
+
+
+def face_areas(vertices: Any, faces: Any) -> Any:
+    """Area of each triangle as trimesh computes it, on the arrays' device.
+
+    Needs neither merging nor orientation, so it is cheaper than an ArrayMesh.
+    """
+    return np.sqrt((_triangles_cross(vertices[faces]) ** 2).sum(axis=1)) / 2.0
+
+
 class ArrayMesh:
     """Closed, consistently oriented triangle mesh on the device of its arrays.
 
@@ -41,32 +123,103 @@ class ArrayMesh:
     vertices : array
         ``(V, 3)`` vertex coordinates, NumPy or CuPy.
     faces : array
-        ``(F, 3)`` vertex indices on the same device.
+        ``(F, 3)`` vertex indices on the same device, wound outward, as
+        ``mesh._marching_cubes`` returns them.
+    merge : bool, optional
+        ``False`` takes float64 vertices and int64 faces that are already
+        merged as they are, as ``scaled()`` does. The default merges.
 
-    The faces are flipped if the enclosed volume comes out negative, as
-    ``trimesh.repair.fix_normals`` does for a mesh with consistent winding.
+    The faces are measured as given, as ``trimesh.Trimesh`` measures them: a
+    mesh wound inward reports a negative volume. Equal and unreferenced
+    vertices are merged as trimesh's processing does.
+
+    Attributes not computed here are read from a ``trimesh.Trimesh`` copy on the
+    host. A delegated method that would change the mesh in place (e.g.
+    ``apply_scale``) raises ``TypeError``: the device arrays and cached
+    quantities would no longer describe it. Use ``scaled()`` for a scaled copy,
+    and ``to_trimesh()`` for a mutable mesh.
     """
 
-    def __init__(self, vertices: Any, faces: Any) -> None:
-        self.vertices = vertices.astype(np.float64)
-        self.faces = faces.astype(np.int64)
-        if self.volume < 0:
-            self.faces = self.faces[:, ::-1].copy()
-            for name in list(vars(self)):
-                if name not in ("vertices", "faces"):
-                    delattr(self, name)
+    def __init__(self, vertices: Any, faces: Any, *, merge: bool = True) -> None:
+        if merge:
+            # astype copies even float64 vertices: with nothing to merge,
+            # _merge_vertices returns them as given, and the caller's array
+            # would then be the mesh's, changing it under its cached values.
+            with on_device_of(vertices):
+                vertices, faces = _merge_vertices(
+                    vertices.astype(np.float64), faces.astype(np.int64)
+                )
+        self.vertices, self.faces = vertices, faces
+
+    def scaled(self, factor: float, origin: Any = None) -> ArrayMesh:
+        """Return a new mesh with every vertex times ``factor``, on the same device.
+
+        With ``origin``, a point ``(3,)`` on the host, every vertex minus it is
+        scaled instead, so ``origin`` moves to 0.
+
+        The vertices are not merged again: the merge tolerance is absolute, so
+        at a small enough ``factor`` it would join vertices this mesh keeps
+        apart. The faces are shared with this mesh, which never changes them;
+        the copy starts with no cached quantity and no host ``trimesh.Trimesh``.
+
+        Raises
+        ------
+        ValueError
+            If ``factor`` is not finite and positive, which would flatten the
+            mesh or turn it inside out.
+        """
+        factor = float(factor)
+        if not np.isfinite(factor) or factor <= 0:
+            raise ValueError(f"factor must be finite and positive; got {factor}")
+        vertices = self.vertices
+        # The new vertices on the vertices' device, which need not be the
+        # current one.
+        with on_device_of(vertices):
+            if origin is not None:
+                vertices = vertices - to_same_device(
+                    np.asarray(origin, dtype=np.float64), vertices
+                )
+            return type(self)(vertices * factor, self.faces, merge=False)
 
     def __getattr__(self, name: str) -> Any:
-        # Called only for attributes not defined here: delegate to trimesh.
+        # Called for attributes not defined here, which go to trimesh, and also
+        # when one defined here raises AttributeError, which must not.
         if name.startswith("_"):
             raise AttributeError(name)
-        return getattr(self.to_trimesh(), name)
+        if hasattr(type(self), name):
+            raise AttributeError(
+                f"ArrayMesh.{name} itself failed with an AttributeError; it is "
+                "not delegated to trimesh."
+            )
+        host = self.to_trimesh()
+        value = getattr(host, name)
+        if not callable(value):
+            return value
+
+        @wraps(value)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            # trimesh's hash covers vertices and faces, not its caches
+            before = hash(host)
+            result = value(*args, **kwargs)
+            if hash(host) != before:
+                del self._host  # rebuilt from the device arrays on next use
+                raise TypeError(
+                    f"ArrayMesh.{name} would change the mesh in place, which "
+                    "ArrayMesh does not support; call to_trimesh() for a mutable "
+                    "trimesh.Trimesh."
+                )
+            return result
+
+        return guarded
 
     def to_trimesh(self) -> Any:
         """Return (and cache) a ``trimesh.Trimesh`` of this mesh on the host."""
         if "_host" not in vars(self):
-            import trimesh
-
+            if trimesh is None:
+                raise RuntimeError(
+                    "trimesh is required for mesh operations. Install with "
+                    "'cubic[mesh]'"
+                )
             self._host = trimesh.Trimesh(
                 asnumpy(self.vertices), asnumpy(self.faces), process=False
             )
@@ -74,30 +227,28 @@ class ArrayMesh:
 
     # -- per-face geometry (trimesh.triangles) --------------------------------
 
-    @cached_property
+    @_on_mesh_device
     def triangles(self) -> Any:
         return self.vertices[self.faces]
 
-    @cached_property
+    @_on_mesh_device
     def triangles_cross(self) -> Any:
-        tri = self.triangles
-        vectors = tri[:, 1:, :] - tri[:, :2, :]
-        return np.cross(vectors[:, 0], vectors[:, 1])
+        return _triangles_cross(self.triangles)
 
-    @cached_property
+    @_on_mesh_device
     def area_faces(self) -> Any:
         return np.sqrt((self.triangles_cross**2).sum(axis=1)) / 2.0
 
-    @cached_property
+    @_on_mesh_device
     def area(self) -> float:
         return float(self.area_faces.sum())
 
-    @cached_property
+    @_on_mesh_device
     def face_normals(self) -> Any:
         unit, valid = _unitize(self.triangles_cross)
         return np.where(valid[:, None], unit, 0.0)
 
-    @cached_property
+    @_on_mesh_device
     def face_angles(self) -> Any:
         tri = self.triangles
         u, _ = _unitize(tri[:, 1] - tri[:, 0])
@@ -108,18 +259,16 @@ class ArrayMesh:
         angles = np.stack([a0, a1, np.pi - a0 - a1], axis=1)
         return np.where((angles < _TOL_MERGE).any(axis=1, keepdims=True), 0.0, angles)
 
-    @cached_property
+    @_on_mesh_device
     def vertex_defects(self) -> Any:
-        angle_sum = np.bincount(
-            self.faces.ravel(),
-            weights=self.face_angles.ravel(),
-            minlength=len(self.vertices),
+        angle_sum = ordered_bincount(
+            self.faces.ravel(), self.face_angles.ravel(), len(self.vertices)
         )
         return 2 * np.pi - angle_sum
 
     # -- mass properties (trimesh.triangles.mass_properties, density 1) -------
 
-    @cached_property
+    @_on_mesh_device
     def _integrated(self) -> np.ndarray:
         tri, crosses = self.triangles, self.triangles_cross
         t0, t1, t2 = tri[:, 0, :], tri[:, 1, :], tri[:, 2, :]
@@ -143,7 +292,7 @@ class ArrayMesh:
             [6, 24, 24, 24, 60, 60, 60, 120, 120, 120], dtype=np.float64
         )
 
-    @cached_property
+    @_on_mesh_device
     def volume(self) -> float:
         return float(self._integrated[0])
 
@@ -151,11 +300,11 @@ class ArrayMesh:
     def mass(self) -> float:
         return self.volume
 
-    @cached_property
+    @_on_mesh_device
     def center_mass(self) -> np.ndarray:
         return self._integrated[1:4] / self.volume
 
-    @cached_property
+    @_on_mesh_device
     def moment_inertia(self) -> np.ndarray:
         s, v, c = self._integrated, self.volume, self.center_mass
         inertia = np.zeros((3, 3))
@@ -167,80 +316,75 @@ class ArrayMesh:
         inertia[0, 2] = inertia[2, 0] = -(s[9] - v * np.prod(c[[0, 2]]))
         return inertia
 
-    @cached_property
+    @_on_mesh_device
     def principal_inertia_components(self) -> np.ndarray:
         return np.linalg.eigh(self.moment_inertia)[0]
 
     # -- edges and adjacency (trimesh.graph) ----------------------------------
 
-    @cached_property
-    def _edge_groups(self) -> tuple[Any, Any, Any]:
-        """Sorted edge keys: (order, start of each run, run length)."""
-        xp = get_array_module(self.faces)
-        edges = np.sort(self.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
-        keys = edges[:, 0] * len(self.vertices) + edges[:, 1]
-        order = np.argsort(keys)
-        sorted_keys = keys[order]
-        is_start = xp.ones(len(keys), dtype=bool)
-        is_start[1:] = sorted_keys[1:] != sorted_keys[:-1]
-        starts = xp.flatnonzero(is_start)
-        lengths = np.diff(xp.concatenate([starts, xp.asarray([len(keys)])]))
-        self._edges_sorted = edges
-        return order, starts, lengths
+    @_on_mesh_device
+    def _edge_groups(self) -> tuple[Any, Any, Any, Any]:
+        """Edges grouped by vertex pair: (edges, order, start of each run, run length).
 
-    @cached_property
+        ``edges`` holds each face's three edges with sorted vertex indices, in
+        face order; ``order`` sorts them so that equal edges form runs.
+        """
+        edges = np.sort(self.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        order, is_start = _group_rows(edges)
+        starts = np.flatnonzero(is_start)
+        lengths = np.diff(starts, append=len(edges))
+        return edges, order, starts, lengths
+
+    @_on_mesh_device
+    def overshared_edge_count(self) -> int:
+        """Count the edges shared by more than two faces, from ``_edge_groups``.
+
+        Neither the Euler number (each counted once) nor the face adjacency
+        (left out) measures such an edge as a surface would.
+        """
+        _, _, _, lengths = self._edge_groups
+        return int((lengths > 2).sum())
+
+    @_on_mesh_device
     def euler_number(self) -> int:
         referenced = int(np.unique(self.faces).size)
-        _, starts, _ = self._edge_groups
+        _, _, starts, _ = self._edge_groups
         return referenced - int(starts.size) + len(self.faces)
 
-    @cached_property
-    def face_adjacency(self) -> Any:
-        xp = get_array_module(self.faces)
-        order, starts, lengths = self._edge_groups
+    @_on_mesh_device
+    def _face_adjacency(self) -> tuple[Any, Any]:
+        """Pairs of faces sharing an edge, and that edge: (pairs, edges)."""
+        edges, order, starts, lengths = self._edge_groups
         first = starts[lengths == 2]
         edge_a, edge_b = order[first], order[first + 1]
-        pair = xp.stack([edge_a // 3, edge_b // 3], axis=1)
+        pair = np.stack([edge_a // 3, edge_b // 3], axis=1)
         keep = pair[:, 0] != pair[:, 1]
-        self.face_adjacency_edges = self._edges_sorted[edge_a[keep]]
-        return np.sort(pair[keep], axis=1)
+        return np.sort(pair[keep], axis=1), edges[edge_a[keep]]
 
-    @cached_property
+    @_on_mesh_device
+    def face_adjacency(self) -> Any:
+        return self._face_adjacency[0]
+
+    @_on_mesh_device
     def face_adjacency_edges(self) -> Any:
-        _ = self.face_adjacency
-        return self.__dict__["face_adjacency_edges"]
+        return self._face_adjacency[1]
 
-    @cached_property
-    def face_adjacency_angles(self) -> Any:
-        normals = self.face_normals[self.face_adjacency]
-        dots = np.clip((normals[:, 0] * normals[:, 1]).sum(axis=1), -1.0, 1.0)
-        return np.abs(np.arccos(dots))
-
-    @cached_property
+    @_on_mesh_device
     def face_adjacency_unshared(self) -> Any:
-        xp = get_array_module(self.faces)
         edges = self.face_adjacency_edges
         out = []
         for side in range(2):
             faces = self.faces[self.face_adjacency[:, side]]
             unshared = (faces != edges[:, :1]) & (faces != edges[:, 1:])
             row_ok = unshared.sum(axis=1) == 1
-            picked = faces[xp.arange(len(faces)), np.argmax(unshared, axis=1)]
+            column = np.argmax(unshared, axis=1)[:, None]
+            picked = np.take_along_axis(faces, column, axis=1)[:, 0]
             out.append(np.where(row_ok, picked, -1))
-        return xp.stack(out, axis=1)
+        return np.stack(out, axis=1)
 
-    @cached_property
+    @_on_mesh_device
     def face_adjacency_convex(self) -> Any:
         normals = self.face_normals[self.face_adjacency[:, 0]]
         origins = self.vertices[self.face_adjacency_edges[:, 0]]
         other = self.vertices[self.face_adjacency_unshared[:, 1]] - origins
         return (other * normals).sum(axis=1) < _TOL_MERGE
-
-    @cached_property
-    def integral_mean_curvature(self) -> float:
-        edges = self.face_adjacency_edges
-        lengths = np.linalg.norm(
-            self.vertices[edges[:, 0]] - self.vertices[edges[:, 1]], axis=1
-        )
-        signs = np.where(self.face_adjacency_convex, 1.0, -1.0)
-        return float((self.face_adjacency_angles * signs * lengths).sum() * 0.5)

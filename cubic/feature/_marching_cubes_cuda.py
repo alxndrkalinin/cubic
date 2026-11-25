@@ -16,7 +16,9 @@ reference's centre-of-mass interpolation sums the same two terms whichever
 cube creates the vertex, and addition is commutative. With the corner values,
 tests and interpolation kept in float64 in the reference's operation order,
 and ``--fmad=false``, the vertices round to the same float32 values as on the
-CPU. The mesh is the same up to the order of vertices and faces.
+CPU. The mesh is the same up to the order of vertices and faces, except with
+``allow_degenerate=False``, where every coincident vertex is merged (see
+``marching_cubes``).
 """
 
 import functools
@@ -24,10 +26,21 @@ from typing import Any
 from collections.abc import Sequence
 
 import numpy as np
-from skimage.measure import _marching_cubes_lewiner_luts as _mcluts
-from skimage.measure._marching_cubes_lewiner import _to_array
 
-from ..cuda import CUDAManager
+from ..cuda import CUDAManager, ascupy, _launch_config, _cuda_functions
+from ._array_mesh import _group_rows
+
+# The lookup tables live in scikit-image's private modules, which a release may
+# move. Only the GPU path reads them, so a failed import must not break
+# ``import cubic.feature.mesh`` for CPU users; marching_cubes raises instead.
+try:
+    from skimage.measure import _marching_cubes_lewiner_luts as _mcluts
+except ImportError:  # pragma: no cover - depends on the scikit-image version
+    _mcluts = None  # type: ignore[assignment]
+try:
+    from skimage.measure._marching_cubes_lewiner import _to_array
+except ImportError:  # pragma: no cover - depends on the scikit-image version
+    _to_array = None  # type: ignore[assignment]
 
 # Lookup tables used by the Lewiner case analysis (the classic table is not).
 _TABLES = (
@@ -434,6 +447,23 @@ extern "C" __global__ void mc_faces(
 """
 
 
+def _require_lookup_tables() -> None:
+    """Raise ``ImportError`` naming the scikit-image internals that did not import."""
+    missing = [
+        name
+        for name, found in (
+            ("skimage.measure._marching_cubes_lewiner_luts", _mcluts),
+            ("skimage.measure._marching_cubes_lewiner._to_array", _to_array),
+        )
+        if found is None
+    ]
+    if missing:
+        raise ImportError(
+            "GPU marching cubes runs on scikit-image's Lewiner lookup tables, "
+            f"but this scikit-image does not provide {', '.join(missing)}."
+        )
+
+
 @functools.cache
 def _lut_layout() -> tuple[np.ndarray, str]:
     """Return the concatenated int8 lookup tables and their offset/shape macros."""
@@ -461,24 +491,20 @@ def _cupy() -> Any:
 
 @functools.cache
 def _kernels(device_id: int) -> tuple[Any, ...]:
-    """Compile the kernels once per device; return them and the device LUTs."""
+    """Return the kernels compiled for a device and that device's copy of the LUTs."""
     cp = _cupy()
     luts, defines = _lut_layout()
+    # compiled with --fmad=false, so every multiply and add rounds separately,
+    # as in the Cython reference
+    names = ("mc_classify", "mc_edge_vertices", "mc_center_vertices", "mc_faces")
+    kernels = _cuda_functions(defines + _KERNELS, names, device_id)
     with cp.cuda.Device(device_id):
-        # --fmad=false keeps every multiply and add separately rounded, as in
-        # the Cython reference.
-        module = cp.RawModule(code=defines + _KERNELS, options=("--fmad=false",))
-        names = ("mc_classify", "mc_edge_vertices", "mc_center_vertices", "mc_faces")
-        return tuple(module.get_function(n) for n in names) + (cp.asarray(luts),)
-
-
-def _grid(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
-    return (max(1, min((size + threads - 1) // threads, 65535 * 8)),), (threads,)
+        return kernels + (ascupy(luts),)
 
 
 def marching_cubes(
     volume: Any,
-    level: float,
+    level: float | None = None,
     spacing: Sequence[float] = (1.0, 1.0, 1.0),
     allow_degenerate: bool = True,
 ) -> tuple[Any, Any]:
@@ -488,14 +514,44 @@ def marching_cubes(
     allow_degenerate=allow_degenerate)`` with the default Lewiner method and
     ``gradient_direction='descent'``, including the output dtypes: float32
     vertices with unit spacing or when degenerate faces are removed, float64
-    otherwise. Vertex and face order differ.
+    otherwise. ``level=None`` is halfway between the volume's minimum and
+    maximum. Vertex and face order differ. Runs on the device of ``volume``,
+    whichever device is current.
+
+    With ``allow_degenerate=False`` the vertices differ from skimage's too:
+    every coincident vertex is merged, where skimage merges only those of
+    degenerate faces, and vertices used only by the dropped faces stay in the
+    array, unreferenced. ``ArrayMesh`` drops them when it merges vertices.
     """
+    _require_lookup_tables()
+    # skimage's check; the port would otherwise broadcast a shorter spacing
+    if len(spacing) != 3:
+        raise ValueError("`spacing` must consist of three floats.")
+    cp = _cupy()
+    # scratch arrays, launches and the outputs must live on the device whose
+    # kernels and LUTs _kernels returns
+    device = volume.device if isinstance(volume, cp.ndarray) else cp.cuda.Device()
+    with device:
+        return _marching_cubes_on_device(volume, level, spacing, allow_degenerate)
+
+
+def _marching_cubes_on_device(
+    volume: Any,
+    level: float | None,
+    spacing: Sequence[float],
+    allow_degenerate: bool,
+) -> tuple[Any, Any]:
     cp = _cupy()
     vol = cp.ascontiguousarray(volume, dtype=cp.float32)
     if vol.ndim != 3 or min(vol.shape) < 2:
         raise ValueError("Input array must be a 3D array of at least 2x2x2.")
+    low, high = float(vol.min()), float(vol.max())
+    if level is None:
+        # skimage's 0.5 * (volume.min() + volume.max()) adds float32 scalars,
+        # so the sum rounds to float32 before it is halved
+        level = 0.5 * float(np.float32(low) + np.float32(high))
     level = float(level)
-    if level < float(vol.min()) or level > float(vol.max()):
+    if level < low or level > high:
         raise ValueError("Surface level must be within volume data range.")
     classify, edge_vertices, center_vertices, write_faces, luts = _kernels(
         vol.device.id
@@ -508,23 +564,26 @@ def marching_cubes(
     edge_used = cp.zeros(3 * n, dtype=cp.uint8)
     center_used = cp.zeros(ncubes, dtype=cp.uint8)
     args = (vol, np.int32(nz), np.int32(ny), np.int32(nx), np.float64(level))
-    classify(*_grid(ncubes), args + (luts, tri_base, tri_count, edge_used, center_used))
+    classify(
+        *_launch_config(ncubes),
+        args + (luts, tri_base, tri_count, edge_used, center_used),
+    )
 
     edge_id = cp.cumsum(edge_used, dtype=cp.int32) - 1
-    n_edges = int(edge_id[-1]) + 1 if n else 0
+    n_edges = int(edge_id[-1]) + 1
     center_id = cp.cumsum(center_used, dtype=cp.int32) - 1 + n_edges
-    n_verts = int(center_id[-1]) + 1 if ncubes else n_edges
+    n_verts = int(center_id[-1]) + 1
     face_end = cp.cumsum(tri_count, dtype=cp.int64)
-    n_faces = int(face_end[-1]) if ncubes else 0
+    n_faces = int(face_end[-1])
     if n_verts == 0 or n_faces == 0:
         raise RuntimeError("No surface found at the given iso value.")
 
     verts = cp.empty((n_verts, 3), dtype=cp.float32)
-    edge_vertices(*_grid(3 * n), args + (edge_used, edge_id, verts))
-    center_vertices(*_grid(ncubes), args + (center_used, center_id, verts))
+    edge_vertices(*_launch_config(3 * n), args + (edge_used, edge_id, verts))
+    center_vertices(*_launch_config(ncubes), args + (center_used, center_id, verts))
     faces = cp.empty((n_faces, 3), dtype=cp.int32)
     write_faces(
-        *_grid(ncubes),
+        *_launch_config(ncubes),
         (
             np.int32(nz),
             np.int32(ny),
@@ -553,16 +612,10 @@ def _remove_degenerate_faces(verts: Any, faces: Any) -> tuple[Any, Any]:
     skimage merges the vertices of degenerate faces and trimesh then merges any
     remaining coincident ones; merging every exact duplicate does both.
     """
-    cp = _cupy()
-    # A lexicographic sort brings duplicates together; cp.unique(axis=0) does
-    # the same but took hours on a few thousand vertices.
-    order = cp.lexsort(verts.T[::-1])
-    ordered = verts[order]
-    first = cp.ones(len(ordered), dtype=bool)
-    first[1:] = (ordered[1:] != ordered[:-1]).any(axis=1)
-    inverse = cp.empty(len(verts), dtype=cp.int32)
-    inverse[order] = (cp.cumsum(first) - 1).astype(cp.int32)
-    unique = ordered[first]
+    order, first = _group_rows(verts)
+    inverse = np.empty_like(faces, shape=len(verts))
+    inverse[order] = (np.cumsum(first) - 1).astype(faces.dtype)
+    unique = verts[order[first]]
     faces = inverse[faces]
     keep = (
         (faces[:, 0] != faces[:, 1])

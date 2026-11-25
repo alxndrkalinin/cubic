@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 import warnings
+import functools
 import threading
 from types import ModuleType
 from typing import Any
 from importlib import import_module
+from contextlib import AbstractContextManager, nullcontext
 
 import numpy as np
 
@@ -79,14 +82,14 @@ class CUDAManager:
 def _is_torch_tensor(array: Any) -> bool:
     """Return True if ``array`` is a torch.Tensor.
 
-    Uses a lazy import: returns False when torch is not installed so the
-    cubic runtime never hard-depends on torch.
+    Reads ``sys.modules`` instead of importing torch: a tensor cannot exist
+    unless torch has been imported, so the answer is False when it has not,
+    and also while another thread is still importing it and ``torch.Tensor``
+    does not exist yet. There is no import to run or to retry, and the cubic
+    runtime never hard-depends on torch.
     """
-    try:
-        import torch
-    except ImportError:
-        return False
-    return isinstance(array, torch.Tensor)
+    tensor = getattr(sys.modules.get("torch"), "Tensor", None)
+    return tensor is not None and isinstance(array, tensor)
 
 
 def get_device(array: np.ndarray) -> str:
@@ -233,6 +236,84 @@ def dispatch_device_call(
     return func(*args, **kwargs)
 
 
+@functools.cache
+def _cuda_functions(
+    source: str, names: tuple[str, ...], device_id: int
+) -> tuple[Any, ...]:
+    """Compile CUDA ``source`` once per device and return its kernels ``names``.
+
+    ``--fmad=false`` keeps every multiply and add separately rounded, as in the
+    scalar C/C++ references; contractions the reference does perform are
+    spelled out as explicit ``fma`` calls.
+    """
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        raise RuntimeError("CuPy is required for the CUDA kernels")
+    with cp.cuda.Device(device_id):
+        module = cp.RawModule(code=source, options=("--fmad=false",))
+        return tuple(module.get_function(name) for name in names)
+
+
+def _launch_config(size: int, threads: int = 256) -> tuple[tuple[int], tuple[int]]:
+    """Grid-stride launch configuration for ``size`` elements, at least one block."""
+    return (max(1, min((size + threads - 1) // threads, 65535 * 8)),), (threads,)
+
+
+_ORDERED_BINCOUNT_CUDA = r"""
+extern "C" __global__ void ordered_bincount(
+    const double* values, const long long* starts, const long long* counts,
+    double* out, const long long n_bins) {
+  for (long long b = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+       b < n_bins; b += (long long)blockDim.x * gridDim.x) {
+    double sum = 0.0;
+    const double* v = values + starts[b];
+    for (long long i = 0; i < counts[b]; ++i) sum += v[i];
+    out[b] = sum;
+  }
+}
+"""
+
+
+def ordered_bincount(ids: Any, weights: Any, minlength: int) -> Any:
+    """Return ``np.bincount(ids, weights, minlength)``, added in input order on either device.
+
+    ``ids`` are non-negative integers and ``weights`` numbers of the same
+    length on one device; the result is float64 on that device, of length
+    ``max(minlength, ids.max() + 1)``. CuPy's weighted ``bincount`` adds with
+    atomics, in an order that changes from run to run, so its sums do too. On
+    CuPy this sorts the weights by bin, keeping their input order within each
+    bin, and one thread per bin adds them from 0 in that order, as NumPy does:
+    the sums are the same on every run and equal NumPy's to the bit for equal
+    inputs. NumPy arrays go to ``np.bincount``.
+    """
+    if get_device(ids) == "CPU":
+        return np.bincount(ids, weights=weights, minlength=minlength)
+    xp = get_array_module(ids)
+    n = len(ids)
+    # Every temporary and the launch on the input's device, which need not be
+    # the current one.
+    with ids.device:
+        if n == 0:  # CuPy 14.0.1's bincount raises on an empty array
+            return xp.zeros(minlength, dtype=np.float64)
+        # The position breaks ties, so the order within a bin is the input
+        # order whether or not the sort is stable.
+        order = np.argsort(
+            ids.astype(np.int64, copy=False) * n + xp.arange(n, dtype=np.int64)
+        )
+        values = xp.ascontiguousarray(weights.astype(np.float64, copy=False)[order])
+        counts = np.bincount(ids, minlength=minlength).astype(np.int64, copy=False)
+        starts = np.cumsum(counts) - counts
+        out = xp.empty(len(counts), dtype=np.float64)
+        (kernel,) = _cuda_functions(
+            _ORDERED_BINCOUNT_CUDA, ("ordered_bincount",), ids.device.id
+        )
+        kernel(
+            *_launch_config(len(counts)),
+            (values, starts, counts, out, np.int64(len(counts))),
+        )
+    return out
+
+
 def to_device(array: np.ndarray, device: str) -> np.ndarray:
     """Move array to the requested device."""
     cp = CUDAManager().get_cp()
@@ -251,10 +332,46 @@ def to_device(array: np.ndarray, device: str) -> np.ndarray:
         )
 
 
+def on_device_of(array: Any) -> AbstractContextManager[Any]:
+    """Return a context in which the GPU that holds ``array`` is current.
+
+    CuPy allocates every new array, and runs every kernel, on the current
+    device, not on that of the operands, so code that should stay on an
+    array's GPU runs inside this. A no-op for a host array. A CuPy array
+    gives its ``device``, a CUDA torch tensor its ``device.index``; any other
+    GPU array (see ``get_device``), or a tensor without an index, keeps the
+    current device.
+    """
+    cp = CUDAManager().get_cp()
+    if cp is None:
+        return nullcontext()
+    # A CuPy array is recognised by the ``id`` of its device, without the torch
+    # check of ``get_device``, which runs at most once, for any other array.
+    index = getattr(getattr(array, "device", None), "id", None)
+    if index is None and _is_torch_tensor(array):
+        device = array.device
+        index = device.index if device.type == "cuda" else None
+    return nullcontext() if index is None else cp.cuda.Device(index)
+
+
 def to_same_device(source_array: np.ndarray, reference_array: np.ndarray) -> np.ndarray:
-    """Move the source_array to the same device as reference_array."""
+    """Move the source_array to the same device as reference_array.
+
+    On the GPU, to the GPU that holds ``reference_array`` (see
+    ``on_device_of``), whichever device is current; a source already there is
+    returned as it is.
+    """
     target_device = get_device(reference_array)
-    return to_device(source_array, target_device)
+    if target_device != "GPU":
+        return to_device(source_array, target_device)
+    with on_device_of(reference_array):
+        moved: Any = to_device(source_array, "GPU")
+        # A CuPy source that is still on another GPU is copied to this one.
+        # ``to_device`` has raised unless CuPy is installed.
+        cp: Any = CUDAManager().get_cp()
+        if moved.device.id != cp.cuda.Device().id:
+            moved = moved.copy()
+    return moved
 
 
 def check_same_device(*arrays: np.ndarray) -> None:
@@ -331,8 +448,7 @@ def to_torch(array: Any, device: Any = None, dtype: Any = None) -> Any:
     - NumPy array → ``torch.from_numpy`` then moved to ``device``.
     - torch.Tensor → moved/cast to ``device``/``dtype`` as requested.
 
-    torch is imported lazily so ``cubic`` still imports without torch installed
-    (mirrors :func:`_is_torch_tensor`).
+    torch is imported lazily so ``cubic`` still imports without torch installed.
 
     Args:
         array: CuPy/NumPy array or torch tensor.
