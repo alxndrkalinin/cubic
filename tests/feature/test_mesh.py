@@ -757,6 +757,20 @@ def test_level_set_vertices_do_not_round_with_their_place_in_the_array(
     assert np.abs(va - vb).max() <= 1e-12
 
 
+def test_array_mesh_does_not_share_the_vertices_it_is_given() -> None:
+    """Changing the float64 vertices given to ``ArrayMesh`` leaves the mesh as it was."""
+    box = trimesh.creation.box(extents=(1.0, 2.0, 3.0))
+    vertices = np.array(box.vertices, dtype=np.float64)
+    built = ArrayMesh(vertices, np.array(box.faces))
+    area = built.area
+
+    vertices *= 2
+
+    assert built.vertices is not vertices
+    assert built.area == area
+    np.testing.assert_array_equal(built.vertices, box.vertices)
+
+
 @pytest.mark.parametrize(
     "build",
     [

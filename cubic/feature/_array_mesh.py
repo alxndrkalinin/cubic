@@ -142,9 +142,12 @@ class ArrayMesh:
 
     def __init__(self, vertices: Any, faces: Any, *, merge: bool = True) -> None:
         if merge:
+            # astype copies even float64 vertices: with nothing to merge,
+            # _merge_vertices returns them as given, and the caller's array
+            # would then be the mesh's, changing it under its cached values.
             with on_device_of(vertices):
                 vertices, faces = _merge_vertices(
-                    vertices.astype(np.float64, copy=False), faces.astype(np.int64)
+                    vertices.astype(np.float64), faces.astype(np.int64)
                 )
         self.vertices, self.faces = vertices, faces
 
