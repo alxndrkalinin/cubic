@@ -1,5 +1,7 @@
 """Fixtures shared by the feature tests."""
 
+import warnings
+from typing import Any
 from collections.abc import Callable
 
 import numpy as np
@@ -116,6 +118,64 @@ def _lumpy_nucleus(seed: int) -> np.ndarray:
 def lumpy_nucleus_of() -> Callable[[int], np.ndarray]:
     """Return ``_lumpy_nucleus``: a lumpy ellipsoid mask of a given seed."""
     return _lumpy_nucleus
+
+
+def _assert_far_object_like_near(
+    nucleus: np.ndarray, to_device: Callable[[np.ndarray], Any]
+) -> None:
+    """Check that ``nucleus`` 2030 voxels from the origin is measured as near it.
+
+    ``nucleus`` is 40 x 64 x 64; ``to_device`` moves each mask to the device
+    to measure on. Every feature of ``extract_surface_features`` of the far
+    copy, and of ``extract_features`` of it as a label, must match the near
+    copy's to 1e-12, and ``mask2mesh(..., sigma=...)`` of the far copy must be
+    the near copy's mesh moved by the offset.
+    """
+    # Local import: the voxel and texture tests share this conftest and need no trimesh.
+    from cubic.feature import mesh
+
+    names = mesh.mesh_feature_list(optional=True)
+    spacing = (2.685, 1.0, 1.0)
+    near = np.zeros((44, 68, 68), dtype=bool)
+    near[2:42, 2:66, 2:66] = nucleus
+    far = np.zeros((44, 68, 2100), dtype=bool)
+    far[2:42, 2:66, 2030:2094] = nucleus
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        values = [
+            mesh.extract_surface_features(
+                to_device(mask), spacing=spacing, features=names
+            )
+            for mask in (near, far)
+        ]
+        _, as_label, _ = mesh.extract_features(
+            to_device(far.astype(np.int32)), names, spacing=spacing
+        )
+    meshes = [
+        mesh.mask2mesh(to_device(mask), spacing=spacing, sigma=5.0)
+        for mask in (near, far)
+    ]
+
+    for name, labelled in zip(names, as_label[0]):
+        near_value = float(values[0][name])
+        assert np.isfinite(near_value), name
+        assert float(values[1][name]) == pytest.approx(near_value, rel=1e-12), name
+        assert labelled == pytest.approx(near_value, rel=1e-12), name
+    offset = np.array([0.0, 0.0, 2028.0])
+    np.testing.assert_array_equal(asnumpy(meshes[0].faces), asnumpy(meshes[1].faces))
+    np.testing.assert_allclose(
+        asnumpy(meshes[1].vertices) - offset,
+        asnumpy(meshes[0].vertices),
+        rtol=0,
+        atol=1e-9,
+    )
+
+
+@pytest.fixture
+def assert_far_object_like_near() -> Callable[..., None]:
+    """Return ``_assert_far_object_like_near``, for either device."""
+    return _assert_far_object_like_near
 
 
 def _flat_vertices(surface: object) -> np.ndarray:

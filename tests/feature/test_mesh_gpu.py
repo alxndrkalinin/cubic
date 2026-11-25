@@ -102,6 +102,37 @@ def test_gpu_marching_cubes_matches_skimage(name: str, gpu_available: bool) -> N
     _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
 
 
+def test_gpu_level_set_matches_cpu_in_float64(gpu_available: bool) -> None:
+    """Both devices give the same float64 level set, bit for bit, at and near level hits.
+
+    A third of the grid values near the level are set to 0.5 or to a float32
+    neighbour of it, so that some vertices round onto grid points and keep
+    their float32 position, and the others move in float64.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    rng = np.random.default_rng(1)
+    volume = ndimage.gaussian_filter(rng.normal(size=(22, 26, 30)), 1.0)
+    volume = (0.5 + 0.5 * volume / np.abs(volume).max()).astype(np.float32)
+    near = np.flatnonzero(np.abs(volume - 0.5) < 0.1)
+    hits = rng.choice(near, size=len(near) // 3, replace=False)
+    half = np.float32(0.5)
+    neighbours = [
+        half,
+        np.nextafter(half, np.float32(1)),
+        np.nextafter(half, np.float32(0)),
+    ]
+    volume.flat[hits] = np.resize(neighbours, len(hits))
+    volume = np.pad(volume, ((3, 2), (5, 1), (40, 0)))
+    step = np.array([2.39, 1.0, 1.0])
+
+    v_cpu, f_cpu = mesh._level_set(volume, step)
+    v_gpu, f_gpu = mesh._level_set(ascupy(volume), step)
+
+    assert v_cpu.dtype == asnumpy(v_gpu).dtype == np.float64
+    _assert_same_mesh(v_gpu, f_gpu, v_cpu, f_cpu)
+
+
 @pytest.mark.parametrize("device", ["CPU", "GPU"])
 def test_marching_cubes_faces_wind_outward(device: str, gpu_available: bool) -> None:
     """The faces from ``mesh._marching_cubes`` enclose a positive volume.
@@ -344,6 +375,57 @@ def test_scaled_copy_stays_on_the_mesh_device(
         assert copy.vertices.device.id == 1
         expected = (asnumpy(ball.vertices) - shift) * 0.5
         np.testing.assert_allclose(asnumpy(copy.vertices), expected, rtol=1e-15)
+
+
+def test_mesh_of_a_mask_on_gpu_1_stays_on_gpu_1(gpu_available: bool) -> None:
+    """A mask on GPU 1 is meshed and measured on GPU 1 while GPU 0 is current.
+
+    The mesh, voxel and blurred, its device arrays computed later with GPU 0
+    current, and its scaled copy all stay on GPU 1, and the features match the
+    host's.
+    """
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs two GPUs")
+    labels = _labels()
+    mask, spacing = labels == 1, (0.3, 0.1, 0.1)
+    with cp.cuda.Device(1):
+        mask_1, labels_1 = cp.asarray(mask), cp.asarray(labels)
+
+    with cp.cuda.Device(0):
+        surfaces = [
+            mesh.mask2mesh(mask_1, spacing=spacing),
+            mesh.mask2mesh(mask_1, spacing=spacing, sigma=0.6),
+        ]
+        arrays = [
+            getattr(surface, name)
+            for surface in surfaces + [surfaces[0].scaled(2.0, origin=np.ones(3))]
+            for name in (
+                "vertices",
+                "faces",
+                "area_faces",
+                "face_normals",
+                "vertex_defects",
+                "face_adjacency",
+            )
+        ]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            on_gpu = mesh.extract_surface_features(mask_1, spacing=spacing)
+            _, on_gpu_labels, _ = mesh.extract_features(labels_1, spacing=spacing)
+        assert cp.cuda.Device().id == 0
+
+    assert [a.device.id for a in arrays] == [1] * len(arrays)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        on_cpu = mesh.extract_surface_features(mask, spacing=spacing)
+        _, on_cpu_labels, _ = mesh.extract_features(labels, spacing=spacing)
+    for name, expected in on_cpu.items():
+        assert on_gpu[name] == pytest.approx(expected, rel=1e-6, nan_ok=True), name
+    np.testing.assert_allclose(on_gpu_labels, on_cpu_labels, rtol=1e-6)
 
 
 def _labels() -> np.ndarray:
@@ -663,10 +745,9 @@ def test_gpu_shape_index_of_a_raw_mesh_matches_numpy(
 
     Its flat vertices have dihedral angles and angle defects that are rounding
     residues, which differ between the devices; ``_principal_curvatures`` sets
-    them to 0 (``_FLAT_ANGLE``, ``_FLAT_DEFECT``), and the shape index, which
-    differed by about 1e-3 between the devices, then agrees to 1e-12. This ball
-    is at the default spacing; ``test_gpu_edge_unit_matches_numpy`` covers the
-    unit the devices measure at.
+    them to 0 (``_FLAT_ANGLE``, ``_FLAT_DEFECT``), and the shape index then
+    agrees to 1e-12. This ball is at the default spacing;
+    ``test_gpu_edge_unit_matches_numpy`` covers the unit the devices measure at.
     """
     if not gpu_available:
         pytest.skip("GPU not available")
@@ -968,6 +1049,17 @@ def test_extract_mesh_features_stays_on_the_gpu(c: float, gpu_available: bool) -
 
     assert isinstance(surface, ArrayMesh) and isinstance(smooth, ArrayMesh)
     assert all(np.isfinite(v) for v in values.values()), values
+
+
+def test_far_object_on_gpu_is_measured_as_near(
+    gpu_available: bool,
+    lumpy_nucleus_of: Callable[[int], np.ndarray],
+    assert_far_object_like_near: Callable[..., None],
+) -> None:
+    """A CuPy mask's object 2030 voxels out gets the features it gets near the origin."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    assert_far_object_like_near(lumpy_nucleus_of(5), ascupy)
 
 
 def test_mask2mesh_on_gpu(gpu_available: bool) -> None:
