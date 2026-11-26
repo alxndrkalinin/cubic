@@ -1103,7 +1103,8 @@ def _local_threshold_mask(
     for i, threshold in enumerate(thresholds, start=1):
         if threshold is not None:
             table[i] = _exact_threshold(image.dtype, threshold)
-    return image.astype(np.float64) > to_same_device(table, image)[labels]
+    # The float64 table promotes the comparison, which is exact for float32.
+    return image > to_same_device(table, image)[labels]
 
 
 def _is_plane(image: np.ndarray) -> bool:
