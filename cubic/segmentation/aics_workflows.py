@@ -1,15 +1,24 @@
 """Device-agnostic Allen Cell Structure Segmenter classic workflows.
 
-Ports of the ``aicssegmentation`` SEC61B (ER) and TOMM20 (mitochondria)
-workflows and the primitives they share. The CPU reference runs ITK's
-gradient anisotropic diffusion and a per-slice Python loop for the 2D
-vesselness filter; here every step is a whole-volume array operation, so the
-same call runs on NumPy or CuPy input. The workflows also accept a single 2D
-plane, segmented as a one-plane volume.
+Ports of the ``aicssegmentation`` SEC61B (ER), TOMM20 (mitochondria), FBL
+and NPM1 (nucleolus) workflows and the primitives they share. The CPU
+reference runs ITK's gradient anisotropic diffusion, per-slice Python loops
+for the 2D vesselness and spot filters, and a whole-volume pass per object for
+its local Otsu thresholds; here every voxel-wise step is a whole-volume array
+operation, so the same call runs on NumPy or CuPy input. The workflows also
+accept a single 2D plane, segmented as a one-plane volume.
+
+The nucleolar workflows' scalar thresholds (triangle, median, global and
+per-object Otsu) are computed on the host from per-label histograms binned on
+the device exactly as ``np.histogram`` bins them, and compared with NumPy's
+promotion. Their masks were bitwise equal to ``aicssegmentation`` on CPU and
+GPU on every volume measured (24 confocal fibroblast tiles of
+31-38x1024x1024 voxels, 12 anti-fibrillarin through FBL and 12 EtBr through
+NPM1).
 
 Each primitive reproduces its reference's arithmetic, dtype, operation order
 and boundary handling (see the per-function notes). For float32 input the
-masks were bitwise equal to ``aicssegmentation`` on every volume measured
+SEC61B and TOMM20 masks were bitwise equal to ``aicssegmentation`` on every volume measured
 (250 light-sheet ER and mitochondria z-stacks of 48x640x960 voxels, acquired
 and predicted) on an x86-64 AVX2 host without AVX-512, where NumPy's float32 power returns glibc's FMA
 ``powf``.
@@ -26,15 +35,19 @@ midpoint (see ``_K_SERIAL_MARGIN``).
 """
 
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure
+from skimage.filters import threshold_otsu
+from skimage.morphology import ball
+from scipy.ndimage._filters import _gaussian_kernel1d as _scipy_gaussian_kernel1d
 
 from ..cuda import (
     asnumpy,
     get_device,
     _launch_config,
+    to_same_device,
     _cuda_functions,
     get_array_module,
 )
@@ -712,6 +725,396 @@ def remove_small_objects_aics(
     return keep[labels]
 
 
+def _label_faces(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """Face-connected labels of ``mask``, as ``skimage.measure.label(connectivity=1)``.
+
+    The label numbering may differ from scikit-image's; the objects do not.
+    """
+    labels, count = _ndimage.label(
+        mask, structure=generate_binary_structure(mask.ndim, 1)
+    )
+    return labels, int(count)
+
+
+def _comparison_dtype(dtype: np.dtype, threshold: Any) -> np.dtype:
+    """Dtype in which NumPy compares a ``dtype`` array with the host scalar ``threshold``.
+
+    NumPy 2 compares a float32 array with a float64 scalar in float64, NumPy 1
+    in float32; resolving the dtype on the host keeps CuPy on the same rule.
+    """
+    return np.result_type(np.empty(0, dtype=dtype), threshold)
+
+
+def _greater(image: np.ndarray, threshold: Any) -> np.ndarray:
+    """``image > threshold`` for a host scalar, promoted as NumPy promotes it."""
+    dtype = _comparison_dtype(image.dtype, threshold)
+    return image.astype(dtype, copy=False) > dtype.type(threshold)
+
+
+def _exact_threshold(dtype: np.dtype, threshold: Any) -> float:
+    """Return the value ``threshold`` takes when compared with a ``dtype`` array.
+
+    Float32 and float64 values are exact in float64, so comparing their float64
+    cast with this value reproduces :func:`_greater` for any threshold.
+    """
+    return float(_comparison_dtype(dtype, threshold).type(threshold))
+
+
+_HIST_BINS = 256
+_Histograms = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+
+
+def _label_histograms(
+    image: np.ndarray, labels: np.ndarray | None = None, n_labels: int = 1
+) -> _Histograms:
+    """256-bin ``skimage.exposure.histogram`` of ``image`` within each label.
+
+    Each label is binned as ``np.histogram(values, 256)`` bins it: the range is
+    the label's own minimum and maximum, the edges are NumPy's ``linspace`` in
+    the image dtype, and each bin index is NumPy's estimate
+    ``(v - min) / (max - min) * 256``, corrected by one where it lands on the
+    wrong side of an edge. The per-voxel steps run on the input's device, the
+    per-label edges on the host.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Floating-point image; NumPy or CuPy.
+    labels : np.ndarray | None
+        Labels ``1..n_labels`` of ``image``'s shape; ``0`` is ignored.
+        ``None`` bins the whole image as one label.
+    n_labels : int
+        Number of labels.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        Host arrays: per-label minima and maxima ``(n_labels,)`` in the image
+        dtype, int64 counts ``(n_labels, 256)`` and bin centers
+        ``(n_labels, 256)``. A label holding a single value has no counts
+        (NumPy would widen its range), so callers return that value first, as
+        scikit-image's thresholds do.
+    """
+    dtype = image.dtype
+    groups: np.ndarray | None = None
+    if labels is None:
+        values = image.ravel()
+        lowest = asnumpy(values.min()).reshape(1).astype(dtype)
+        highest = asnumpy(values.max()).reshape(1).astype(dtype)
+    else:
+        flat_labels = labels.ravel()
+        inside = flat_labels > 0
+        groups = flat_labels[inside].astype(np.intp) - 1
+        values = image.ravel()[inside]
+        lowest, highest = _group_extremes(values, groups, n_labels)
+    varying = highest > lowest
+    edges = np.zeros((n_labels, _HIST_BINS + 1), dtype=dtype)
+    for i in np.flatnonzero(varying):
+        pair = np.array([lowest[i], highest[i]], dtype=dtype)
+        edges[i] = np.histogram_bin_edges(pair, _HIST_BINS)
+    centers = (edges[:, :-1] + edges[:, 1:]) / 2.0
+    if not varying.any():
+        # No labels, or none with a range to bin: no counts to compute (and
+        # CuPy's bincount rejects an empty index).
+        return lowest, highest, np.zeros((n_labels, _HIST_BINS), np.int64), centers
+    # NumPy's norm_denom: last_edge - first_edge in the image dtype.
+    span = highest - lowest
+    flat_edges = to_same_device(edges.ravel(), image)
+    if labels is None:
+        first, denom = lowest[0], span[0]
+    else:
+        assert groups is not None
+        keep = to_same_device(varying, image)[groups]
+        groups, values = groups[keep], values[keep]
+        first = to_same_device(lowest, image)[groups]
+        denom = to_same_device(span, image)[groups]
+    index = (((values - first) / denom) * dtype.type(_HIST_BINS)).astype(np.intp)
+    index = np.where(index == _HIST_BINS, _HIST_BINS - 1, index)
+    row = 0 if groups is None else groups * (_HIST_BINS + 1)
+    index -= (values < flat_edges[row + index]).astype(np.intp)
+    index += (
+        (values >= flat_edges[row + index + 1]) & (index != _HIST_BINS - 1)
+    ).astype(np.intp)
+    if groups is not None:
+        index += groups * _HIST_BINS
+    counts = np.bincount(index, minlength=n_labels * _HIST_BINS)
+    return lowest, highest, asnumpy(counts).reshape(n_labels, _HIST_BINS), centers
+
+
+def _group_extremes(
+    values: np.ndarray, groups: np.ndarray, n_groups: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Host arrays of the minimum and maximum of ``values`` in each group ``0..n-1``.
+
+    On the host an unbuffered ``ufunc.at`` scatter; SciPy's labeled
+    ``minimum``/``maximum`` would argsort the whole image for each. On GPU
+    cupyx's labeled reductions, on labels ``1..n``: past 30 labels cupyx
+    switches to a sort that reads each label's extremes from where labels
+    ``1..max`` start, so label 0 is left at zero. Extremes are exact in any
+    dtype.
+    """
+    dtype = values.dtype
+    lowest = np.full(n_groups, np.inf, dtype=dtype)
+    highest = np.full(n_groups, -np.inf, dtype=dtype)
+    if values.size == 0:
+        # No voxel in any group (cupyx's reductions reject an empty input).
+        return lowest, highest
+    if get_device(values) == "CPU":
+        np.minimum.at(lowest, groups, values)
+        np.maximum.at(highest, groups, values)
+        return lowest, highest
+    labels = groups + 1
+    index = to_same_device(np.arange(1, n_groups + 1), values)
+    lowest = asnumpy(_ndimage.minimum(values, labels, index)).astype(dtype)
+    highest = asnumpy(_ndimage.maximum(values, labels, index)).astype(dtype)
+    return lowest, highest
+
+
+def _otsu_from_histogram(counts: np.ndarray, centers: np.ndarray) -> Any:
+    """``skimage.filters.threshold_otsu`` of an image with this histogram."""
+    return threshold_otsu(hist=(counts, centers))
+
+
+def _triangle_from_histogram(counts: np.ndarray, centers: np.ndarray) -> Any:
+    """``skimage.filters.threshold_triangle`` of an image with this histogram.
+
+    scikit-image's code after its histogram call, verbatim; the function itself
+    takes no histogram. The constant-image case is left to the caller.
+    """
+    hist, bin_centers = counts, centers
+    nbins = len(hist)
+    arg_peak_height = np.argmax(hist)
+    peak_height = hist[arg_peak_height]
+    arg_low_level, arg_high_level = np.flatnonzero(hist)[[0, -1]]
+    flip = arg_peak_height - arg_low_level < arg_high_level - arg_peak_height
+    if flip:
+        hist = hist[::-1]
+        arg_low_level = nbins - arg_high_level - 1
+        arg_peak_height = nbins - arg_peak_height - 1
+    width = arg_peak_height - arg_low_level
+    x1 = np.arange(width)
+    y1 = hist[x1 + arg_low_level]
+    norm = np.sqrt(peak_height**2 + width**2)
+    peak_height /= norm
+    width /= norm
+    length = peak_height * x1 - width * y1
+    arg_level = np.argmax(length) + arg_low_level
+    if flip:
+        arg_level = nbins - arg_level - 1
+    return bin_centers[arg_level]
+
+
+def _thresholds_from_histograms(
+    histograms: _Histograms,
+    method: Callable[[np.ndarray, np.ndarray], Any],
+) -> list[Any]:
+    """Histogram threshold ``method`` of each of :func:`_label_histograms`' labels.
+
+    A label of a single value returns that value, as scikit-image's Otsu and
+    triangle thresholds do for a constant image.
+    """
+    lowest, highest, counts, centers = histograms
+    return [
+        lo if lo == hi else method(c, b)
+        for lo, hi, c, b in zip(lowest, highest, counts, centers)
+    ]
+
+
+def _histogram_thresholds(
+    image: np.ndarray,
+    method: Callable[[np.ndarray, np.ndarray], Any],
+    labels: np.ndarray | None = None,
+    n_labels: int = 1,
+) -> list[Any]:
+    """Histogram threshold ``method`` of ``image`` within each label, on the host."""
+    return _thresholds_from_histograms(
+        _label_histograms(image, labels, n_labels), method
+    )
+
+
+def _median(image: np.ndarray) -> Any:
+    """``np.percentile(image, 50)`` on either device.
+
+    On GPU the middle order statistics come from a device partition (a copy;
+    ``image`` is left as it is), and NumPy interpolates them on the host: a
+    sorted array of the one or two middle values has the same interpolation
+    weight as the whole image. A NaN anywhere makes the median NaN, as in NumPy;
+    the partition would hide it in the tail.
+    """
+    if get_device(image) == "CPU":
+        return np.percentile(image, 50)
+    flat = image.ravel()
+    if np.isnan(flat.max()):
+        return flat.dtype.type(np.nan)
+    k = (flat.size - 1) // 2
+    count = 2 - flat.size % 2  # one middle value for odd sizes, two for even
+    middle = np.partition(flat, list(range(k, k + count)))[k : k + count]
+    return np.percentile(asnumpy(middle), 50)
+
+
+# SciPy's NI_Correlate1D for a symmetric odd-length filter, one output per
+# thread: the line is read in double, the centre tap goes first, then each pair
+# of taps (left + right) * w from the outermost inwards, accumulated in double
+# and stored in the output dtype. cupyx sums tap by tap instead, which rounds
+# differently where a second-derivative pass cancels to near zero. Boundaries
+# follow mode="reflect" (half-sample symmetric) at any distance.
+_CORRELATE_CUDA_SOURCE = r"""
+__device__ __forceinline__ long reflect_index(long j, long n) {
+  long period = 2 * n;
+  j %= period;
+  if (j < 0) j += period;
+  return j < n ? j : period - 1 - j;
+}
+
+template <typename T>
+__device__ void correlate1d_symmetric(
+    const T* in, T* out, const double* w, int half,
+    long outer, long length, long inner) {
+  long n = outer * length * inner;
+  for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += (long)blockDim.x * gridDim.x) {
+    long i = idx % inner, l = (idx / inner) % length, o = idx / (inner * length);
+    const T* line = in + o * length * inner + i;
+    double acc = (double)line[l * inner] * w[half];
+    for (int k = half; k >= 1; --k) {
+      double left = (double)line[reflect_index(l - k, length) * inner];
+      double right = (double)line[reflect_index(l + k, length) * inner];
+      acc += (left + right) * w[half - k];
+    }
+    out[idx] = (T)acc;
+  }
+}
+
+extern "C" __global__ void correlate1d_symmetric_f32(
+    const float* in, float* out, const double* w, int half,
+    long outer, long length, long inner) {
+  correlate1d_symmetric<float>(in, out, w, half, outer, length, inner);
+}
+
+extern "C" __global__ void correlate1d_symmetric_f64(
+    const double* in, double* out, const double* w, int half,
+    long outer, long length, long inner) {
+  correlate1d_symmetric<double>(in, out, w, half, outer, length, inner);
+}
+"""
+
+
+def _gaussian_filter1d_cuda(
+    image: np.ndarray, sigma: float, axis: int, order: int
+) -> np.ndarray:
+    """``scipy.ndimage.gaussian_filter1d(mode="reflect", truncate=4)`` of a float CuPy array.
+
+    SciPy's own weights (``_gaussian_kernel1d``, reversed as SciPy reverses
+    them) through :data:`_CORRELATE_CUDA_SOURCE`; bitwise equal to SciPy for
+    float32 and float64 input. The kernel reads its weights as symmetric, which
+    Gaussian kernels of even ``order`` (0 and 2 here) are.
+    """
+    xp = get_array_module(image)
+    radius = int(4.0 * float(sigma) + 0.5)
+    weights = _scipy_gaussian_kernel1d(sigma, order, radius)[::-1]
+    name = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64"}[image.dtype]
+    image = xp.ascontiguousarray(image)
+    shape = image.shape
+    outer = int(np.prod(shape[:axis]))
+    inner = int(np.prod(shape[axis + 1 :]))
+    device = _cupy_device(image)
+    with device:
+        (kernel,) = _cuda_functions(
+            _CORRELATE_CUDA_SOURCE, (f"correlate1d_symmetric_{name}",), device.id
+        )
+        out = xp.empty_like(image)
+        kernel(
+            *_launch_config(image.size),
+            (
+                image,
+                out,
+                xp.asarray(np.ascontiguousarray(weights)),
+                np.int32(radius),
+                np.int64(outer),
+                np.int64(shape[axis]),
+                np.int64(inner),
+            ),
+        )
+    return out
+
+
+def dot_slice_by_slice(image: np.ndarray, log_sigma: float) -> np.ndarray:
+    """2D spot filter ``-sigma**2 * LoG`` on each z-plane of an image.
+
+    Port of ``aicssegmentation.core.seg_dot.dot_slice_by_slice`` without a
+    cutoff: ``scipy.ndimage.gaussian_laplace`` (``mode="reflect"``,
+    ``truncate=4``) over the last two axes, every plane at once. Each 1D
+    Gaussian pass is stored in the image dtype, as in SciPy; on GPU a kernel
+    replays SciPy's float64 summation order (float32 and float64 input).
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Floating-point image ``(..., Y, X)``; leading axes are independent planes.
+    log_sigma : float
+        Gaussian scale, roughly the radius of the target dots.
+
+    Returns
+    -------
+    np.ndarray
+        Filter response in the image dtype, on the input's device.
+    """
+    on_gpu = get_device(image) == "GPU"
+    if on_gpu and image.dtype not in (np.float32, np.float64):
+        raise TypeError(f"image must be float32 or float64 on GPU, got {image.dtype}")
+    axes = (image.ndim - 2, image.ndim - 1)
+
+    def second_derivative(derivative_axis: int) -> np.ndarray:
+        """Gaussian passes over both axes, the second derivative along one."""
+        out = image
+        for axis in axes:
+            order = 2 if axis == derivative_axis else 0
+            if on_gpu:
+                out = _gaussian_filter1d_cuda(out, log_sigma, axis, order)
+            else:
+                out = _ndimage.gaussian_filter1d(
+                    out, log_sigma, axis=axis, order=order, mode="reflect", truncate=4.0
+                )
+        return out
+
+    # Not sum(): its leading ``0 + x`` turns a -0.0 into +0.0.
+    laplace = second_derivative(axes[0]) + second_derivative(axes[1])
+    return ((-1 * (log_sigma**2)) * laplace).astype(image.dtype, copy=False)
+
+
+def _low_level_mask(
+    smooth: np.ndarray,
+    inclusive: bool,
+    min_size: int = 700,
+    histogram: _Histograms | None = None,
+) -> np.ndarray:
+    """Step 1 of the nucleolar workflows: the dim, nucleus-scale regions.
+
+    ``smooth > (triangle + median) / 2``, keeping face-connected objects of at
+    least ``min_size`` voxels. ``histogram`` is ``smooth``'s whole-image
+    :func:`_label_histograms`, if the caller has it.
+    """
+    if histogram is None:
+        histogram = _label_histograms(smooth)
+    (triangle,) = _thresholds_from_histograms(histogram, _triangle_from_histogram)
+    threshold = (triangle + _median(smooth)) / 2
+    return remove_small_objects_aics(
+        _greater(smooth, threshold), min_size, inclusive=inclusive
+    )
+
+
+def _local_threshold_mask(
+    image: np.ndarray, labels: np.ndarray, thresholds: Sequence[Any]
+) -> np.ndarray:
+    """``image > thresholds[i - 1]`` within each label ``i``; ``None`` selects nothing."""
+    table = np.full(len(thresholds) + 1, np.inf)
+    for i, threshold in enumerate(thresholds, start=1):
+        if threshold is not None:
+            table[i] = _exact_threshold(image.dtype, threshold)
+    # The float64 table promotes the comparison, which is exact for float32.
+    return image > to_same_device(table, image)[labels]
+
+
 def _is_plane(image: np.ndarray) -> bool:
     """Tell a 2D plane (``True``) from a volume (``False``); raise otherwise."""
     if image.ndim not in (2, 3):
@@ -724,6 +1127,14 @@ def _resolve_inclusive(size_filter_inclusive: bool | None) -> bool:
     if size_filter_inclusive is None:
         return _SKIMAGE_USES_MAX_SIZE
     return size_filter_inclusive
+
+
+def _normalize_and_smooth(
+    image: np.ndarray, normalization: tuple[float, float], smoothing_sigma: float
+) -> np.ndarray:
+    """First steps of the nucleolar workflows: float32, normalized, Gaussian smoothed."""
+    norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
+    return _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
 
 
 def workflow_sec61b(
@@ -756,10 +1167,8 @@ def workflow_sec61b(
     np.ndarray
         Boolean mask of the input's shape, on the input's device.
     """
-    if _is_plane(image):
-        return workflow_sec61b(
-            image[None], size_filter_inclusive=size_filter_inclusive
-        )[0]
+    plane = _is_plane(image)
+    image = image[None] if plane else image
     inclusive = _resolve_inclusive(size_filter_inclusive)
     norm = intensity_normalization(image.astype(np.float32, copy=False), (2.5, 7.5))
     smooth = gradient_anisotropic_diffusion(norm)
@@ -768,7 +1177,8 @@ def workflow_sec61b(
     del smooth
     bw = remove_small_objects_aics(bw, 15, inclusive=inclusive)
     bw = remove_small_objects_aics(bw, 3, per_slice=True, inclusive=inclusive)
-    return remove_small_objects_aics(bw, 15, inclusive=inclusive)
+    bw = remove_small_objects_aics(bw, 15, inclusive=inclusive)
+    return bw[0] if plane else bw
 
 
 def workflow_tomm20(
@@ -801,14 +1211,197 @@ def workflow_tomm20(
     np.ndarray
         Boolean mask of the input's shape, on the input's device.
     """
-    if _is_plane(image):
-        return workflow_tomm20(
-            image[None], size_filter_inclusive=size_filter_inclusive
-        )[0]
+    plane = _is_plane(image)
+    image = image[None] if plane else image
     norm = intensity_normalization(image.astype(np.float32, copy=False), (3.5, 15.0))
     smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
     del norm
     bw = vesselness_slice_by_slice(smooth, sigmas=[1.5]) > 0.16
-    return remove_small_objects_aics(
+    bw = remove_small_objects_aics(
         bw, 10, inclusive=_resolve_inclusive(size_filter_inclusive)
     )
+    return bw[0] if plane else bw
+
+
+def workflow_fbl(
+    image: np.ndarray,
+    *,
+    normalization: tuple[float, float] = (0.5, 18),
+    smoothing_sigma: float = 1.0,
+    dot_sigma: float = 1,
+    dot_cutoff: float | None = 0.01,
+    local_otsu_factor: float = 1.0,
+    low_level_min_size: int = 700,
+    min_area: int = 5,
+    size_filter_inclusive: bool | None = None,
+) -> np.ndarray:
+    """FBL (nucleolus, dense fibrillar component) classic segmentation.
+
+    Port of ``aicssegmentation.structure_wrapper.seg_fbl.Workflow_fbl`` (no
+    rescaling): Gaussian smoothing, a low-level triangle-median threshold, an
+    Otsu threshold within each low-level object, and 2D spot detections merged
+    in. The defaults are the reference's fixed parameters; other values tune
+    the workflow to a dataset, as the Allen Cell Segmenter intends.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        3D image ``(Z, Y, X)``, or one 2D plane ``(Y, X)``; NumPy or CuPy.
+        Converted to float32 first; the bitwise match with the reference holds
+        for float32 input (the reference normalizes other dtypes in their own
+        precision). A 2D plane is segmented as a one-plane volume, so every
+        step sees only that plane: its own intensity statistics and no
+        smoothing or connectivity across z. The mask can therefore differ from
+        the same plane of a whole-volume segmentation.
+    normalization : tuple[float, float]
+        Auto-contrast bounds ``(a, b)``: the image is clipped to
+        ``[mean - a*std, mean + b*std]`` and rescaled to ``[0, 1]``.
+    smoothing_sigma : float
+        Sigma of the 3D Gaussian smoothing (``mode="nearest"``, ``truncate=3``).
+    dot_sigma : float
+        Scale of the 2D spot filter (:func:`dot_slice_by_slice`) whose
+        detections are merged into the mask, roughly the spot radius in pixels.
+    dot_cutoff : float | None
+        Spot-filter response above which a pixel is a detection; ``None``
+        skips the spot step, leaving the per-object Otsu mask.
+    local_otsu_factor : float
+        Factor applied to each low-level object's Otsu level to give its
+        threshold; the default 1 uses the Otsu level itself, as the
+        reference does. Above 1 it keeps only the brightest part of each
+        object, for images where the low level spans whole cells.
+    low_level_min_size : int
+        Smallest low-level (nucleus-scale) object kept, in voxels.
+    min_area : int
+        Smallest object kept in the final mask, in voxels.
+    size_filter_inclusive : bool | None
+        Small-object semantics of the reference run: ``True`` reproduces
+        ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
+        releases, ``None`` (default) follows the installed scikit-image. See
+        :func:`remove_small_objects_aics`.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask of the input's shape, on the input's device.
+    """
+    plane = _is_plane(image)
+    image = image[None] if plane else image
+    inclusive = _resolve_inclusive(size_filter_inclusive)
+    smooth = _normalize_and_smooth(image, normalization, smoothing_sigma)
+    labels, count = _label_faces(_low_level_mask(smooth, inclusive, low_level_min_size))
+    thresholds = [
+        local_otsu_factor * t
+        for t in _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    ]
+    bw = _local_threshold_mask(smooth, labels, thresholds)
+    del labels
+    if dot_cutoff is not None:
+        finer = _greater(dot_slice_by_slice(smooth, dot_sigma), dot_cutoff)
+        bw |= remove_small_objects_aics(finer, min_area, inclusive=inclusive)
+    bw = remove_small_objects_aics(bw, min_area, inclusive=inclusive)
+    return bw[0] if plane else bw
+
+
+def workflow_npm1(
+    image: np.ndarray,
+    *,
+    normalization: tuple[float, float] = (0.5, 15),
+    smoothing_sigma: float = 1.0,
+    dot_sigma: float = 2,
+    dot_cutoff: float | None = 0.025,
+    hole_sigmas: Sequence[float] = (2, 1),
+    hole_cutoff: float | None = 0.025,
+    low_level_min_size: int = 700,
+    dilation_radius: int = 2,
+    local_cutoff_factor: float = 0.333,
+    local_otsu_factor: float = 0.98,
+    min_area: int = 5,
+    size_filter_inclusive: bool | None = None,
+) -> np.ndarray:
+    """NPM1 (nucleolus, granular component) classic segmentation.
+
+    Port of ``aicssegmentation.structure_wrapper.seg_npm1.Workflow_npm1`` (no
+    rescaling): Gaussian smoothing, a low-level triangle-median threshold
+    dilated by a ball, a scaled Otsu threshold within each low-level object
+    bright enough against the global Otsu threshold, bright 2D spots inside the
+    low level, and dark 2D spots cut out as holes. The defaults are the
+    reference's fixed parameters; other values tune the workflow to a dataset,
+    as the Allen Cell Segmenter intends.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        3D image ``(Z, Y, X)``, or one 2D plane ``(Y, X)``; NumPy or CuPy.
+        Converted to float32 first; the bitwise match with the reference holds
+        for float32 input (the reference normalizes other dtypes in their own
+        precision). A 2D plane is segmented as a one-plane volume, so every
+        step sees only that plane: its own intensity statistics and no
+        smoothing, dilation or connectivity across z. The mask can therefore
+        differ from the same plane of a whole-volume segmentation.
+    normalization : tuple[float, float]
+        Auto-contrast bounds ``(a, b)``: the image is clipped to
+        ``[mean - a*std, mean + b*std]`` and rescaled to ``[0, 1]``.
+    smoothing_sigma : float
+        Sigma of the 3D Gaussian smoothing (``mode="nearest"``, ``truncate=3``).
+    dot_sigma : float
+        Scale of the 2D spot filter for bright spots added inside the low level.
+    dot_cutoff : float | None
+        Bright-spot response threshold; ``None`` adds no spots.
+    hole_sigmas : Sequence[float]
+        Scales of the 2D spot filter on the inverted image; dark spots at any
+        of them are cut out as holes.
+    hole_cutoff : float | None
+        Dark-spot response threshold; ``None`` cuts no holes.
+    low_level_min_size : int
+        Smallest low-level (nucleus-scale) object kept, in voxels.
+    dilation_radius : int
+        Radius of the ball the low-level mask is dilated by; ``0`` skips it.
+    local_cutoff_factor : float
+        An object is thresholded only if its Otsu level exceeds this factor
+        times the global Otsu level; dimmer objects are dropped.
+    local_otsu_factor : float
+        Factor applied to each object's Otsu level to give its threshold.
+    min_area : int
+        Smallest object kept in the final mask, in voxels.
+    size_filter_inclusive : bool | None
+        Small-object semantics of the reference run: ``True`` reproduces
+        ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
+        releases, ``None`` (default) follows the installed scikit-image. See
+        :func:`remove_small_objects_aics`.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask of the input's shape, on the input's device.
+    """
+    plane = _is_plane(image)
+    image = image[None] if plane else image
+    inclusive = _resolve_inclusive(size_filter_inclusive)
+    smooth = _normalize_and_smooth(image, normalization, smoothing_sigma)
+    histogram = _label_histograms(smooth)
+    low = _low_level_mask(smooth, inclusive, low_level_min_size, histogram)
+    if dilation_radius > 0:
+        # skimage's grey dilation reflects at the border; for a binary mask and
+        # a ball that adds nothing a zero border does not, as each reflected
+        # voxel has a nearer in-image twin inside the ball.
+        low = _ndimage.binary_dilation(
+            low, structure=to_same_device(ball(dilation_radius), smooth)
+        )
+    (global_otsu,) = _thresholds_from_histograms(histogram, _otsu_from_histogram)
+    local_cutoff = local_cutoff_factor * global_otsu
+    labels, count = _label_faces(low)
+    thresholds = [
+        local_otsu_factor * t if t > local_cutoff else None
+        for t in _histogram_thresholds(smooth, _otsu_from_histogram, labels, count)
+    ]
+    bw = _local_threshold_mask(smooth, labels, thresholds)
+    del labels
+    if dot_cutoff is not None:
+        bw |= _greater(dot_slice_by_slice(smooth, dot_sigma), dot_cutoff) & low
+    if hole_cutoff is not None:
+        inverted = 1 - smooth
+        del smooth
+        for sigma in hole_sigmas:
+            bw &= ~_greater(dot_slice_by_slice(inverted, sigma), hole_cutoff)
+    bw = remove_small_objects_aics(bw, min_area, inclusive=inclusive)
+    return bw[0] if plane else bw
