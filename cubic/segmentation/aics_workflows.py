@@ -736,13 +736,18 @@ def _label_faces(mask: np.ndarray) -> tuple[np.ndarray, int]:
     return labels, int(count)
 
 
-def _greater(image: np.ndarray, threshold: Any) -> np.ndarray:
-    """``image > threshold`` for a host scalar, promoted as NumPy promotes it.
+def _comparison_dtype(dtype: np.dtype, threshold: Any) -> np.dtype:
+    """Dtype in which NumPy compares a ``dtype`` array with the host scalar ``threshold``.
 
     NumPy 2 compares a float32 array with a float64 scalar in float64, NumPy 1
     in float32; resolving the dtype on the host keeps CuPy on the same rule.
     """
-    dtype = np.result_type(np.empty(0, dtype=image.dtype), threshold)
+    return np.result_type(np.empty(0, dtype=dtype), threshold)
+
+
+def _greater(image: np.ndarray, threshold: Any) -> np.ndarray:
+    """``image > threshold`` for a host scalar, promoted as NumPy promotes it."""
+    dtype = _comparison_dtype(image.dtype, threshold)
     return image.astype(dtype, copy=False) > dtype.type(threshold)
 
 
@@ -752,8 +757,7 @@ def _exact_threshold(dtype: np.dtype, threshold: Any) -> float:
     Float32 and float64 values are exact in float64, so comparing their float64
     cast with this value reproduces :func:`_greater` for any threshold.
     """
-    kind = np.result_type(np.empty(0, dtype=dtype), threshold)
-    return float(kind.type(threshold))
+    return float(_comparison_dtype(dtype, threshold).type(threshold))
 
 
 _HIST_BINS = 256
