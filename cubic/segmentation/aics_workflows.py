@@ -1121,6 +1121,14 @@ def _resolve_inclusive(size_filter_inclusive: bool | None) -> bool:
     return size_filter_inclusive
 
 
+def _normalize_and_smooth(
+    image: np.ndarray, normalization: tuple[float, float], smoothing_sigma: float
+) -> np.ndarray:
+    """First steps of the nucleolar workflows: float32, normalized, Gaussian smoothed."""
+    norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
+    return _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
+
+
 def workflow_sec61b(
     image: np.ndarray, *, size_filter_inclusive: bool | None = None
 ) -> np.ndarray:
@@ -1271,9 +1279,7 @@ def workflow_fbl(
     plane = _is_plane(image)
     image = image[None] if plane else image
     inclusive = _resolve_inclusive(size_filter_inclusive)
-    norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
-    smooth = _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
-    del norm
+    smooth = _normalize_and_smooth(image, normalization, smoothing_sigma)
     labels, count = _label_faces(_low_level_mask(smooth, inclusive, low_level_min_size))
     thresholds = [
         local_otsu_factor * t
@@ -1363,9 +1369,7 @@ def workflow_npm1(
     plane = _is_plane(image)
     image = image[None] if plane else image
     inclusive = _resolve_inclusive(size_filter_inclusive)
-    norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
-    smooth = _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
-    del norm
+    smooth = _normalize_and_smooth(image, normalization, smoothing_sigma)
     histogram = _label_histograms(smooth)
     low = _low_level_mask(smooth, inclusive, low_level_min_size, histogram)
     if dilation_radius > 0:
