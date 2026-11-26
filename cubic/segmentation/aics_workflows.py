@@ -978,20 +978,18 @@ extern "C" __global__ void correlate1d_symmetric_f64(
 
 
 def _gaussian_filter1d_cuda(
-    image: np.ndarray, sigma: float, axis: int, order: int, truncate: float
+    image: np.ndarray, sigma: float, axis: int, order: int
 ) -> np.ndarray:
-    """``scipy.ndimage.gaussian_filter1d(mode="reflect")`` of a float CuPy array.
+    """``scipy.ndimage.gaussian_filter1d(mode="reflect", truncate=4)`` of a float CuPy array.
 
     SciPy's own weights (``_gaussian_kernel1d``, reversed as SciPy reverses
     them) through :data:`_CORRELATE_CUDA_SOURCE`; bitwise equal to SciPy for
-    float32 and float64 input.
+    float32 and float64 input. The kernel reads its weights as symmetric, which
+    Gaussian kernels of even ``order`` (0 and 2 here) are.
     """
     xp = get_array_module(image)
-    radius = int(truncate * float(sigma) + 0.5)
+    radius = int(4.0 * float(sigma) + 0.5)
     weights = _scipy_gaussian_kernel1d(sigma, order, radius)[::-1]
-    # SciPy's symmetry test; Gaussian kernels of even order always pass it.
-    if np.abs(weights - weights[::-1]).max() > np.finfo(np.float64).eps:
-        raise ValueError(f"order {order} gives an asymmetric Gaussian kernel")
     name = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64"}[image.dtype]
     image = xp.ascontiguousarray(image)
     shape = image.shape
@@ -1043,19 +1041,22 @@ def dot_slice_by_slice(image: np.ndarray, log_sigma: float) -> np.ndarray:
     if on_gpu and image.dtype not in (np.float32, np.float64):
         raise TypeError(f"image must be float32 or float64 on GPU, got {image.dtype}")
     axes = (image.ndim - 2, image.ndim - 1)
-    laplace = None
-    for derivative_axis in axes:
+
+    def second_derivative(derivative_axis: int) -> np.ndarray:
+        """Gaussian passes over both axes, the second derivative along one."""
         out = image
         for axis in axes:
             order = 2 if axis == derivative_axis else 0
             if on_gpu:
-                out = _gaussian_filter1d_cuda(out, log_sigma, axis, order, 4.0)
+                out = _gaussian_filter1d_cuda(out, log_sigma, axis, order)
             else:
                 out = _ndimage.gaussian_filter1d(
                     out, log_sigma, axis=axis, order=order, mode="reflect", truncate=4.0
                 )
-        laplace = out if laplace is None else laplace + out
-    assert laplace is not None  # two axes
+        return out
+
+    # Not sum(): its leading ``0 + x`` turns a -0.0 into +0.0.
+    laplace = second_derivative(axes[0]) + second_derivative(axes[1])
     return ((-1 * (log_sigma**2)) * laplace).astype(image.dtype, copy=False)
 
 
