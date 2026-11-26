@@ -938,11 +938,14 @@ def _median(image: np.ndarray) -> Any:
     On GPU the middle order statistics come from a device partition (a copy;
     ``image`` is left as it is), and NumPy interpolates them on the host: a
     sorted array of the one or two middle values has the same interpolation
-    weight as the whole image.
+    weight as the whole image. A NaN anywhere makes the median NaN, as in NumPy;
+    the partition would hide it in the tail.
     """
     if get_device(image) == "CPU":
         return np.percentile(image, 50)
     flat = image.ravel()
+    if np.isnan(flat.max()):
+        return flat.dtype.type(np.nan)
     k = (flat.size - 1) // 2
     count = 2 - flat.size % 2  # one middle value for odd sizes, two for even
     middle = np.partition(flat, list(range(k, k + count)))[k : k + count]

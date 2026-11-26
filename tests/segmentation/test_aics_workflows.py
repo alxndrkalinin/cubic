@@ -478,6 +478,17 @@ def test_median_matches_numpy(use_gpu: bool, size: int, gpu_available: bool) -> 
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize("size", [1001, 1000])
+def test_median_propagates_nan(use_gpu: bool, size: int, gpu_available: bool) -> None:
+    """One NaN anywhere makes the median NaN, as ``np.percentile(x, 50)`` does."""
+    x = np.random.default_rng(7).random(size).astype(np.float32)
+    x[size // 3] = np.nan
+    median = _median(_to_device(x, use_gpu, gpu_available))
+    expected = np.percentile(x, 50)
+    assert np.isnan(expected) and np.isnan(median) and median.dtype == expected.dtype
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
 @pytest.mark.parametrize("sigma", [1, 2])
 def test_dot_slice_by_slice_matches_reference(
     use_gpu: bool, sigma: int, gpu_available: bool
