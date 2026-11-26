@@ -761,11 +761,12 @@ def _exact_threshold(dtype: np.dtype, threshold: Any) -> float:
 
 
 _HIST_BINS = 256
+_Histograms = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
 def _label_histograms(
     image: np.ndarray, labels: np.ndarray | None = None, n_labels: int = 1
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> _Histograms:
     """256-bin ``skimage.exposure.histogram`` of ``image`` within each label.
 
     Each label is binned as ``np.histogram(values, 256)`` bins it: the range is
@@ -898,22 +899,32 @@ def _triangle_from_histogram(counts: np.ndarray, centers: np.ndarray) -> Any:
     return bin_centers[arg_level]
 
 
+def _thresholds_from_histograms(
+    histograms: _Histograms,
+    method: Callable[[np.ndarray, np.ndarray], Any],
+) -> list[Any]:
+    """Histogram threshold ``method`` of each of :func:`_label_histograms`' labels.
+
+    A label of a single value returns that value, as scikit-image's Otsu and
+    triangle thresholds do for a constant image.
+    """
+    lowest, highest, counts, centers = histograms
+    return [
+        lo if lo == hi else method(c, b)
+        for lo, hi, c, b in zip(lowest, highest, counts, centers)
+    ]
+
+
 def _histogram_thresholds(
     image: np.ndarray,
     method: Callable[[np.ndarray, np.ndarray], Any],
     labels: np.ndarray | None = None,
     n_labels: int = 1,
 ) -> list[Any]:
-    """Histogram threshold ``method`` of ``image`` within each label, on the host.
-
-    A label of a single value returns that value, as scikit-image's Otsu and
-    triangle thresholds do for a constant image.
-    """
-    lowest, highest, counts, centers = _label_histograms(image, labels, n_labels)
-    return [
-        lo if lo == hi else method(c, b)
-        for lo, hi, c, b in zip(lowest, highest, counts, centers)
-    ]
+    """Histogram threshold ``method`` of ``image`` within each label, on the host."""
+    return _thresholds_from_histograms(
+        _label_histograms(image, labels, n_labels), method
+    )
 
 
 def _median(image: np.ndarray) -> Any:
@@ -1064,14 +1075,20 @@ def dot_slice_by_slice(image: np.ndarray, log_sigma: float) -> np.ndarray:
 
 
 def _low_level_mask(
-    smooth: np.ndarray, inclusive: bool, min_size: int = 700
+    smooth: np.ndarray,
+    inclusive: bool,
+    min_size: int = 700,
+    histogram: _Histograms | None = None,
 ) -> np.ndarray:
     """Step 1 of the nucleolar workflows: the dim, nucleus-scale regions.
 
     ``smooth > (triangle + median) / 2``, keeping face-connected objects of at
-    least ``min_size`` voxels.
+    least ``min_size`` voxels. ``histogram`` is ``smooth``'s whole-image
+    :func:`_label_histograms`, if the caller has it.
     """
-    (triangle,) = _histogram_thresholds(smooth, _triangle_from_histogram)
+    if histogram is None:
+        histogram = _label_histograms(smooth)
+    (triangle,) = _thresholds_from_histograms(histogram, _triangle_from_histogram)
     threshold = (triangle + _median(smooth)) / 2
     return remove_small_objects_aics(
         _greater(smooth, threshold), min_size, inclusive=inclusive
@@ -1348,7 +1365,8 @@ def workflow_npm1(
     norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
     smooth = _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
     del norm
-    low = _low_level_mask(smooth, inclusive, low_level_min_size)
+    histogram = _label_histograms(smooth)
+    low = _low_level_mask(smooth, inclusive, low_level_min_size, histogram)
     if dilation_radius > 0:
         # skimage's grey dilation reflects at the border; for a binary mask and
         # a ball that adds nothing a zero border does not, as each reflected
@@ -1356,7 +1374,7 @@ def workflow_npm1(
         low = _ndimage.binary_dilation(
             low, structure=to_same_device(ball(dilation_radius), smooth)
         )
-    (global_otsu,) = _histogram_thresholds(smooth, _otsu_from_histogram)
+    (global_otsu,) = _thresholds_from_histograms(histogram, _otsu_from_histogram)
     local_cutoff = local_cutoff_factor * global_otsu
     labels, count = _label_faces(low)
     thresholds = [
