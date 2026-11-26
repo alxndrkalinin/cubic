@@ -919,15 +919,18 @@ def _histogram_thresholds(
 def _median(image: np.ndarray) -> Any:
     """``np.percentile(image, 50)`` on either device.
 
-    On GPU the middle order statistics come from a device sort, and NumPy
-    interpolates them on the host: a sorted array of the one or two middle
-    values has the same interpolation weight as the whole image.
+    On GPU the middle order statistics come from a device partition (a copy;
+    ``image`` is left as it is), and NumPy interpolates them on the host: a
+    sorted array of the one or two middle values has the same interpolation
+    weight as the whole image.
     """
     if get_device(image) == "CPU":
         return np.percentile(image, 50)
-    flat = np.sort(image.ravel())
+    flat = image.ravel()
     k = (flat.size - 1) // 2
-    return np.percentile(asnumpy(flat[k : k + 2 - flat.size % 2]), 50)
+    count = 2 - flat.size % 2  # one middle value for odd sizes, two for even
+    middle = np.partition(flat, list(range(k, k + count)))[k : k + count]
+    return np.percentile(asnumpy(middle), 50)
 
 
 # SciPy's NI_Correlate1D for a symmetric odd-length filter, one output per
