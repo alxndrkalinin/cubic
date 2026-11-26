@@ -1125,10 +1125,8 @@ def workflow_sec61b(
     np.ndarray
         Boolean mask of the input's shape, on the input's device.
     """
-    if _is_plane(image):
-        return workflow_sec61b(
-            image[None], size_filter_inclusive=size_filter_inclusive
-        )[0]
+    plane = _is_plane(image)
+    image = image[None] if plane else image
     inclusive = _resolve_inclusive(size_filter_inclusive)
     norm = intensity_normalization(image.astype(np.float32, copy=False), (2.5, 7.5))
     smooth = gradient_anisotropic_diffusion(norm)
@@ -1137,7 +1135,8 @@ def workflow_sec61b(
     del smooth
     bw = remove_small_objects_aics(bw, 15, inclusive=inclusive)
     bw = remove_small_objects_aics(bw, 3, per_slice=True, inclusive=inclusive)
-    return remove_small_objects_aics(bw, 15, inclusive=inclusive)
+    bw = remove_small_objects_aics(bw, 15, inclusive=inclusive)
+    return bw[0] if plane else bw
 
 
 def workflow_tomm20(
@@ -1170,17 +1169,16 @@ def workflow_tomm20(
     np.ndarray
         Boolean mask of the input's shape, on the input's device.
     """
-    if _is_plane(image):
-        return workflow_tomm20(
-            image[None], size_filter_inclusive=size_filter_inclusive
-        )[0]
+    plane = _is_plane(image)
+    image = image[None] if plane else image
     norm = intensity_normalization(image.astype(np.float32, copy=False), (3.5, 15.0))
     smooth = _gaussian_nearest(norm, [1.0] * norm.ndim)
     del norm
     bw = vesselness_slice_by_slice(smooth, sigmas=[1.5]) > 0.16
-    return remove_small_objects_aics(
+    bw = remove_small_objects_aics(
         bw, 10, inclusive=_resolve_inclusive(size_filter_inclusive)
     )
+    return bw[0] if plane else bw
 
 
 def workflow_fbl(
@@ -1244,18 +1242,8 @@ def workflow_fbl(
     np.ndarray
         Boolean mask of the input's shape, on the input's device.
     """
-    if _is_plane(image):
-        return workflow_fbl(
-            image[None],
-            normalization=normalization,
-            smoothing_sigma=smoothing_sigma,
-            dot_sigma=dot_sigma,
-            dot_cutoff=dot_cutoff,
-            local_otsu_factor=local_otsu_factor,
-            low_level_min_size=low_level_min_size,
-            min_area=min_area,
-            size_filter_inclusive=size_filter_inclusive,
-        )[0]
+    plane = _is_plane(image)
+    image = image[None] if plane else image
     inclusive = _resolve_inclusive(size_filter_inclusive)
     norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
     smooth = _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
@@ -1270,7 +1258,8 @@ def workflow_fbl(
     if dot_cutoff is not None:
         finer = _greater(dot_slice_by_slice(smooth, dot_sigma), dot_cutoff)
         bw |= remove_small_objects_aics(finer, min_area, inclusive=inclusive)
-    return remove_small_objects_aics(bw, min_area, inclusive=inclusive)
+    bw = remove_small_objects_aics(bw, min_area, inclusive=inclusive)
+    return bw[0] if plane else bw
 
 
 def workflow_npm1(
@@ -1345,22 +1334,8 @@ def workflow_npm1(
     np.ndarray
         Boolean mask of the input's shape, on the input's device.
     """
-    if _is_plane(image):
-        return workflow_npm1(
-            image[None],
-            normalization=normalization,
-            smoothing_sigma=smoothing_sigma,
-            dot_sigma=dot_sigma,
-            dot_cutoff=dot_cutoff,
-            hole_sigmas=hole_sigmas,
-            hole_cutoff=hole_cutoff,
-            low_level_min_size=low_level_min_size,
-            dilation_radius=dilation_radius,
-            local_cutoff_factor=local_cutoff_factor,
-            local_otsu_factor=local_otsu_factor,
-            min_area=min_area,
-            size_filter_inclusive=size_filter_inclusive,
-        )[0]
+    plane = _is_plane(image)
+    image = image[None] if plane else image
     inclusive = _resolve_inclusive(size_filter_inclusive)
     norm = intensity_normalization(image.astype(np.float32, copy=False), normalization)
     smooth = _gaussian_nearest(norm, [smoothing_sigma] * norm.ndim)
@@ -1389,4 +1364,5 @@ def workflow_npm1(
         del smooth
         for sigma in hole_sigmas:
             bw &= ~_greater(dot_slice_by_slice(inverted, sigma), hole_cutoff)
-    return remove_small_objects_aics(bw, min_area, inclusive=inclusive)
+    bw = remove_small_objects_aics(bw, min_area, inclusive=inclusive)
+    return bw[0] if plane else bw
