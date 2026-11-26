@@ -1258,10 +1258,6 @@ def workflow_fbl(
         ``[mean - a*std, mean + b*std]`` and rescaled to ``[0, 1]``.
     smoothing_sigma : float
         Sigma of the 3D Gaussian smoothing (``mode="nearest"``, ``truncate=3``).
-    low_level_min_size : int
-        Smallest low-level (nucleus-scale) object kept, in voxels.
-    min_area : int
-        Smallest object kept in the final mask, in voxels.
     dot_sigma : float
         Scale of the 2D spot filter (:func:`dot_slice_by_slice`) whose
         detections are merged into the mask, roughly the spot radius in pixels.
@@ -1273,6 +1269,10 @@ def workflow_fbl(
         threshold; the default 1 uses the Otsu level itself, as the
         reference does. Above 1 it keeps only the brightest part of each
         object, for images where the low level spans whole cells.
+    low_level_min_size : int
+        Smallest low-level (nucleus-scale) object kept, in voxels.
+    min_area : int
+        Smallest object kept in the final mask, in voxels.
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
@@ -1343,10 +1343,6 @@ def workflow_npm1(
         ``[mean - a*std, mean + b*std]`` and rescaled to ``[0, 1]``.
     smoothing_sigma : float
         Sigma of the 3D Gaussian smoothing (``mode="nearest"``, ``truncate=3``).
-    low_level_min_size : int
-        Smallest low-level (nucleus-scale) object kept, in voxels.
-    min_area : int
-        Smallest object kept in the final mask, in voxels.
     dot_sigma : float
         Scale of the 2D spot filter for bright spots added inside the low level.
     dot_cutoff : float | None
@@ -1356,6 +1352,8 @@ def workflow_npm1(
         of them are cut out as holes.
     hole_cutoff : float | None
         Dark-spot response threshold; ``None`` cuts no holes.
+    low_level_min_size : int
+        Smallest low-level (nucleus-scale) object kept, in voxels.
     dilation_radius : int
         Radius of the ball the low-level mask is dilated by; ``0`` skips it.
     local_cutoff_factor : float
@@ -1363,6 +1361,8 @@ def workflow_npm1(
         times the global Otsu level; dimmer objects are dropped.
     local_otsu_factor : float
         Factor applied to each object's Otsu level to give its threshold.
+    min_area : int
+        Smallest object kept in the final mask, in voxels.
     size_filter_inclusive : bool | None
         Small-object semantics of the reference run: ``True`` reproduces
         ``aicssegmentation`` under scikit-image >= 0.26, ``False`` under older
