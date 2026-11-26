@@ -813,12 +813,14 @@ def _label_histograms(
         pair = np.array([lowest[i], highest[i]], dtype=dtype)
         edges[i] = np.histogram_bin_edges(pair, _HIST_BINS)
     centers = (edges[:, :-1] + edges[:, 1:]) / 2.0
+    if not varying.any():
+        # No labels, or none with a range to bin: no counts to compute (and
+        # CuPy's bincount rejects an empty index).
+        return lowest, highest, np.zeros((n_labels, _HIST_BINS), np.int64), centers
     # NumPy's norm_denom: last_edge - first_edge in the image dtype.
     span = highest - lowest
     flat_edges = to_same_device(edges.ravel(), image)
     if labels is None:
-        if not varying[0]:
-            return lowest, highest, np.zeros((1, _HIST_BINS), np.int64), centers
         first, denom = lowest[0], span[0]
     else:
         assert groups is not None
@@ -852,9 +854,12 @@ def _group_extremes(
     dtype.
     """
     dtype = values.dtype
+    lowest = np.full(n_groups, np.inf, dtype=dtype)
+    highest = np.full(n_groups, -np.inf, dtype=dtype)
+    if values.size == 0:
+        # No voxel in any group (cupyx's reductions reject an empty input).
+        return lowest, highest
     if get_device(values) == "CPU":
-        lowest = np.full(n_groups, np.inf, dtype=dtype)
-        highest = np.full(n_groups, -np.inf, dtype=dtype)
         np.minimum.at(lowest, groups, values)
         np.maximum.at(highest, groups, values)
         return lowest, highest

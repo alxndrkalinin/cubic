@@ -419,6 +419,33 @@ def test_label_histograms_many_labels(use_gpu: bool, gpu_available: bool) -> Non
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize(
+    ("n_labels", "constant_labels"), [(0, False), (2, False), (2, True)]
+)
+def test_label_histograms_without_varying_labels(
+    use_gpu: bool, n_labels: int, constant_labels: bool, gpu_available: bool
+) -> None:
+    """No labels, only background, or only constant labels give zero counts, as on the host."""
+    img = np.random.default_rng(9).random((3, 8, 8)).astype(np.float32)
+    labels = np.zeros(img.shape, dtype=np.int32)
+    if constant_labels:
+        labels[0], labels[1] = 1, 2
+        img[0], img[1] = 2.0, 3.0
+    expected = _label_histograms(img, labels, n_labels)
+    lowest, highest, counts, centers = _label_histograms(
+        _to_device(img, use_gpu, gpu_available),
+        _to_device(labels, use_gpu, gpu_available),
+        n_labels,
+    )
+    assert lowest.shape == highest.shape == (n_labels,) and lowest.dtype == img.dtype
+    assert counts.shape == centers.shape == (n_labels, 256) and counts.dtype == np.int64
+    assert not counts.any()
+    for cpu, got in zip(expected, (lowest, highest, counts, centers)):
+        assert got.dtype == cpu.dtype
+        np.testing.assert_array_equal(got, cpu)
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
 def test_histogram_thresholds_match_skimage(use_gpu: bool, gpu_available: bool) -> None:
     """Otsu and triangle thresholds equal skimage's, per label and whole-image."""
     img = _gaussian_nearest(
@@ -777,6 +804,27 @@ def test_workflow_parameters_gpu_matches_cpu(
     cpu = workflow(img, **kwargs)
     gpu = workflow(ascupy(img), **kwargs)
     assert cpu.any() and (cpu != workflow(img)).any()
+    np.testing.assert_array_equal(asnumpy(gpu), cpu)
+
+
+@pytest.mark.parametrize("workflow", _NUCLEOLAR)
+@pytest.mark.parametrize("constant", [False, True])
+def test_nucleolar_without_low_level_objects_gpu_matches_cpu(
+    workflow, constant: bool, gpu_available: bool
+) -> None:
+    """A tile with no low-level object, or a constant one, segments alike on both devices."""
+    if not gpu_available:
+        pytest.skip("GPU not available")
+    if constant:
+        img = np.full((4, 20, 20), 5.0, dtype=np.float32)
+        kwargs: dict = {}
+    else:
+        img, kwargs = _nucleoli(), {"low_level_min_size": 10**6}
+    cpu = workflow(img, **kwargs)
+    gpu = workflow(ascupy(img), **kwargs)
+    # FBL keeps the spot detections where no low-level object survives.
+    assert cpu.any() == (workflow is workflow_fbl and not constant)
+    assert get_device(gpu) == "GPU"
     np.testing.assert_array_equal(asnumpy(gpu), cpu)
 
 
