@@ -787,43 +787,45 @@ def test_workflow_rejects_other_dimensionalities(workflow) -> None:
         workflow(np.zeros((2, 4, 8, 8), dtype=np.float32))
 
 
-@pytest.mark.parametrize(
-    ("workflow", "module_name", "func_name"),
-    [
-        (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
-        (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
-        (workflow_fbl, "seg_fbl", "Workflow_fbl"),
-        (workflow_npm1, "seg_npm1", "Workflow_npm1"),
-    ],
-)
-def test_workflow_matches_aicssegmentation(
-    workflow, module_name: str, func_name: str
-) -> None:
-    """Masks equal ``aicssegmentation``'s under the installed scikit-image."""
-    if workflow not in _NUCLEOLAR:
+# (workflow, its ``aicssegmentation`` module and function, whether that
+# reference needs ITK for its diffusion step)
+_AICS_REFERENCES = [
+    (workflow_sec61b, "seg_sec61b", "Workflow_sec61b", True),
+    (workflow_tomm20, "seg_tomm20", "Workflow_tomm20", True),
+    (workflow_fbl, "seg_fbl", "Workflow_fbl", False),
+    (workflow_npm1, "seg_npm1", "Workflow_npm1", False),
+]
+
+
+def _aics_reference(module_name: str, func_name: str, needs_itk: bool):
+    """Return the ``aicssegmentation`` workflow function, skipping if it cannot run."""
+    if needs_itk:
         pytest.importorskip("itk")
     module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
+    return getattr(module, func_name)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "module_name", "func_name", "needs_itk"), _AICS_REFERENCES
+)
+def test_workflow_matches_aicssegmentation(
+    workflow, module_name: str, func_name: str, needs_itk: bool
+) -> None:
+    """Masks equal ``aicssegmentation``'s under the installed scikit-image."""
+    reference = _aics_reference(module_name, func_name, needs_itk)
     img = _volume(workflow, seed=5)
-    expected = getattr(module, func_name)(img.copy(), output_type="array") > 0
+    expected = reference(img.copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(img), expected)
 
 
 @pytest.mark.parametrize(
-    ("workflow", "module_name", "func_name"),
-    [
-        (workflow_sec61b, "seg_sec61b", "Workflow_sec61b"),
-        (workflow_tomm20, "seg_tomm20", "Workflow_tomm20"),
-        (workflow_fbl, "seg_fbl", "Workflow_fbl"),
-        (workflow_npm1, "seg_npm1", "Workflow_npm1"),
-    ],
+    ("workflow", "module_name", "func_name", "needs_itk"), _AICS_REFERENCES
 )
 def test_workflow_plane_matches_aicssegmentation(
-    workflow, module_name: str, func_name: str
+    workflow, module_name: str, func_name: str, needs_itk: bool
 ) -> None:
     """A plane's mask equals ``aicssegmentation`` run on the one-plane volume."""
-    if workflow not in _NUCLEOLAR:
-        pytest.importorskip("itk")
-    module = pytest.importorskip(f"aicssegmentation.structure_wrapper.{module_name}")
+    reference = _aics_reference(module_name, func_name, needs_itk)
     plane = _plane(workflow, seed=5, index=2)
-    expected = getattr(module, func_name)(plane[None].copy(), output_type="array") > 0
+    expected = reference(plane[None].copy(), output_type="array") > 0
     np.testing.assert_array_equal(workflow(plane), expected[0])
